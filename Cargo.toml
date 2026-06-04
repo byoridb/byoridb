@@ -15,15 +15,15 @@ path = "src/main.rs"
 name = "byoridb-backup"
 path = "src/backup_cli.rs"
 
-# The server binaries are the RocksDB consumers: enable the `rocksdb` feature
-# on the stack so StorageEnv / MetaServer / backup compile. (Embedded keeps it
-# off — that's the whole point of the feature.)
+# The server binaries enable the network layers (`server` on graph forwards to
+# storage RPC + meta server). The KV backend (redb) is pure-Rust and always on,
+# so there's no storage feature to flip anymore.
 [dependencies]
 byoridb-common = { path = "byoridb-common" }
-byoridb-graph = { path = "byoridb-graph", features = ["rocksdb", "server"] }
-byoridb-storage = { path = "byoridb-storage", features = ["rocksdb"] }
-byoridb-meta = { path = "byoridb-meta", features = ["rocksdb"] }
-byoridb-kvstore = { path = "byoridb-kvstore", features = ["rocksdb"] }
+byoridb-graph = { path = "byoridb-graph", features = ["server"] }
+byoridb-storage = { path = "byoridb-storage", features = ["distributed"] }
+byoridb-meta = { path = "byoridb-meta", features = ["server"] }
+byoridb-kvstore = { path = "byoridb-kvstore" }
 byoridb-codec = { path = "byoridb-codec" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
@@ -38,10 +38,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 byoridb-common = { path = "byoridb-common" }
 byoridb-parser = { path = "byoridb-parser" }
 byoridb-executor = { path = "byoridb-executor" }
-byoridb-kvstore = { path = "byoridb-kvstore", features = ["rocksdb"] }
-byoridb-storage = { path = "byoridb-storage", features = ["rocksdb"] }
-byoridb-meta = { path = "byoridb-meta", features = ["rocksdb"] }
-byoridb-graph = { path = "byoridb-graph", features = ["rocksdb", "server"] }
+byoridb-kvstore = { path = "byoridb-kvstore" }
+byoridb-storage = { path = "byoridb-storage", features = ["distributed"] }
+byoridb-meta = { path = "byoridb-meta", features = ["server"] }
+byoridb-graph = { path = "byoridb-graph", features = ["server"] }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 criterion = "0.5"
@@ -91,7 +91,7 @@ serde_json = "1.0"
 bincode = "1.3"
 
 # Storage
-rocksdb = "0.22"
+redb = "4.1"
 
 # Networking
 tonic = { version = "0.12", features = ["gzip", "zstd"] }

@@ -8,9 +8,20 @@ pub type Result<T> = std::result::Result<T, KVStoreError>;
 
 #[derive(Error, Debug)]
 pub enum KVStoreError {
-    #[cfg(feature = "rocksdb")]
-    #[error("RocksDB error: {0}")]
-    RocksDB(#[from] rocksdb::Error),
+    #[error("redb database error: {0}")]
+    RedbDatabase(#[from] redb::DatabaseError),
+
+    #[error("redb transaction error: {0}")]
+    RedbTransaction(#[from] redb::TransactionError),
+
+    #[error("redb table error: {0}")]
+    RedbTable(#[from] redb::TableError),
+
+    #[error("redb storage error: {0}")]
+    RedbStorage(#[from] redb::StorageError),
+
+    #[error("redb commit error: {0}")]
+    RedbCommit(#[from] redb::CommitError),
 
     #[error("Key not found: {0:?}")]
     KeyNotFound(Vec<u8>),

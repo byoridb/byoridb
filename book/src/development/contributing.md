@@ -6,9 +6,8 @@ We welcome contributions to ByoriDB.
 
 ### Prerequisites
 
-- Rust 1.75+
-- C++ compiler (clang or gcc)
-- CMake 3.10+
+- Rust 1.90+
+- protobuf-compiler (for gRPC codegen)
 - Git
 
 ### Setup

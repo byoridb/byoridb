@@ -2,12 +2,11 @@
 
 This project is built using the following open source software:
 
-## RocksDB
-ByoriDB leverages RocksDB as its underlying key-value storage engine.
-- **Component**: Storage Engine (`byoridb-kvstore` embeds the C++ library)
-- **License**: Apache 2.0 (Dual Licensed with GPLv2; we elect Apache 2.0)
-- **Copyright**: Copyright (c) 2011-present, Facebook, Inc. All rights reserved.
-- **Source**: https://github.com/facebook/rocksdb
+## redb
+ByoriDB uses redb as its underlying key-value storage engine.
+- **Component**: Storage Engine (`byoridb-kvstore`, pure-Rust embedded KV)
+- **License**: MIT/Apache 2.0
+- **Source**: https://github.com/cberner/redb
 
 ## Rust Crates
 This project uses various Rust crates from crates.io. Key dependencies include:
@@ -18,7 +17,7 @@ This project uses various Rust crates from crates.io. Key dependencies include:
 | **tonic** | MIT | gRPC Framework |
 | **prost** | Apache 2.0 | Protocol Buffers implementation |
 | **serde** | MIT/Apache 2.0 | Serialization framework |
-| **rocksdb** | MIT/Apache 2.0 | Rust bindings for RocksDB |
+| **redb** | MIT/Apache 2.0 | Pure-Rust embedded key-value store |
 | **clap** | MIT/Apache 2.0 | Command Line Argument Parser |
 | **rustyline** | MIT | Readline implementation for CLI |
 | **comfy-table** | MIT | CLI Table Formatting |

@@ -1,11 +1,10 @@
 # Build Stage
 FROM rust:1.90-slim-bookworm AS builder
 
-# Install build dependencies for RocksDB and gRPC
+# Build dependencies. The KV store is now pure-Rust (redb), so the RocksDB C++
+# toolchain (cmake, clang, libclang-dev) is gone. protobuf-compiler is for gRPC
+# codegen; build-essential/pkg-config cover native crates (zstd, openssl-sys).
 RUN apt-get update && apt-get install -y \
-    cmake \
-    clang \
-    libclang-dev \
     protobuf-compiler \
     build-essential \
     pkg-config \

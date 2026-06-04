@@ -7,7 +7,7 @@ Thank you for your interest in contributing to ByoriDB! We welcome contributions
 ### Prerequisites
 
 - **Rust**: We use the latest stable version of Rust. Install it via [rustup](https://rustup.rs/).
-- **C++ Build Tools**: Required for compiling RocksDB (e.g., `cmake`, `clang`, `gcc`).
+- No C++ build tools required — storage is pure-Rust (redb).
 
 ### Building the Project
 
@@ -67,7 +67,7 @@ We follow standard Rust coding conventions.
 ## Project Structure
 
 - `byoridb-common`: Core data types (Value, Vertex, Edge, DataSet).
-- `byoridb-kvstore`: KV storage layer with RocksDB + WAL.
+- `byoridb-kvstore`: KV storage layer (redb, pure Rust).
 - `byoridb-codec`: Row encoding/decoding with schema versioning.
 - `byoridb-storage`: Storage service, Raft consensus, indexing.
 - `byoridb-meta`: Metadata management, partition allocation.

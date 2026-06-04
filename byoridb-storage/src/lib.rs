@@ -12,11 +12,9 @@
 //! - Partition migration and management
 
 pub mod codec;
-// `env` (StorageEnv) opens a WalKVStore and `server` (StorageServer) builds on
-// it — both require the RocksDB-backed kvstore. Gate them behind `rocksdb` so
-// the storage *types* (index, key, codec, proto, errors) stay pure-Rust and
-// usable by the embedded build. These are server-only, unused in-process.
-#[cfg(feature = "rocksdb")]
+// `env` (StorageEnv) opens a redb-backed KVStore — pure Rust, always available
+// (embedded or server). `server` (StorageServer) serves it over gRPC and is
+// gated behind `distributed`.
 pub mod env;
 pub mod error;
 // The heartbeat sender talks to the Meta cluster via MetaClient (gRPC), so it
@@ -32,7 +30,7 @@ pub mod raft;
 // not wasm-compatible. Gate behind `distributed`; embedded never serves RPC.
 #[cfg(feature = "distributed")]
 pub mod rpc;
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "distributed")]
 pub mod server;
 
 /// Generated protobuf types
@@ -63,5 +61,5 @@ pub use raft::{
 };
 #[cfg(feature = "distributed")]
 pub use rpc::StorageRpcService;
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "distributed")]
 pub use server::StorageServer;

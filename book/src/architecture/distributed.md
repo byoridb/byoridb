@@ -84,7 +84,7 @@ CREATE SPACE my_space(
 3. Leader appends to Raft log
 4. Leader replicates to followers
 5. Once majority acknowledges, commit
-6. Apply to RocksDB and respond
+6. Apply to redb and respond
 
 ### Read Options
 

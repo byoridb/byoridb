@@ -7,7 +7,7 @@
 use byoridb_common::datatypes::vertex::Tag;
 use byoridb_common::{Edge, Value, Vertex};
 use byoridb_graph::service::GraphService;
-use byoridb_kvstore::{KVStoreOptions, RocksdbKVStore};
+use byoridb_kvstore::{KVStoreOptions, RedbKVStore};
 use byoridb_parser::parse;
 use std::sync::Arc;
 
@@ -71,7 +71,7 @@ async fn use_graph_service() -> Result<(), Box<dyn std::error::Error>> {
     // Create a temporary KVStore
     let temp_dir = std::env::temp_dir().join("byoridb_example_kvstore");
     let _ = std::fs::remove_dir_all(&temp_dir); // Clean up if exists
-    let kvstore = Arc::new(RocksdbKVStore::open(&temp_dir, KVStoreOptions::default())?);
+    let kvstore = Arc::new(RedbKVStore::open(&temp_dir, KVStoreOptions::default())?);
 
     // Create a graph service
     let graph_service = GraphService::new(kvstore);

@@ -11,7 +11,7 @@ pub enum KeyType {
     EdgeIndex = 5,
 }
 
-/// Helper to generate keys for RocksDB
+/// Helper to generate keys for the KV store
 /// Key Format:
 /// Vertex: PartID (4) + VertexID (8) + KeyType(1) + TagID (4)
 /// Edge:   PartID (4) + SrcVertexID (8) + KeyType(1) + EdgeType (4) + Rank (8) + DstVertexID (8)

@@ -2,11 +2,16 @@
 //
 // This source code is licensed under Apache 2.0 License.
 
-//! Backup and restore functionality using RocksDB Checkpoint
+//! Backup and restore functionality for the redb-backed KVStore.
 //!
-//! This module provides hot backup capabilities for ByoriDB's KVStore.
-//! It uses RocksDB's Checkpoint feature to create consistent point-in-time
-//! snapshots without blocking writes.
+//! redb is a single-file, pure-Rust store with built-in ACID durability
+//! (every commit fsyncs). A consistent point-in-time backup is taken by
+//! opening the source under a read transaction (an MVCC snapshot) and
+//! draining every key/value into a fresh redb file. Restore copies that
+//! static file back into a target directory.
+//!
+//! The data directory contract matches [`crate::RedbKVStore`]: a *directory*
+//! whose redb file is `data.redb`.
 //!
 //! # Usage
 //!
@@ -14,25 +19,25 @@
 //! use byoridb_kvstore::backup::{BackupManager, BackupOptions};
 //!
 //! let manager = BackupManager::new("/path/to/db", "/path/to/backups")?;
-//!
-//! // Create a backup
 //! let backup_info = manager.create_backup(None)?;
-//!
-//! // List backups
 //! let backups = manager.list_backups()?;
-//!
-//! // Restore from backup
-//! manager.restore_backup(&backup_info.id, "/path/to/restore")?;
+//! manager.restore_backup(&backup_info.id, "/path/to/restore", false)?;
 //! ```
 
-use rocksdb::{checkpoint::Checkpoint, Options, DB};
+use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
+
+/// Single KV table — must match [`crate::store`]'s definition.
+const KV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
+
+/// redb data file name inside a data directory or backup directory.
+const DATA_FILE: &str = "data.redb";
 
 /// Backup-related errors
 #[derive(Debug, Error)]
@@ -40,8 +45,20 @@ pub enum BackupError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("RocksDB error: {0}")]
-    RocksDB(#[from] rocksdb::Error),
+    #[error("redb database error: {0}")]
+    RedbDatabase(#[from] redb::DatabaseError),
+
+    #[error("redb transaction error: {0}")]
+    RedbTransaction(#[from] redb::TransactionError),
+
+    #[error("redb table error: {0}")]
+    RedbTable(#[from] redb::TableError),
+
+    #[error("redb storage error: {0}")]
+    RedbStorage(#[from] redb::StorageError),
+
+    #[error("redb commit error: {0}")]
+    RedbCommit(#[from] redb::CommitError),
 
     #[error("Serialization error: {0}")]
     Serialization(String),
@@ -78,7 +95,8 @@ pub struct BackupInfo {
 pub struct BackupOptions {
     /// Optional label for the backup
     pub label: Option<String>,
-    /// Whether to flush WAL before backup (ensures all data is persisted)
+    /// Retained for API compatibility. redb fsyncs on every commit, so there
+    /// is nothing extra to flush before a backup; this field is a no-op.
     pub flush_before_backup: bool,
 }
 
@@ -91,9 +109,9 @@ impl Default for BackupOptions {
     }
 }
 
-/// Manages backups for a RocksDB database
+/// Manages backups for a redb database directory.
 pub struct BackupManager {
-    /// Path to the source database
+    /// Path to the source database **directory** (contains `data.redb`).
     db_path: PathBuf,
     /// Path to the backup directory
     backup_dir: PathBuf,
@@ -103,13 +121,12 @@ impl BackupManager {
     /// Create a new BackupManager
     ///
     /// # Arguments
-    /// * `db_path` - Path to the RocksDB database directory
+    /// * `db_path` - Path to the database directory (holds `data.redb`)
     /// * `backup_dir` - Path where backups will be stored
     pub fn new<P: AsRef<Path>, Q: AsRef<Path>>(db_path: P, backup_dir: Q) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
         let backup_dir = backup_dir.as_ref().to_path_buf();
 
-        // Create backup directory if it doesn't exist
         if !backup_dir.exists() {
             fs::create_dir_all(&backup_dir)?;
             // Restrict access to owner only — backup files contain raw DB data
@@ -127,14 +144,13 @@ impl BackupManager {
         })
     }
 
-    /// Create a backup of the database
+    /// Create a consistent backup of the database.
     ///
-    /// Uses RocksDB's Checkpoint feature for consistent hot backups.
-    /// The backup is created in a subdirectory named with a timestamp.
+    /// Opens the source redb under a read snapshot and drains it into a fresh
+    /// redb file under a timestamped subdirectory.
     pub fn create_backup(&self, options: Option<BackupOptions>) -> Result<BackupInfo> {
         let options = options.unwrap_or_default();
 
-        // Generate backup ID from timestamp
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -147,32 +163,11 @@ impl BackupManager {
             backup_id, self.db_path, backup_path
         );
 
-        // Open the database - read-write if flush is needed, otherwise read-only
-        let mut db_opts = Options::default();
-        db_opts.create_if_missing(false);
+        fs::create_dir_all(&backup_path)?;
+        snapshot_copy(&self.db_path.join(DATA_FILE), &backup_path.join(DATA_FILE))?;
 
-        if options.flush_before_backup {
-            // Open in read-write mode to allow flush
-            let db = DB::open(&db_opts, &self.db_path)?;
-            debug!("Flushing WAL before backup");
-            db.flush()?;
-
-            // Create checkpoint
-            let checkpoint = Checkpoint::new(&db)?;
-            checkpoint.create_checkpoint(&backup_path)?;
-        } else {
-            // Open in read-only mode (safer, no modifications)
-            let db = DB::open_for_read_only(&db_opts, &self.db_path, false)?;
-
-            // Create checkpoint
-            let checkpoint = Checkpoint::new(&db)?;
-            checkpoint.create_checkpoint(&backup_path)?;
-        }
-
-        // Calculate backup size
         let size_bytes = calculate_dir_size(&backup_path)?;
 
-        // Create backup info
         let backup_info = BackupInfo {
             id: backup_id,
             created_at: timestamp,
@@ -181,7 +176,6 @@ impl BackupManager {
             source_path: self.db_path.to_string_lossy().to_string(),
         };
 
-        // Save metadata
         self.save_backup_metadata(&backup_info)?;
 
         info!(
@@ -217,11 +211,8 @@ impl BackupManager {
                             warn!("Failed to load backup metadata from {:?}: {}", path, e);
                         }
                     }
-                } else {
-                    // Try to reconstruct metadata from directory
-                    if let Some(info) = self.reconstruct_backup_info(&path) {
-                        backups.push(info);
-                    }
+                } else if let Some(info) = self.reconstruct_backup_info(&path) {
+                    backups.push(info);
                 }
             }
         }
@@ -246,11 +237,11 @@ impl BackupManager {
         })
     }
 
-    /// Restore a backup to a target directory
+    /// Restore a backup to a target **directory**.
     ///
     /// # Arguments
     /// * `backup_id` - ID of the backup to restore
-    /// * `target_path` - Path where the database will be restored
+    /// * `target_path` - Directory where `data.redb` will be placed
     /// * `overwrite` - If true, overwrite existing target directory
     pub fn restore_backup<P: AsRef<Path>>(
         &self,
@@ -265,7 +256,6 @@ impl BackupManager {
             return Err(BackupError::BackupNotFound(backup_id.to_string()));
         }
 
-        // Validate backup
         self.validate_backup(&backup_path)?;
 
         if target_path.exists() {
@@ -281,14 +271,10 @@ impl BackupManager {
 
         info!("Restoring backup '{}' to {:?}", backup_id, target_path);
 
-        // Copy backup to target
-        copy_dir_recursive(&backup_path, target_path)?;
-
-        // Remove metadata file from restored directory (not needed in running DB)
-        let metadata_in_target = target_path.join("backup_metadata.json");
-        if metadata_in_target.exists() {
-            fs::remove_file(metadata_in_target)?;
-        }
+        // The backup's data.redb is a static, consistent file — a plain copy
+        // into the target directory is sufficient. Metadata is left behind.
+        fs::create_dir_all(target_path)?;
+        fs::copy(backup_path.join(DATA_FILE), target_path.join(DATA_FILE))?;
 
         info!(
             "Backup '{}' restored successfully to {:?}",
@@ -331,21 +317,17 @@ impl BackupManager {
         Ok(deleted)
     }
 
-    /// Validate that a backup is complete and valid
+    /// Validate that a backup is complete and openable.
     fn validate_backup(&self, backup_path: &Path) -> Result<()> {
-        // Check for essential RocksDB files
-        let current_file = backup_path.join("CURRENT");
-        if !current_file.exists() {
-            return Err(BackupError::InvalidBackup(
-                "Missing CURRENT file".to_string(),
-            ));
+        let data_file = backup_path.join(DATA_FILE);
+        if !data_file.exists() {
+            return Err(BackupError::InvalidBackup(format!(
+                "Missing {} file",
+                DATA_FILE
+            )));
         }
 
-        // Try to open the backup as read-only to verify integrity
-        let mut opts = Options::default();
-        opts.create_if_missing(false);
-
-        match DB::open_for_read_only(&opts, backup_path, false) {
+        match Database::open(&data_file) {
             Ok(_) => Ok(()),
             Err(e) => Err(BackupError::InvalidBackup(format!(
                 "Failed to open backup: {}",
@@ -397,6 +379,33 @@ impl BackupManager {
     }
 }
 
+/// Open `src` redb under a read snapshot and drain every key/value into a
+/// freshly created `dst` redb file. This yields a consistent, self-contained
+/// copy regardless of concurrent commits to `src`.
+fn snapshot_copy(src: &Path, dst: &Path) -> Result<()> {
+    let source = Database::open(src)?;
+    let rtx = source.begin_read()?;
+
+    let dest = Database::create(dst)?;
+    let wtx = dest.begin_write()?;
+    {
+        let mut dst_table = wtx.open_table(KV_TABLE)?;
+        match rtx.open_table(KV_TABLE) {
+            Ok(src_table) => {
+                for entry in src_table.range::<&[u8]>(..)? {
+                    let (k, v) = entry?;
+                    dst_table.insert(k.value(), v.value())?;
+                }
+            }
+            // A pristine source that never wrote the table is a valid empty DB.
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    wtx.commit()?;
+    Ok(())
+}
+
 /// Calculate total size of a directory recursively
 fn calculate_dir_size(path: &Path) -> Result<u64> {
     let mut total = 0;
@@ -417,25 +426,6 @@ fn calculate_dir_size(path: &Path) -> Result<u64> {
     }
 
     Ok(total)
-}
-
-/// Copy a directory recursively
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)?;
-
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            fs::copy(&src_path, &dst_path)?;
-        }
-    }
-
-    Ok(())
 }
 
 /// Format bytes as human-readable string
@@ -513,18 +503,25 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn create_test_db(path: &Path) -> DB {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        let db = DB::open(&opts, path).unwrap();
+    /// Create a redb data directory (`<dir>/data.redb`) with test rows.
+    fn create_test_db(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        let db = Database::create(dir.join(DATA_FILE)).unwrap();
+        let wtx = db.begin_write().unwrap();
+        {
+            let mut t = wtx.open_table(KV_TABLE).unwrap();
+            t.insert(b"key1".as_slice(), b"value1".as_slice()).unwrap();
+            t.insert(b"key2".as_slice(), b"value2".as_slice()).unwrap();
+            t.insert(b"key3".as_slice(), b"value3".as_slice()).unwrap();
+        }
+        wtx.commit().unwrap();
+    }
 
-        // Add some test data
-        db.put(b"key1", b"value1").unwrap();
-        db.put(b"key2", b"value2").unwrap();
-        db.put(b"key3", b"value3").unwrap();
-        db.flush().unwrap();
-
-        db
+    fn read_key(dir: &Path, key: &[u8]) -> Option<Vec<u8>> {
+        let db = Database::open(dir.join(DATA_FILE)).unwrap();
+        let rtx = db.begin_read().unwrap();
+        let t = rtx.open_table(KV_TABLE).unwrap();
+        t.get(key).unwrap().map(|g| g.value().to_vec())
     }
 
     #[test]
@@ -533,14 +530,10 @@ mod tests {
         let db_path = temp_dir.path().join("test_db");
         let backup_dir = temp_dir.path().join("backups");
 
-        // Create test database
-        let _db = create_test_db(&db_path);
-        drop(_db); // Close DB
+        create_test_db(&db_path);
 
-        // Create backup manager
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
 
-        // Create backup (no flush needed since test DB already flushed)
         let backup_info = manager
             .create_backup(Some(BackupOptions {
                 label: Some("test backup".to_string()),
@@ -552,7 +545,6 @@ mod tests {
         assert_eq!(backup_info.label, Some("test backup".to_string()));
         assert!(backup_info.size_bytes > 0);
 
-        // List backups
         let backups = manager.list_backups().unwrap();
         assert_eq!(backups.len(), 1);
         assert_eq!(backups[0].id, backup_info.id);
@@ -565,11 +557,8 @@ mod tests {
         let backup_dir = temp_dir.path().join("backups");
         let restore_path = temp_dir.path().join("restored_db");
 
-        // Create test database
-        let _db = create_test_db(&db_path);
-        drop(_db);
+        create_test_db(&db_path);
 
-        // Create backup (no flush needed since test DB already flushed)
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
         let backup_info = manager
             .create_backup(Some(BackupOptions {
@@ -578,19 +567,13 @@ mod tests {
             }))
             .unwrap();
 
-        // Restore backup
         manager
             .restore_backup(&backup_info.id, &restore_path, false)
             .unwrap();
 
-        // Verify restored data
-        let mut opts = Options::default();
-        opts.create_if_missing(false);
-        let restored_db = DB::open(&opts, &restore_path).unwrap();
-
-        assert_eq!(restored_db.get(b"key1").unwrap(), Some(b"value1".to_vec()));
-        assert_eq!(restored_db.get(b"key2").unwrap(), Some(b"value2".to_vec()));
-        assert_eq!(restored_db.get(b"key3").unwrap(), Some(b"value3".to_vec()));
+        assert_eq!(read_key(&restore_path, b"key1"), Some(b"value1".to_vec()));
+        assert_eq!(read_key(&restore_path, b"key2"), Some(b"value2".to_vec()));
+        assert_eq!(read_key(&restore_path, b"key3"), Some(b"value3".to_vec()));
     }
 
     #[test]
@@ -599,8 +582,7 @@ mod tests {
         let db_path = temp_dir.path().join("test_db");
         let backup_dir = temp_dir.path().join("backups");
 
-        let _db = create_test_db(&db_path);
-        drop(_db);
+        create_test_db(&db_path);
 
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
         let backup_info = manager
@@ -623,8 +605,7 @@ mod tests {
         let db_path = temp_dir.path().join("test_db");
         let backup_dir = temp_dir.path().join("backups");
 
-        let _db = create_test_db(&db_path);
-        drop(_db);
+        create_test_db(&db_path);
 
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
         let opts = BackupOptions {
@@ -632,7 +613,6 @@ mod tests {
             flush_before_backup: false,
         };
 
-        // Create multiple backups
         for _ in 0..5 {
             manager.create_backup(Some(opts.clone())).unwrap();
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -640,7 +620,6 @@ mod tests {
 
         assert_eq!(manager.list_backups().unwrap().len(), 5);
 
-        // Keep only 2 most recent
         let deleted = manager.cleanup_old_backups(2).unwrap();
         assert_eq!(deleted.len(), 3);
         assert_eq!(manager.list_backups().unwrap().len(), 2);
@@ -661,8 +640,7 @@ mod tests {
         let db_path = temp_dir.path().join("test_db");
         let backup_dir = temp_dir.path().join("backups");
 
-        let _db = create_test_db(&db_path);
-        drop(_db);
+        create_test_db(&db_path);
 
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
 
@@ -679,13 +657,10 @@ mod tests {
 
     #[test]
     fn test_format_bytes_unit_boundaries() {
-        // Just under 1 KB stays in bytes
         assert_eq!(format_bytes(1023), "1023 bytes");
-        // Exact unit boundaries
         assert_eq!(format_bytes(1024), "1.00 KB");
         assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
-        // Large value uses GB unit
         assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.00 GB");
     }
 
@@ -693,13 +668,11 @@ mod tests {
 
     #[test]
     fn test_format_timestamp_epoch() {
-        // Unix epoch: 1970-01-01 00:00:00 UTC
         assert_eq!(format_timestamp(0), "1970-01-01 00:00:00 UTC");
     }
 
     #[test]
     fn test_format_timestamp_known_value() {
-        // 2024-01-01 00:00:00 UTC == 1704067200
         assert_eq!(
             format_timestamp(1_704_067_200),
             "2024-01-01 00:00:00 UTC",
@@ -709,13 +682,11 @@ mod tests {
 
     #[test]
     fn test_format_timestamp_non_leap_year_feb_28() {
-        // 2023-02-28 12:34:56 UTC == 1677587696
         assert_eq!(format_timestamp(1_677_587_696), "2023-02-28 12:34:56 UTC");
     }
 
     #[test]
     fn test_format_timestamp_leap_day() {
-        // 2024-02-29 00:00:00 UTC == 1709164800 (Feb 29 only exists in leap years)
         assert_eq!(
             format_timestamp(1_709_164_800),
             "2024-02-29 00:00:00 UTC",
@@ -730,7 +701,6 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let backup_dir = temp_dir.path().join("backups_empty");
         let manager = BackupManager::new(temp_dir.path().join("db"), &backup_dir).unwrap();
-        // BackupManager::new creates the directory; it must still report no backups.
         assert!(manager.list_backups().unwrap().is_empty());
     }
 
@@ -740,7 +710,6 @@ mod tests {
         let backup_dir = temp_dir.path().join("backups");
         fs::create_dir_all(&backup_dir).unwrap();
 
-        // Directories that don't start with `backup_` must be skipped silently.
         fs::create_dir_all(backup_dir.join("scratch")).unwrap();
         fs::create_dir_all(backup_dir.join("logs")).unwrap();
 
@@ -754,8 +723,7 @@ mod tests {
         let db_path = temp_dir.path().join("test_db");
         let backup_dir = temp_dir.path().join("backups");
 
-        let _db = create_test_db(&db_path);
-        drop(_db);
+        create_test_db(&db_path);
 
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
         let opts = BackupOptions {
@@ -763,15 +731,13 @@ mod tests {
             flush_before_backup: false,
         };
 
-        let mut ids = Vec::new();
         for _ in 0..3 {
-            ids.push(manager.create_backup(Some(opts.clone())).unwrap().id);
+            manager.create_backup(Some(opts.clone())).unwrap();
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
 
         let listed = manager.list_backups().unwrap();
         assert_eq!(listed.len(), 3);
-        // list_backups is sorted by created_at DESC
         for window in listed.windows(2) {
             assert!(window[0].created_at >= window[1].created_at);
         }
@@ -784,8 +750,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("db");
         let backup_dir = temp_dir.path().join("backups");
-        let _db = create_test_db(&db_path);
-        drop(_db);
+        create_test_db(&db_path);
 
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
         match manager.get_backup("backup_does_not_exist") {
@@ -801,8 +766,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("db");
         let backup_dir = temp_dir.path().join("backups");
-        let _db = create_test_db(&db_path);
-        drop(_db);
+        create_test_db(&db_path);
 
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
         assert!(matches!(
@@ -818,8 +782,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("db");
         let backup_dir = temp_dir.path().join("backups");
-        let _db = create_test_db(&db_path);
-        drop(_db);
+        create_test_db(&db_path);
 
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
         let result = manager.restore_backup("missing", temp_dir.path().join("restored"), false);
@@ -833,8 +796,7 @@ mod tests {
         let backup_dir = temp_dir.path().join("backups");
         let restore_path = temp_dir.path().join("restored");
 
-        let _db = create_test_db(&db_path);
-        drop(_db);
+        create_test_db(&db_path);
 
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
         let info = manager
@@ -844,7 +806,6 @@ mod tests {
             }))
             .unwrap();
 
-        // Pre-create the restore target — restore must refuse without overwrite=true
         fs::create_dir_all(&restore_path).unwrap();
         fs::write(restore_path.join("sentinel"), b"in_use").unwrap();
 
@@ -852,7 +813,6 @@ mod tests {
             .restore_backup(&info.id, &restore_path, false)
             .unwrap_err();
         assert!(matches!(err, BackupError::RestoreTargetExists(_)));
-        // Sentinel must still be there (no destruction without permission)
         assert!(restore_path.join("sentinel").exists());
     }
 
@@ -863,8 +823,7 @@ mod tests {
         let backup_dir = temp_dir.path().join("backups");
         let restore_path = temp_dir.path().join("restored");
 
-        let _db = create_test_db(&db_path);
-        drop(_db);
+        create_test_db(&db_path);
 
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
         let info = manager
@@ -874,7 +833,6 @@ mod tests {
             }))
             .unwrap();
 
-        // Pre-existing target with junk content
         fs::create_dir_all(&restore_path).unwrap();
         fs::write(restore_path.join("junk.txt"), b"stale").unwrap();
 
@@ -882,29 +840,22 @@ mod tests {
             .restore_backup(&info.id, &restore_path, true)
             .unwrap();
 
-        // After overwrite, junk.txt must be gone and the restored DB must work
         assert!(
             !restore_path.join("junk.txt").exists(),
             "overwrite must wipe stale contents first"
         );
-
-        let mut opts = Options::default();
-        opts.create_if_missing(false);
-        let restored = DB::open(&opts, &restore_path).unwrap();
-        assert_eq!(restored.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+        assert_eq!(read_key(&restore_path, b"key1"), Some(b"value1".to_vec()));
     }
 
     #[test]
     fn test_restored_db_strips_metadata_file() {
-        // backup_metadata.json is internal — the restored directory must not
-        // ship it (RocksDB would treat it as a stray file).
+        // Only data.redb is copied on restore — metadata stays in the backup dir.
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("db");
         let backup_dir = temp_dir.path().join("backups");
         let restore_path = temp_dir.path().join("restored");
 
-        let _db = create_test_db(&db_path);
-        drop(_db);
+        create_test_db(&db_path);
 
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
         let info = manager
@@ -914,7 +865,6 @@ mod tests {
             }))
             .unwrap();
 
-        // The original backup directory keeps its metadata
         assert!(backup_dir
             .join(&info.id)
             .join("backup_metadata.json")
@@ -924,7 +874,6 @@ mod tests {
             .restore_backup(&info.id, &restore_path, false)
             .unwrap();
 
-        // The restored copy must not retain it
         assert!(!restore_path.join("backup_metadata.json").exists());
     }
 
@@ -935,8 +884,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("db");
         let backup_dir = temp_dir.path().join("backups");
-        let _db = create_test_db(&db_path);
-        drop(_db);
+        create_test_db(&db_path);
 
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
         let opts = BackupOptions {
@@ -944,7 +892,6 @@ mod tests {
             flush_before_backup: false,
         };
         manager.create_backup(Some(opts.clone())).unwrap();
-        // backup IDs include a Unix-second timestamp; sleep to avoid collision
         std::thread::sleep(std::time::Duration::from_secs(1));
         manager.create_backup(Some(opts)).unwrap();
 
@@ -958,8 +905,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("db");
         let backup_dir = temp_dir.path().join("backups");
-        let _db = create_test_db(&db_path);
-        drop(_db);
+        create_test_db(&db_path);
 
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
         let opts = BackupOptions {
@@ -997,17 +943,12 @@ mod tests {
         assert!(opts.label.is_none());
     }
 
-    // ----- create_backup with default options -----------------------------
-
     #[test]
-    fn test_create_backup_with_default_options_flushes() {
-        // Default options request a flush-before-backup; this exercises the
-        // read-write open path (different code branch from `flush=false`).
+    fn test_create_backup_with_default_options() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("db");
         let backup_dir = temp_dir.path().join("backups");
-        let _db = create_test_db(&db_path);
-        drop(_db);
+        create_test_db(&db_path);
 
         let manager = BackupManager::new(&db_path, &backup_dir).unwrap();
         let info = manager.create_backup(None).unwrap(); // None -> defaults

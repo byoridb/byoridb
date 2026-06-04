@@ -18,7 +18,7 @@ The project is organized into several crates:
 | Crate | Description |
 |-------|-------------|
 | `byoridb-common` | Core data types (Value, Vertex, Edge, DataSet) |
-| `byoridb-kvstore` | KV storage layer with RocksDB |
+| `byoridb-kvstore` | KV storage layer (redb, pure Rust) |
 | `byoridb-codec` | Row encoding/decoding |
 | `byoridb-storage` | Storage service for vertices and edges |
 | `byoridb-meta` | Metadata management (spaces, schemas) |

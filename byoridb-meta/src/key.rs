@@ -4,7 +4,7 @@
 
 //! Meta key utilities for consistent binary key encoding
 //!
-//! All keys use big-endian byte encoding for consistent sorting in RocksDB.
+//! All keys use big-endian byte encoding for consistent sorting in the KV store.
 
 /// Meta key builder for metadata storage
 ///
