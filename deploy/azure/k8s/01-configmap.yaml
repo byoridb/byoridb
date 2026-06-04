@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: byoridb-config
+  namespace: byoridb
+data:
+  BYORIDB__SERVER__GRAPH_ADDR: "0.0.0.0:9669"
+  BYORIDB__SERVER__HTTP_ADDR: "0.0.0.0:19669"
+  BYORIDB__SERVER__STORAGE_ADDR: "0.0.0.0:44500"
+  # Vec<String>: comma-separated, parsed by AppConfig's list_separator.
+  BYORIDB__STORAGE__DATA_PATHS: "/app/data"
+  RUST_LOG: "info,byoridb=info"

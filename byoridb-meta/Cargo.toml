@@ -1,0 +1,42 @@
+[package]
+name = "byoridb-meta"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# Enables the RocksDB-backed MetaServer (server-only). axum is only used by
+# server.rs, which is itself rocksdb-gated, so pull it in via this feature.
+# server.rs also serves gRPC (MetaServiceServer), so it requires `distributed`.
+default = []
+rocksdb = ["byoridb-kvstore/rocksdb", "dep:axum", "distributed"]
+# Enables the gRPC layer (proto + MetaClient/StorageClient/rpc/service). Pulls
+# in tonic (→ axum/hyper/mio), not wasm-compatible. The pure metadata *types*
+# (schema, hotspot, key, error) stay available to the embedded build.
+distributed = ["dep:tonic", "dep:prost"]
+
+[dependencies]
+byoridb-common = { path = "../byoridb-common" }
+byoridb-kvstore = { path = "../byoridb-kvstore" }
+byoridb-codec = { path = "../byoridb-codec" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+tokio-stream = "0.1"
+axum = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[lints]
+workspace = true

@@ -1,0 +1,40 @@
+[package]
+name = "byoridb-executor"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# Enables distributed query execution (remote Storage nodes via gRPC + Meta
+# client). Pulls in tonic (not wasm-compatible) and the gated layers of
+# byoridb-storage / byoridb-meta. The embedded build runs local-only.
+distributed = ["dep:tonic", "byoridb-storage/distributed", "byoridb-meta/distributed"]
+
+[dependencies]
+byoridb-common = { path = "../byoridb-common" }
+byoridb-codec = { path = "../byoridb-codec" }
+byoridb-parser = { path = "../byoridb-parser" }
+byoridb-storage = { path = "../byoridb-storage" }
+byoridb-kvstore = { path = "../byoridb-kvstore" }
+byoridb-meta = { path = "../byoridb-meta" }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bumpalo = { workspace = true }
+parking_lot = { workspace = true }
+futures = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "graph_traversal"
+harness = false
+
+[lints]
+workspace = true

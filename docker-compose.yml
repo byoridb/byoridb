@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  byoridb-server-1:
+    build: .
+    image: byoridb-server:latest
+    container_name: byoridb-server-1
+    ports:
+      - "9669:9669"
+      - "19669:19669"
+    environment:
+      - RUST_LOG=info
+      - BYORIDB__SERVER__GRAPH_ADDR=0.0.0.0:9669
+      - BYORIDB__SERVER__HTTP_ADDR=0.0.0.0:19669
+      - BYORIDB__STORAGE__DATA_PATHS=/app/data
+    volumes:
+      - byoridb-data-1:/app/data
+
+  byoridb-server-2:
+    image: byoridb-server:latest
+    container_name: byoridb-server-2
+    ports:
+      - "9670:9669"
+      - "19670:19669"
+    environment:
+      - RUST_LOG=info
+      - BYORIDB__SERVER__GRAPH_ADDR=0.0.0.0:9669
+      - BYORIDB__SERVER__HTTP_ADDR=0.0.0.0:19669
+      - BYORIDB__STORAGE__DATA_PATHS=/app/data
+    volumes:
+      - byoridb-data-2:/app/data
+
+  byoridb-server-3:
+    image: byoridb-server:latest
+    container_name: byoridb-server-3
+    ports:
+      - "9671:9669"
+      - "19671:19669"
+    environment:
+      - RUST_LOG=info
+      - BYORIDB__SERVER__GRAPH_ADDR=0.0.0.0:9669
+      - BYORIDB__SERVER__HTTP_ADDR=0.0.0.0:19669
+      - BYORIDB__STORAGE__DATA_PATHS=/app/data
+    volumes:
+      - byoridb-data-3:/app/data
+
+volumes:
+  byoridb-data-1:
+  byoridb-data-2:
+  byoridb-data-3:

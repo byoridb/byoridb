@@ -1,0 +1,153 @@
+syntax = "proto3";
+
+package raft;
+
+// Raft consensus service for inter-node communication
+// Each storage node runs this service to participate in Raft consensus
+service RaftService {
+    // RequestVote RPC - called by candidates to gather votes
+    rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+
+    // AppendEntries RPC - called by leader to replicate log entries and send heartbeats
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+
+    // InstallSnapshot RPC - called by leader to send snapshot to lagging followers
+    rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+// ===== RequestVote RPC =====
+
+message RequestVoteRequest {
+    // Partition identifier
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+
+    // Candidate's term
+    uint64 term = 3;
+    // Candidate requesting vote
+    uint64 candidate_id = 4;
+    // Index of candidate's last log entry
+    uint64 last_log_index = 5;
+    // Term of candidate's last log entry
+    uint64 last_log_term = 6;
+}
+
+message RequestVoteResponse {
+    // Current term, for candidate to update itself
+    uint64 term = 1;
+    // True means candidate received vote
+    bool vote_granted = 2;
+}
+
+// ===== AppendEntries RPC =====
+
+message AppendEntriesRequest {
+    // Partition identifier
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+
+    // Leader's term
+    uint64 term = 3;
+    // Leader's ID so follower can redirect clients
+    uint64 leader_id = 4;
+    // Index of log entry immediately preceding new ones
+    uint64 prev_log_index = 5;
+    // Term of prev_log_index entry
+    uint64 prev_log_term = 6;
+    // Log entries to store (empty for heartbeat)
+    repeated LogEntry entries = 7;
+    // Leader's commit index
+    uint64 leader_commit = 8;
+}
+
+message AppendEntriesResponse {
+    // Current term, for leader to update itself
+    uint64 term = 1;
+    // True if follower contained entry matching prev_log_index and prev_log_term
+    bool success = 2;
+    // The index of the last log entry (for optimization)
+    uint64 match_index = 3;
+}
+
+// ===== InstallSnapshot RPC =====
+
+message InstallSnapshotRequest {
+    // Partition identifier
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+
+    // Leader's term
+    uint64 term = 3;
+    // Leader's ID
+    uint64 leader_id = 4;
+    // The snapshot replaces all entries up through and including this index
+    uint64 last_included_index = 5;
+    // Term of last_included_index
+    uint64 last_included_term = 6;
+    // Byte offset where chunk is positioned in the snapshot file
+    uint64 offset = 7;
+    // Raw bytes of the snapshot chunk
+    bytes data = 8;
+    // True if this is the last chunk
+    bool done = 9;
+}
+
+message InstallSnapshotResponse {
+    // Current term, for leader to update itself
+    uint64 term = 1;
+}
+
+// ===== Log Entry =====
+
+message LogEntry {
+    // Term when entry was received by leader
+    uint64 term = 1;
+    // Position in the log (1-indexed)
+    uint64 index = 2;
+    // Command to apply to state machine (serialized)
+    bytes command = 3;
+}
+
+// ===== Command types =====
+
+message Command {
+    oneof command_type {
+        NoopCommand noop = 1;
+        PutCommand put = 2;
+        DeleteCommand delete = 3;
+        ConfigChangeCommand config_change = 4;
+    }
+}
+
+message NoopCommand {
+    // No-op command for leader confirmation
+}
+
+message PutCommand {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    bytes key = 3;
+    bytes value = 4;
+}
+
+message DeleteCommand {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    bytes key = 3;
+}
+
+message ConfigChangeCommand {
+    oneof change_type {
+        AddNodeChange add_node = 1;
+        RemoveNodeChange remove_node = 2;
+    }
+}
+
+message AddNodeChange {
+    uint64 node_id = 1;
+    string addr = 2;
+}
+
+message RemoveNodeChange {
+    uint64 node_id = 1;
+}

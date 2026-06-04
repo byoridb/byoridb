@@ -1,0 +1,6 @@
+target/
+!target/release/byoridb-server
+**/*.rs.bk
+.git/
+.env
+data/

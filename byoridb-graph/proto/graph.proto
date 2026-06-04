@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+package graph;
+
+// The Graph Service definition
+service GraphService {
+  // Authenticate user
+  rpc Authenticate (AuthenticateRequest) returns (AuthenticateResponse);
+  
+  // Sign out
+  rpc SignOut (SignOutRequest) returns (SignOutResponse);
+  
+  // Execute a query
+  rpc Execute (ExecuteRequest) returns (ExecuteResponse);
+  
+  // Execute a query and return JSON
+  rpc ExecuteJson (ExecuteRequest) returns (ExecuteJsonResponse);
+}
+
+// Request to authenticate
+message AuthenticateRequest {
+  string username = 1;
+  string password = 2;
+}
+
+// Response from authentication
+message AuthenticateResponse {
+  int64 session_id = 1;
+  int32 error_code = 2; // 0 for success
+  string error_msg = 3;
+}
+
+// Request to sign out
+message SignOutRequest {
+  int64 session_id = 1;
+}
+
+// Response from sign out
+message SignOutResponse {
+  int32 error_code = 1;
+  string error_msg = 2; // 0 for success
+}
+
+// Request to execute a query
+message ExecuteRequest {
+  int64 session_id = 1;
+  string statement = 2;
+}
+
+// Response from execution.
+//
+// `result` carries the structured DataSet. The legacy `data` field stayed
+// `bytes` (JSON-encoded) through PR 4; PR 9 deprecates it in favor of the
+// proto-native `result`. Clients should prefer `result` and fall back to
+// `data` only when talking to pre-PR9 servers.
+// error_code values: 0 = success, 1 = query error, 2 = session not found / expired
+message ExecuteResponse {
+  int32 error_code = 1;
+  string error_msg = 2;
+  int64 latency_us = 3;
+  // Deprecated in PR 9: kept as the JSON-encoded form for backward
+  // compatibility with older clients. New clients should read `result`.
+  bytes data = 4 [deprecated = true];
+  // Structured query result. Empty for non-DQL statements (CREATE, DROP, ...).
+  DataSet result = 5;
+}
+
+// error_code values: 0 = success, 1 = query error, 2 = session not found / expired
+message ExecuteJsonResponse {
+  int32 error_code = 1;
+  string error_msg = 2;
+  int64 latency_us = 3;
+  string json_data = 4;
+}
+
+// ===== Structured query result =====
+
+// A result set with named columns and rows of typed values. Mirrors
+// `byoridb_common::datatypes::dataset::DataSet`.
+message DataSet {
+  repeated string column_names = 1;
+  repeated Row rows = 2;
+}
+
+message Row {
+  repeated Value values = 1;
+}
+
+// Subset of `byoridb_common::Value` directly representable on the wire.
+// Complex types (Vertex, Edge, Path, List, Map, Set, nested DataSet,
+// Date/Time/DateTime, Geography, Duration) fall back to `json_value` so
+// the client can still display them — promoting them to full proto types
+// is left for a follow-up PR (see MOCK_REMEDIATION_PLAN.md).
+message Value {
+  oneof value {
+    NullValue null_value = 1;
+    bool bool_value = 2;
+    int64 int_value = 3;
+    double float_value = 4;
+    string string_value = 5;
+    string json_value = 6;
+  }
+}
+
+enum NullValue {
+  NULL_VALUE = 0;
+}

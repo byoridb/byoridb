@@ -1,0 +1,334 @@
+syntax = "proto3";
+
+package storage;
+
+// Storage Service provides data operations and partition management
+// Each storage node runs this service
+service StorageService {
+    // Get all data for a partition (for migration)
+    rpc GetPartitionData(GetPartitionDataRequest) returns (stream PartitionDataChunk);
+
+    // Receive partition data (from another storage node during migration)
+    rpc TransferPartition(stream PartitionDataChunk) returns (TransferPartitionResponse);
+
+    // Update partition ownership (from Meta service)
+    rpc UpdatePartitionOwnership(UpdatePartitionOwnershipRequest) returns (UpdatePartitionOwnershipResponse);
+
+    // Get partition status
+    rpc GetPartitionStatus(GetPartitionStatusRequest) returns (GetPartitionStatusResponse);
+
+    // Scan partition keys with prefix
+    rpc ScanPartition(ScanPartitionRequest) returns (stream KeyValuePair);
+
+    // ===== Query RPCs =====
+
+    // Batch get vertices by VID list
+    rpc BatchGetVertices(BatchGetVerticesRequest) returns (BatchGetVerticesResponse);
+
+    // Batch get edges by EdgeKey list
+    rpc BatchGetEdges(BatchGetEdgesRequest) returns (BatchGetEdgesResponse);
+
+    // Scan vertices in a partition
+    rpc ScanVertices(ScanVerticesRequest) returns (ScanVerticesResponse);
+
+    // Scan edges in a partition
+    rpc ScanEdges(ScanEdgesRequest) returns (ScanEdgesResponse);
+
+    // Targeted neighbor fetch by source VID list.
+    // Replaces the partition-wide ScanEdges + post-filter pattern used by
+    // distributed GO when the source VID set is small relative to the
+    // partition's edge count. Each source VID is read with an O(degree)
+    // prefix scan instead of an O(partition_edges) scan, so a query like
+    // "GO FROM <small_set>" stays cheap regardless of overall edge volume.
+    rpc GetNeighborsBySource(GetNeighborsBySourceRequest) returns (GetNeighborsBySourceResponse);
+
+    // ===== Index Lookup RPCs =====
+
+    // Lookup vertices by tag index
+    rpc LookupTagIndex(LookupTagIndexRequest) returns (LookupTagIndexResponse);
+
+    // Lookup edges by edge index
+    rpc LookupEdgeIndex(LookupEdgeIndexRequest) returns (LookupEdgeIndexResponse);
+
+    // Check if keys exist using Bloom filter (fast existence check)
+    rpc CheckBloomFilter(CheckBloomFilterRequest) returns (CheckBloomFilterResponse);
+}
+
+// ===== Common Types =====
+
+enum ErrorCode {
+    SUCCEEDED = 0;
+    E_PARTITION_NOT_FOUND = 1;
+    E_NOT_LEADER = 2;
+    E_TRANSFER_FAILED = 3;
+    E_INVALID_REQUEST = 4;
+    E_INTERNAL_ERROR = 99;
+}
+
+enum PartitionStatus {
+    PS_LEADER = 0;
+    PS_FOLLOWER = 1;
+    PS_NOT_OWNED = 2;
+    PS_TRANSFERRING = 3;
+}
+
+message HostAddr {
+    string host = 1;
+    uint32 port = 2;
+}
+
+message KeyValuePair {
+    bytes key = 1;
+    bytes value = 2;
+}
+
+// ===== GetPartitionData =====
+
+message GetPartitionDataRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    // Optional: only get data for specific key prefix
+    bytes key_prefix = 3;
+}
+
+message PartitionDataChunk {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    // Batch of key-value pairs
+    repeated KeyValuePair data = 3;
+    // True if this is the last chunk
+    bool done = 4;
+    // Total keys in partition (set in first chunk)
+    uint64 total_keys = 5;
+    // Checksum for integrity verification (optional)
+    uint64 checksum = 6;
+}
+
+// ===== TransferPartition =====
+
+message TransferPartitionResponse {
+    ErrorCode code = 1;
+    // Number of keys received
+    uint64 keys_received = 2;
+    string error_message = 3;
+}
+
+// ===== UpdatePartitionOwnership =====
+
+message UpdatePartitionOwnershipRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    PartitionStatus new_status = 3;
+    // New leader address (if status is LEADER or FOLLOWER)
+    HostAddr leader = 4;
+    // All replicas for this partition
+    repeated HostAddr replicas = 5;
+}
+
+message UpdatePartitionOwnershipResponse {
+    ErrorCode code = 1;
+    string error_message = 2;
+}
+
+// ===== GetPartitionStatus =====
+
+message GetPartitionStatusRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+}
+
+message GetPartitionStatusResponse {
+    ErrorCode code = 1;
+    PartitionStatus status = 2;
+    HostAddr leader = 3;
+    repeated HostAddr replicas = 4;
+    uint64 key_count = 5;
+    uint64 data_size_bytes = 6;
+}
+
+// ===== ScanPartition =====
+
+message ScanPartitionRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    bytes start_key = 3;
+    bytes end_key = 4;
+    uint32 limit = 5;
+}
+
+// ===== Query RPCs =====
+
+// Batch get vertices by VID list
+message BatchGetVerticesRequest {
+    uint32 space_id = 1;
+    repeated int64 vids = 2;
+    repeated string tag_names = 3;
+    repeated string prop_names = 4;
+}
+
+message BatchGetVerticesResponse {
+    ErrorCode code = 1;
+    repeated VertexData vertices = 2;
+    string error_message = 3;
+}
+
+message VertexData {
+    int64 vid = 1;
+    repeated TagData tags = 2;
+}
+
+message TagData {
+    string tag_name = 1;
+    map<string, bytes> properties = 2;
+}
+
+// Batch get edges by EdgeKey list
+message BatchGetEdgesRequest {
+    uint32 space_id = 1;
+    repeated EdgeKey edge_keys = 2;
+    repeated string prop_names = 3;
+}
+
+message EdgeKey {
+    int64 src_vid = 1;
+    int64 dst_vid = 2;
+    string edge_type = 3;
+    int64 ranking = 4;
+}
+
+message BatchGetEdgesResponse {
+    ErrorCode code = 1;
+    repeated EdgeData edges = 2;
+    string error_message = 3;
+}
+
+message EdgeData {
+    EdgeKey key = 1;
+    map<string, bytes> properties = 2;
+}
+
+// Scan vertices in a partition
+message ScanVerticesRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    string tag_name = 3;
+    repeated string prop_names = 4;
+    bytes cursor = 5;
+    uint32 limit = 6;
+}
+
+message ScanVerticesResponse {
+    ErrorCode code = 1;
+    repeated VertexData vertices = 2;
+    bytes next_cursor = 3;
+    bool has_more = 4;
+    string error_message = 5;
+}
+
+// Scan edges in a partition
+message ScanEdgesRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    string edge_type = 3;
+    repeated string prop_names = 4;
+    bytes cursor = 5;
+    uint32 limit = 6;
+}
+
+message ScanEdgesResponse {
+    ErrorCode code = 1;
+    repeated EdgeData edges = 2;
+    bytes next_cursor = 3;
+    bool has_more = 4;
+    string error_message = 5;
+}
+
+// Targeted neighbor fetch — read all out-edges of each listed src_vid
+// using O(degree) prefix scans, then filter by edge_types.
+message GetNeighborsBySourceRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    repeated int64 src_vids = 3;
+    repeated string edge_types = 4;     // empty = all types
+    uint32 limit_per_src = 5;           // 0 = unlimited
+    repeated string prop_names = 6;     // empty = all properties
+}
+
+message GetNeighborsBySourceResponse {
+    ErrorCode code = 1;
+    repeated EdgeData edges = 2;
+    string error_message = 3;
+    // Number of distinct source VIDs that returned at least one edge.
+    uint32 sources_with_edges = 4;
+}
+
+// ===== Index Lookup RPCs =====
+
+// Index value for lookup (supports multiple types)
+message IndexValue {
+    oneof value {
+        bool bool_value = 1;
+        int64 int_value = 2;
+        double float_value = 3;
+        string string_value = 4;
+    }
+}
+
+// Lookup vertices by tag index
+message LookupTagIndexRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    uint32 index_id = 3;
+    string index_name = 4;       // Alternative to index_id
+    repeated IndexValue values = 5;  // Property values to match
+    uint32 limit = 6;
+    bytes cursor = 7;            // For pagination
+}
+
+message LookupTagIndexResponse {
+    ErrorCode code = 1;
+    repeated int64 vids = 2;     // Matching vertex IDs
+    bytes next_cursor = 3;
+    bool has_more = 4;
+    string error_message = 5;
+}
+
+// Lookup edges by edge index
+message LookupEdgeIndexRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    uint32 index_id = 3;
+    string index_name = 4;       // Alternative to index_id
+    repeated IndexValue values = 5;  // Property values to match
+    uint32 limit = 6;
+    bytes cursor = 7;            // For pagination
+}
+
+message LookupEdgeIndexResponse {
+    ErrorCode code = 1;
+    repeated EdgeKey edges = 2;  // Matching edge keys
+    bytes next_cursor = 3;
+    bool has_more = 4;
+    string error_message = 5;
+}
+
+// Bloom filter for fast existence check
+message CheckBloomFilterRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    BloomFilterType filter_type = 3;
+    repeated int64 keys = 4;     // Keys to check (VIDs or hashes)
+}
+
+enum BloomFilterType {
+    BF_VERTEX = 0;              // Check vertex existence
+    BF_EDGE = 1;                // Check edge existence
+    BF_TAG_INDEX = 2;           // Check tag index entry
+    BF_EDGE_INDEX = 3;          // Check edge index entry
+}
+
+message CheckBloomFilterResponse {
+    ErrorCode code = 1;
+    repeated bool may_exist = 2; // True = might exist, False = definitely not exist
+    string error_message = 3;
+}

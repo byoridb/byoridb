@@ -1,0 +1,93 @@
+// Copyright (c) 2024 ByoriDB
+//
+// This source code is licensed under Apache 2.0 License.
+
+syntax = "proto3";
+
+package data;
+
+// Value represents a property value with type information
+message Value {
+    oneof value {
+        bool bool_value = 1;
+        int64 int_value = 2;
+        double float_value = 3;
+        string string_value = 4;
+        bytes bytes_value = 5;
+        Date date_value = 6;
+        DateTime datetime_value = 7;
+        Geography geography_value = 8;
+        NullValue null_value = 9;
+        List list_value = 10;
+        Map map_value = 11;
+    }
+}
+
+// Null value type
+enum NullValue {
+    NULL_VALUE = 0;
+}
+
+// Date type (year, month, day)
+message Date {
+    uint32 year = 1;
+    uint32 month = 2;
+    uint32 day = 3;
+}
+
+// DateTime type
+message DateTime {
+    uint32 year = 1;
+    uint32 month = 2;
+    uint32 day = 3;
+    uint32 hour = 4;
+    uint32 minute = 5;
+    uint32 second = 6;
+    uint32 microsecond = 7;
+}
+
+// Geography type (WKT string for now)
+message Geography {
+    string wkt = 1;
+}
+
+// List of values
+message List {
+    repeated Value values = 1;
+}
+
+// Map of string to value
+message Map {
+    map<string, Value> values = 1;
+}
+
+// Tag data within a vertex
+message Tag {
+    string name = 1;
+    map<string, Value> properties = 2;
+}
+
+// Vertex data
+message Vertex {
+    int64 vid = 1;
+    repeated Tag tags = 2;
+}
+
+// Edge data
+message Edge {
+    int64 src_vid = 1;
+    int64 dst_vid = 2;
+    string edge_type = 3;
+    int64 ranking = 4;
+    map<string, Value> properties = 5;
+}
+
+// Batch of vertices (for bulk operations)
+message VertexBatch {
+    repeated Vertex vertices = 1;
+}
+
+// Batch of edges (for bulk operations)
+message EdgeBatch {
+    repeated Edge edges = 1;
+}

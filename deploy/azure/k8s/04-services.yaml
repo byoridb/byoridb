@@ -1,0 +1,34 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: byoridb-headless
+  namespace: byoridb
+  labels:
+    app.kubernetes.io/name: byoridb
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: byoridb
+    app.kubernetes.io/component: server
+  ports:
+    - { name: grpc, port: 9669,  targetPort: 9669 }
+    - { name: http, port: 19669, targetPort: 19669 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: byoridb-public
+  namespace: byoridb
+  labels:
+    app.kubernetes.io/name: byoridb
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  loadBalancerSourceRanges:
+    - 3.37.7.191/32
+  selector:
+    app.kubernetes.io/name: byoridb
+    app.kubernetes.io/component: server
+  ports:
+    - { name: grpc, port: 9669,  targetPort: 9669 }
+    - { name: http, port: 19669, targetPort: 19669 }

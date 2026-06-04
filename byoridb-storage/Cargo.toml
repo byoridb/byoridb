@@ -1,0 +1,39 @@
+[package]
+name = "byoridb-storage"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[features]
+# Enables the RocksDB-backed StorageEnv / StorageServer (server-only).
+default = []
+rocksdb = ["byoridb-kvstore/rocksdb"]
+# Enables the gRPC RPC layer (proto types + StorageRpcService). Pulls in tonic
+# (→ axum/hyper/mio/socket2) which cannot compile to wasm32. Off for embedded;
+# the storage *types* (index, key, codec, errors, raft) stay pure-Rust.
+distributed = ["dep:tonic", "dep:prost"]
+
+[dependencies]
+byoridb-common = { path = "../byoridb-common" }
+byoridb-kvstore = { path = "../byoridb-kvstore" }
+byoridb-codec = { path = "../byoridb-codec" }
+byoridb-meta = { path = "../byoridb-meta" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+tokio-stream = "0.1"
+bincode.workspace = true
+byteorder = "1.5.0"
+rand = "0.8"
+
+[lints]
+workspace = true

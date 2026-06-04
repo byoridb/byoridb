@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: byoridb-server
+  namespace: byoridb
+  labels:
+    app.kubernetes.io/name: byoridb
+    app.kubernetes.io/component: server
+spec:
+  serviceName: byoridb-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: byoridb
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: byoridb
+        app.kubernetes.io/component: server
+    spec:
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 60
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: byoridb
+          effect: NoSchedule
+      nodeSelector:
+        workload: byoridb
+      containers:
+        - name: byoridb-server
+          image: byoridbacr23236.azurecr.io/byoridb-server:1.0.1
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: byoridb-config
+            - secretRef:
+                name: byoridb-root
+          ports:
+            - { containerPort: 9669,  name: grpc }
+            - { containerPort: 19669, name: http }
+          readinessProbe:
+            tcpSocket: { port: 9669 }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket: { port: 9669 }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 4
+          resources:
+            requests: { cpu: "500m", memory: "2Gi" }
+            limits:   { cpu: "1500m", memory: "6Gi" }
+          volumeMounts:
+            - { name: data, mountPath: /app/data }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: managed-csi-premium
+        resources:
+          requests:
+            storage: 128Gi

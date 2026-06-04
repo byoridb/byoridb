@@ -1,0 +1,53 @@
+[package]
+name = "byoridb-graph"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# Forwards the RocksDB backend down the stack. Graph itself uses only storage/
+# meta *types*, so no source is gated here — this just lets the server crate
+# turn RocksDB on through graph.
+default = []
+rocksdb = ["byoridb-kvstore/rocksdb", "byoridb-storage/rocksdb", "byoridb-meta/rocksdb"]
+# Network servers (gRPC via tonic + HTTP via axum), the Prometheus exporter, and
+# tracing-subscriber logging init. Off for embedded/in-process use; the
+# standalone server crate turns it on. (`metrics` facade stays always-on — the
+# execute path records through it.)
+server = [
+    "dep:tonic",
+    "dep:prost",
+    "dep:axum",
+    "dep:metrics-exporter-prometheus",
+    "dep:tracing-subscriber",
+]
+
+[dependencies]
+byoridb-common = { path = "../byoridb-common" }
+byoridb-storage = { path = "../byoridb-storage" }
+byoridb-parser = { path = "../byoridb-parser" }
+byoridb-executor = { path = "../byoridb-executor" }
+byoridb-kvstore = { path = "../byoridb-kvstore" }
+byoridb-meta = { path = "../byoridb-meta" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+argon2 = "0.5"
+regex = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[lints]
+workspace = true

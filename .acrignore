@@ -1,0 +1,7 @@
+target/
+.git/
+data/
+**/*.rs.bk
+.claude/
+book/book/
+aidlc-docs/

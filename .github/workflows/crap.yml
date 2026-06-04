@@ -1,0 +1,67 @@
+name: CRAP Score
+
+on:
+  # Weekly check every Monday 02:00 UTC
+  schedule:
+    - cron: '0 2 * * 1'
+  # Manual trigger with optional threshold override
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: 'CRAP score threshold (default: 50)'
+        required: false
+        default: '50'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # M4 threshold: 30 (gate-grace.md M4 policy).
+  CRAP_THRESHOLD: ${{ github.event.inputs.threshold || '30' }}
+
+jobs:
+  crap:
+    name: CRAP Score Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, llvm-tools-preview
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-crap-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-crap-
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Run CRAP check
+        env:
+          CRAP_THRESHOLD: ${{ env.CRAP_THRESHOLD }}
+          CRAP_TOP: '30'
+          CRAP_WORK_DIR: /tmp/crap
+        run: |
+          mkdir -p /tmp/crap
+          bash scripts/crap_check.sh
+
+      - name: Upload CRAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crap-report-${{ github.run_id }}
+          path: /tmp/crap/
+          retention-days: 30

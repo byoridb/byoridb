@@ -1,0 +1,492 @@
+syntax = "proto3";
+
+package meta;
+
+// Meta Service provides metadata management for ByoriDB
+// This includes spaces, tags, edges, indexes, partitions, and users
+service MetaService {
+    // Space operations
+    rpc CreateSpace(CreateSpaceRequest) returns (CreateSpaceResponse);
+    rpc GetSpace(GetSpaceRequest) returns (GetSpaceResponse);
+    rpc ListSpaces(ListSpacesRequest) returns (ListSpacesResponse);
+    rpc DropSpace(DropSpaceRequest) returns (DropSpaceResponse);
+
+    // Tag operations
+    rpc CreateTag(CreateTagRequest) returns (CreateTagResponse);
+    rpc GetTag(GetTagRequest) returns (GetTagResponse);
+    rpc ListTags(ListTagsRequest) returns (ListTagsResponse);
+    rpc DropTag(DropTagRequest) returns (DropTagResponse);
+    rpc AlterTag(AlterTagRequest) returns (AlterTagResponse);
+    rpc GetTagVersions(GetTagVersionsRequest) returns (GetTagVersionsResponse);
+
+    // Edge type operations
+    rpc CreateEdge(CreateEdgeRequest) returns (CreateEdgeResponse);
+    rpc GetEdge(GetEdgeRequest) returns (GetEdgeResponse);
+    rpc ListEdges(ListEdgesRequest) returns (ListEdgesResponse);
+    rpc DropEdge(DropEdgeRequest) returns (DropEdgeResponse);
+    rpc AlterEdge(AlterEdgeRequest) returns (AlterEdgeResponse);
+    rpc GetEdgeVersions(GetEdgeVersionsRequest) returns (GetEdgeVersionsResponse);
+
+    // Index operations
+    rpc CreateTagIndex(CreateTagIndexRequest) returns (CreateTagIndexResponse);
+    rpc CreateEdgeIndex(CreateEdgeIndexRequest) returns (CreateEdgeIndexResponse);
+    rpc ListTagIndexes(ListTagIndexesRequest) returns (ListTagIndexesResponse);
+    rpc ListEdgeIndexes(ListEdgeIndexesRequest) returns (ListEdgeIndexesResponse);
+    rpc DropTagIndex(DropTagIndexRequest) returns (DropTagIndexResponse);
+    rpc DropEdgeIndex(DropEdgeIndexRequest) returns (DropEdgeIndexResponse);
+
+    // Partition operations
+    rpc GetPartsAlloc(GetPartsAllocRequest) returns (GetPartsAllocResponse);
+    rpc GetPartHosts(GetPartHostsRequest) returns (GetPartHostsResponse);
+
+    // Host operations
+    rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
+
+    // Heartbeat for leader election and health check
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// ===== Common Types =====
+
+enum ErrorCode {
+    SUCCEEDED = 0;
+    E_SPACE_NOT_FOUND = 1;
+    E_SPACE_ALREADY_EXISTS = 2;
+    E_TAG_NOT_FOUND = 3;
+    E_TAG_ALREADY_EXISTS = 4;
+    E_EDGE_NOT_FOUND = 5;
+    E_EDGE_ALREADY_EXISTS = 6;
+    E_INDEX_NOT_FOUND = 7;
+    E_INDEX_ALREADY_EXISTS = 8;
+    E_FIELD_NOT_FOUND = 9;
+    E_PARTITION_NOT_FOUND = 10;
+    E_LEADER_CHANGED = 11;
+    E_FIELD_ALREADY_EXISTS = 12;
+    E_INVALID_ALTER_OPERATION = 13;
+    E_INTERNAL_ERROR = 99;
+}
+
+// ALTER operation type
+enum AlterOperationType {
+    ADD_COLUMN = 0;
+    DROP_COLUMN = 1;
+    CHANGE_COLUMN = 2;
+}
+
+enum VidType {
+    VID_INT64 = 0;
+    VID_FIXED_STRING = 1;
+}
+
+// Partition strategy for data distribution
+enum PartitionStrategyType {
+    PS_HASH = 0;    // hash(vid) % N + 1
+    PS_RANGE = 1;   // Range-based partitioning
+    PS_MODULO = 2;  // vid % N + 1 (without hashing)
+}
+
+message PartitionStrategy {
+    PartitionStrategyType strategy_type = 1;
+    repeated int64 range_boundaries = 2;  // Only used when strategy_type is PS_RANGE
+}
+
+enum DataType {
+    DT_BOOL = 0;
+    DT_INT8 = 1;
+    DT_INT16 = 2;
+    DT_INT32 = 3;
+    DT_INT64 = 4;
+    DT_FLOAT = 5;
+    DT_DOUBLE = 6;
+    DT_STRING = 7;
+    DT_FIXED_STRING = 8;
+    DT_TIMESTAMP = 9;
+    DT_DATE = 10;
+    DT_TIME = 11;
+    DT_DATETIME = 12;
+    DT_GEOGRAPHY = 13;
+}
+
+message HostAddr {
+    string host = 1;
+    uint32 port = 2;
+}
+
+message Field {
+    string name = 1;
+    DataType data_type = 2;
+    bool nullable = 3;
+    string default_value = 4;
+    uint32 fixed_string_len = 5;  // Only used when data_type is FIXED_STRING
+}
+
+// ===== Schema Types =====
+
+message SpaceDesc {
+    uint32 space_id = 1;
+    string space_name = 2;
+    uint32 partition_num = 3;
+    uint32 replica_factor = 4;
+    VidType vid_type = 5;
+    uint32 vid_size = 6;  // For FIXED_STRING type
+    PartitionStrategy partition_strategy = 7;
+}
+
+message TagDesc {
+    uint32 tag_id = 1;
+    uint32 space_id = 2;
+    string tag_name = 3;
+    int32 version = 4;
+    repeated Field fields = 5;
+}
+
+message EdgeDesc {
+    uint32 edge_id = 1;
+    uint32 space_id = 2;
+    string edge_name = 3;
+    int32 version = 4;
+    repeated Field fields = 5;
+}
+
+message TagIndexDesc {
+    uint32 index_id = 1;
+    uint32 space_id = 2;
+    string index_name = 3;
+    uint32 tag_id = 4;
+    repeated string fields = 5;
+}
+
+message EdgeIndexDesc {
+    uint32 index_id = 1;
+    uint32 space_id = 2;
+    string index_name = 3;
+    uint32 edge_id = 4;
+    repeated string fields = 5;
+}
+
+message PartAlloc {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    repeated HostAddr hosts = 3;
+}
+
+// ===== Space Operations =====
+
+message CreateSpaceRequest {
+    string space_name = 1;
+    uint32 partition_num = 2;
+    uint32 replica_factor = 3;
+    VidType vid_type = 4;
+    uint32 vid_size = 5;  // For FIXED_STRING type
+    PartitionStrategy partition_strategy = 6;
+}
+
+message CreateSpaceResponse {
+    ErrorCode code = 1;
+    uint32 space_id = 2;
+    HostAddr leader = 3;
+}
+
+message GetSpaceRequest {
+    string space_name = 1;
+}
+
+message GetSpaceResponse {
+    ErrorCode code = 1;
+    SpaceDesc space = 2;
+    HostAddr leader = 3;
+}
+
+message ListSpacesRequest {}
+
+message ListSpacesResponse {
+    ErrorCode code = 1;
+    repeated SpaceDesc spaces = 2;
+    HostAddr leader = 3;
+}
+
+message DropSpaceRequest {
+    string space_name = 1;
+}
+
+message DropSpaceResponse {
+    ErrorCode code = 1;
+    HostAddr leader = 2;
+}
+
+// ===== Tag Operations =====
+
+message CreateTagRequest {
+    uint32 space_id = 1;
+    string tag_name = 2;
+    repeated Field fields = 3;
+}
+
+message CreateTagResponse {
+    ErrorCode code = 1;
+    uint32 tag_id = 2;
+    HostAddr leader = 3;
+}
+
+message GetTagRequest {
+    uint32 space_id = 1;
+    string tag_name = 2;
+}
+
+message GetTagResponse {
+    ErrorCode code = 1;
+    TagDesc tag = 2;
+    HostAddr leader = 3;
+}
+
+message ListTagsRequest {
+    uint32 space_id = 1;
+}
+
+message ListTagsResponse {
+    ErrorCode code = 1;
+    repeated TagDesc tags = 2;
+    HostAddr leader = 3;
+}
+
+message DropTagRequest {
+    uint32 space_id = 1;
+    string tag_name = 2;
+}
+
+message DropTagResponse {
+    ErrorCode code = 1;
+    HostAddr leader = 2;
+}
+
+// ALTER operation for schema changes
+message AlterOperation {
+    AlterOperationType op_type = 1;
+    Field field = 2;            // Field definition for ADD_COLUMN
+    string field_name = 3;       // Field name for DROP_COLUMN (future)
+}
+
+message AlterTagRequest {
+    uint32 space_id = 1;
+    string tag_name = 2;
+    repeated AlterOperation operations = 3;
+}
+
+message AlterTagResponse {
+    ErrorCode code = 1;
+    int32 new_version = 2;       // The new schema version after ALTER
+    HostAddr leader = 3;
+}
+
+message GetTagVersionsRequest {
+    uint32 space_id = 1;
+    string tag_name = 2;
+}
+
+message GetTagVersionsResponse {
+    ErrorCode code = 1;
+    repeated TagDesc versions = 2;  // All schema versions for this tag
+    HostAddr leader = 3;
+}
+
+// ===== Edge Operations =====
+
+message CreateEdgeRequest {
+    uint32 space_id = 1;
+    string edge_name = 2;
+    repeated Field fields = 3;
+}
+
+message CreateEdgeResponse {
+    ErrorCode code = 1;
+    uint32 edge_id = 2;
+    HostAddr leader = 3;
+}
+
+message GetEdgeRequest {
+    uint32 space_id = 1;
+    string edge_name = 2;
+}
+
+message GetEdgeResponse {
+    ErrorCode code = 1;
+    EdgeDesc edge = 2;
+    HostAddr leader = 3;
+}
+
+message ListEdgesRequest {
+    uint32 space_id = 1;
+}
+
+message ListEdgesResponse {
+    ErrorCode code = 1;
+    repeated EdgeDesc edges = 2;
+    HostAddr leader = 3;
+}
+
+message DropEdgeRequest {
+    uint32 space_id = 1;
+    string edge_name = 2;
+}
+
+message DropEdgeResponse {
+    ErrorCode code = 1;
+    HostAddr leader = 2;
+}
+
+message AlterEdgeRequest {
+    uint32 space_id = 1;
+    string edge_name = 2;
+    repeated AlterOperation operations = 3;
+}
+
+message AlterEdgeResponse {
+    ErrorCode code = 1;
+    int32 new_version = 2;       // The new schema version after ALTER
+    HostAddr leader = 3;
+}
+
+message GetEdgeVersionsRequest {
+    uint32 space_id = 1;
+    string edge_name = 2;
+}
+
+message GetEdgeVersionsResponse {
+    ErrorCode code = 1;
+    repeated EdgeDesc versions = 2;  // All schema versions for this edge
+    HostAddr leader = 3;
+}
+
+// ===== Tag Index Operations =====
+
+message CreateTagIndexRequest {
+    uint32 space_id = 1;
+    string index_name = 2;
+    string tag_name = 3;
+    repeated string fields = 4;
+}
+
+message CreateTagIndexResponse {
+    ErrorCode code = 1;
+    uint32 index_id = 2;
+    HostAddr leader = 3;
+}
+
+message ListTagIndexesRequest {
+    uint32 space_id = 1;
+}
+
+message ListTagIndexesResponse {
+    ErrorCode code = 1;
+    repeated TagIndexDesc indexes = 2;
+    HostAddr leader = 3;
+}
+
+message DropTagIndexRequest {
+    uint32 space_id = 1;
+    string index_name = 2;
+}
+
+message DropTagIndexResponse {
+    ErrorCode code = 1;
+    HostAddr leader = 2;
+}
+
+// ===== Edge Index Operations =====
+
+message CreateEdgeIndexRequest {
+    uint32 space_id = 1;
+    string index_name = 2;
+    string edge_name = 3;
+    repeated string fields = 4;
+}
+
+message CreateEdgeIndexResponse {
+    ErrorCode code = 1;
+    uint32 index_id = 2;
+    HostAddr leader = 3;
+}
+
+message ListEdgeIndexesRequest {
+    uint32 space_id = 1;
+}
+
+message ListEdgeIndexesResponse {
+    ErrorCode code = 1;
+    repeated EdgeIndexDesc indexes = 2;
+    HostAddr leader = 3;
+}
+
+message DropEdgeIndexRequest {
+    uint32 space_id = 1;
+    string index_name = 2;
+}
+
+message DropEdgeIndexResponse {
+    ErrorCode code = 1;
+    HostAddr leader = 2;
+}
+
+// ===== Partition Operations =====
+
+message GetPartsAllocRequest {
+    uint32 space_id = 1;
+}
+
+message GetPartsAllocResponse {
+    ErrorCode code = 1;
+    repeated PartAlloc parts = 2;
+    HostAddr leader = 3;
+}
+
+message GetPartHostsRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+}
+
+message GetPartHostsResponse {
+    ErrorCode code = 1;
+    repeated HostAddr hosts = 2;
+    HostAddr leader = 3;
+}
+
+// ===== Heartbeat =====
+
+message HeartbeatRequest {
+    HostAddr host = 1;
+    string role = 2;  // "meta", "storage", "graph"
+    int64 cluster_id = 3;  // must match server's cluster_id; 0 = first registration
+}
+
+message HeartbeatResponse {
+    ErrorCode code = 1;
+    HostAddr leader = 2;
+    int64 cluster_id = 3;
+}
+
+// ===== Host Operations =====
+
+// Storage host status reported by Meta.
+enum HostStatusProto {
+    HS_ONLINE = 0;
+    HS_OFFLINE = 1;
+}
+
+// A single storage host with live partition counts.
+message HostItem {
+    HostAddr host = 1;
+    HostStatusProto status = 2;
+    // Number of partitions for which this host is the designated leader
+    // (currently defined as the first host in the partition allocation).
+    uint64 leader_count = 3;
+    // Total number of partitions assigned to this host across all spaces.
+    uint64 part_count = 4;
+}
+
+message ListHostsRequest {}
+
+message ListHostsResponse {
+    ErrorCode code = 1;
+    repeated HostItem hosts = 2;
+    HostAddr leader = 3;
+}

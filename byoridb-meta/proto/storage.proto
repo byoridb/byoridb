@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package storage;
+
+// Storage Service provides data operations and partition management
+// Each storage node runs this service
+service StorageService {
+    // Get all data for a partition (for migration)
+    rpc GetPartitionData(GetPartitionDataRequest) returns (stream PartitionDataChunk);
+
+    // Receive partition data (from another storage node during migration)
+    rpc TransferPartition(stream PartitionDataChunk) returns (TransferPartitionResponse);
+
+    // Update partition ownership (from Meta service)
+    rpc UpdatePartitionOwnership(UpdatePartitionOwnershipRequest) returns (UpdatePartitionOwnershipResponse);
+
+    // Get partition status
+    rpc GetPartitionStatus(GetPartitionStatusRequest) returns (GetPartitionStatusResponse);
+
+    // Scan partition keys with prefix
+    rpc ScanPartition(ScanPartitionRequest) returns (stream KeyValuePair);
+}
+
+// ===== Common Types =====
+
+enum ErrorCode {
+    SUCCEEDED = 0;
+    E_PARTITION_NOT_FOUND = 1;
+    E_NOT_LEADER = 2;
+    E_TRANSFER_FAILED = 3;
+    E_INVALID_REQUEST = 4;
+    E_INTERNAL_ERROR = 99;
+}
+
+enum PartitionStatus {
+    PS_LEADER = 0;
+    PS_FOLLOWER = 1;
+    PS_NOT_OWNED = 2;
+    PS_TRANSFERRING = 3;
+}
+
+message HostAddr {
+    string host = 1;
+    uint32 port = 2;
+}
+
+message KeyValuePair {
+    bytes key = 1;
+    bytes value = 2;
+}
+
+// ===== GetPartitionData =====
+
+message GetPartitionDataRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    // Optional: only get data for specific key prefix
+    bytes key_prefix = 3;
+}
+
+message PartitionDataChunk {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    // Batch of key-value pairs
+    repeated KeyValuePair data = 3;
+    // True if this is the last chunk
+    bool done = 4;
+    // Total keys in partition (set in first chunk)
+    uint64 total_keys = 5;
+    // Checksum for integrity verification (optional)
+    uint64 checksum = 6;
+}
+
+// ===== TransferPartition =====
+
+message TransferPartitionResponse {
+    ErrorCode code = 1;
+    // Number of keys received
+    uint64 keys_received = 2;
+    string error_message = 3;
+}
+
+// ===== UpdatePartitionOwnership =====
+
+message UpdatePartitionOwnershipRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    PartitionStatus new_status = 3;
+    // New leader address (if status is LEADER or FOLLOWER)
+    HostAddr leader = 4;
+    // All replicas for this partition
+    repeated HostAddr replicas = 5;
+}
+
+message UpdatePartitionOwnershipResponse {
+    ErrorCode code = 1;
+    string error_message = 2;
+}
+
+// ===== GetPartitionStatus =====
+
+message GetPartitionStatusRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+}
+
+message GetPartitionStatusResponse {
+    ErrorCode code = 1;
+    PartitionStatus status = 2;
+    HostAddr leader = 3;
+    repeated HostAddr replicas = 4;
+    uint64 key_count = 5;
+    uint64 data_size_bytes = 6;
+}
+
+// ===== ScanPartition =====
+
+message ScanPartitionRequest {
+    uint32 space_id = 1;
+    uint32 part_id = 2;
+    bytes start_key = 3;
+    bytes end_key = 4;
+    uint32 limit = 5;
+}

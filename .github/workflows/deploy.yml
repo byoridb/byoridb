@@ -1,0 +1,102 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag override (default: git sha)'
+        required: false
+
+env:
+  ACR_REGISTRY: byoridbacr23236.azurecr.io
+  IMAGE_NAME: byoridb-server
+  AKS_RESOURCE_GROUP: byoridb-prod-rg
+  AKS_CLUSTER: byoridb-aks
+  K8S_NAMESPACE: byoridb
+  K8S_CONTAINER: byoridb-server
+
+jobs:
+  build-and-deploy:
+    name: Build Docker image & deploy to AKS
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set image tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="sha-$(git rev-parse --short HEAD)"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Image tag: $TAG"
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        run: az acr login --name byoridbacr23236
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.90"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-deploy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-deploy-
+
+      - name: Build release binary
+        run: cargo build --release --bin byoridb-server
+
+      - name: Build & push Docker image
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          IMAGE="$ACR_REGISTRY/$IMAGE_NAME"
+          docker build \
+            --build-arg BINARY_PATH=target/release/byoridb-server \
+            -f Dockerfile.prebuilt \
+            -t "$IMAGE:$TAG" \
+            -t "$IMAGE:latest" \
+            .
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group $AKS_RESOURCE_GROUP \
+            --name $AKS_CLUSTER \
+            --overwrite-existing
+
+      - name: Deploy to AKS
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          IMAGE="$ACR_REGISTRY/$IMAGE_NAME:$TAG"
+          kubectl set image statefulset/byoridb-server \
+            $K8S_CONTAINER="$IMAGE" \
+            -n $K8S_NAMESPACE
+          kubectl rollout status statefulset/byoridb-server \
+            -n $K8S_NAMESPACE \
+            --timeout=300s
