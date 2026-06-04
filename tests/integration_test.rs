@@ -7,7 +7,7 @@
 use byoridb_common::{datatypes::vertex::Tag, Edge, Value, Vertex};
 use byoridb_executor::ExecutionPlanBuilder;
 use byoridb_graph::service::GraphService;
-use byoridb_kvstore::{KVStoreOptions, RocksdbKVStore};
+use byoridb_kvstore::{KVStoreOptions, RedbKVStore};
 use byoridb_parser::parse;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -426,7 +426,7 @@ fn create_test_service() -> (GraphService, tempfile::TempDir) {
 
     let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
     let kvstore = Arc::new(
-        RocksdbKVStore::open(temp_dir.path(), KVStoreOptions::default())
+        RedbKVStore::open(temp_dir.path(), KVStoreOptions::default())
             .expect("Failed to create KVStore"),
     );
     let service = GraphService::new(kvstore);

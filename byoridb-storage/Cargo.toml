@@ -7,12 +7,11 @@ edition = "2021"
 tonic-build = "0.12"
 
 [features]
-# Enables the RocksDB-backed StorageEnv / StorageServer (server-only).
 default = []
-rocksdb = ["byoridb-kvstore/rocksdb"]
-# Enables the gRPC RPC layer (proto types + StorageRpcService). Pulls in tonic
-# (→ axum/hyper/mio/socket2) which cannot compile to wasm32. Off for embedded;
-# the storage *types* (index, key, codec, errors, raft) stay pure-Rust.
+# Enables the gRPC RPC layer (proto types + StorageRpcService + StorageServer).
+# Pulls in tonic (→ axum/hyper/mio/socket2) which cannot compile to wasm32. Off
+# for embedded; StorageEnv and the storage *types* (index, key, codec, errors,
+# raft) are pure-Rust and always available (redb-backed, no C++ toolchain).
 distributed = ["dep:tonic", "dep:prost"]
 
 [dependencies]

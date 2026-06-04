@@ -17,7 +17,7 @@
 
 use byoridb_common::hash::compute_partition;
 use byoridb_executor::distributed::DistributedQueryExecutor;
-use byoridb_kvstore::{KVStoreOptions, RocksdbKVStore};
+use byoridb_kvstore::{KVStoreOptions, RedbKVStore};
 use byoridb_storage::proto::storage::EdgeKey;
 use byoridb_storage::{IndexManager, IndexType, PartitionInfo, PartitionManager, PartitionStatus};
 use std::collections::HashMap;
@@ -175,7 +175,7 @@ async fn test_partition_manager_ownership() {
 async fn test_index_manager_basic_operations() {
     let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
     let kvstore: Arc<dyn byoridb_kvstore::KVStore> = Arc::new(
-        RocksdbKVStore::open(temp_dir.path(), KVStoreOptions::default())
+        RedbKVStore::open(temp_dir.path(), KVStoreOptions::default())
             .expect("Failed to create KVStore"),
     );
 
@@ -361,7 +361,7 @@ fn test_index_value_types() {
 async fn test_storage_service_with_partition_data() {
     let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
     let kvstore: Arc<dyn byoridb_kvstore::KVStore> = Arc::new(
-        RocksdbKVStore::open(temp_dir.path(), KVStoreOptions::default())
+        RedbKVStore::open(temp_dir.path(), KVStoreOptions::default())
             .expect("Failed to create KVStore"),
     );
 

@@ -4,9 +4,8 @@ Get ByoriDB running in under 5 minutes.
 
 ## Prerequisites
 
-- Rust 1.75+ (install via [rustup](https://rustup.rs/))
-- C++ compiler (clang or gcc)
-- CMake 3.10+
+- Rust 1.90+ (install via [rustup](https://rustup.rs/))
+- protobuf-compiler (for gRPC codegen)
 
 ## Build from Source
 

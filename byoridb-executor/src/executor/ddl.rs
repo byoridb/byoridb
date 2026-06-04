@@ -93,7 +93,7 @@ impl Executor {
     /// MetaClient is configured (e.g. pure embedded mode without a meta
     /// server), the operation returns a clear error rather than silently
     /// persisting into kvstore, because the full index lifecycle
-    /// (`IndexManager`, partition-local index RocksDB layout) requires the
+    /// (`IndexManager`, partition-local index KV layout) requires the
     /// Meta and Storage services.
     pub(super) async fn handle_create_tag_index(
         &self,

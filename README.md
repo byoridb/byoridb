@@ -19,7 +19,7 @@
 
 - **Safety & Speed** — Rust's memory safety with C++-level performance via zero-cost abstractions
 - **Distributed by Design** — Raft consensus, consistent hashing, and horizontal scaling from day one
-- **Modern Stack** — Tokio async runtime + RocksDB LSM-Tree, no JVM tuning or GC pauses
+- **Modern Stack** — Tokio async runtime + redb (pure-Rust embedded KV), no JVM tuning or GC pauses
 - **nGQL Compatible** — Familiar query language for graph operations with expanding Cypher-style support
 
 ## Quick Start
@@ -27,7 +27,7 @@
 ### Prerequisites
 
 - Rust 1.90+ (pinned via `rust-toolchain.toml`)
-- RocksDB build dependencies (`cmake`, `clang`, `libclang-dev`)
+- No C++ toolchain required — pure-Rust storage (redb)
 - `protobuf-compiler` for gRPC codegen
 
 ### Build & Run
@@ -140,7 +140,7 @@ FETCH PROP ON person $f.dst;
 
 ### Storage Engine
 
-- RocksDB with custom WAL (CRC32C checksums)
+- redb — pure-Rust embedded KV with built-in ACID durability
 - Bloom filter (10-bit/key, ~1% FPR)
 - 256MB block cache (LRU)
 - Batch get optimization
@@ -186,14 +186,14 @@ FETCH PROP ON person $f.dst;
               ┌─────▼──────┐           ┌────────▼────────┐
               │ byoridb-   │           │   byoridb-      │
               │  kvstore   │           │   kvstore       │
-              │ (RocksDB)  │           │  (RocksDB)      │
+              │ (redb)  │           │  (redb)      │
               └────────────┘           └─────────────────┘
 ```
 
 | Crate | Role |
 |-------|------|
 | `byoridb-common` | Core data types (Value, Vertex, Edge, DataSet) |
-| `byoridb-kvstore` | KV storage layer with RocksDB + WAL |
+| `byoridb-kvstore` | KV storage layer (redb, pure Rust) |
 | `byoridb-codec` | Row encoding/decoding with proto/JSON dual format |
 | `byoridb-storage` | Storage service, Raft consensus, indexing |
 | `byoridb-meta` | Metadata management, partition allocation |
@@ -204,7 +204,7 @@ FETCH PROP ON person $f.dst;
 
 ## Performance
 
-*Benchmark environment: Apple Silicon, Rust 1.90, RocksDB with Bloom Filter*
+*Benchmark environment: Apple Silicon, Rust 1.90, redb*
 
 ### Query Latency
 
@@ -238,7 +238,7 @@ FETCH PROP ON person $f.dst;
 |-----------|--------|
 | Arena allocation (Bumpalo) | ~16x faster allocation |
 | Bloom filter | 20–40% fewer disk reads |
-| Batch get | 50–80% fewer RocksDB calls |
+| Batch get | 50–80% fewer KV round-trips |
 | Predicate pushdown | 10–100x less data transfer |
 | RPC compression (zstd) | 30–50% bandwidth reduction |
 | `scan_stream` BoxStream | BFS hot-path −39–49% |
@@ -287,7 +287,7 @@ cargo build
 # Release build (LTO enabled)
 cargo build --release
 
-# Run all tests (serial — RocksDB file contention)
+# Run all tests (serial — redb file lock contention)
 cargo test --workspace -- --test-threads=1
 
 # Run with debug logging

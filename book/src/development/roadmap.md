@@ -13,7 +13,7 @@ Current status and future plans for ByoriDB.
   - [x] ALTER TAG/EDGE ADD (online schema change)
 
 - [x] Storage Engine
-  - [x] RocksDB integration
+  - [x] Pure-Rust KV (redb) integration
   - [x] Vertex/Edge encoding
   - [x] Schema version support
   - [x] Bloom filter

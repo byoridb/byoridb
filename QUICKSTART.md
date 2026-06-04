@@ -6,7 +6,7 @@ This guide will help you get ByoriDB up and running.
 
 - **Rust**: Latest stable version (install via [rustup](https://rustup.rs/))
 - **Linux/macOS**: Windows is not currently supported
-- **C++ build tools**: cmake, clang, or gcc (for RocksDB compilation)
+- No C++ build tools required — storage is pure-Rust (redb)
 
 ## 1. Build and Run
 

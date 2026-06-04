@@ -6,7 +6,7 @@
 
 use crate::error::{Result, StorageError};
 use byoridb_codec::SchemaProvider;
-use byoridb_kvstore::{KVStore, KVStoreOptions, WalKVStore};
+use byoridb_kvstore::{KVStore, KVStoreOptions, RedbKVStore};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -50,9 +50,9 @@ impl StorageEnv {
             .first()
             .ok_or_else(|| StorageError::Internal("No data path specified".to_string()))?;
 
-        // Use WAL-enabled KVStore for durability
-        info!("Opening WAL-enabled KVStore at {:?}", data_path);
-        let kvstore = Arc::new(WalKVStore::open(data_path, config.kvstore_opts.clone())?);
+        // redb provides built-in ACID durability (fsync on every commit).
+        info!("Opening redb KVStore at {:?}", data_path);
+        let kvstore = Arc::new(RedbKVStore::open(data_path, config.kvstore_opts.clone())?);
 
         Ok(StorageEnv {
             config,

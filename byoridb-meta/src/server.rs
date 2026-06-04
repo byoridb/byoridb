@@ -9,7 +9,7 @@ use crate::proto::meta_service_server::MetaServiceServer;
 use crate::rpc::MetaRpcService;
 use crate::service::MetaService;
 use axum::extract::State;
-use byoridb_kvstore::{KVStoreOptions, RocksdbKVStore};
+use byoridb_kvstore::{KVStoreOptions, RedbKVStore};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -78,7 +78,7 @@ impl MetaServer {
         }
 
         let opts = KVStoreOptions::default();
-        let kvstore = Arc::new(RocksdbKVStore::open(&config.data_path, opts)?);
+        let kvstore = Arc::new(RedbKVStore::open(&config.data_path, opts)?);
         let service = Arc::new(MetaService::new(kvstore));
 
         Ok(MetaServer {

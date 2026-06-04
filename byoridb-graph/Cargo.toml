@@ -4,21 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-# Forwards the RocksDB backend down the stack. Graph itself uses only storage/
-# meta *types*, so no source is gated here — this just lets the server crate
-# turn RocksDB on through graph.
 default = []
-rocksdb = ["byoridb-kvstore/rocksdb", "byoridb-storage/rocksdb", "byoridb-meta/rocksdb"]
 # Network servers (gRPC via tonic + HTTP via axum), the Prometheus exporter, and
 # tracing-subscriber logging init. Off for embedded/in-process use; the
-# standalone server crate turns it on. (`metrics` facade stays always-on — the
-# execute path records through it.)
+# standalone server crate turns it on. Forwards the network layers down the
+# stack (storage RPC + meta server). (`metrics` facade stays always-on — the
+# execute path records through it.) The KV backend (redb) is always available.
 server = [
     "dep:tonic",
     "dep:prost",
     "dep:axum",
     "dep:metrics-exporter-prometheus",
     "dep:tracing-subscriber",
+    "byoridb-storage/distributed",
+    "byoridb-meta/server",
 ]
 
 [dependencies]

@@ -1,25 +1,30 @@
 # Storage Engine
 
-ByoriDB uses RocksDB as its underlying storage engine.
+ByoriDB uses **redb**, a pure-Rust embedded key-value store, as its underlying
+storage engine. There is no C++ toolchain dependency.
 
-## RocksDB Architecture
+## redb Architecture
+
+redb is a single-file, copy-on-write **B-tree** store with full ACID
+transactions and MVCC — not an LSM tree.
 
 ```
 ┌─────────────────────────────────────────────┐
 │              Write Path                      │
-│  Write → MemTable → Immutable MemTable      │
-│                          ↓                   │
-│              Flush to SST Files              │
+│  begin_write → insert/remove → commit        │
+│   (single writer, serialized; fsync on commit)│
 └─────────────────────────────────────────────┘
                         ↓
 ┌─────────────────────────────────────────────┐
-│              LSM Tree                        │
-│  Level 0: [SST] [SST] [SST]                 │
-│  Level 1: [  SST  ] [  SST  ]               │
-│  Level 2: [    SST    ] [    SST    ]       │
-│              ↓ Compaction                    │
+│            Copy-on-write B-tree              │
+│  Pages are versioned; readers see a stable   │
+│  MVCC snapshot while a writer commits.        │
+│  Free pages are reclaimed automatically.      │
 └─────────────────────────────────────────────┘
 ```
+
+All rows live in a single redb table (`"kv"`) keyed by raw bytes; prefix scans
+are range queries over that ordered keyspace.
 
 ## Key Encoding
 
@@ -43,49 +48,18 @@ ByoriDB uses RocksDB as its underlying storage engine.
 
 The schema version enables lazy migration for online schema changes.
 
-## Performance Optimizations
+## Performance Tuning
 
-### Block Cache
-
-LRU cache for frequently accessed data blocks:
+redb exposes a small surface. The main knob is the page cache size:
 
 ```toml
 [storage]
-block_cache_size = "256MB"  # Increase for read-heavy workloads
+cache_size = "256MB"  # redb page cache; increase for read-heavy workloads
 ```
 
-### Bloom Filter
-
-Probabilistic filter to reduce disk reads:
-
-```toml
-[storage]
-bloom_filter_bits_per_key = 10  # ~1% false positive rate
-```
-
-### Write Buffer
-
-In-memory buffer before flushing to disk:
-
-```toml
-[storage]
-write_buffer_size = "64MB"
-max_write_buffer_number = 3
-```
-
-### Compression
-
-```toml
-[storage]
-compression = "lz4"  # Options: none, snappy, lz4, zstd
-```
-
-| Algorithm | Speed | Ratio | Recommendation |
-|-----------|-------|-------|----------------|
-| none | Fastest | 1:1 | SSD with space to spare |
-| snappy | Fast | ~1.5:1 | General purpose |
-| lz4 | Fast | ~2:1 | Good balance (default) |
-| zstd | Slower | ~3:1 | Storage constrained |
+Durability is `Immediate` by default — every commit is fsynced and checksummed,
+giving crash safety without a separate write-ahead log. (redb has no LSM
+memtable/bloom-filter/compression knobs; those were RocksDB-specific.)
 
 ## Data Layout
 
@@ -132,7 +106,7 @@ For online schema changes, the storage layer handles multiple schema versions:
 
 ```
 Read Path:
-1. Read row from RocksDB
+1. Read row from the KV store
 2. Extract schema_version from row
 3. If version < current:
    - Decode with old schema
@@ -148,28 +122,11 @@ This lazy migration approach:
 - Rows updated on next write
 - Gradual migration over time
 
-## Compaction
+## Space Reclamation
 
-RocksDB background compaction:
-
-```toml
-[storage]
-max_background_compactions = 4
-target_file_size_base = "64MB"
-```
-
-### Compaction Triggers
-
-- Level 0 file count exceeds threshold
-- Level size exceeds target
-- Manual compaction request
-
-### During Compaction
-
-- Merge SST files
-- Remove deleted keys
-- Apply compression
-- Reclaim space
+redb has no LSM compaction. As a copy-on-write B-tree it tracks free pages and
+reuses them on subsequent writes automatically, so deleted keys' space is
+reclaimed without a background compaction process.
 
 ## Snapshots
 
@@ -186,4 +143,5 @@ byoridb-admin snapshot list
 byoridb-admin snapshot restore --id <snapshot_id>
 ```
 
-Snapshots use RocksDB's checkpoint feature for efficient creation.
+Snapshots are taken by opening a read transaction (an MVCC snapshot) on the
+single redb file and copying it into a self-contained backup file.

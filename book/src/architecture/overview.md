@@ -30,8 +30,8 @@ ByoriDB uses a storage-compute separation architecture with three main services.
            │                               ▼
            ▼                      ┌─────────────────┐
     ┌──────────────┐              │    KVStore      │
-    │   KVStore    │              │   (RocksDB)     │
-    │  (RocksDB)   │              └─────────────────┘
+    │   KVStore    │              │    (redb)       │
+    │    (redb)    │              └─────────────────┘
     └──────────────┘
 ```
 
@@ -84,7 +84,7 @@ Key characteristics:
 
 Underlying storage engine:
 
-- **RocksDB**: LSM-tree based storage
+- **redb**: pure-Rust embedded B-tree storage
 - **Raft**: Distributed consensus protocol
 - **Snapshots**: Point-in-time backups
 - **Compaction**: Background optimization
@@ -98,7 +98,7 @@ Underlying storage engine:
 2. Graph Service → Meta Service (get partition info)
 3. Graph Service → Storage Service (write to leader)
 4. Storage Leader → Raft Log (replicate)
-5. Storage Leader → RocksDB (apply)
+5. Storage Leader → redb (apply)
 6. Ack back to client
 ```
 
@@ -108,7 +108,7 @@ Underlying storage engine:
 1. Client → Graph Service (FETCH PROP)
 2. Graph Service → Meta Service (get schema + partition)
 3. Graph Service → Storage Service (read from any replica)
-4. Storage → RocksDB → Return data
+4. Storage → redb → Return data
 5. Graph Service → Apply schema version transformation
 6. Return to client
 ```

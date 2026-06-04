@@ -198,7 +198,7 @@ nullable 필드 0개 스키마에서 서버 crash.
 - `byoridb-meta/src/server.rs` — 127.0.0.1 바인딩으로 변경
 
 **S-12 [Medium] TLS — 의도적 미구현, 네트워크 격리로 대체**
-유동 IP 환경에서는 IP SAN 인증서 관리 비용이 크고, 대부분의 DB 배포(Redis, RocksDB 등)가 네트워크 격리에 의존하는 것과 동일한 패턴.
+유동 IP 환경에서는 IP SAN 인증서 관리 비용이 크고, 대부분의 DB 배포(Redis, PostgreSQL 등)가 네트워크 격리에 의존하는 것과 동일한 패턴.
 - **운영 필수 조건**: VPC/내부망 격리 + 방화벽/보안 그룹으로 외부 접근 차단
 - 퍼블릭 네트워크 노출이 필요한 경우에는 앞단에 TLS 종료 프록시(nginx, envoy) 배치 권장
 - 규정 준수(PCI-DSS, HIPAA) 요구 시 재검토
@@ -236,12 +236,15 @@ HTTP API에 쿼리 크기 제한 없음 (gRPC는 64MB 제한 있음).
 
 ### B. KVStore 성능 후속 (P2, 측정 기반)
 
-상세는 `byoridb-kvstore/benches/wal_overhead.rs` 측정 결과 참조. 기준선은
-2026-05-08 `single_put/wal_kvstore=2.30 µs`(write_entry flush 제거 후, −33%).
+> **2026-06-05 redb 전환으로 이 섹션 대부분 무효화.** RocksDB + 외부 WAL(wal.rs,
+> WalKVStore)을 제거하고 순수 Rust **redb**로 단일화 (C++ 툴체인 의존 제거,
+> clean build ~28s). redb 자체 ACID(`Durability::Immediate` = commit마다 fsync)가
+> durability를 제공하므로 이중 WAL 최적화/CRC32C 항목은 자연 해소됨.
+> `benches/wal_overhead.rs`도 삭제.
 
-- **append_put 핫스팟 분석** — 100회 serial(225µs) vs batch(55µs) 4× 차이. 프로파일러로 hot path 확정 후 `append_batch_streaming` API 검토. 보류 권장: 프로파일이 분산되면(특정 함수 < 30%) 마이크로 최적화 회피.
-- **RocksDB 내부 WAL 비활성**(`WriteOptions::disable_wal(true)`) — 이중 WAL 제거로 추가 −0.30 µs 가능. 위험: 외부 WAL이 유일한 source of truth가 됨. **선결 조건**: 외부 WAL checksum을 byte-sum → CRC32C로 강화.
-- **WAL checksum CRC32C** — 현재 `wrapping_add` 단순 합은 두 바이트 swap을 못 잡음. `crc32fast` 도입, 1바이트 magic으로 기존 byte-sum 구분. 단독으로는 정확성 개선이지 성능 변화는 거의 없음.
+- **redb 쓰기 처리량 재측정** — redb는 단일 writer 직렬화 + commit fsync(Immediate)라, 고빈도 단일 `put`이 (구) RocksDB memtable 버퍼링보다 느릴 수 있음. 핫패스는 `batch_put`로 묶고, 필요 시 `Durability::Eventual` 옵션 노출 검토(`KVStoreOptions.use_fsync` 자리에 예약됨).
+- ~~RocksDB 내부 WAL 비활성~~ — 무효 (RocksDB 제거).
+- ~~WAL checksum CRC32C~~ — 무효 (외부 WAL 제거, redb 내부 체크섬 사용).
 
 ### C. 그래프 알고리즘 후속 (P2~P3, 워크로드 의존)
 
@@ -343,9 +346,10 @@ Azure AKS에 실제로 배포해보며 발견된 마찰 포인트.
   적용: Dockerfile `rust:1.90-slim-bookworm` 고정 + `rust-toolchain.toml` 추가(channel="1.90"). 로컬/CI/Docker가 동일 toolchain 사용. 후속: CI에 `rustup show && cargo check`로 toolchain 일치 검사 추가는 별건.
 - **G-2 `byoridb-server` 분산 launcher 통합** (High)
   PLAN.md 검증된 기능에 분산 클러스터가 있지만, `byoridb-server` bin은 single-node only. 분산 모드를 위한 환경변수/CLI 인터페이스 부재(`AppConfig`에 peer list/cluster ID/raft 옵션 없음). 운영용 분산 배포 전에 필수. 인터페이스 예: `BYORIDB__CLUSTER__PEERS`, `BYORIDB__CLUSTER__NODE_ID`, `BYORIDB__CLUSTER__BOOTSTRAP`.
-- **G-3 컨테이너 빌드 시간 단축** (Medium)
-  ACR Tasks에서 RocksDB + workspace 풀 컴파일이 hot path. 현재 Dockerfile의 dummy-source 캐싱은 `Cargo.lock` 변경 시 전부 무효화. 후보:
-  1. cargo-chef로 dependency layer 분리(LSM/RocksDB 변경 빈도 낮음)
+- **G-3 컨테이너 빌드 시간 단축** (Medium — redb 전환으로 우선순위 하락)
+  2026-06-05 redb 전환으로 RocksDB C++ 컴파일(수 분)이 사라져 clean build ~28s.
+  hot path 상당 부분 해소. 남은 후보:
+  1. cargo-chef로 dependency layer 분리(workspace 외부 의존 변경 빈도 낮음)
   2. ACR Tasks `--cache-from`로 이전 이미지 layer 재사용
   3. multi-arch가 불필요하면 ACR Tasks 대신 GitHub Actions self-hosted + sccache 검토
 - **G-4 Azure 배포 스크립트화** ✅ 적용 완료 (2026-05-14)
@@ -511,7 +515,7 @@ Phase 0–7 모두 ✅, 커밋 `1d90124`. 핵심 임팩트:
 
 - criterion 벤치는 매 iter마다 새 키 사용(LSM 누적 회피). `AtomicU64` monotonic counter.
 - 디스크 I/O 벤치 `sample_size` 30~50 권장. 100은 시간 낭비.
-- *통제군* 반드시 같이 측정(예: rocksdb backend, batch path). 의도치 않은 영향 확인용.
+- *통제군* 반드시 같이 측정(예: memory backend, batch path). 의도치 않은 영향 확인용.
 - `change p > 0.05`는 noise. 기준선 대비 Δ가 5σ 이상일 때만 의미 있음.
 
 **커밋/푸시**

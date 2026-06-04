@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-# Enables the RocksDB-backed MetaServer (server-only). axum is only used by
-# server.rs, which is itself rocksdb-gated, so pull it in via this feature.
-# server.rs also serves gRPC (MetaServiceServer), so it requires `distributed`.
 default = []
-rocksdb = ["byoridb-kvstore/rocksdb", "dep:axum", "distributed"]
+# Enables MetaServer (server.rs). It serves gRPC (MetaServiceServer) and an
+# axum HTTP layer, so it pulls in axum and the gRPC `distributed` layer. The KV
+# backend (redb) is always available, no feature needed.
+server = ["dep:axum", "distributed"]
 # Enables the gRPC layer (proto + MetaClient/StorageClient/rpc/service). Pulls
 # in tonic (→ axum/hyper/mio), not wasm-compatible. The pure metadata *types*
 # (schema, hotspot, key, error) stay available to the embedded build.

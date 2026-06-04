@@ -11,7 +11,7 @@
 //! - Index lookups (LOOKUP)
 
 use byoridb_graph::service::GraphService;
-use byoridb_kvstore::{KVStoreOptions, RocksdbKVStore};
+use byoridb_kvstore::{KVStoreOptions, RedbKVStore};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -31,7 +31,7 @@ impl TestEnv {
 
         let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
         let kvstore = Arc::new(
-            RocksdbKVStore::open(temp_dir.path(), KVStoreOptions::default())
+            RedbKVStore::open(temp_dir.path(), KVStoreOptions::default())
                 .expect("Failed to create KVStore"),
         );
         let graph_service = GraphService::new(kvstore);

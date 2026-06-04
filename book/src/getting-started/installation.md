@@ -14,10 +14,12 @@
 - Disk: SSD recommended for production
 
 ### Software Dependencies
-- Rust 1.75 or later
-- C++ compiler (clang 10+ or gcc 7+)
-- CMake 3.10+
+- Rust 1.90 or later
+- protobuf-compiler (for gRPC codegen)
 - pkg-config
+
+The storage engine is pure-Rust (redb), so **no C++ toolchain** (cmake/clang) is
+required. `build-essential`/`pkg-config` cover the few native crates (zstd, openssl).
 
 ## Install Dependencies
 
@@ -25,21 +27,21 @@
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential cmake pkg-config clang
+sudo apt install -y build-essential pkg-config protobuf-compiler
 ```
 
 ### macOS
 
 ```bash
 xcode-select --install
-brew install cmake
+brew install protobuf
 ```
 
 ### CentOS/RHEL
 
 ```bash
 sudo yum groupinstall -y "Development Tools"
-sudo yum install -y cmake3 clang
+sudo yum install -y protobuf-compiler
 ```
 
 ## Install Rust
@@ -103,17 +105,16 @@ cargo test
 
 ## Troubleshooting
 
-### RocksDB Compilation Errors
+### Protobuf Compiler Not Found
 
-If you see RocksDB compilation errors:
+If the gRPC build fails with a missing `protoc`:
 
 ```bash
 # Ubuntu/Debian
-sudo apt install -y libclang-dev
+sudo apt install -y protobuf-compiler
 
 # macOS
-brew install llvm
-export LIBCLANG_PATH=$(brew --prefix llvm)/lib
+brew install protobuf
 ```
 
 ### Linking Errors

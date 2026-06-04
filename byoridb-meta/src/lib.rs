@@ -29,8 +29,8 @@ pub mod rebalancer;
 #[cfg(feature = "distributed")]
 pub mod rpc;
 pub mod schema;
-// `server` (MetaServer) opens a RocksdbKVStore — server-only, requires RocksDB.
-#[cfg(feature = "rocksdb")]
+// `server` (MetaServer) opens a redb-backed KVStore and serves gRPC/HTTP.
+#[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "distributed")]
 pub mod service;
@@ -54,7 +54,7 @@ pub use client::{HostInfo, HostLiveness, MetaClient};
 pub use error::{MetaError, Result};
 #[cfg(feature = "distributed")]
 pub use failure_detector::{FailedNode, FailureDetector, FailureDetectorConfig, RecoveryResult};
-#[cfg(feature = "rocksdb")]
+#[cfg(feature = "server")]
 pub use server::{MetaServer, MetaServerConfig};
 #[cfg(feature = "distributed")]
 pub use service::MetaService;
