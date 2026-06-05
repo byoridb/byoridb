@@ -29,7 +29,18 @@ impl Executor {
                 } else {
                     space
                 };
-                let mut inserted = 0;
+                // Fetch the tag-index list once (not per row), then collect every
+                // KV write into a single batch so the whole multi-row INSERT
+                // commits in one redb transaction (one fsync) instead of one per
+                // put. This is the dominant cost for bulk loads. The batch is
+                // also atomic — a multi-row INSERT now applies all-or-nothing.
+                let space_id = self.ctx.space_id.unwrap_or(1);
+                let tag_indexes = match self.ctx.index_manager.as_ref() {
+                    Some(im) => im.list_tag_indexes(space_id).await,
+                    None => Vec::new(),
+                };
+                let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut inserted = 0i64;
                 for vertex in vertices {
                     // Schema validation: verify each tag and its fields exist
                     for tag in &vertex.tags {
@@ -51,41 +62,41 @@ impl Executor {
                     };
                     let data = VertexCodec::encode_vertex(&codec_vertex)
                         .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
-                    self.ctx.kvstore.put(key.as_bytes(), &data).await?;
-                    // Write tag-vid secondary index for label-only MATCH acceleration.
+                    batch.push((key.into_bytes(), data));
+                    // Tag-vid secondary index for label-only MATCH acceleration.
                     // Key: {space}:tagvid:{tag_name}:{vid} → empty value.
                     for tag in &codec_vertex.tags {
                         let tagvid_key =
                             format!("{}:tagvid:{}:{}", effective_space, tag.name, vertex.vid);
-                        self.ctx.kvstore.put(tagvid_key.as_bytes(), &[]).await?;
+                        batch.push((tagvid_key.into_bytes(), Vec::new()));
                     }
-                    if let Some(index_manager) = self.ctx.index_manager.as_ref() {
-                        let space_id = self.ctx.space_id.unwrap_or(1);
-                        for index in index_manager.list_tag_indexes(space_id).await {
-                            for tag in codec_vertex
-                                .tags
+                    for index in &tag_indexes {
+                        for tag in codec_vertex
+                            .tags
+                            .iter()
+                            .filter(|tag| tag.name == index.schema_name)
+                        {
+                            let values = index
+                                .fields
                                 .iter()
-                                .filter(|tag| tag.name == index.schema_name)
-                            {
-                                let values = index
-                                    .fields
-                                    .iter()
-                                    .map(|field| {
-                                        self.byoridb_value_to_index_value(
-                                            tag.properties
-                                                .get(field)
-                                                .unwrap_or(&byoridb_common::Value::null()),
-                                        )
-                                    })
-                                    .collect::<Vec<_>>();
-                                index_manager
-                                    .insert_tag_index(1, index.id, &values, vertex.vid)
-                                    .await
-                                    .map_err(|e| ExecutionError::InvalidOperation(e.to_string()))?;
-                            }
+                                .map(|field| {
+                                    self.byoridb_value_to_index_value(
+                                        tag.properties
+                                            .get(field)
+                                            .unwrap_or(&byoridb_common::Value::null()),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            let idx_key = byoridb_storage::KeyUtils::tag_index_key(
+                                1, index.id, &values, vertex.vid,
+                            );
+                            batch.push((idx_key, Vec::new()));
                         }
                     }
                     inserted += 1;
+                }
+                if !batch.is_empty() {
+                    self.ctx.kvstore.batch_put(batch).await?;
                 }
                 Ok(ExecutorResult {
                     columns: vec!["Inserted".to_string()],
@@ -106,7 +117,15 @@ impl Executor {
                 } else {
                     space
                 };
-                let mut inserted = 0;
+                // Collect all KV writes into one batch → single redb commit
+                // (one fsync) per multi-row INSERT, applied atomically.
+                let space_id = self.ctx.space_id.unwrap_or(1);
+                let edge_indexes = match self.ctx.index_manager.as_ref() {
+                    Some(im) => im.list_edge_indexes(space_id).await,
+                    None => Vec::new(),
+                };
+                let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut inserted = 0i64;
                 for edge in edges {
                     // Schema validation: verify edge type and its fields exist
                     let edge_type_name = edge.edge_type.clone();
@@ -126,41 +145,37 @@ impl Executor {
                     };
                     let data = VertexCodec::encode_edge(&codec_edge)
                         .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
-                    self.ctx.kvstore.put(key.as_bytes(), &data).await?;
-                    if let Some(index_manager) = self.ctx.index_manager.as_ref() {
-                        let space_id = self.ctx.space_id.unwrap_or(1);
-                        for index in index_manager
-                            .list_edge_indexes(space_id)
-                            .await
-                            .into_iter()
-                            .filter(|index| index.schema_name == edge_type_name)
-                        {
-                            let values = index
-                                .fields
-                                .iter()
-                                .map(|field| {
-                                    self.byoridb_value_to_index_value(
-                                        codec_edge
-                                            .properties
-                                            .get(field)
-                                            .unwrap_or(&byoridb_common::Value::null()),
-                                    )
-                                })
-                                .collect::<Vec<_>>();
-                            index_manager
-                                .insert_edge_index(
-                                    1,
-                                    index.id,
-                                    &values,
-                                    codec_edge.src_vid,
-                                    codec_edge.ranking,
-                                    codec_edge.dst_vid,
+                    batch.push((key.into_bytes(), data));
+                    for index in edge_indexes
+                        .iter()
+                        .filter(|index| index.schema_name == edge_type_name)
+                    {
+                        let values = index
+                            .fields
+                            .iter()
+                            .map(|field| {
+                                self.byoridb_value_to_index_value(
+                                    codec_edge
+                                        .properties
+                                        .get(field)
+                                        .unwrap_or(&byoridb_common::Value::null()),
                                 )
-                                .await
-                                .map_err(|e| ExecutionError::InvalidOperation(e.to_string()))?;
-                        }
+                            })
+                            .collect::<Vec<_>>();
+                        let idx_key = byoridb_storage::KeyUtils::edge_index_key(
+                            1,
+                            index.id,
+                            &values,
+                            codec_edge.src_vid,
+                            codec_edge.ranking,
+                            codec_edge.dst_vid,
+                        );
+                        batch.push((idx_key, Vec::new()));
                     }
                     inserted += 1;
+                }
+                if !batch.is_empty() {
+                    self.ctx.kvstore.batch_put(batch).await?;
                 }
                 Ok(ExecutorResult {
                     columns: vec!["Inserted".to_string()],
