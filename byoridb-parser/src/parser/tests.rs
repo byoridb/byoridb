@@ -983,3 +983,22 @@ fn test_profile_sets_profile_true() {
         other => panic!("expected Explain, got {:?}", other),
     }
 }
+
+#[test]
+fn test_create_index_on_keyword_named_tag() {
+    // LDBC's `Tag` class: the tag name collides with the TAG keyword.
+    // `ON Tag(...)` must read `Tag` as the tag name, not the optional keyword.
+    parse("CREATE TAG INDEX tag_name_idx ON Tag(name)").unwrap();
+    parse("CREATE TAG INDEX IF NOT EXISTS tag_name_idx ON Tag(name)").unwrap();
+    // Explicit `ON TAG name(...)` prefix still works.
+    parse("CREATE INDEX TAG person_age_idx ON TAG person(age)").unwrap();
+    // Plain `ON name(...)` (TAG keyword omitted) still works.
+    parse("CREATE TAG INDEX i ON person(last_name)").unwrap();
+}
+
+#[test]
+fn test_create_edge_index_on_keyword_named_edge() {
+    parse("CREATE EDGE INDEX e_idx ON Edge(weight)").unwrap();
+    parse("CREATE INDEX EDGE e_idx ON EDGE knows(since)").unwrap();
+    parse("CREATE EDGE INDEX e_idx ON knows(since)").unwrap();
+}

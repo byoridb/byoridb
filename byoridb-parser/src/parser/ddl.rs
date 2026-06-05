@@ -417,8 +417,15 @@ impl Parser {
         let if_not_exists = self.parse_if_not_exists()?;
         let index_name = self.consume_identifier()?;
         self.consume_token(Token::On)?;
-        // Optional `TAG` keyword before the tag name
-        self.match_token(Token::Tag);
+        // Optional `TAG` keyword (`ON TAG name(...)`). Skip it only when it is a
+        // real keyword prefix; if the tag is literally named `Tag` (e.g. LDBC's
+        // Tag class), `ON Tag(...)` has `(` right after — leave it for
+        // consume_identifier to read as the tag name instead of swallowing it.
+        if self.peek_token()? == Token::Tag
+            && self.tokens.get(self.pos + 1).map(|t| &t.token) != Some(&Token::LParen)
+        {
+            self.advance();
+        }
         let tag_name = self.consume_identifier()?;
 
         self.consume_token(Token::LParen)?;
@@ -444,8 +451,14 @@ impl Parser {
         let if_not_exists = self.parse_if_not_exists()?;
         let index_name = self.consume_identifier()?;
         self.consume_token(Token::On)?;
-        // Optional `EDGE` keyword before the edge name
-        self.match_token(Token::Edge);
+        // Optional `EDGE` keyword (`ON EDGE name(...)`). Skip it only when it is
+        // a real keyword prefix; if the edge is literally named `Edge`,
+        // `ON Edge(...)` has `(` right after — leave it for consume_identifier.
+        if self.peek_token()? == Token::Edge
+            && self.tokens.get(self.pos + 1).map(|t| &t.token) != Some(&Token::LParen)
+        {
+            self.advance();
+        }
         let edge_name = self.consume_identifier()?;
 
         self.consume_token(Token::LParen)?;
