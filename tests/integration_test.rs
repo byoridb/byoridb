@@ -1059,3 +1059,45 @@ async fn test_crud_full_workflow() {
 
     service.sign_out(session_id, session_id).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_show_stats_reports_empty_tag_and_edge_as_zero() {
+    // Regression for LDBC validation feedback #5: an empty tag/edge must appear
+    // in SHOW STATS with count 0, not be absent (which read as actual=None).
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE stats_zero").await;
+    execute(&service, session_id, "USE stats_zero").await;
+    execute(&service, session_id, "CREATE TAG Person(name STRING)").await;
+    execute(&service, session_id, "CREATE EDGE knows()").await;
+    // Deliberately insert no data — counts must be 0, not missing.
+
+    let ds = execute(&service, session_id, "SHOW STATS").await;
+
+    let has_tag_zero = ds.rows.iter().any(|r| {
+        r.len() >= 3
+            && r[0] == Value::String("Tag".to_string())
+            && r[1] == Value::String("Person".to_string())
+            && r[2] == Value::Int(0)
+    });
+    let has_edge_zero = ds.rows.iter().any(|r| {
+        r.len() >= 3
+            && r[0] == Value::String("Edge".to_string())
+            && r[1] == Value::String("knows".to_string())
+            && r[2] == Value::Int(0)
+    });
+    assert!(
+        has_tag_zero,
+        "empty tag Person must report count 0, got rows: {:?}",
+        ds.rows
+    );
+    assert!(
+        has_edge_zero,
+        "empty edge knows must report count 0, got rows: {:?}",
+        ds.rows
+    );
+}
