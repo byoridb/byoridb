@@ -117,6 +117,7 @@ impl HttpServer {
             .route("/health", get(health_check))
             .route("/metrics", get(metrics_endpoint))
             .route("/api/v1/metrics", get(metrics_json))
+            .route("/api/v1/diagnostics/queries", get(list_active_queries))
             .route("/api/v1/session", post(create_session))
             .route("/api/v1/session/:id", delete(delete_session))
             .route("/api/v1/query", post(execute_query))
@@ -161,6 +162,17 @@ async fn metrics_json() -> Json<serde_json::Value> {
         "metrics": {
             "prometheus_url": "/metrics"
         }
+    }))
+}
+
+/// Diagnostics: list queries currently executing on the server. Useful for
+/// seeing what a long-running load is doing and whether work continues after a
+/// client-side HTTP timeout.
+async fn list_active_queries(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let queries = state.service.list_active_queries();
+    Json(serde_json::json!({
+        "count": queries.len(),
+        "queries": queries,
     }))
 }
 

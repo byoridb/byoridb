@@ -1177,3 +1177,35 @@ async fn test_lookup_qualified_property_filter_without_index() {
         ds.rows
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_active_query_registry_cleared_after_execution() {
+    // Observability (#3): the in-flight registry must drop entries on every
+    // exit path. After all queries complete it must be empty (no leak), which
+    // also keeps the byoridb_inflight_queries gauge balanced.
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE diag_test").await;
+    execute(&service, session_id, "USE diag_test").await;
+    execute(&service, session_id, "CREATE TAG person(name STRING)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX person(name) VALUES 1:("a"), 2:("b")"#,
+    )
+    .await;
+    // A failing query must also clean up.
+    let _ = service
+        .execute(session_id, "LOOKUP ON nonexistent_tag".to_string())
+        .await;
+
+    assert!(
+        service.list_active_queries().is_empty(),
+        "registry must be empty after queries finish, got: {:?}",
+        service.list_active_queries()
+    );
+}
