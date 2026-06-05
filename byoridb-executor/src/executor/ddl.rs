@@ -191,15 +191,21 @@ impl Executor {
         tag_name: &str,
         props: &[String],
     ) -> Result<()> {
-        let Some(index_manager) = self.ctx.index_manager.as_ref() else {
+        if self.ctx.index_manager.is_none() {
             return Ok(());
-        };
+        }
         let prefix = format!("{}:vertex:", space);
         let rows = self
             .ctx
             .kvstore
             .scan_prefix_limited(prefix.as_bytes(), None)
             .await?;
+        // Backfill in chunked batches: one redb commit (one fsync) per chunk
+        // instead of one per index entry. Without this, backfilling a large tag
+        // (e.g. LDBC post, ~hundreds of thousands of rows) issues a fsync per
+        // row and times out.
+        const CHUNK: usize = 4096;
+        let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for (key, value) in rows {
             let key_str = String::from_utf8_lossy(&key);
             let vid = key_str
@@ -222,12 +228,20 @@ impl Executor {
                             )
                         })
                         .collect::<Vec<_>>();
-                    index_manager
-                        .insert_tag_index(1, index_id, &values, vid)
-                        .await
-                        .map_err(|e| ExecutionError::InvalidOperation(e.to_string()))?;
+                    let idx_key =
+                        byoridb_storage::KeyUtils::tag_index_key(1, index_id, &values, vid);
+                    batch.push((idx_key, Vec::new()));
+                    if batch.len() >= CHUNK {
+                        self.ctx
+                            .kvstore
+                            .batch_put(std::mem::take(&mut batch))
+                            .await?;
+                    }
                 }
             }
+        }
+        if !batch.is_empty() {
+            self.ctx.kvstore.batch_put(batch).await?;
         }
         Ok(())
     }
@@ -239,15 +253,18 @@ impl Executor {
         edge_name: &str,
         props: &[String],
     ) -> Result<()> {
-        let Some(index_manager) = self.ctx.index_manager.as_ref() else {
+        if self.ctx.index_manager.is_none() {
             return Ok(());
-        };
+        }
         let prefix = format!("{}:edge:", space);
         let rows = self
             .ctx
             .kvstore
             .scan_prefix_limited(prefix.as_bytes(), None)
             .await?;
+        // Chunked batches — one fsync per chunk (see backfill_tag_index).
+        const CHUNK: usize = 4096;
+        let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for (_, value) in rows {
             let Ok(edge) = VertexCodec::decode_edge(&value) else {
                 continue;
@@ -265,17 +282,24 @@ impl Executor {
                     )
                 })
                 .collect::<Vec<_>>();
-            index_manager
-                .insert_edge_index(
-                    1,
-                    index_id,
-                    &values,
-                    edge.src_vid,
-                    edge.ranking,
-                    edge.dst_vid,
-                )
-                .await
-                .map_err(|e| ExecutionError::InvalidOperation(e.to_string()))?;
+            let idx_key = byoridb_storage::KeyUtils::edge_index_key(
+                1,
+                index_id,
+                &values,
+                edge.src_vid,
+                edge.ranking,
+                edge.dst_vid,
+            );
+            batch.push((idx_key, Vec::new()));
+            if batch.len() >= CHUNK {
+                self.ctx
+                    .kvstore
+                    .batch_put(std::mem::take(&mut batch))
+                    .await?;
+            }
+        }
+        if !batch.is_empty() {
+            self.ctx.kvstore.batch_put(batch).await?;
         }
         Ok(())
     }

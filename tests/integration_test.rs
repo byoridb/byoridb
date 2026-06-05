@@ -1101,3 +1101,79 @@ async fn test_show_stats_reports_empty_tag_and_edge_as_zero() {
         ds.rows
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_create_index_backfills_existing_data() {
+    // CREATE INDEX after data is loaded must backfill existing rows (the LDBC
+    // --skip-indexes-then-create flow). Backfill is now chunk-batched.
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE backfill_test").await;
+    execute(&service, session_id, "USE backfill_test").await;
+    execute(&service, session_id, "CREATE TAG person(name STRING)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX person(name) VALUES 1:("alice"), 2:("bob"), 3:("alice")"#,
+    )
+    .await;
+    // Index created AFTER the data exists → must backfill.
+    execute(
+        &service,
+        session_id,
+        "CREATE TAG INDEX person_name_idx ON person(name)",
+    )
+    .await;
+
+    let ds = execute(
+        &service,
+        session_id,
+        r#"LOOKUP ON person WHERE person.name == "alice""#,
+    )
+    .await;
+    assert_eq!(
+        ds.rows.len(),
+        2,
+        "backfilled index must find both alice vertices, got: {:?}",
+        ds.rows
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_lookup_qualified_property_filter_without_index() {
+    // WHERE person.name == "alice" (qualified PropRef) must filter even with no
+    // index (fallback predicate-pushdown path). Previously expr_to_filter_expr
+    // returned None for PropRef → FilterExpr::True → every row leaked through.
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE lookup_filter").await;
+    execute(&service, session_id, "USE lookup_filter").await;
+    execute(&service, session_id, "CREATE TAG person(name STRING)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX person(name) VALUES 1:("alice"), 2:("bob"), 3:("alice")"#,
+    )
+    .await;
+    // No index created → fallback path.
+    let ds = execute(
+        &service,
+        session_id,
+        r#"LOOKUP ON person WHERE person.name == "alice""#,
+    )
+    .await;
+    assert_eq!(
+        ds.rows.len(),
+        2,
+        "qualified-property filter must exclude bob, got: {:?}",
+        ds.rows
+    );
+}
