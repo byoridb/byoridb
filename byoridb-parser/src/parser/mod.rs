@@ -208,17 +208,28 @@ impl Parser {
         false
     }
 
+    /// Human-readable position of the current token, for error messages.
+    pub(crate) fn err_location(&self) -> String {
+        match self.tokens.get(self.pos) {
+            Some(t) => format!("line {}, column {}", t.line, t.column),
+            None => "end of input".to_string(),
+        }
+    }
+
     pub(crate) fn consume_token(&mut self, expected: Token) -> Result<()> {
         if let Ok(token) = self.peek_token() {
             if std::mem::discriminant(&token) == std::mem::discriminant(&expected) {
                 self.advance();
                 return Ok(());
             }
+            return Err(ParseError::UnexpectedToken(format!(
+                "expected {:?}, found {:?} at {}",
+                expected,
+                token,
+                self.err_location()
+            )));
         }
-        Err(ParseError::UnexpectedToken(format!(
-            "{:?} expected",
-            expected
-        )))
+        Err(ParseError::UnexpectedEOF)
     }
 
     pub(crate) fn consume_identifier(&mut self) -> Result<String> {
@@ -235,8 +246,9 @@ impl Parser {
                     Ok(keyword_str)
                 } else {
                     Err(ParseError::UnexpectedToken(format!(
-                        "Identifier expected, found {:?}",
-                        token
+                        "identifier expected, found {:?} at {}",
+                        token,
+                        self.err_location()
                     )))
                 }
             }
