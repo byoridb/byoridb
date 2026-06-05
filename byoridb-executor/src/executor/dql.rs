@@ -1117,62 +1117,59 @@ impl Executor {
     }
 
     /// Convert AST Expression to FilterExpr for predicate pushdown
+    /// Extract a field name from a comparison operand. Accepts a bare
+    /// `Identifier` (`WHERE name = ...`) and a qualified `PropRef`
+    /// (`WHERE person.name = ...`, which LDBC/nGQL queries use) — both yield the
+    /// property name. Without PropRef support, qualified predicates silently
+    /// failed to convert and LOOKUP fell back to FilterExpr::True (no filter).
+    fn field_name_of(expr: &Expression) -> Option<String> {
+        match expr {
+            Expression::Identifier(s) => Some(s.clone()),
+            Expression::PropRef { prop, .. } => Some(prop.clone()),
+            _ => None,
+        }
+    }
+
+    /// A `field <op> value` operand pair: field name (Identifier or PropRef) +
+    /// a literal value.
+    fn field_value_pair(
+        &self,
+        field_expr: &Expression,
+        value_expr: &Expression,
+    ) -> Option<(String, byoridb_common::Value)> {
+        let field = Self::field_name_of(field_expr)?;
+        let value = self.expr_to_value(value_expr)?;
+        Some((field, value))
+    }
+
     pub(super) fn expr_to_filter_expr(&self, expr: &Expression) -> Option<FilterExpr> {
         match expr {
             Expression::BinaryOp { op, left, right } => match op {
                 BinaryOperator::Eq => {
-                    if let Expression::Identifier(field) = left.as_ref() {
-                        if let Some(value) = self.expr_to_value(right.as_ref()) {
-                            return Some(FilterExpr::eq(field.clone(), value));
-                        }
+                    // field == value, or value == field
+                    if let Some((f, v)) = self.field_value_pair(left, right) {
+                        return Some(FilterExpr::eq(f, v));
                     }
-                    if let Expression::Identifier(field) = right.as_ref() {
-                        if let Some(value) = self.expr_to_value(left.as_ref()) {
-                            return Some(FilterExpr::eq(field.clone(), value));
-                        }
+                    if let Some((f, v)) = self.field_value_pair(right, left) {
+                        return Some(FilterExpr::eq(f, v));
                     }
                     None
                 }
-                BinaryOperator::Neq => {
-                    if let Expression::Identifier(field) = left.as_ref() {
-                        if let Some(value) = self.expr_to_value(right.as_ref()) {
-                            return Some(FilterExpr::ne(field.clone(), value));
-                        }
-                    }
-                    None
-                }
-                BinaryOperator::Lt => {
-                    if let Expression::Identifier(field) = left.as_ref() {
-                        if let Some(value) = self.expr_to_value(right.as_ref()) {
-                            return Some(FilterExpr::lt(field.clone(), value));
-                        }
-                    }
-                    None
-                }
-                BinaryOperator::Lte => {
-                    if let Expression::Identifier(field) = left.as_ref() {
-                        if let Some(value) = self.expr_to_value(right.as_ref()) {
-                            return Some(FilterExpr::le(field.clone(), value));
-                        }
-                    }
-                    None
-                }
-                BinaryOperator::Gt => {
-                    if let Expression::Identifier(field) = left.as_ref() {
-                        if let Some(value) = self.expr_to_value(right.as_ref()) {
-                            return Some(FilterExpr::gt(field.clone(), value));
-                        }
-                    }
-                    None
-                }
-                BinaryOperator::Gte => {
-                    if let Expression::Identifier(field) = left.as_ref() {
-                        if let Some(value) = self.expr_to_value(right.as_ref()) {
-                            return Some(FilterExpr::ge(field.clone(), value));
-                        }
-                    }
-                    None
-                }
+                BinaryOperator::Neq => self
+                    .field_value_pair(left, right)
+                    .map(|(f, v)| FilterExpr::ne(f, v)),
+                BinaryOperator::Lt => self
+                    .field_value_pair(left, right)
+                    .map(|(f, v)| FilterExpr::lt(f, v)),
+                BinaryOperator::Lte => self
+                    .field_value_pair(left, right)
+                    .map(|(f, v)| FilterExpr::le(f, v)),
+                BinaryOperator::Gt => self
+                    .field_value_pair(left, right)
+                    .map(|(f, v)| FilterExpr::gt(f, v)),
+                BinaryOperator::Gte => self
+                    .field_value_pair(left, right)
+                    .map(|(f, v)| FilterExpr::ge(f, v)),
                 BinaryOperator::And => {
                     let left_filter = self.expr_to_filter_expr(left.as_ref())?;
                     let right_filter = self.expr_to_filter_expr(right.as_ref())?;
@@ -1262,17 +1259,13 @@ impl Executor {
                 left,
                 right,
             } => {
-                // Try: field == value
-                if let Expression::Identifier(field) = left.as_ref() {
-                    if let Some(value) = self.expr_to_value(right.as_ref()) {
-                        return Some((field.clone(), value));
-                    }
+                // Try: field == value (field may be Identifier or PropRef)
+                if let Some(pair) = self.field_value_pair(left, right) {
+                    return Some(pair);
                 }
                 // Try: value == field
-                if let Expression::Identifier(field) = right.as_ref() {
-                    if let Some(value) = self.expr_to_value(left.as_ref()) {
-                        return Some((field.clone(), value));
-                    }
+                if let Some(pair) = self.field_value_pair(right, left) {
+                    return Some(pair);
                 }
                 None
             }
