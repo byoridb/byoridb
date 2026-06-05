@@ -10,10 +10,40 @@ use super::metrics::{QueryTimer, QueryType};
 use super::session::SessionManager;
 use byoridb_common::DataSet;
 use byoridb_kvstore::KVStore;
+use dashmap::DashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
+
+/// A query currently executing, exposed via the diagnostics endpoint so an
+/// operator can see what the server is working on (and whether work continues
+/// after an HTTP client timed out).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunningQuery {
+    pub id: u64,
+    pub session_id: i64,
+    pub query_type: &'static str,
+    pub query: String,
+    pub space: String,
+    pub started_at_ms: u64,
+}
+
+/// RAII guard: removes the query from the active registry and decrements the
+/// in-flight gauge on drop, so every exit path (success, error, early return,
+/// panic) cleans up.
+struct ActiveQueryGuard {
+    registry: Arc<DashMap<u64, RunningQuery>>,
+    id: u64,
+}
+
+impl Drop for ActiveQueryGuard {
+    fn drop(&mut self) {
+        self.registry.remove(&self.id);
+        crate::metrics::dec_inflight();
+    }
+}
 
 /// Default interval for the background session-cleanup task (60 seconds).
 pub const DEFAULT_SESSION_CLEANUP_INTERVAL_SECS: u64 = 60;
@@ -23,6 +53,9 @@ pub struct GraphService {
     session_manager: Arc<SessionManager>,
     auth_manager: Arc<AuthManager>,
     kvstore: Arc<dyn KVStore>,
+    /// Queries currently executing, keyed by a monotonic id.
+    active_queries: Arc<DashMap<u64, RunningQuery>>,
+    query_seq: Arc<AtomicU64>,
 }
 
 impl GraphService {
@@ -33,6 +66,8 @@ impl GraphService {
             session_manager: Arc::new(SessionManager::new()),
             auth_manager,
             kvstore,
+            active_queries: Arc::new(DashMap::new()),
+            query_seq: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -48,6 +83,61 @@ impl GraphService {
             session_manager: Arc::new(SessionManager::new()),
             auth_manager: Arc::new(auth_manager),
             kvstore,
+            active_queries: Arc::new(DashMap::new()),
+            query_seq: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Register a query in the active-query registry and bump the in-flight
+    /// gauge. The returned guard removes it on drop (any exit path).
+    fn register_active_query(
+        &self,
+        session_id: i64,
+        query_type: QueryType,
+        query: &str,
+        space: &str,
+    ) -> ActiveQueryGuard {
+        let id = self.query_seq.fetch_add(1, Ordering::Relaxed);
+        let started_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.active_queries.insert(
+            id,
+            RunningQuery {
+                id,
+                session_id,
+                query_type: query_type.as_str(),
+                query: query.to_string(),
+                space: space.to_string(),
+                started_at_ms,
+            },
+        );
+        crate::metrics::inc_inflight();
+        ActiveQueryGuard {
+            registry: self.active_queries.clone(),
+            id,
+        }
+    }
+
+    /// Snapshot of queries currently executing, oldest first.
+    pub fn list_active_queries(&self) -> Vec<RunningQuery> {
+        let mut v: Vec<RunningQuery> = self
+            .active_queries
+            .iter()
+            .map(|e| e.value().clone())
+            .collect();
+        v.sort_by_key(|q| q.started_at_ms);
+        v
+    }
+
+    /// Map a write query type to its `rows_written` metric label.
+    fn rows_written_op(query_type: QueryType) -> Option<&'static str> {
+        match query_type {
+            QueryType::Insert => Some("insert"),
+            QueryType::Update => Some("update"),
+            QueryType::Delete => Some("delete"),
+            _ => None,
         }
     }
 
@@ -192,6 +282,10 @@ impl GraphService {
             .with_slow_threshold(1000) // 1 second threshold
             .with_query(&stmt);
 
+        // Track as in-flight for the lifetime of this call. The guard removes
+        // the entry and decrements the gauge on every exit path.
+        let _active_guard = self.register_active_query(session_id, query_type, &stmt, &space);
+
         // Create context
         let mut context = crate::context::ExecutionContext::new(session_id);
         if let Some(space) = session.space {
@@ -219,7 +313,16 @@ impl GraphService {
 
         // Record metrics
         match &result {
-            Ok(_) => {
+            Ok(dataset) => {
+                // Record write throughput: INSERT/UPDATE/DELETE return a single
+                // Int row carrying the affected-row count ("Inserted"/etc).
+                if let Some(op) = Self::rows_written_op(query_type) {
+                    if let Some(byoridb_common::Value::Int(n)) =
+                        dataset.rows.first().and_then(|r| r.first())
+                    {
+                        crate::metrics::record_rows_written(op, (*n).max(0) as u64);
+                    }
+                }
                 let full_scan = full_scan_flag
                     .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
                     .unwrap_or(false);

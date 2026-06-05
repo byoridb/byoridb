@@ -36,6 +36,8 @@ pub mod metric_names {
     pub const ACTIVE_SESSIONS: &str = "byoridb_active_sessions";
     pub const STORAGE_BYTES: &str = "byoridb_storage_bytes";
     pub const SLOW_QUERIES: &str = "byoridb_slow_queries_total";
+    pub const INFLIGHT_QUERIES: &str = "byoridb_inflight_queries";
+    pub const ROWS_WRITTEN: &str = "byoridb_rows_written_total";
 
     // Partition metrics
     pub const PARTITION_REQUESTS: &str = "byoridb_partition_requests_total";
@@ -109,6 +111,14 @@ pub fn init_metrics() -> PrometheusHandle {
     describe_gauge!(metric_names::ACTIVE_SESSIONS, "Number of active sessions");
     describe_gauge!(metric_names::STORAGE_BYTES, "Total storage size in bytes");
     describe_counter!(metric_names::SLOW_QUERIES, "Total number of slow queries");
+    describe_gauge!(
+        metric_names::INFLIGHT_QUERIES,
+        "Number of queries currently executing"
+    );
+    describe_counter!(
+        metric_names::ROWS_WRITTEN,
+        "Total rows written by INSERT/UPDATE/DELETE, by operation"
+    );
 
     // Partition metrics
     describe_counter!(
@@ -197,6 +207,21 @@ pub fn record_slow_query(query_type: QueryType, duration_ms: u64, query: &str, f
         query = query,
         "Slow query detected"
     );
+}
+
+/// Increment the in-flight query gauge (one query started executing).
+pub fn inc_inflight() {
+    gauge!(metric_names::INFLIGHT_QUERIES).increment(1.0);
+}
+
+/// Decrement the in-flight query gauge (one query finished).
+pub fn dec_inflight() {
+    gauge!(metric_names::INFLIGHT_QUERIES).decrement(1.0);
+}
+
+/// Record rows written by a write op (`insert` / `update` / `delete`).
+pub fn record_rows_written(op: &'static str, rows: u64) {
+    counter!(metric_names::ROWS_WRITTEN, "op" => op).increment(rows);
 }
 
 /// Update active connections count
