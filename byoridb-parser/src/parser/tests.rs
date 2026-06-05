@@ -1002,3 +1002,22 @@ fn test_create_edge_index_on_keyword_named_edge() {
     parse("CREATE INDEX EDGE e_idx ON EDGE knows(since)").unwrap();
     parse("CREATE EDGE INDEX e_idx ON knows(since)").unwrap();
 }
+
+#[test]
+fn test_parse_errors_carry_location_and_expectation() {
+    // consume_identifier failure: reports what was found + where (feedback #7).
+    let e = parse("CREATE TAG INDEX i ON (x)").unwrap_err();
+    let m = format!("{e}");
+    assert!(
+        m.contains("identifier expected") && m.contains("line 1") && m.contains("column"),
+        "identifier error must carry location: {m}"
+    );
+
+    // consume_token failure: reports expected + found + location.
+    let e2 = parse("CREATE SPACE s PARTITION 4").unwrap_err(); // expects BY after PARTITION
+    let m2 = format!("{e2}");
+    assert!(
+        m2.contains("expected") && m2.contains("line 1"),
+        "token error must carry expected+location: {m2}"
+    );
+}
