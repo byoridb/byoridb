@@ -954,8 +954,19 @@ impl Executor {
             .kvstore
             .scan_prefix(vertex_prefix.as_bytes())
             .await?;
-        let mut tag_counts: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
+        // Seed every schema-defined tag with 0 so an empty tag reports 0 rather
+        // than being absent from the output — validation tools can then tell
+        // "0 rows" apart from "tag does not exist".
+        let mut tag_counts: std::collections::BTreeMap<String, i64> = self
+            .show_schema_names_from_kvstore(&SchemaKey::tag_prefix(&space), ":tag:")
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| match r.into_iter().next() {
+                Some(byoridb_common::Value::String(s)) => Some((s, 0)),
+                _ => None,
+            })
+            .collect();
         for (_, value) in &vertex_entries {
             total_vertices += 1;
             if let Ok(v) = byoridb_codec::VertexCodec::decode_vertex(value) {
@@ -978,8 +989,17 @@ impl Executor {
         // Count edges by type (segment 3 in key)
         let edge_prefix = format!("{}:edge:", space);
         let edge_entries = self.ctx.kvstore.scan_prefix(edge_prefix.as_bytes()).await?;
-        let mut edge_counts: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
+        // Seed every schema-defined edge type with 0 (same rationale as tags).
+        let mut edge_counts: std::collections::BTreeMap<String, i64> = self
+            .show_schema_names_from_kvstore(&SchemaKey::edge_prefix(&space), ":edge:")
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| match r.into_iter().next() {
+                Some(byoridb_common::Value::String(s)) => Some((s, 0)),
+                _ => None,
+            })
+            .collect();
         for (key, _) in &edge_entries {
             total_edges += 1;
             if let Ok(key_s) = std::str::from_utf8(key) {
