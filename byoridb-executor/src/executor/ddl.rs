@@ -184,6 +184,18 @@ impl Executor {
         Ok(ExecutorResult::empty())
     }
 
+    /// Delete every key under `prefix` in chunked batches (one redb commit per
+    /// chunk so a large purge doesn't fsync per key). Returns keys removed.
+    async fn delete_by_prefix(&self, prefix: &[u8]) -> Result<usize> {
+        let entries = self.ctx.kvstore.scan_prefix(prefix).await?;
+        let n = entries.len();
+        let keys: Vec<Vec<u8>> = entries.into_iter().map(|(k, _)| k).collect();
+        for chunk in keys.chunks(4096) {
+            self.ctx.kvstore.batch_delete(chunk.to_vec()).await?;
+        }
+        Ok(n)
+    }
+
     async fn backfill_tag_index(
         &self,
         space: &str,
@@ -693,20 +705,51 @@ impl Executor {
             crate::plan::DropPlan::Space { name, if_exists } => {
                 let space_key = format!("space:{}", name);
 
-                // Check if space exists
-                if self.ctx.kvstore.get(space_key.as_bytes()).await?.is_none() {
+                // Read the space meta first: we need its id to purge indexes,
+                // and to honor IF EXISTS.
+                let Some(meta) = self.ctx.kvstore.get(space_key.as_bytes()).await? else {
                     if if_exists {
                         return Ok(ExecutorResult {
                             columns: vec![],
                             rows: vec![],
                             latency_ms: 0,
                         });
-                    } else {
-                        return Err(ExecutionError::SpaceNotFound(name));
+                    }
+                    return Err(ExecutionError::SpaceNotFound(name));
+                };
+
+                let space_id = serde_json::from_slice::<serde_json::Value>(&meta)
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(|i| i.as_u64()))
+                    .map(|i| i as u32);
+
+                // 1. Index entries (by index_id prefix, part_id=1) + in-memory
+                //    definitions — so the same space name can be recreated and
+                //    its indexes re-created without "already exists".
+                if let (Some(im), Some(sid)) = (self.ctx.index_manager.as_ref(), space_id) {
+                    let mut defs = im.list_tag_indexes(sid).await;
+                    defs.extend(im.list_edge_indexes(sid).await);
+                    for def in defs {
+                        let prefix = match def.index_type {
+                            byoridb_storage::IndexType::Tag => {
+                                byoridb_storage::KeyUtils::tag_index_prefix(1, def.id)
+                            }
+                            byoridb_storage::IndexType::Edge => {
+                                byoridb_storage::KeyUtils::edge_index_prefix(1, def.id)
+                            }
+                        };
+                        self.delete_by_prefix(&prefix).await?;
+                        let _ = im.drop_index(sid, &def.index_name).await;
                     }
                 }
 
-                // Delete space
+                // 2. Vertex / edge / tag-vid data: "{name}:..."
+                self.delete_by_prefix(format!("{}:", name).as_bytes())
+                    .await?;
+                // 3. Tag / edge schema: "space:{name}:..."
+                self.delete_by_prefix(format!("space:{}:", name).as_bytes())
+                    .await?;
+                // 4. The space meta key itself.
                 self.ctx.kvstore.delete(space_key.as_bytes()).await?;
 
                 Ok(ExecutorResult {
