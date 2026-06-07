@@ -639,6 +639,43 @@ async fn test_crud_vertex_insert_and_fetch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_insert_preserves_semicolon_inside_string_literal() {
+    let (service, _temp_dir) = create_test_service();
+
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE semicolon_literal_test").await;
+    execute(&service, session_id, "USE semicolon_literal_test").await;
+    execute(&service, session_id, "CREATE TAG player(name STRING)").await;
+
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX player(name) VALUES 1:("Alice; Bob")"#,
+    )
+    .await;
+
+    let result = execute(&service, session_id, "FETCH PROP ON player 1").await;
+    assert_eq!(result.row_count(), 1);
+    let stored = result.rows[0]
+        .iter()
+        .find_map(|value| match value {
+            Value::String(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .expect("FETCH should return a JSON string payload");
+    assert!(
+        stored.contains("Alice; Bob"),
+        "stored payload should preserve semicolon, got {stored}"
+    );
+
+    service.sign_out(session_id, session_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_crud_edge_insert_and_go() {
     let (service, _temp_dir) = create_test_service();
 

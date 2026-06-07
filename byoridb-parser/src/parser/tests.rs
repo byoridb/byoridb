@@ -153,6 +153,20 @@ fn test_parse_trailing_semicolon_keeps_single_statement() {
 }
 
 #[test]
+fn test_parse_semicolon_inside_string_literal_is_not_compound_separator() {
+    let result = parse(r#"INSERT VERTEX person(name) VALUES 1:("Alice; Bob")"#).unwrap();
+    match result {
+        Statement::Insert(stmt) => {
+            assert_eq!(stmt.insert_type, InsertType::Vertex);
+            assert_eq!(stmt.vertices.len(), 1);
+            assert_eq!(stmt.vertices[0].tags.len(), 1);
+            assert_eq!(stmt.vertices[0].tags[0].props.len(), 1);
+        }
+        other => panic!("Expected Insert, got {:?}", other),
+    }
+}
+
+#[test]
 fn test_parse_lookup() {
     let result = parse("LOOKUP ON player WHERE player.age > 30");
     assert!(result.is_ok());

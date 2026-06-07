@@ -245,17 +245,6 @@ impl GraphService {
             .clone()
             .unwrap_or_else(|| "default".to_string());
 
-        // Split on ';' to support compound statements ($var = ...; GO FROM $var ...)
-        let stmts: Vec<&str> = stmt
-            .split(';')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if stmts.len() > 1 {
-            return self.execute_compound(session_id, &session, stmts).await;
-        }
-
         // Parse query
         let statement =
             byoridb_parser::parse(&stmt).map_err(|e| GraphError::ParseError(e.to_string()))?;
@@ -334,71 +323,6 @@ impl GraphService {
         }
 
         result
-    }
-
-    /// Execute a compound statement sequence, resolving `$var = <stmt>` bindings.
-    ///
-    /// Each statement is executed in order. If a statement has the form
-    /// `$name = <query>`, the result is stored under `name` and injected into
-    /// subsequent statements that reference `$name.col` in their FROM clause.
-    async fn execute_compound(
-        &self,
-        _session_id: i64,
-        session: &crate::session::Session,
-        stmts: Vec<&str>,
-    ) -> Result<DataSet> {
-        use std::collections::HashMap;
-
-        let mut vars: HashMap<String, byoridb_executor::ExecutorResult> = HashMap::new();
-        let mut last_result = DataSet::new(vec![]);
-
-        for raw in stmts {
-            // Check for `$var = <stmt>` pattern
-            let (var_name, query) = if raw.starts_with('$') {
-                if let Some(eq_pos) = raw.find('=') {
-                    let name = raw[1..eq_pos].trim().to_string();
-                    let q = raw[eq_pos + 1..].trim();
-                    (Some(name), q)
-                } else {
-                    (None, raw)
-                }
-            } else {
-                (None, raw)
-            };
-
-            let statement =
-                byoridb_parser::parse(query).map_err(|e| GraphError::ParseError(e.to_string()))?;
-
-            let plan = byoridb_executor::ExecutionPlanBuilder::build(statement)
-                .map_err(crate::adapter::executor_error_to_graph_error)?;
-
-            let ctx = crate::adapter::create_executor_context(
-                session.space.clone(),
-                self.kvstore.clone(),
-            );
-            // Inject variable bindings from previous statements.
-            // `ctx.vars` is now wrapped in a Mutex so the executor can
-            // share the context behind an `Arc` and still mutate bindings
-            // mid-query — set the contents directly here instead of
-            // replacing the whole field.
-            for (k, v) in &vars {
-                ctx.bind_var(k.clone(), v.clone());
-            }
-
-            let executor = byoridb_executor::Executor::new(std::sync::Arc::new(ctx));
-            let result = executor
-                .execute(plan)
-                .await
-                .map_err(crate::adapter::executor_error_to_graph_error)?;
-
-            last_result = crate::adapter::executor_result_to_dataset(result.clone());
-
-            if let Some(name) = var_name {
-                vars.insert(name, result);
-            }
-        }
-
-        Ok(last_result)
     }
 
     /// AUTH-SYNC: after a successful user-management statement, sync the
