@@ -60,6 +60,8 @@ pub trait KVStore: Send + Sync {
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
     async fn delete(&self, key: &[u8]) -> Result<()>;
     async fn batch_put(&self, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()>;
+    /// Delete many keys in a single transaction (missing keys are ignored).
+    async fn batch_delete(&self, keys: Vec<Vec<u8>>) -> Result<()>;
     async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
     /// Batch get multiple keys in a single operation
@@ -242,6 +244,24 @@ impl KVStore for RedbKVStore {
                 let mut table = wtx.open_table(KV_TABLE)?;
                 for (key, value) in &pairs {
                     table.insert(key.as_slice(), value.as_slice())?;
+                }
+            }
+            wtx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Delete all keys in a single transaction (one fsync). Missing keys are
+    /// no-ops. Used by DROP SPACE to purge a space's key ranges efficiently.
+    async fn batch_delete(&self, keys: Vec<Vec<u8>>) -> Result<()> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let wtx = db.begin_write()?;
+            {
+                let mut table = wtx.open_table(KV_TABLE)?;
+                for key in &keys {
+                    table.remove(key.as_slice())?;
                 }
             }
             wtx.commit()?;
@@ -437,6 +457,14 @@ impl KVStore for MemoryKVStore {
         let mut data = self.data.write().await;
         for (key, value) in pairs {
             data.insert(key, value);
+        }
+        Ok(())
+    }
+
+    async fn batch_delete(&self, keys: Vec<Vec<u8>>) -> Result<()> {
+        let mut data = self.data.write().await;
+        for key in &keys {
+            data.remove(key);
         }
         Ok(())
     }

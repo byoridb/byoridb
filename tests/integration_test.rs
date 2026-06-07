@@ -1209,3 +1209,82 @@ async fn test_active_query_registry_cleared_after_execution() {
         service.list_active_queries()
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_drop_space_purges_data_for_name_reuse() {
+    // Repeated-benchmark blocker: DROP SPACE must purge data/schema/index so the
+    // same name can be recreated with no stale rows or "index already exists".
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    // Round 1: create + index + data.
+    execute(&service, session_id, "CREATE SPACE reuse_test").await;
+    execute(&service, session_id, "USE reuse_test").await;
+    execute(&service, session_id, "CREATE TAG person(name STRING)").await;
+    execute(
+        &service,
+        session_id,
+        "CREATE TAG INDEX person_name_idx ON person(name)",
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX person(name) VALUES 1:("alice"), 2:("bob")"#,
+    )
+    .await;
+
+    execute(&service, session_id, "DROP SPACE reuse_test").await;
+
+    // Round 2: recreate same name.
+    execute(&service, session_id, "CREATE SPACE reuse_test").await;
+    execute(&service, session_id, "USE reuse_test").await;
+    execute(&service, session_id, "CREATE TAG person(name STRING)").await;
+
+    // (a) Index recreation must succeed (in-memory def was purged).
+    let idx = service
+        .execute(
+            session_id,
+            "CREATE TAG INDEX person_name_idx ON person(name)".to_string(),
+        )
+        .await;
+    assert!(
+        idx.is_ok(),
+        "index must be recreatable after DROP SPACE, got: {:?}",
+        idx.err()
+    );
+
+    // (b) SHOW STATS: person count must be 0, not the stale 2.
+    let stats = execute(&service, session_id, "SHOW STATS").await;
+    let person_count = stats.rows.iter().find_map(|r| {
+        if r.len() >= 3 && r[1] == Value::String("person".to_string()) {
+            if let Value::Int(n) = r[2] {
+                return Some(n);
+            }
+        }
+        None
+    });
+    assert_eq!(
+        person_count,
+        Some(0),
+        "person count must be 0 after DROP+recreate, got: {:?} / rows {:?}",
+        person_count,
+        stats.rows
+    );
+
+    // (c) LOOKUP must find no stale data.
+    let lookup = execute(
+        &service,
+        session_id,
+        r#"LOOKUP ON person WHERE person.name == "alice""#,
+    )
+    .await;
+    assert!(
+        lookup.rows.is_empty(),
+        "no stale rows after DROP+recreate, got: {:?}",
+        lookup.rows
+    );
+}
