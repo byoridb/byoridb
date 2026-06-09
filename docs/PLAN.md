@@ -115,11 +115,18 @@ insertion-only 증분 → B/F 삭제 증분 → (먼 미래) 분산 materializat
 - Stardog/Virtuoso/Neptune/Jena의 backward-chaining 구현은 2차 자료로만 확인됨.
 - `owl:sameAs` 동치 추론의 LPG 상 비용·처리법.
 
-**O-1 [P0, 선결 부채] 역방향 edge 인덱스** ⬜ 미착수
-`algo::get_incoming_neighbors`가 O(전체 엣지) 풀스캔. transitive 추론은 역방향
-탐색을 대량 수행하므로 이게 없으면 온톨로지 추론 성능이 무의미.
-`{space}:in-edge:{dst}:{edge_type}:{src}:{ranking}` 역방향 인덱스 도입 →
-INSERT/DELETE EDGE에서 양방향 기록. (C 섹션의 reverse index 항목을 여기로 승격)
+**O-1 [P0, 선결 부채] 역방향 edge 인덱스** ✅ 완료 (2026-06-09)
+LDBC Q8 `GO FROM <many ids> OVER reply_of REVERSELY`가 120s timeout으로 발동.
+`algo::get_incoming_neighbors`가 `{space}:edge:` 전체를 스캔해 dst로 필터하던
+O(전체 엣지) 풀스캔(src 25개 fan-out × 1.48M edge ≈ 3,700만 디코드)이 원인.
+수정: `{space}:in-edge:{dst}:{edge_type}:{src}:{ranking}` 역방향 인덱스 도입(value는
+정방향과 동일한 denormalized edge payload). `get_incoming_neighbors`는 이제
+`{space}:in-edge:{dst}:` prefix scan → **O(in-degree)**, 정방향과 대칭. INSERT
+EDGE가 같은 batch로 양방향 기록, DELETE EDGE가 양쪽 삭제(UPDATE는 vertex 전용이라
+무관). MATCH reverse single-edge 최적화도 자동 수혜 + EXPLAIN을 reverse-edge index로
+정확히 표시(더 이상 FULL SCAN 오표시 안 함). `SchemaKey::in_edge_data` + 유닛/통합
+테스트 추가. **기존 데이터는 역방향 entry가 없으므로 space 재로드 필요**(SF0.1
+재로드로 처리, 백필 마이그레이션은 미구현).
 
 **O-2 [P0, 선결 부채] 변길이 경로 `*1..n` 실행** ⬜ 미착수
 파서·AST(`EdgePattern.range`)는 있으나 실행기 미구현. transitive closure가

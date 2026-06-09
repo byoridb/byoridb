@@ -30,7 +30,8 @@ pub enum ProfileOp {
     FullScan,
     /// Outgoing edge prefix scan (`GO` / MATCH forward expand).
     GetNeighbors,
-    /// Incoming edge scan (reverse traversal) — currently a full edge scan.
+    /// Incoming edge expansion (reverse traversal) via the reverse-edge index
+    /// (`{space}:in-edge:{dst}:` prefix scan) — O(in-degree), not a full scan.
     GetIncoming,
     /// MATCH multi-hop edge expansion, aggregated across hops.
     Expand,

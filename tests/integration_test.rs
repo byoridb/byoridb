@@ -726,6 +726,71 @@ async fn test_crud_edge_insert_and_go() {
     service.sign_out(session_id, session_id).await;
 }
 
+/// Reverse traversal (`GO ... REVERSELY`) must find in-neighbors via the
+/// reverse-edge index, and INSERT/DELETE EDGE must keep that index in sync.
+/// (PLAN.md O-1 — replaces the old O(E) space-wide edge scan.)
+#[tokio::test(flavor = "multi_thread")]
+async fn test_go_reversely_uses_reverse_edge_index() {
+    let (service, _temp_dir) = create_test_service();
+
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE reverse_edge_test").await;
+    execute(&service, session_id, "USE reverse_edge_test").await;
+    execute(&service, session_id, "CREATE TAG person(name STRING)").await;
+    execute(&service, session_id, "CREATE EDGE knows(weight DOUBLE)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX person(name) VALUES 1:("Alice"), 2:("Bob"), 3:("Charlie")"#,
+    )
+    .await;
+    // Edges INTO Bob(2): Alice->Bob, Charlie->Bob. Alice->Charlie is noise that
+    // a correct reverse index must NOT surface for Bob.
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE knows(weight) VALUES 1->2:(0.9), 3->2:(0.7), 1->3:(0.5)",
+    )
+    .await;
+
+    // Collect the in-neighbor vid from each row (no YIELD → [src, dst], dst is
+    // the incoming source vertex for reverse traversal).
+    let in_neighbors = |ds: &byoridb_common::DataSet| -> Vec<i64> {
+        let mut v: Vec<i64> = ds
+            .rows
+            .iter()
+            .filter_map(|r| match r.last() {
+                Some(Value::Int(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    let result = execute(&service, session_id, "GO FROM 2 OVER knows REVERSELY").await;
+    assert_eq!(
+        in_neighbors(&result),
+        vec![1, 3],
+        "reverse traversal from Bob should yield Alice and Charlie"
+    );
+
+    // Deleting Alice->Bob must remove the matching reverse-index entry.
+    execute(&service, session_id, "DELETE EDGE knows 1->2").await;
+    let result = execute(&service, session_id, "GO FROM 2 OVER knows REVERSELY").await;
+    assert_eq!(
+        in_neighbors(&result),
+        vec![3],
+        "after deleting Alice->Bob, only Charlie remains incoming to Bob"
+    );
+
+    service.sign_out(session_id, session_id).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_crud_lookup() {
     let (service, _temp_dir) = create_test_service();

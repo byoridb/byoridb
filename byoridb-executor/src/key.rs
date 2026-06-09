@@ -18,6 +18,8 @@
 /// Data keys (vertex/edge data):
 /// - Vertex: `{space}:vertex:{vid}`
 /// - Edge data: `{space}:edge:{src}:{edge_type_id}:{ranking}`
+/// - Reverse-edge (in-edge) index: `{space}:in-edge:{dst}:{edge_type}:{src}:{ranking}`
+///   (denormalized edge value; enables O(in-degree) reverse traversal)
 ///
 /// System keys (user management):
 /// - User: `__user_{username}`
@@ -88,6 +90,27 @@ impl SchemaKey {
         format!("{}:edge:{}:", space, src).into_bytes()
     }
 
+    // ===== Reverse-edge (in-edge) index keys =====
+
+    /// Create a reverse-edge data key: `{space}:in-edge:{dst}:{edge_type}:{src}:{ranking}`.
+    ///
+    /// The value stored under this key is the same denormalized edge payload as
+    /// the forward `edge_data` key, so reverse traversal needs no second lookup.
+    /// `edge_type` lands on segment index 3 — identical to the forward key — so
+    /// the shared `edge_type_from_key` filter works for both directions.
+    pub fn in_edge_data(space: &str, dst: i64, edge_type: &str, src: i64, ranking: i64) -> Vec<u8> {
+        format!(
+            "{}:in-edge:{}:{}:{}:{}",
+            space, dst, edge_type, src, ranking
+        )
+        .into_bytes()
+    }
+
+    /// Create an in-edge prefix for all edges pointing into a vertex: `{space}:in-edge:{dst}:`
+    pub fn in_edge_data_dst_prefix(space: &str, dst: i64) -> Vec<u8> {
+        format!("{}:in-edge:{}:", space, dst).into_bytes()
+    }
+
     // ===== Index keys =====
 
     /// Create a tag index key: `space:{space}:tag_index:{name}`
@@ -145,6 +168,40 @@ mod tests {
             SchemaKey::edge_data("my_space", 1, "knows", 2, 0),
             b"my_space:edge:1:knows:2:0".to_vec()
         );
+    }
+
+    #[test]
+    fn test_in_edge_data_key() {
+        assert_eq!(
+            SchemaKey::in_edge_data("my_space", 2, "knows", 1, 0),
+            b"my_space:in-edge:2:knows:1:0".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_in_edge_data_dst_prefix() {
+        assert_eq!(
+            SchemaKey::in_edge_data_dst_prefix("my_space", 2),
+            b"my_space:in-edge:2:".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_in_edge_edge_type_segment_matches_forward() {
+        // Both forward and reverse keys must place edge_type at split segment 3
+        // so the shared edge_type_from_key filter works for either direction.
+        let fwd = SchemaKey::edge_data("s", 1, "knows", 2, 0);
+        let rev = SchemaKey::in_edge_data("s", 2, "knows", 1, 0);
+        let seg = |k: &[u8]| {
+            std::str::from_utf8(k)
+                .unwrap()
+                .split(':')
+                .nth(3)
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(seg(&fwd), "knows");
+        assert_eq!(seg(&rev), "knows");
     }
 
     #[test]

@@ -64,8 +64,8 @@ impl MatchExecutor {
 
         // Optimisation: detect WHERE id(end_var)==X for single-edge patterns.
         // Instead of scanning all start-node candidates and traversing forward,
-        // we call get_incoming_neighbors(X) once — one sequential edge scan
-        // vs N random prefix scans (where N = candidate count, often 100K+).
+        // we call get_incoming_neighbors(X) once — an O(in-degree) reverse-edge
+        // index lookup vs N forward prefix scans (N = candidate count, 100K+).
         let id_bindings = plan
             .where_clause
             .as_ref()
@@ -1038,9 +1038,9 @@ impl MatchExecutor {
     ///
     /// Instead of scanning all start-node candidates and doing one edge
     /// prefix-scan per candidate (O(N × scan)), we call
-    /// `get_incoming_neighbors(end_vid)` once (one sequential edge scan over
-    /// the whole space) and treat each returned source as a start-node
-    /// candidate.  The sequential scan is significantly faster than N random
+    /// `get_incoming_neighbors(end_vid)` once — an O(in-degree) reverse-edge
+    /// index lookup (`{space}:in-edge:{end_vid}:` prefix scan) — and treat each
+    /// returned source as a start-node candidate. Far cheaper than N forward
     /// prefix-scans when N is large (e.g. 100K products).
     #[allow(clippy::too_many_arguments)]
     async fn match_reverse_single_edge(
@@ -1067,9 +1067,9 @@ impl MatchExecutor {
             return Ok(()); // end vertex doesn't match label/prop filter
         }
 
-        // One sequential edge scan: find all edges pointing INTO end_vid.
-        // This is a full edge-space scan (no reverse-edge index yet, PLAN.md O-1).
-        self.ctx.mark_full_scan();
+        // Find all edges pointing INTO end_vid via the reverse-edge index
+        // (`{space}:in-edge:{end_vid}:` prefix scan) — O(in-degree), not a full
+        // scan (PLAN.md O-1).
         let rev_profiling = self.ctx.profiling();
         let rev_start = std::time::Instant::now();
         let incoming =
@@ -1077,10 +1077,10 @@ impl MatchExecutor {
         if rev_profiling {
             self.ctx.record_profile(
                 ProfileOp::Expand,
-                format!("reverse scan into vid={} (full edge scan)", end_vid),
+                format!("reverse-edge index into vid={}", end_vid),
                 incoming.len() as u64,
                 rev_start.elapsed().as_micros() as u64,
-                true,
+                false,
             );
         }
 
@@ -1687,7 +1687,7 @@ fn compare_values(
 
 /// Extract `id(var) == literal_int` (or reversed) bindings from a WHERE expression.
 /// Handles AND chains. Returns map from variable name → VID.
-pub(super) fn extract_id_eq_bindings(expr: &Expression) -> HashMap<String, i64> {
+pub(crate) fn extract_id_eq_bindings(expr: &Expression) -> HashMap<String, i64> {
     match expr {
         Expression::BinaryOp {
             op: BinaryOperator::And,

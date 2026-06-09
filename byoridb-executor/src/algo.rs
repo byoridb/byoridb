@@ -58,46 +58,48 @@ pub async fn get_neighbors(
 
 /// Find vertices that have an edge pointing **into** `dst` (reverse traversal).
 ///
-/// Key format: `{space}:edge:{src}:{edge_type}:{dst}:{ranking}`
-/// Since there is no reverse index, this performs a space-wide edge scan and
-/// filters by dst. O(E) per call — acceptable for correctness; a reverse
-/// index can be added later for performance.
+/// Reads the reverse-edge index `{space}:in-edge:{dst}:{edge_type}:{src}:{ranking}`,
+/// whose value is the denormalized edge payload. This is a prefix scan over a
+/// single vertex's in-edges — **O(in-degree)**, symmetric to the outgoing
+/// `get_neighbors_counted` scan. INSERT/DELETE EDGE maintain the index
+/// (see `executor::dml`).
+///
+/// Note: edges inserted before the reverse index existed have no in-edge
+/// entries, so a space must be (re)loaded after this index was introduced for
+/// reverse traversal to return results (see PLAN.md O-1).
 pub async fn get_incoming_neighbors(
     ctx: &ExecutionContext,
     space: &str,
     dst: i64,
     edge_types: &[String],
 ) -> Result<Vec<GraphNeighbor>> {
-    let edge_prefix = format!("{}:edge:", space);
+    let in_edge_prefix = crate::key::SchemaKey::in_edge_data_dst_prefix(space, dst);
     let edge_type_set: HashSet<String> = edge_types.iter().cloned().collect();
 
-    // Use scan_prefix + manual filter to avoid closure capture issues
-    let raw = ctx.kvstore.scan_prefix(edge_prefix.as_bytes()).await?;
+    // Reverse key places edge_type on segment 3, same as the forward key, so
+    // edge_type_from_key filters both directions identically.
+    let results = ctx
+        .kvstore
+        .scan_with_filter(
+            &in_edge_prefix,
+            Box::new(move |key, _| {
+                edge_type_set.is_empty()
+                    || edge_type_from_key(key)
+                        .map(|edge_type| edge_type_set.contains(edge_type))
+                        .unwrap_or(false)
+            }),
+            None,
+        )
+        .await?;
 
-    let mut neighbors = Vec::new();
-    for (key, value) in raw {
-        // Filter by edge_type from key segment 3 (works for BOTH key formats):
-        //   legacy: {space}:edge:{src}:{edge_type}:{ranking}       (no dst in key)
-        //   new:    {space}:edge:{src}:{edge_type}:{dst}:{ranking}
-        // Segment 3 is always edge_type regardless of format.
-        if !edge_type_set.is_empty() {
-            let key_s = match std::str::from_utf8(&key) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let edge_type = key_s.split(':').nth(3).unwrap_or("");
-            if !edge_type_set.contains(edge_type) {
-                continue;
-            }
-        }
-        // Decode value to get the actual dst_vid — reliable for both key formats
+    let mut neighbors = Vec::with_capacity(results.len());
+    for (_key, value) in results {
         if let Ok(edge_data) = VertexCodec::decode_edge(&value) {
-            if edge_data.dst_vid == dst {
-                neighbors.push(GraphNeighbor {
-                    dst: edge_data.src_vid,
-                    edge: edge_data,
-                });
-            }
+            // Reverse traversal yields the *source* vertex as the neighbor.
+            neighbors.push(GraphNeighbor {
+                dst: edge_data.src_vid,
+                edge: edge_data,
+            });
         }
     }
 

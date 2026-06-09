@@ -15,8 +15,9 @@ pub use match_executor::MatchExecutor;
 pub use pattern_matcher::PatternMatcher;
 
 // Re-exported for the EXPLAIN/PROFILE plan-tree builder so it can statically
-// determine which tag index a MATCH start-node pattern would use.
-pub(crate) use match_executor::pick_index_plan;
+// determine which tag index a MATCH start-node pattern would use, and detect
+// the reverse single-edge optimisation (WHERE id(end)==X) it would apply.
+pub(crate) use match_executor::{extract_id_eq_bindings, pick_index_plan};
 
 #[cfg(test)]
 mod tests {
@@ -440,6 +441,36 @@ mod h6_multipattern_tests {
             .unwrap();
         ctx.kvstore
             .put(b"default:edge:2:has_tag:201:0", &eblob(2, 201, "has_tag"))
+            .await
+            .unwrap();
+        // Reverse-edge index entries (key: {space}:in-edge:{dst}:{type}:{src}:{rank}),
+        // mirroring the production INSERT EDGE write so reverse traversal works.
+        ctx.kvstore
+            .put(
+                b"default:in-edge:100:belongs_to:1:0",
+                &eblob(1, 100, "belongs_to"),
+            )
+            .await
+            .unwrap();
+        ctx.kvstore
+            .put(
+                b"default:in-edge:100:belongs_to:2:0",
+                &eblob(2, 100, "belongs_to"),
+            )
+            .await
+            .unwrap();
+        ctx.kvstore
+            .put(
+                b"default:in-edge:200:has_tag:1:0",
+                &eblob(1, 200, "has_tag"),
+            )
+            .await
+            .unwrap();
+        ctx.kvstore
+            .put(
+                b"default:in-edge:201:has_tag:2:0",
+                &eblob(2, 201, "has_tag"),
+            )
             .await
             .unwrap();
     }

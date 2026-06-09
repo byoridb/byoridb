@@ -215,6 +215,10 @@ mod tests {
             .put(key.as_bytes(), &data)
             .await
             .unwrap();
+        // Mirror the production INSERT EDGE write of the reverse-edge index so
+        // reverse traversal (get_incoming_neighbors) finds this edge.
+        let in_key = crate::key::SchemaKey::in_edge_data("default", dst, edge_type, src, ranking);
+        executor.ctx.kvstore.put(&in_key, &data).await.unwrap();
     }
 
     async fn insert_weighted_test_edge(

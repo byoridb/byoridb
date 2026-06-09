@@ -470,14 +470,11 @@ impl Executor {
             )));
         }
 
-        // Incoming / undirected traversal scans the whole edge space per hop
-        // (no reverse-edge index yet — see PLAN.md O-1). Flag it for the
-        // slow-query log and pick the matching profile operator.
-        let scans_incoming =
-            !matches!(plan.direction, byoridb_parser::ast::EdgeDirection::Outgoing);
-        if scans_incoming {
-            self.ctx.mark_full_scan();
-        }
+        // Reverse / undirected traversal reads the reverse-edge index
+        // (`{space}:in-edge:{dst}:`), an O(in-degree) prefix scan — no longer a
+        // space-wide full scan (PLAN.md O-1 done). Tracked only to pick the
+        // matching profile operator.
+        let is_reverse = !matches!(plan.direction, byoridb_parser::ast::EdgeDirection::Outgoing);
         let profiling = self.ctx.profiling();
         let prof_start = std::time::Instant::now();
         let mut scanned_neighbors: u64 = 0;
@@ -556,7 +553,7 @@ impl Executor {
         }
 
         if profiling {
-            let op = if scans_incoming {
+            let op = if is_reverse {
                 ProfileOp::GetIncoming
             } else {
                 ProfileOp::GetNeighbors
@@ -566,7 +563,7 @@ impl Executor {
                 format!("over [{}]", plan.over_edges.join(", ")),
                 scanned_neighbors,
                 prof_start.elapsed().as_micros() as u64,
-                scans_incoming,
+                false, // reverse-edge index scan, not a full scan
             );
         }
 

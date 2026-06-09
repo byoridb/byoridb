@@ -35,6 +35,9 @@ pub enum AccessPath {
     TagVidIndex,
     /// Edge prefix scan bounded by source VID (not a full scan).
     EdgePrefix,
+    /// Reverse-edge index prefix scan (`{space}:in-edge:{dst}:`) for reverse
+    /// traversal — bounded by destination VID, not a full scan.
+    ReverseEdgeIndex,
     /// Point lookup of vertices by VID (batch_get).
     PointLookup,
     /// Un-indexed full scan.
@@ -49,6 +52,7 @@ impl AccessPath {
             AccessPath::Index(name) => format!("index: {}", name),
             AccessPath::TagVidIndex => "index: tag-vid".to_string(),
             AccessPath::EdgePrefix => "edge prefix scan".to_string(),
+            AccessPath::ReverseEdgeIndex => "reverse-edge index".to_string(),
             AccessPath::PointLookup => "point lookup".to_string(),
             AccessPath::FullScan => "⚠ FULL SCAN".to_string(),
             AccessPath::None => "-".to_string(),
@@ -145,9 +149,10 @@ fn build_go(p: &crate::plan::GoPlan) -> PlanNode {
     };
     let (access, op) = match p.direction {
         EdgeDirection::Outgoing => (AccessPath::EdgePrefix, ProfileOp::GetNeighbors),
-        EdgeDirection::Incoming => (AccessPath::FullScan, ProfileOp::GetIncoming),
-        // Undirected scans incoming edges (full scan) plus outgoing.
-        EdgeDirection::Undirected => (AccessPath::FullScan, ProfileOp::GetIncoming),
+        // Reverse traversal reads the reverse-edge index (`{space}:in-edge:{dst}:`).
+        EdgeDirection::Incoming => (AccessPath::ReverseEdgeIndex, ProfileOp::GetIncoming),
+        // Undirected combines the forward edge prefix with the reverse-edge index.
+        EdgeDirection::Undirected => (AccessPath::ReverseEdgeIndex, ProfileOp::GetIncoming),
     };
 
     let source = if !p.from_clause.vids.is_empty() {
@@ -212,23 +217,51 @@ async fn build_lookup(ctx: &ExecutionContext, p: &LookupPlan) -> PlanNode {
     PlanNode::new("Project", cols, AccessPath::None).child(node)
 }
 
+/// For a single-edge path `(start)-[e]->(end)` with `WHERE id(end)==X`, return
+/// the end node. This is the case `MatchExecutor` serves via the reverse-edge
+/// index — it starts from the id-bound end vertex (point lookup) and
+/// reverse-expands, never scanning the start label — so EXPLAIN must reflect
+/// that rather than a misleading start-label full scan.
+fn reverse_single_edge_end(p: &crate::plan::MatchPlan) -> Option<&NodePattern> {
+    if !p.optional_patterns.is_empty() {
+        return None;
+    }
+    let path = match &p.pattern {
+        Pattern::Path(path) if path.edges.len() == 1 => path,
+        _ => return None,
+    };
+    let end = path.nodes.first()?;
+    let end_var = end.variable.as_deref()?;
+    let bindings = crate::match_impl::extract_id_eq_bindings(p.where_clause.as_ref()?);
+    bindings.contains_key(end_var).then_some(end)
+}
+
 async fn build_match(ctx: &ExecutionContext, p: &crate::plan::MatchPlan) -> PlanNode {
     let start_node = pattern_start(&p.pattern);
     let edge_count = pattern_edge_count(&p.pattern);
+    let reverse_end = reverse_single_edge_end(p);
 
-    // Start-node scan: index / tag-vid / full scan.
-    let (start_access, start_op, start_label) = match start_node {
-        Some(node) => {
-            let access = match_start_access(ctx, node).await;
-            let op = match &access {
-                AccessPath::Index(_) => ProfileOp::IndexScan,
-                AccessPath::TagVidIndex => ProfileOp::TagVidScan,
-                _ => ProfileOp::FullScan,
-            };
-            let label = node.labels.first().cloned().unwrap_or_default();
-            (access, op, label)
+    // Start-node scan. For the reverse single-edge optimisation, execution
+    // starts from the id-bound END node (point lookup) and reads the
+    // reverse-edge index; otherwise from the start node via index / tag-vid /
+    // full scan.
+    let (start_access, start_op, start_label) = if let Some(end) = reverse_end {
+        let label = end.labels.first().cloned().unwrap_or_default();
+        (AccessPath::PointLookup, ProfileOp::GetVertices, label)
+    } else {
+        match start_node {
+            Some(node) => {
+                let access = match_start_access(ctx, node).await;
+                let op = match &access {
+                    AccessPath::Index(_) => ProfileOp::IndexScan,
+                    AccessPath::TagVidIndex => ProfileOp::TagVidScan,
+                    _ => ProfileOp::FullScan,
+                };
+                let label = node.labels.first().cloned().unwrap_or_default();
+                (access, op, label)
+            }
+            None => (AccessPath::FullScan, ProfileOp::FullScan, String::new()),
         }
-        None => (AccessPath::FullScan, ProfileOp::FullScan, String::new()),
     };
     let scan_detail = if start_label.is_empty() {
         "all vertices".to_string()
@@ -237,15 +270,17 @@ async fn build_match(ctx: &ExecutionContext, p: &crate::plan::MatchPlan) -> Plan
     };
     let mut node = PlanNode::new("NodeScan", scan_detail, start_access).with_profile(start_op);
 
-    // Edge expansion.
+    // Edge expansion: reverse single-edge expands via the reverse-edge index,
+    // forward expansion via the source-bounded edge prefix.
     if edge_count > 0 {
-        node = PlanNode::new(
-            "Expand",
-            format!("{} hop(s)", edge_count),
-            AccessPath::EdgePrefix,
-        )
-        .with_profile(ProfileOp::Expand)
-        .child(node);
+        let expand_access = if reverse_end.is_some() {
+            AccessPath::ReverseEdgeIndex
+        } else {
+            AccessPath::EdgePrefix
+        };
+        node = PlanNode::new("Expand", format!("{} hop(s)", edge_count), expand_access)
+            .with_profile(ProfileOp::Expand)
+            .child(node);
     }
 
     // Comma-separated multi-pattern → inner join.
@@ -875,9 +910,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_reverse_single_edge_flags_full_scan() {
-        // WHERE id(c)==X on a single edge triggers the reverse-scan path,
-        // which is a full edge scan and must surface as FULL SCAN + set the flag.
+    async fn profile_reverse_single_edge_uses_reverse_edge_index() {
+        // WHERE id(c)==X on a single edge triggers the reverse-edge index path:
+        // start from the id-bound end vertex and reverse-expand — O(in-degree),
+        // NOT a full scan. EXPLAIN must surface the reverse-edge index and the
+        // full-scan flag must stay clear (PLAN.md O-1).
         let exec = exec_graph().await;
         let res = run(
             &exec,
@@ -885,16 +922,28 @@ mod tests {
         )
         .await;
         let ai = access_col(&res);
+        let has_reverse_index = res
+            .rows
+            .iter()
+            .any(|r| matches!(&r[ai], byoridb_common::Value::String(s) if s.contains("reverse-edge index")));
+        assert!(
+            has_reverse_index,
+            "reverse single-edge should use the reverse-edge index: {:?}",
+            res.rows
+        );
         let has_full = res
             .rows
             .iter()
             .any(|r| matches!(&r[ai], byoridb_common::Value::String(s) if s.contains("FULL SCAN")));
         assert!(
-            has_full,
-            "reverse single-edge scan should flag FULL SCAN: {:?}",
+            !has_full,
+            "reverse single-edge must not full scan: {:?}",
             res.rows
         );
-        assert!(exec.ctx().took_full_scan(), "full_scan flag must be set");
+        assert!(
+            !exec.ctx().took_full_scan(),
+            "full_scan flag must stay clear for the reverse-edge index path"
+        );
     }
 
     #[tokio::test]

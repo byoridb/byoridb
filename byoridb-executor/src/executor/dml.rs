@@ -145,7 +145,18 @@ impl Executor {
                     };
                     let data = VertexCodec::encode_edge(&codec_edge)
                         .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
-                    batch.push((key.into_bytes(), data));
+                    batch.push((key.into_bytes(), data.clone()));
+                    // Reverse-edge index: {space}:in-edge:{dst}:{edge_type}:{src}:{ranking}
+                    // holds the same denormalized payload so reverse traversal
+                    // is an O(in-degree) prefix scan (see algo::get_incoming_neighbors).
+                    let in_edge_key = SchemaKey::in_edge_data(
+                        &effective_space,
+                        edge.dst,
+                        &edge_type_name,
+                        edge.src,
+                        edge.ranking,
+                    );
+                    batch.push((in_edge_key, data));
                     for index in edge_indexes
                         .iter()
                         .filter(|index| index.schema_name == edge_type_name)
@@ -402,6 +413,15 @@ impl Executor {
             );
             if self.ctx.kvstore.get(key.as_bytes()).await?.is_some() {
                 self.ctx.kvstore.delete(key.as_bytes()).await?;
+                // Keep the reverse-edge index in sync (written by INSERT EDGE).
+                let in_edge_key = SchemaKey::in_edge_data(
+                    &effective_space,
+                    *dst,
+                    &plan.edge_name,
+                    *src,
+                    *ranking,
+                );
+                self.ctx.kvstore.delete(&in_edge_key).await?;
                 deleted += 1;
             }
         }
