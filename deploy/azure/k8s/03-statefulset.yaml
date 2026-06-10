@@ -30,6 +30,10 @@ spec:
         workload: byoridb
       containers:
         - name: byoridb-server
+          # PLACEHOLDER TAG — the deploy workflow substitutes the real
+          # commit-sha tag at apply time. Never `kubectl apply` this file
+          # raw: it reverts the image, and a pod made NotReady by the revert
+          # deadlocks StatefulSet updates (2026-06-11 incident).
           image: byoridbacr23236.azurecr.io/byoridb-server:1.0.1
           imagePullPolicy: IfNotPresent
           envFrom:
