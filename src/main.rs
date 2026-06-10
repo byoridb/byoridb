@@ -21,8 +21,12 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::load().expect("Failed to load configuration");
     info!("Configuration loaded: {:?}", config);
 
-    // 3. Create shutdown channel
+    // 3. Create shutdown channel + shared readiness/drain state.
+    // The gRPC and HTTP services both report in-flight queries into this
+    // state; the signal handler uses it to fail readiness and drain before
+    // tearing the servers down.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let shutdown_state = std::sync::Arc::new(byoridb_graph::ShutdownState::new());
 
     // 3.5. Cluster mode detection
     let is_cluster = !config.cluster.peers.is_empty();
@@ -103,7 +107,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 5. Start Graph Service (gRPC)
     let graph_addr = config.server.graph_addr;
-    let graph_server = byoridb_graph::server::GraphServer::new(graph_addr, kvstore.clone());
+    let graph_server = byoridb_graph::server::GraphServer::new_with_shutdown(
+        graph_addr,
+        kvstore.clone(),
+        shutdown_state.clone(),
+    );
     let mut graph_shutdown_rx = shutdown_tx.subscribe();
 
     let graph_handle = tokio::spawn(async move {
@@ -123,7 +131,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 6. Start HTTP Service
     let http_addr = config.server.http_addr;
-    let http_server = byoridb_graph::server::HttpServer::new(http_addr, kvstore.clone());
+    let http_server = byoridb_graph::server::HttpServer::new_with_shutdown(
+        http_addr,
+        kvstore.clone(),
+        shutdown_state.clone(),
+    );
     let mut http_shutdown_rx = shutdown_tx.subscribe();
 
     let http_handle = tokio::spawn(async move {
@@ -154,6 +166,28 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 8. Graceful shutdown sequence
+    //
+    // Order matters: fail readiness first (k8s stops routing, new queries are
+    // rejected with a clear error), then drain in-flight queries, and only
+    // then stop the servers — so running queries/loads finish instead of
+    // being cut mid-write.
+    shutdown_state.stop_accepting();
+    info!("Readiness set to NOT READY; new queries are rejected. Draining in-flight queries...");
+
+    let drain_timeout = tokio::time::Duration::from_secs(25);
+    let drained = shutdown_state
+        .drain(drain_timeout, tokio::time::Duration::from_millis(200))
+        .await;
+    if drained {
+        info!("All in-flight queries drained");
+    } else {
+        warn!(
+            "Drain timed out after {:?}; {} query(ies) still running will be cut",
+            drain_timeout,
+            shutdown_state.active_queries()
+        );
+    }
+
     info!("Shutting down services...");
 
     // Send shutdown signal to all services

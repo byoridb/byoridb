@@ -27,6 +27,7 @@ pub mod planner;
 pub mod server;
 pub mod service;
 pub mod session;
+pub mod shutdown;
 
 pub use auth::{AuthManager, Permission, PermissionEntry, Role, Session, User};
 pub use error::{GraphError, Result};
@@ -40,3 +41,4 @@ pub use partition::{compute_partition, compute_partitions, PartitionRouter, Spac
 #[cfg(feature = "server")]
 pub use server::{GraphServer, HttpServer};
 pub use service::GraphService;
+pub use shutdown::ShutdownState;

@@ -36,12 +36,15 @@ pub struct RunningQuery {
 struct ActiveQueryGuard {
     registry: Arc<DashMap<u64, RunningQuery>>,
     id: u64,
+    /// Shared drain counter for graceful shutdown (see [`crate::shutdown`]).
+    shutdown: Arc<crate::shutdown::ShutdownState>,
 }
 
 impl Drop for ActiveQueryGuard {
     fn drop(&mut self) {
         self.registry.remove(&self.id);
         crate::metrics::dec_inflight();
+        self.shutdown.query_finished();
     }
 }
 
@@ -56,6 +59,9 @@ pub struct GraphService {
     /// Queries currently executing, keyed by a monotonic id.
     active_queries: Arc<DashMap<u64, RunningQuery>>,
     query_seq: Arc<AtomicU64>,
+    /// Readiness flag + in-flight drain counter, shared with the server
+    /// binary's signal handler (and across the gRPC/HTTP service instances).
+    shutdown: Arc<crate::shutdown::ShutdownState>,
 }
 
 impl GraphService {
@@ -68,6 +74,7 @@ impl GraphService {
             kvstore,
             active_queries: Arc::new(DashMap::new()),
             query_seq: Arc::new(AtomicU64::new(1)),
+            shutdown: Arc::new(crate::shutdown::ShutdownState::new()),
         }
     }
 
@@ -85,7 +92,21 @@ impl GraphService {
             kvstore,
             active_queries: Arc::new(DashMap::new()),
             query_seq: Arc::new(AtomicU64::new(1)),
+            shutdown: Arc::new(crate::shutdown::ShutdownState::new()),
         }
+    }
+
+    /// Replace the readiness/drain state with one shared by the embedding
+    /// server binary (both the gRPC and HTTP services should share it so the
+    /// drain counter covers every in-flight query).
+    pub fn with_shutdown_state(mut self, shutdown: Arc<crate::shutdown::ShutdownState>) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+
+    /// The readiness/drain state this service reports into.
+    pub fn shutdown_state(&self) -> Arc<crate::shutdown::ShutdownState> {
+        self.shutdown.clone()
     }
 
     /// Register a query in the active-query registry and bump the in-flight
@@ -114,9 +135,11 @@ impl GraphService {
             },
         );
         crate::metrics::inc_inflight();
+        self.shutdown.query_started();
         ActiveQueryGuard {
             registry: self.active_queries.clone(),
             id,
+            shutdown: self.shutdown.clone(),
         }
     }
 
@@ -233,6 +256,15 @@ impl GraphService {
     /// Execute a query statement
     pub async fn execute(&self, session_id: i64, stmt: String) -> Result<DataSet> {
         debug!("Executing query on session {}: {}", session_id, stmt);
+
+        // Graceful shutdown: once the signal handler flips readiness off, new
+        // queries fail fast and clearly; queries already past this gate drain
+        // to completion before the servers stop.
+        if !self.shutdown.is_accepting() {
+            return Err(GraphError::InvalidOperation(
+                "server is shutting down; not accepting new queries".to_string(),
+            ));
+        }
 
         // Validate session and get context data
         let session = match self.session_manager.get_session(session_id).await {

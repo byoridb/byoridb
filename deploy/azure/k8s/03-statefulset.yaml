@@ -40,13 +40,16 @@ spec:
           ports:
             - { containerPort: 9669,  name: grpc }
             - { containerPort: 19669, name: http }
+          # /ready flips to 503 the moment a graceful shutdown starts, so the
+          # pod leaves Service endpoints while in-flight queries drain. A bare
+          # TCP probe stayed "ready" during shutdown (socket still listening).
           readinessProbe:
-            tcpSocket: { port: 9669 }
-            initialDelaySeconds: 10
-            periodSeconds: 5
-            failureThreshold: 6
+            httpGet: { path: /ready, port: 19669 }
+            initialDelaySeconds: 5
+            periodSeconds: 3
+            failureThreshold: 1
           livenessProbe:
-            tcpSocket: { port: 9669 }
+            httpGet: { path: /health, port: 19669 }
             initialDelaySeconds: 30
             periodSeconds: 15
             failureThreshold: 4

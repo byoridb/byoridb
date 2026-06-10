@@ -33,6 +33,20 @@ impl GraphServer {
         }
     }
 
+    /// Like [`GraphServer::new`] but sharing the binary-wide readiness/drain
+    /// state, so SIGTERM rejects new gRPC queries and the drain counter sees
+    /// gRPC in-flight queries too.
+    pub fn new_with_shutdown(
+        addr: SocketAddr,
+        kvstore: Arc<dyn KVStore>,
+        shutdown: Arc<crate::shutdown::ShutdownState>,
+    ) -> Self {
+        GraphServer {
+            service: GraphService::new(kvstore).with_shutdown_state(shutdown),
+            addr,
+        }
+    }
+
     /// Start the gRPC server with compression support
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
         use std::sync::Arc;
@@ -96,6 +110,19 @@ impl HttpServer {
         }
     }
 
+    /// Like [`HttpServer::new`] but sharing the binary-wide readiness/drain
+    /// state (see [`GraphServer::new_with_shutdown`]). `/ready` reports it.
+    pub fn new_with_shutdown(
+        addr: SocketAddr,
+        kvstore: Arc<dyn KVStore>,
+        shutdown: Arc<crate::shutdown::ShutdownState>,
+    ) -> Self {
+        HttpServer {
+            service: Arc::new(GraphService::new(kvstore).with_shutdown_state(shutdown)),
+            addr,
+        }
+    }
+
     /// Start the HTTP server
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
         use std::time::Duration;
@@ -115,6 +142,7 @@ impl HttpServer {
         // Build REST API with state
         let app = Router::new()
             .route("/health", get(health_check))
+            .route("/ready", get(readiness_check))
             .route("/metrics", get(metrics_endpoint))
             .route("/api/v1/metrics", get(metrics_json))
             .route("/api/v1/diagnostics/queries", get(list_active_queries))
@@ -136,6 +164,18 @@ impl HttpServer {
 /// Health check endpoint
 async fn health_check() -> &'static str {
     "OK"
+}
+
+/// Readiness endpoint: 200 while accepting queries, 503 once a graceful
+/// shutdown has begun. Kubernetes uses this to pull the pod out of Service
+/// endpoints *before* the process exits, so clients stop seeing
+/// connection-refused during rollouts and node drains.
+async fn readiness_check(State(state): State<AppState>) -> (StatusCode, &'static str) {
+    if state.service.shutdown_state().is_accepting() {
+        (StatusCode::OK, "READY")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "SHUTTING DOWN")
+    }
 }
 
 /// Prometheus metrics endpoint

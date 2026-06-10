@@ -869,6 +869,39 @@ async fn test_index_definitions_survive_across_queries() {
     service.sign_out(session_id, session_id).await;
 }
 
+/// Graceful shutdown: once readiness is flipped off, new queries must be
+/// rejected with a clear error (k8s stops routing via /ready; this guards the
+/// window where a connection is already open).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_shutdown_rejects_new_queries() {
+    let (service, _temp_dir) = create_test_service();
+
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    // Sanity: queries work while accepting.
+    execute(&service, session_id, "CREATE SPACE shutdown_test").await;
+
+    let state = service.shutdown_state();
+    assert!(state.is_accepting());
+    assert_eq!(state.active_queries(), 0, "no queries should be in flight");
+
+    state.stop_accepting();
+
+    let err = service
+        .execute(session_id, "SHOW SPACES".to_string())
+        .await
+        .expect_err("queries must be rejected after stop_accepting");
+    assert!(
+        err.to_string().contains("shutting down"),
+        "rejection must clearly say the server is shutting down: {err}"
+    );
+
+    service.sign_out(session_id, session_id).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_crud_lookup() {
     let (service, _temp_dir) = create_test_service();
