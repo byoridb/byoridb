@@ -791,6 +791,84 @@ async fn test_go_reversely_uses_reverse_edge_index() {
     service.sign_out(session_id, session_id).await;
 }
 
+/// Index definitions must survive across queries (each GraphService query
+/// builds a fresh executor context + IndexManager) and across restarts —
+/// both flow through the persisted-definition load in byoridb-storage.
+/// Before persistence: CREATE INDEX's definition died with its query context,
+/// so INSERT wrote no index entries and LOOKUP always fell back to full scan.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_index_definitions_survive_across_queries() {
+    let (service, _temp_dir) = create_test_service();
+
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE index_persist_test").await;
+    execute(&service, session_id, "USE index_persist_test").await;
+    execute(&service, session_id, "CREATE TAG person(name STRING)").await;
+    execute(
+        &service,
+        session_id,
+        "CREATE TAG INDEX person_name_idx ON person(name)",
+    )
+    .await;
+
+    // Separate query → fresh executor context: the definition must be there.
+    let shown = execute(&service, session_id, "SHOW TAG INDEXES").await;
+    let listed = shown.rows.iter().any(|row| {
+        row.iter()
+            .any(|v| matches!(v, Value::String(s) if s.contains("person_name_idx")))
+    });
+    assert!(
+        listed,
+        "SHOW TAG INDEXES must list the index created by an earlier query: {:?}",
+        shown.rows
+    );
+
+    // INSERT in yet another query must see the definition and write entries.
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX person(name) VALUES 1:("Alice"), 2:("Bob")"#,
+    )
+    .await;
+
+    // EXPLAIN must pick the index access path (not a full-scan fallback)…
+    let explain = execute(
+        &service,
+        session_id,
+        r#"EXPLAIN LOOKUP ON person WHERE person.name == "Alice""#,
+    )
+    .await;
+    let uses_index = explain.rows.iter().any(|row| {
+        row.iter()
+            .any(|v| matches!(v, Value::String(s) if s.contains("index:")))
+    });
+    assert!(
+        uses_index,
+        "LOOKUP must use the persisted index definition: {:?}",
+        explain.rows
+    );
+
+    // …and the indexed LOOKUP must return the matching vertex.
+    let found = execute(
+        &service,
+        session_id,
+        r#"LOOKUP ON person WHERE person.name == "Alice""#,
+    )
+    .await;
+    assert_eq!(
+        found.row_count(),
+        1,
+        "indexed LOOKUP should find exactly Alice: {:?}",
+        found.rows
+    );
+
+    service.sign_out(session_id, session_id).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_crud_lookup() {
     let (service, _temp_dir) = create_test_service();

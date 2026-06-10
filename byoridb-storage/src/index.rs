@@ -11,20 +11,34 @@
 
 use crate::key::{IndexValue, KeyUtils};
 use byoridb_kvstore::KVStore;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tokio::sync::{OnceCell, RwLock};
+use tracing::{debug, info, warn};
+
+/// KV prefix under which index *definitions* are persisted.
+/// Key: `__meta:index_def:{space_id}:{index_id}` → serde_json(IndexDef).
+/// Definitions used to live only in the in-memory maps, so every fresh
+/// `IndexManager` (per-query executor context, or a server restart) started
+/// empty: INSERT stopped writing index entries and LOOKUP silently fell back
+/// to full scans. Persisting the definitions and lazy-loading them on first
+/// use makes index metadata survive both query boundaries and restarts.
+pub const INDEX_DEF_PREFIX: &str = "__meta:index_def:";
+
+fn index_def_key(space_id: u32, index_id: u32) -> Vec<u8> {
+    format!("{}{}:{}", INDEX_DEF_PREFIX, space_id, index_id).into_bytes()
+}
 
 /// Index type (tag or edge)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexType {
     Tag,
     Edge,
 }
 
 /// Index definition
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexDef {
     pub id: u32,
     pub space_id: u32,
@@ -78,17 +92,97 @@ pub struct IndexManager {
     index_names: RwLock<HashMap<(u32, String), u32>>,
     /// Next index ID
     next_index_id: RwLock<u32>,
+    /// One-shot lazy load of persisted definitions (see [`INDEX_DEF_PREFIX`]).
+    loaded: OnceCell<()>,
 }
 
 impl IndexManager {
     /// Create a new index manager
+    ///
+    /// Persisted index definitions are loaded lazily on first use, so a
+    /// freshly constructed manager (per-query context or post-restart) sees
+    /// every index created by earlier managers over the same kvstore.
     pub fn new(kvstore: Arc<dyn KVStore>) -> Self {
         Self {
             kvstore,
             indexes: RwLock::new(HashMap::new()),
             index_names: RwLock::new(HashMap::new()),
             next_index_id: RwLock::new(1),
+            loaded: OnceCell::new(),
         }
+    }
+
+    /// Load persisted index definitions from the kvstore exactly once.
+    ///
+    /// Rebuilds the in-memory maps and advances `next_index_id` past the
+    /// largest persisted id. Mutating entry points propagate errors; read
+    /// paths (`get_*`/`list_*`) log and degrade to the unloaded view instead,
+    /// because their signatures carry no error channel.
+    async fn ensure_loaded(&self) -> Result<(), IndexError> {
+        self.loaded
+            .get_or_try_init(|| async {
+                let entries = self
+                    .kvstore
+                    .scan_prefix(INDEX_DEF_PREFIX.as_bytes())
+                    .await
+                    .map_err(|e| IndexError::Storage(e.to_string()))?;
+
+                let mut indexes = self.indexes.write().await;
+                let mut names = self.index_names.write().await;
+                let mut max_id = 0u32;
+                let mut loaded = 0usize;
+                for (key, value) in entries {
+                    let def: IndexDef = match serde_json::from_slice(&value) {
+                        Ok(def) => def,
+                        Err(e) => {
+                            // A corrupt definition must not take down every
+                            // index — skip it loudly.
+                            warn!(
+                                "Skipping corrupt index definition at {:?}: {}",
+                                String::from_utf8_lossy(&key),
+                                e
+                            );
+                            continue;
+                        }
+                    };
+                    max_id = max_id.max(def.id);
+                    names.insert((def.space_id, def.index_name.clone()), def.id);
+                    indexes.insert((def.space_id, def.id), def);
+                    loaded += 1;
+                }
+                if loaded > 0 {
+                    let mut next_id = self.next_index_id.write().await;
+                    *next_id = (*next_id).max(max_id + 1);
+                    info!("Loaded {} persisted index definition(s)", loaded);
+                }
+                Ok(())
+            })
+            .await
+            .map(|_| ())
+    }
+
+    /// Read-path variant of [`ensure_loaded`]: log instead of propagating.
+    async fn ensure_loaded_or_log(&self) {
+        if let Err(e) = self.ensure_loaded().await {
+            warn!("Failed to load persisted index definitions: {}", e);
+        }
+    }
+
+    /// Persist one index definition to the kvstore.
+    async fn persist_def(&self, def: &IndexDef) -> Result<(), IndexError> {
+        let value = serde_json::to_vec(def).map_err(|e| IndexError::Storage(e.to_string()))?;
+        self.kvstore
+            .put(&index_def_key(def.space_id, def.id), &value)
+            .await
+            .map_err(|e| IndexError::Storage(e.to_string()))
+    }
+
+    /// Remove one persisted index definition from the kvstore.
+    async fn delete_persisted_def(&self, space_id: u32, index_id: u32) -> Result<(), IndexError> {
+        self.kvstore
+            .delete(&index_def_key(space_id, index_id))
+            .await
+            .map_err(|e| IndexError::Storage(e.to_string()))
     }
 
     /// Create a new tag index
@@ -105,6 +199,8 @@ impl IndexManager {
             "Creating tag index '{}' on tag {}({}) with fields {:?}",
             index_name, tag_name, tag_id, fields
         );
+
+        self.ensure_loaded().await?;
 
         // Check if index already exists
         {
@@ -132,6 +228,10 @@ impl IndexManager {
             fields,
             field_indices,
         };
+
+        // Persist first, then register in memory — a failed KV write must not
+        // leave a definition that silently evaporates with this manager.
+        self.persist_def(&index_def).await?;
 
         // Store index definition
         {
@@ -163,6 +263,8 @@ impl IndexManager {
             index_name, edge_type_name, edge_type_id, fields
         );
 
+        self.ensure_loaded().await?;
+
         // Check if index already exists
         {
             let names = self.index_names.read().await;
@@ -189,6 +291,9 @@ impl IndexManager {
             fields,
             field_indices,
         };
+
+        // Persist first, then register in memory (see create_tag_index).
+        self.persist_def(&index_def).await?;
 
         // Store index definition
         {
@@ -217,6 +322,10 @@ impl IndexManager {
             .ok_or_else(|| IndexError::IndexNotFound(index_name.to_string()))?;
 
         info!("Dropping index '{}' (ID {})", index_name, index_def.id);
+
+        // Remove the persisted definition first so a failure leaves the
+        // index intact rather than resurrecting on the next load.
+        self.delete_persisted_def(space_id, index_def.id).await?;
 
         // Remove from name mapping
         {
@@ -260,6 +369,9 @@ impl IndexManager {
         let deleted_count = self
             .delete_all_index_entries(&index_def, partition_ids)
             .await?;
+
+        // Remove the persisted definition (see drop_index).
+        self.delete_persisted_def(space_id, index_def.id).await?;
 
         // Remove from name mapping
         {
@@ -317,6 +429,7 @@ impl IndexManager {
 
     /// Get an index definition by name
     pub async fn get_index(&self, space_id: u32, index_name: &str) -> Option<IndexDef> {
+        self.ensure_loaded_or_log().await;
         let names = self.index_names.read().await;
         let index_id = names.get(&(space_id, index_name.to_string()))?;
 
@@ -326,12 +439,14 @@ impl IndexManager {
 
     /// Get an index definition by ID
     pub async fn get_index_by_id(&self, space_id: u32, index_id: u32) -> Option<IndexDef> {
+        self.ensure_loaded_or_log().await;
         let indexes = self.indexes.read().await;
         indexes.get(&(space_id, index_id)).cloned()
     }
 
     /// List all indexes in a space
     pub async fn list_indexes(&self, space_id: u32) -> Vec<IndexDef> {
+        self.ensure_loaded_or_log().await;
         let indexes = self.indexes.read().await;
         indexes
             .values()
@@ -342,6 +457,7 @@ impl IndexManager {
 
     /// List tag indexes in a space
     pub async fn list_tag_indexes(&self, space_id: u32) -> Vec<IndexDef> {
+        self.ensure_loaded_or_log().await;
         let indexes = self.indexes.read().await;
         indexes
             .values()
@@ -352,6 +468,7 @@ impl IndexManager {
 
     /// List edge indexes in a space
     pub async fn list_edge_indexes(&self, space_id: u32) -> Vec<IndexDef> {
+        self.ensure_loaded_or_log().await;
         let indexes = self.indexes.read().await;
         indexes
             .values()
@@ -601,6 +718,112 @@ pub enum IndexError {
 mod tests {
     use super::*;
     use byoridb_kvstore::MemoryKVStore;
+
+    /// Restart regression (PLAN.md 선재 이슈): definitions must survive a
+    /// fresh IndexManager over the same kvstore — the per-query-context and
+    /// server-restart cases share this exact mechanism.
+    #[tokio::test]
+    async fn test_index_definitions_survive_manager_recreation() {
+        let kvstore: Arc<dyn KVStore> = Arc::new(MemoryKVStore::new());
+
+        let manager = IndexManager::new(kvstore.clone());
+        let tag_idx_id = manager
+            .create_tag_index(
+                1,
+                "person_name_idx".to_string(),
+                10,
+                "person".to_string(),
+                vec!["name".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        manager
+            .create_edge_index(
+                1,
+                "knows_since_idx".to_string(),
+                20,
+                "knows".to_string(),
+                vec!["since".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        drop(manager);
+
+        // "Restart": brand-new manager over the same kvstore.
+        let reborn = IndexManager::new(kvstore.clone());
+        let def = reborn
+            .get_index(1, "person_name_idx")
+            .await
+            .expect("tag index definition must survive manager recreation");
+        assert_eq!(def.id, tag_idx_id);
+        assert_eq!(def.index_type, IndexType::Tag);
+        assert_eq!(def.schema_name, "person");
+        assert_eq!(def.fields, vec!["name".to_string()]);
+
+        assert_eq!(reborn.list_tag_indexes(1).await.len(), 1);
+        assert_eq!(reborn.list_edge_indexes(1).await.len(), 1);
+
+        // ID allocation must continue past persisted ids, not collide.
+        let new_id = reborn
+            .create_tag_index(
+                1,
+                "person_age_idx".to_string(),
+                10,
+                "person".to_string(),
+                vec!["age".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        assert!(
+            new_id > 2,
+            "new id {} must not collide with persisted ids",
+            new_id
+        );
+
+        // Duplicate-name check must also see persisted definitions.
+        let dup = reborn
+            .create_tag_index(
+                1,
+                "person_name_idx".to_string(),
+                10,
+                "person".to_string(),
+                vec!["name".to_string()],
+                vec![0],
+            )
+            .await;
+        assert!(matches!(dup, Err(IndexError::IndexAlreadyExists(_))));
+    }
+
+    /// Dropped definitions must stay dropped after a manager recreation.
+    #[tokio::test]
+    async fn test_dropped_index_does_not_resurrect_after_recreation() {
+        let kvstore: Arc<dyn KVStore> = Arc::new(MemoryKVStore::new());
+
+        let manager = IndexManager::new(kvstore.clone());
+        manager
+            .create_tag_index(
+                1,
+                "tmp_idx".to_string(),
+                10,
+                "person".to_string(),
+                vec!["name".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        manager.drop_index(1, "tmp_idx").await.unwrap();
+        drop(manager);
+
+        let reborn = IndexManager::new(kvstore);
+        assert!(
+            reborn.get_index(1, "tmp_idx").await.is_none(),
+            "dropped index must not resurrect from persisted state"
+        );
+        assert!(reborn.list_indexes(1).await.is_empty());
+    }
 
     #[tokio::test]
     async fn test_create_tag_index() {

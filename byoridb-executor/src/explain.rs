@@ -619,18 +619,24 @@ fn pattern_edge_count(pattern: &Pattern) -> usize {
 }
 
 fn eq_field(expr: &Expression) -> Option<String> {
+    // Recognize both bare identifiers (`name == "x"`) and qualified property
+    // refs (`person.name == "x"`) — mirrors dql.rs `field_name_of` (PR#7);
+    // the stale Identifier-only copy here made EXPLAIN report FULL SCAN for
+    // lookups the executor actually serves from the index.
+    fn field_of(e: &Expression) -> Option<String> {
+        match e {
+            Expression::Identifier(f) => Some(f.clone()),
+            Expression::PropRef { prop, .. } => Some(prop.clone()),
+            _ => None,
+        }
+    }
     if let Expression::BinaryOp {
         op: BinaryOperator::Eq,
         left,
         right,
     } = expr
     {
-        if let Expression::Identifier(f) = left.as_ref() {
-            return Some(f.clone());
-        }
-        if let Expression::Identifier(f) = right.as_ref() {
-            return Some(f.clone());
-        }
+        return field_of(left).or_else(|| field_of(right));
     }
     None
 }

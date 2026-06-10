@@ -943,8 +943,29 @@ impl Executor {
                             let mut rows = Vec::new();
                             for (vid, data_opt) in vids.iter().zip(results.iter()) {
                                 if let Some(data) = data_opt {
+                                    // Vertices are proto-encoded (with a legacy
+                                    // JSON fallback) — same dual-format decode
+                                    // as the scan path below. This branch used
+                                    // to JSON-decode only: it predated the
+                                    // proto codec and was unreachable while
+                                    // index definitions never survived their
+                                    // creating query.
                                     let vertex_data: serde_json::Value =
-                                        serde_json::from_slice(data)?;
+                                        if VertexCodec::is_proto_format(data) {
+                                            match VertexCodec::decode_vertex(data) {
+                                                Ok(v) => VertexCodec::vertex_to_json(&v),
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        "Skipping undecodable vertex {} in index lookup: {}",
+                                                        vid,
+                                                        e
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        } else {
+                                            serde_json::from_slice(data)?
+                                        };
                                     let mut row = Vec::new();
                                     row.push(byoridb_common::Value::Int(*vid));
                                     if let Some(tags) = vertex_data.get("tags") {
