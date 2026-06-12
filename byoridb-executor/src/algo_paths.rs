@@ -213,7 +213,7 @@ pub async fn all_shortest_paths(
                         // Another shortest predecessor discovered within the
                         // same level. `collect_neighbor_vids` dedups per-u,
                         // so no duplicate (u, v) pair can land here.
-                        parents.get_mut(&v).expect("depth implies parents").push(u);
+                        parents.entry(v).or_default().push(u);
                     }
                     _ => {}
                 }
@@ -237,14 +237,21 @@ pub async fn all_shortest_paths(
         if max_paths > 0 && paths.len() >= max_paths {
             break;
         }
-        let head = *partial.last().expect("partial path is never empty");
+        // Stack entries always hold at least [target]; guard instead of
+        // panicking per the no-expect gate rule.
+        let Some(&head) = partial.last() else {
+            continue;
+        };
         if head == start {
             let mut path = partial;
             path.reverse();
             paths.push(path);
             continue;
         }
-        for &p in &parents[&head] {
+        let Some(preds) = parents.get(&head) else {
+            continue;
+        };
+        for &p in preds {
             let mut extended = partial.clone();
             extended.push(p);
             stack.push(extended);
