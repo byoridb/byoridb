@@ -94,6 +94,13 @@ jobs:
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
           IMAGE="$ACR_REGISTRY/$IMAGE_NAME:$TAG"
+          # The LB allowlist tracks the operator's dynamic IP and is managed
+          # out-of-band via `kubectl patch`; the manifest only carries a
+          # bootstrap default. Save the live value before apply so the
+          # manifest's baked CIDR cannot clobber it (observed incident,
+          # 2026-06-12 — every deploy locked the operator out).
+          LIVE_LB_RANGES=$(kubectl get svc byoridb-public -n $K8S_NAMESPACE \
+            -o jsonpath='{.spec.loadBalancerSourceRanges}' 2>/dev/null || true)
           # Apply manifests with the freshly built image substituted in, so
           # probe/resource changes roll out together with the code as ONE
           # converged spec. Never `kubectl apply` the raw statefulset: its
@@ -104,6 +111,10 @@ jobs:
             sed "s|image: $ACR_REGISTRY/$IMAGE_NAME:.*|image: $IMAGE|" "$f" \
               | kubectl apply -f -
           done
+          if [ -n "$LIVE_LB_RANGES" ]; then
+            kubectl patch svc byoridb-public -n $K8S_NAMESPACE \
+              -p "{\"spec\":{\"loadBalancerSourceRanges\":$LIVE_LB_RANGES}}"
+          fi
           kubectl rollout status statefulset/byoridb-server \
             -n $K8S_NAMESPACE \
             --timeout=300s
