@@ -180,7 +180,14 @@ var-length 표시 확인)
 - **미해결(후속)**: Undirected 사용 데이터도 in-edge entry 필요(O-1 백필
   caveat 동일). per-path 행/edge list 바인딩은 Cypher 호환 필요 시 후속.
 
-**O-3 [P1] 클래스 계층 / TBox 모델링** 🔶 설계 완료 (2026-06-12), 구현 미착수
+**O-3 [P1] 클래스 계층 / TBox 모델링** ✅ 구현·배포 완료 (2026-06-12, 커밋
+8c6989a → AKS sha-8c6989a. 프로덕션 스모크 7/7: 계층 생성/SHOW/DESCRIBE/
+자기참조 거부/RESTRICT/DROP TAG 거부/INSERT+MATCH 호환, 일회용 space 정리)
+신규 `executor/class_ddl.rs` (515 LoC, 테스트 포함). 파서 4 + 실행기 11 회귀,
+워크스페이스 641 통과, 게이트 차단 0 (info 1건 — corrupt 메타 무음 폐기 →
+에러 전파로 즉시 해소: DROP RESTRICT 자식 검사가 전 자식을 봐야 함).
+ALTER CLASS(SUBCLASS 변경)·분산 meta 연동(G-2 이후)·추론 포함 매칭(O-5/O-7)은
+후속. 설계 결정(D1~D6)은 아래 유지.
 스키마를 "태그"가 아니라 "클래스 + subClassOf 관계"로 표현.
 
 *설계 결정 (2026-06-12):*
