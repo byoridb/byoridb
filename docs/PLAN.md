@@ -128,10 +128,57 @@ EDGE가 같은 batch로 양방향 기록, DELETE EDGE가 양쪽 삭제(UPDATE는
 테스트 추가. **기존 데이터는 역방향 entry가 없으므로 space 재로드 필요**(SF0.1
 재로드로 처리, 백필 마이그레이션은 미구현).
 
-**O-2 [P0, 선결 부채] 변길이 경로 `*1..n` 실행** ⬜ 미착수
+**O-2 [P0, 선결 부채] 변길이 경로 `*1..n` 실행** ✅ 완료 (2026-06-12, 트랙 1+2
+구현·배포·프로덕션 실증 — 운영 완료로 종결)
 파서·AST(`EdgePattern.range`)는 있으나 실행기 미구현. transitive closure가
-본질적으로 변길이 경로이므로 온톨로지 추론의 하부 연산. `match_edges`에
-range 반복 + 사이클 방지(visited set) 추가.
+본질적으로 변길이 경로이므로 온톨로지 추론의 하부 연산.
+
+LDBC Q13/Q14(shortest path 계열)가 하네스 포팅 한계로 엔진 과제로 분리되며
+설계 확정(2026-06-12). **두 트랙으로 분할, 트랙 1 선행:**
+
+*트랙 1 — FIND PATH 확장 (LDBC Q13/Q14 unblock)* ✅ 구현·배포 완료
+(2026-06-12, 커밋 bca1beb+de0880f, main 머지 → AKS 배포 sha-de0880f.
+프로덕션 SF0.1에서 Q13 알려진 쌍 length=3, Q14 알려진 쌍 단일 경로 일치
+스모크 통과)
+- 파서: `FIND ALL SHORTEST PATHS`(`PATH` 단수형도 허용) + `BIDIRECT` +
+  `UPTO n STEPS`(양수 검증, `max_go_steps` 상한 — 초과 시 에러). lexer에
+  `UPTO`/`PATHS` 토큰 추가.
+- `algo_paths.rs` 신설: `shortest_path`(단일, bidirect 지원) +
+  `all_shortest_paths`(레벨 동기 multi-parent DAG → 전 경로 열거).
+  bidirect 확장은 forward `{space}:edge:` + O-1 `{space}:in-edge:` 양쪽
+  prefix scan. codec에 `decode_edge_src` fast path 추가(in-edge 값에서
+  src만 varint 추출). `max_traversal_nodes` 캡이 mid-level에 걸리면
+  부분 결과 대신 빈 결과(+cap_reached) — 부분 all-paths는 오답이므로.
+  경로 수 상한 `ExecutionConfig.max_find_paths`(기본 1,024, 초과 시 warn).
+- 결과 포맷: `path` 컬럼 `Value::List(vids)`(기존 `"1->2->3"` 문자열 폐기).
+  HTTP에선 JSON 배열로 직렬화. Q13=하네스가 len-1, Q14 weight 스코어링은
+  하네스 측(message 레벨 조인이라 엔진 범위 아님, 쌍 단위 캐시).
+- **부수 수정: `Value::PartialEq`가 List/Map/Set/Path/Date/Time/DateTime/
+  Duration에서 무조건 `false`** (자기 자신과도 불일치) → 구조 비교 추가.
+- 제약: `WEIGHT BY`는 `BIDIRECT`/`ALL SHORTEST PATHS`와 조합 불가(에러).
+  EXPLAIN이 "BFS all shortest paths BIDIRECT" + reverse-edge index 표시.
+- 미해결: O-1과 동일한 in-edge 백필 caveat — 역방향 entry 없는 기존
+  데이터에선 BIDIRECT가 빈 결과. FIND의 WHERE/YIELD 절은 여전히 미구현
+  (파싱만 됨, 기존과 동일).
+
+*트랙 2 — MATCH `*min..max` 본체 (`match_impl/var_length.rs` 신설)* ✅ 구현
+완료 (2026-06-12, 커밋 6336ecd 배포. 프로덕션 실증: SF0.1 무방향 knows
+`*1..2` 401 vertex가 GO forward+REVERSELY 독립 계산과 정확 일치, EXPLAIN
+var-length 표시 확인)
+- `match_edges`가 range 존재 시 `expand_var_length`로 위임. DFS 명시 스택,
+  경로 내 visited-vertex로 사이클 차단(transitive closure 의미론). 결과는
+  **distinct terminal vertex 단위**(경로당 1행이 아님 — Cypher와의 차이,
+  중간 노드 미바인딩).
+- 방향 3종 지원 + **기존 버그 수정**: `EdgeDirection::Undirected`가
+  `match_edges`에서 Outgoing으로 처리되던 것을 forward+in-edge 합집합으로
+  (`neighbors_for_direction` 헬퍼, 고정 hop에도 적용).
+- max > `max_go_steps`(20) 시 에러, `max_traversal_nodes` 캡 도달 시 부분
+  결과+warn. 변길이 edge variable 바인딩(`[e:t*1..2]`)은 명시 에러로 거부
+  (1단계 미지원). EXPLAIN Expand에 `var-length *min..max` 표시.
+- 회귀 8건: chain/min>1/cycle 종료/terminal filter/캡 에러/edge var 거부/
+  무방향 단일 hop(역방향 저장)/무방향 변길이 혼합 방향.
+- **미해결(후속)**: Undirected 사용 데이터도 in-edge entry 필요(O-1 백필
+  caveat 동일). per-path 행/edge list 바인딩은 Cypher 호환 필요 시 후속.
 
 **O-3 [P1] 클래스 계층 / TBox 모델링** ⬜ 미착수
 스키마를 "태그"가 아니라 "클래스 + subClassOf 관계"로 표현. 메타 서비스에
@@ -359,6 +406,11 @@ Azure AKS에 실제로 배포해보며 발견된 마찰 포인트.
   1. cargo-chef로 dependency layer 분리(workspace 외부 의존 변경 빈도 낮음)
   2. ACR Tasks `--cache-from`로 이전 이미지 layer 재사용
   3. multi-arch가 불필요하면 ACR Tasks 대신 GitHub Actions self-hosted + sccache 검토
+- **G-10 배포 시 LB allowlist 클로버** ✅ 수정 완료 (2026-06-12, db09b74)
+  deploy.yml의 매니페스트 재적용이 `byoridb-public`의 `loadBalancerSourceRanges`를
+  매니페스트 baked IP로 매 배포마다 리셋 → 유동 IP 운영자가 배포 직후 잠김(2회 발생).
+  수정: apply 전 라이브 값 저장 → apply 후 복원. `kubectl patch`가 allowlist 단일
+  진실원, 매니페스트 값은 svc 최초 생성용 bootstrap default (04-services.yaml 주석 참조).
 - **G-4 Azure 배포 스크립트화** ✅ 적용 완료 (2026-05-14)
   `deploy/azure/bootstrap.sh` 작성. 부딪혔던 동시성 제약을 모두 봉인:
   - AKS create는 `--attach-acr` 없이 → 별도 `az aks update --attach-acr` 단계로 분리
