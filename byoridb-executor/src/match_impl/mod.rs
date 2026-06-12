@@ -10,6 +10,7 @@
 
 mod match_executor;
 mod pattern_matcher;
+mod var_length;
 
 pub use match_executor::MatchExecutor;
 pub use pattern_matcher::PatternMatcher;
@@ -504,6 +505,190 @@ mod h6_multipattern_tests {
         );
         let res = exec.execute_match(plan).await.unwrap();
         assert_eq!(res.rows.len(), 2, "both products joined with their tags");
+    }
+
+    fn make_context() -> Arc<ExecutionContext> {
+        Arc::new(
+            ExecutionContext::new(Arc::new(MemoryKVStore::new()))
+                .with_space("default".to_string())
+                .with_space_id(1),
+        )
+    }
+
+    /// Insert an edge with both its forward key and the O-1 in-edge index
+    /// entry, mirroring what INSERT EDGE writes. Needed for Incoming and
+    /// Undirected traversal tests.
+    async fn put_edge_both_ways(ctx: &Arc<ExecutionContext>, src: i64, dst: i64, etype: &str) {
+        let blob = eblob(src, dst, etype);
+        let fwd = format!("default:edge:{}:{}:{}:0", src, etype, dst);
+        ctx.kvstore.put(fwd.as_bytes(), &blob).await.unwrap();
+        let rev = crate::key::SchemaKey::in_edge_data("default", dst, etype, src, 0);
+        ctx.kvstore.put(&rev, &blob).await.unwrap();
+    }
+
+    /// Chain 1→2→3→4 (class), branch 2→5, cycle edge 3→1.
+    async fn seed_var_length(ctx: &Arc<ExecutionContext>) {
+        for vid in 1..=5 {
+            ctx.kvstore
+                .put(
+                    format!("default:vertex:{}", vid).as_bytes(),
+                    &vblob("class", &format!("C{}", vid)),
+                )
+                .await
+                .unwrap();
+        }
+        put_edge_both_ways(ctx, 1, 2, "subclass_of").await;
+        put_edge_both_ways(ctx, 2, 3, "subclass_of").await;
+        put_edge_both_ways(ctx, 3, 4, "subclass_of").await;
+        put_edge_both_ways(ctx, 2, 5, "subclass_of").await;
+        put_edge_both_ways(ctx, 3, 1, "subclass_of").await;
+    }
+
+    fn returned_vids(res: &crate::executor::ExecutorResult) -> Vec<i64> {
+        let mut vids: Vec<i64> = res
+            .rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(byoridb_common::Value::Int(v)) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        vids.sort();
+        vids
+    }
+
+    #[tokio::test]
+    async fn var_length_range_expands_chain() {
+        let ctx = make_context();
+        seed_var_length(&ctx).await;
+        let exec = MatchExecutor::new(ctx.clone());
+
+        // 1..2 hops from vertex 1: depth1 {2}, depth2 {3, 5}.
+        let plan =
+            match_plan("MATCH (a)-[:subclass_of*1..2]->(b) WHERE id(a)==1 RETURN id(b) AS vid");
+        let res = exec.execute_match(plan).await.unwrap();
+        assert_eq!(returned_vids(&res), vec![2, 3, 5]);
+    }
+
+    #[tokio::test]
+    async fn var_length_min_greater_than_one_excludes_direct_neighbors() {
+        let ctx = make_context();
+        seed_var_length(&ctx).await;
+        let exec = MatchExecutor::new(ctx.clone());
+
+        // 2..3 hops from vertex 1: depth2 {3, 5}, depth3 {4} (1 is on the
+        // path so the 3→1 cycle edge is skipped).
+        let plan =
+            match_plan("MATCH (a)-[:subclass_of*2..3]->(b) WHERE id(a)==1 RETURN id(b) AS vid");
+        let res = exec.execute_match(plan).await.unwrap();
+        assert_eq!(returned_vids(&res), vec![3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn var_length_terminates_on_cycles() {
+        let ctx = make_context();
+        seed_var_length(&ctx).await;
+        let exec = MatchExecutor::new(ctx.clone());
+
+        // Cycle 1→2→3→1 with a generous range: must terminate, never
+        // re-enter the start vertex, and reach the whole component.
+        let plan =
+            match_plan("MATCH (a)-[:subclass_of*1..10]->(b) WHERE id(a)==1 RETURN id(b) AS vid");
+        let res = exec.execute_match(plan).await.unwrap();
+        assert_eq!(returned_vids(&res), vec![2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn var_length_applies_terminal_node_filter() {
+        let ctx = make_context();
+        seed_var_length(&ctx).await;
+        let exec = MatchExecutor::new(ctx.clone());
+
+        let plan = match_plan(
+            "MATCH (a)-[:subclass_of*1..3]->(b:class {name: \"C4\"}) WHERE id(a)==1 \
+             RETURN id(b) AS vid",
+        );
+        let res = exec.execute_match(plan).await.unwrap();
+        assert_eq!(returned_vids(&res), vec![4]);
+    }
+
+    #[tokio::test]
+    async fn var_length_range_exceeding_max_go_steps_errors() {
+        let ctx = make_context();
+        seed_var_length(&ctx).await;
+        let exec = MatchExecutor::new(ctx.clone());
+
+        let plan =
+            match_plan("MATCH (a)-[:subclass_of*1..99]->(b) WHERE id(a)==1 RETURN id(b) AS vid");
+        let err = exec.execute_match(plan).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds the maximum"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn var_length_rejects_edge_variable_binding() {
+        let ctx = make_context();
+        seed_var_length(&ctx).await;
+        let exec = MatchExecutor::new(ctx.clone());
+
+        let plan =
+            match_plan("MATCH (a)-[e:subclass_of*1..2]->(b) WHERE id(a)==1 RETURN id(b) AS vid");
+        let err = exec.execute_match(plan).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not supported"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn undirected_single_hop_matches_reverse_stored_edge() {
+        let ctx = make_context();
+        let exec = MatchExecutor::new(ctx.clone());
+
+        // Edge stored 2→1 only. Undirected `-[:knows]-` from 1 must reach 2;
+        // previously Undirected fell through to outgoing-only and found
+        // nothing.
+        ctx.kvstore
+            .put(b"default:vertex:1", &vblob("person", "A"))
+            .await
+            .unwrap();
+        ctx.kvstore
+            .put(b"default:vertex:2", &vblob("person", "B"))
+            .await
+            .unwrap();
+        put_edge_both_ways(&ctx, 2, 1, "knows").await;
+
+        let plan = match_plan("MATCH (a)-[:knows]-(b) WHERE id(a)==1 RETURN id(b) AS vid");
+        let res = exec.execute_match(plan).await.unwrap();
+        assert_eq!(returned_vids(&res), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn var_length_undirected_traverses_mixed_directions() {
+        let ctx = make_context();
+        let exec = MatchExecutor::new(ctx.clone());
+
+        // 2→1 and 2→3 stored: reaching 3 from 1 requires walking 2→1
+        // backwards then 2→3 forwards.
+        for vid in 1..=3 {
+            ctx.kvstore
+                .put(
+                    format!("default:vertex:{}", vid).as_bytes(),
+                    &vblob("person", &format!("P{}", vid)),
+                )
+                .await
+                .unwrap();
+        }
+        put_edge_both_ways(&ctx, 2, 1, "knows").await;
+        put_edge_both_ways(&ctx, 2, 3, "knows").await;
+
+        let plan = match_plan("MATCH (a)-[:knows*1..2]-(b) WHERE id(a)==1 RETURN id(b) AS vid");
+        let res = exec.execute_match(plan).await.unwrap();
+        assert_eq!(returned_vids(&res), vec![2, 3]);
     }
 
     #[tokio::test]

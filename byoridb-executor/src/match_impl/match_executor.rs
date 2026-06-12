@@ -1547,12 +1547,65 @@ impl MatchExecutor {
             let edge = edges[edge_idx];
             let node = nodes[edge_idx];
 
-            let neighbors = if edge.direction == byoridb_parser::ast::EdgeDirection::Incoming {
-                algo::get_incoming_neighbors(&self.ctx, space, current_vid, &edge.edge_types)
-                    .await?
-            } else {
-                algo::get_neighbors(&self.ctx, space, current_vid, &edge.edge_types).await?
-            };
+            // Variable-length hop (`*min..max`): expand to all distinct
+            // terminal vertices in range, filter them against the node
+            // pattern, and recurse — intermediate vertices are not bound.
+            if edge.range.is_some() {
+                let terminals = super::var_length::expand_var_length(
+                    &self.ctx,
+                    space,
+                    current_vid,
+                    edge,
+                    matcher,
+                )
+                .await?;
+                if terminals.is_empty() {
+                    return Ok(());
+                }
+                let dst_keys: Vec<Vec<u8>> = terminals
+                    .iter()
+                    .map(|dst| format!("{}:vertex:{}", space, dst).into_bytes())
+                    .collect();
+                let dst_blobs = self.ctx.kvstore.batch_get(&dst_keys).await?;
+                for (dst_vid, dst_blob_opt) in terminals.into_iter().zip(dst_blobs.into_iter()) {
+                    let dst_blob = match dst_blob_opt {
+                        Some(b) => b,
+                        None => continue,
+                    };
+                    if !matcher.matches_node(&dst_blob, node)? {
+                        continue;
+                    }
+                    if let Some(ref node_var) = node.variable {
+                        bindings.insert(node_var.clone(), byoridb_common::Value::Int(dst_vid));
+                    }
+                    self.match_edges(
+                        space,
+                        edges,
+                        nodes,
+                        edge_idx + 1,
+                        dst_vid,
+                        matcher,
+                        bindings,
+                        rows,
+                    )
+                    .await?;
+                    if let Some(ref node_var) = node.variable {
+                        bindings.remove(node_var);
+                    }
+                }
+                return Ok(());
+            }
+
+            // Fixed single hop. Undirected unions both scan directions —
+            // previously it silently fell through to outgoing-only.
+            let neighbors = super::var_length::neighbors_for_direction(
+                &self.ctx,
+                space,
+                current_vid,
+                &edge.edge_types,
+                &edge.direction,
+            )
+            .await?;
 
             let mut surviving: Vec<(i64, EdgeData)> = Vec::with_capacity(neighbors.len());
             for neighbor in neighbors {

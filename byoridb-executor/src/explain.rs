@@ -278,7 +278,18 @@ async fn build_match(ctx: &ExecutionContext, p: &crate::plan::MatchPlan) -> Plan
         } else {
             AccessPath::EdgePrefix
         };
-        node = PlanNode::new("Expand", format!("{} hop(s)", edge_count), expand_access)
+        let ranges = pattern_var_length_ranges(&p.pattern);
+        let detail = if ranges.is_empty() {
+            format!("{} hop(s)", edge_count)
+        } else {
+            let spec = ranges
+                .iter()
+                .map(|(lo, hi)| format!("*{}..{}", lo, hi))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{} hop(s), var-length {}", edge_count, spec)
+        };
+        node = PlanNode::new("Expand", detail, expand_access)
             .with_profile(ProfileOp::Expand)
             .child(node);
     }
@@ -627,6 +638,24 @@ fn pattern_edge_count(pattern: &Pattern) -> usize {
                 Pattern::Multiple(_) => 0,
             })
             .sum(),
+    }
+}
+
+/// Collect `*min..max` ranges across the pattern so EXPLAIN can surface
+/// variable-length hops in the Expand node.
+fn pattern_var_length_ranges(pattern: &Pattern) -> Vec<(u64, u64)> {
+    fn from_path(p: &byoridb_parser::ast::PathPattern) -> Vec<(u64, u64)> {
+        p.edges.iter().filter_map(|e| e.range).collect()
+    }
+    match pattern {
+        Pattern::Path(p) => from_path(p),
+        Pattern::Multiple(ps) => ps
+            .iter()
+            .flat_map(|p| match p {
+                Pattern::Path(pp) => from_path(pp),
+                Pattern::Multiple(_) => Vec::new(),
+            })
+            .collect(),
     }
 }
 
