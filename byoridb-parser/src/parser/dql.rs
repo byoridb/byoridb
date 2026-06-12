@@ -108,11 +108,19 @@ impl Parser {
 
     // ===== FIND statement =====
 
-    /// Parse: FIND SHORTEST PATH FROM vid TO vid OVER edge [WHERE ...] [YIELD ...]
+    /// Parse: FIND [ALL] SHORTEST PATH[S] FROM vid TO vid OVER edge
+    ///        [WEIGHT BY prop] [BIDIRECT] [UPTO n STEPS] [WHERE ...] [YIELD ...]
     pub(crate) fn parse_find(&mut self) -> ParseResult {
         self.consume_token(Token::Find)?;
 
-        let find_type = if self.match_token(Token::Shortest) {
+        let find_type = if self.match_token(Token::All) {
+            self.consume_token(Token::Shortest)?;
+            // Accept both PATHS and PATH after ALL SHORTEST.
+            if !self.match_token(Token::Paths) {
+                self.consume_token(Token::Path)?;
+            }
+            FindType::AllShortestPaths
+        } else if self.match_token(Token::Shortest) {
             self.consume_token(Token::Path)?;
             FindType::ShortestPath
         } else {
@@ -140,7 +148,31 @@ impl Parser {
             None
         };
 
-        // Optional: BIDIRECT, REVERSELY, or UPTO steps parsing could go here
+        // Optional BIDIRECT and UPTO n STEPS, in either order.
+        let mut bidirect = false;
+        let mut upto_steps = None;
+        loop {
+            if self.match_token(Token::Bidirect) {
+                bidirect = true;
+            } else if self.match_token(Token::Upto) {
+                let steps = match self.peek_token()? {
+                    Token::Integer(n) if n > 0 => {
+                        self.advance();
+                        n as u32
+                    }
+                    _ => {
+                        return Err(ParseError::InvalidSyntax(format!(
+                            "UPTO expects a positive integer step count at {}",
+                            self.err_location()
+                        )));
+                    }
+                };
+                self.consume_token(Token::Steps)?;
+                upto_steps = Some(steps);
+            } else {
+                break;
+            }
+        }
 
         let where_clause = if self.match_token(Token::Where) {
             Some(self.parse_expression()?)
@@ -160,7 +192,8 @@ impl Parser {
             to_vid,
             over_edge,
             weight_prop,
-            upto_steps: None,
+            bidirect,
+            upto_steps,
             where_clause,
             yield_clause,
         }))

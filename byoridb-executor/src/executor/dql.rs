@@ -1385,9 +1385,28 @@ impl Executor {
             vec![plan.over_edge.clone()]
         };
         let edge_types: &[String] = &edge_types_owned;
+
+        // UPTO follows the same cap as GO steps (S-5).
+        let max_go_steps = self.ctx.config.max_go_steps;
+        if let Some(upto) = plan.upto_steps {
+            if max_go_steps > 0 && upto > max_go_steps {
+                return Err(ExecutionError::InvalidOperation(format!(
+                    "UPTO {} STEPS exceeds the maximum of {}",
+                    upto, max_go_steps
+                )));
+            }
+        }
+        let max_steps = plan.upto_steps.unwrap_or(10) as usize;
+        let all_shortest = matches!(plan.find_type, crate::plan::FindType::AllShortestPaths);
+
         let profiling = self.ctx.profiling();
         let find_start = std::time::Instant::now();
-        let (path_opt, metrics) = if let Some(weight_prop) = plan.weight_prop.as_deref() {
+        let (paths, metrics) = if let Some(weight_prop) = plan.weight_prop.as_deref() {
+            if plan.bidirect || all_shortest {
+                return Err(ExecutionError::InvalidOperation(
+                    "WEIGHT BY cannot be combined with BIDIRECT or ALL SHORTEST PATHS".to_string(),
+                ));
+            }
             let (result, metrics) = crate::algo::dijkstra_shortest_path(
                 &self.ctx,
                 from_vid,
@@ -1396,16 +1415,40 @@ impl Executor {
                 weight_prop,
             )
             .await?;
-            (result.map(|(path, _weight)| path), metrics)
-        } else {
-            crate::algo::bfs_shortest_path(
+            (
+                result.map(|(path, _weight)| path).into_iter().collect(),
+                metrics,
+            )
+        } else if all_shortest {
+            let max_paths = self.ctx.config.max_find_paths;
+            let (paths, metrics) = crate::algo_paths::all_shortest_paths(
                 &self.ctx,
                 from_vid,
                 to_vid,
                 edge_types,
-                plan.upto_steps.unwrap_or(10) as usize,
+                max_steps,
+                plan.bidirect,
+                max_paths,
             )
-            .await?
+            .await?;
+            if max_paths > 0 && paths.len() >= max_paths {
+                tracing::warn!(
+                    max_find_paths = max_paths,
+                    "FIND ALL SHORTEST PATHS hit max_find_paths; result is truncated"
+                );
+            }
+            (paths, metrics)
+        } else {
+            let (path, metrics) = crate::algo_paths::shortest_path(
+                &self.ctx,
+                from_vid,
+                to_vid,
+                edge_types,
+                max_steps,
+                plan.bidirect,
+            )
+            .await?;
+            (path.into_iter().collect(), metrics)
         };
 
         tracing::info!(
@@ -1454,18 +1497,18 @@ impl Executor {
         }
 
         let columns = vec!["path".to_string()];
-        let mut rows = Vec::new();
-
-        if let Some(path) = path_opt {
-            // Convert path (Vec<i64>) to Value (List or String representation)
-            // Using String for now as List value type might not be fully supported in formatting
-            let path_str = path
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join("->");
-            rows.push(vec![byoridb_common::Value::String(path_str)]);
-        }
+        // One row per path; the path is a list of vids so clients can read
+        // hop count and intermediate vertices without string parsing.
+        let rows: Vec<Vec<byoridb_common::Value>> = paths
+            .into_iter()
+            .map(|path| {
+                vec![byoridb_common::Value::List(
+                    byoridb_common::datatypes::list::List::with_values(
+                        path.into_iter().map(byoridb_common::Value::Int).collect(),
+                    ),
+                )]
+            })
+            .collect();
 
         Ok(ExecutorResult {
             columns,

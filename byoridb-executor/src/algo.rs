@@ -39,7 +39,7 @@ pub struct TraversalMetrics {
 }
 
 impl TraversalMetrics {
-    fn record_frontier(&mut self, size: usize) {
+    pub(crate) fn record_frontier(&mut self, size: usize) {
         let size = size as u64;
         if size > self.max_frontier_size {
             self.max_frontier_size = size;
@@ -209,7 +209,7 @@ pub async fn visit_neighbors_limited(
     Ok(visited)
 }
 
-fn edge_type_from_key(key: &[u8]) -> Option<&str> {
+pub(crate) fn edge_type_from_key(key: &[u8]) -> Option<&str> {
     let key_str = std::str::from_utf8(key).ok()?;
     key_str.split(':').nth(3)
 }

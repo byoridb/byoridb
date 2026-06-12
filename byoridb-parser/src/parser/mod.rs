@@ -264,6 +264,8 @@ impl Parser {
             Token::Tag => "tag",
             Token::Tags => "tags",
             Token::Path => "path",
+            Token::Paths => "paths",
+            Token::Upto => "upto",
             Token::Weight => "weight",
             Token::Space => "space",
             Token::Spaces => "spaces",

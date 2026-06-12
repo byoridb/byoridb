@@ -283,6 +283,9 @@ pub struct FindPlan {
     pub to_vid: Expression,
     pub over_edge: String,
     pub weight_prop: Option<String>,
+    /// Expand edges in both directions (reads the O-1 in-edge index for the
+    /// reverse direction). See `FindStatement::bidirect`.
+    pub bidirect: bool,
     pub upto_steps: Option<u32>,
     pub where_clause: Option<Expression>,
     pub yield_clause: Option<String>,
@@ -292,6 +295,7 @@ pub struct FindPlan {
 pub enum FindType {
     Path,
     ShortestPath,
+    AllShortestPaths,
 }
 
 pub struct MatchReturnColumn {
@@ -887,11 +891,13 @@ impl ExecutionPlanBuilder {
                 find_type: match find_stmt.find_type {
                     byoridb_parser::ast::FindType::Path => FindType::Path,
                     byoridb_parser::ast::FindType::ShortestPath => FindType::ShortestPath,
+                    byoridb_parser::ast::FindType::AllShortestPaths => FindType::AllShortestPaths,
                 },
                 from_vid: find_stmt.from_vid,
                 to_vid: find_stmt.to_vid,
                 over_edge: find_stmt.over_edge,
                 weight_prop: find_stmt.weight_prop,
+                bidirect: find_stmt.bidirect,
                 upto_steps: find_stmt.upto_steps,
                 where_clause: find_stmt.where_clause,
                 yield_clause: find_stmt.yield_clause.map(|c| format!("{:?}", c)),

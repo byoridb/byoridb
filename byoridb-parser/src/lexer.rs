@@ -74,10 +74,14 @@ pub enum Token {
     Steps,
     #[token("STEP", ignore(case))]
     Step,
+    #[token("PATHS", ignore(case))]
+    Paths,
     #[token("PATH", ignore(case))]
     Path,
     #[token("SHORTEST", ignore(case))]
     Shortest,
+    #[token("UPTO", ignore(case))]
+    Upto,
     #[token("WEIGHT", ignore(case))]
     Weight,
     #[token("ALL", ignore(case))]

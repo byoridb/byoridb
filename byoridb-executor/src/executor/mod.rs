@@ -813,16 +813,14 @@ mod tests {
             to_vid: Expression::Literal(Literal::Int(2)),
             over_edge: "follow".to_string(),
             weight_prop: Some("cost".to_string()),
+            bidirect: false,
             upto_steps: None,
             where_clause: None,
             yield_clause: None,
         };
 
         let result = executor.execute_find(plan).await.unwrap();
-        assert_eq!(
-            result.rows,
-            vec![vec![byoridb_common::Value::String("1->3->2".to_string())]]
-        );
+        assert_eq!(result.rows, vec![vec![path_value(&[1, 3, 2])]]);
     }
 
     #[tokio::test]
@@ -895,10 +893,76 @@ mod tests {
         let plan = ExecutionPlanBuilder::build(statement).unwrap();
 
         let result = executor.execute(plan).await.unwrap();
+        assert_eq!(result.rows, vec![vec![path_value(&[1, 3, 2])]]);
+    }
+
+    /// Expected FIND PATH row value: a list of vids.
+    fn path_value(vids: &[i64]) -> byoridb_common::Value {
+        byoridb_common::Value::List(byoridb_common::datatypes::list::List::with_values(
+            vids.iter()
+                .map(|&v| byoridb_common::Value::Int(v))
+                .collect(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_find_all_shortest_paths_end_to_end() {
+        let executor = create_executor();
+
+        // Diamond 1 -> {2, 3} -> 4 plus a longer detour 1->5->6->4.
+        insert_test_edge(&executor, 1, 2, "follow", 0).await;
+        insert_test_edge(&executor, 1, 3, "follow", 0).await;
+        insert_test_edge(&executor, 2, 4, "follow", 0).await;
+        insert_test_edge(&executor, 3, 4, "follow", 0).await;
+        insert_test_edge(&executor, 1, 5, "follow", 0).await;
+        insert_test_edge(&executor, 5, 6, "follow", 0).await;
+        insert_test_edge(&executor, 6, 4, "follow", 0).await;
+
+        let statement =
+            byoridb_parser::parse("FIND ALL SHORTEST PATHS FROM 1 TO 4 OVER follow UPTO 5 STEPS")
+                .unwrap();
+        let plan = ExecutionPlanBuilder::build(statement).unwrap();
+
+        let result = executor.execute(plan).await.unwrap();
+        assert_eq!(result.columns, vec!["path".to_string()]);
+        let mut rows = result.rows;
+        rows.sort_by_key(|r| format!("{:?}", r));
         assert_eq!(
-            result.rows,
-            vec![vec![byoridb_common::Value::String("1->3->2".to_string())]]
+            rows,
+            vec![vec![path_value(&[1, 2, 4])], vec![path_value(&[1, 3, 4])]]
         );
+    }
+
+    #[tokio::test]
+    async fn test_find_upto_exceeding_max_go_steps_errors() {
+        let executor = create_executor();
+
+        let statement =
+            byoridb_parser::parse("FIND SHORTEST PATH FROM 1 TO 2 OVER follow UPTO 999 STEPS")
+                .unwrap();
+        let plan = ExecutionPlanBuilder::build(statement).unwrap();
+
+        let err = executor.execute(plan).await.unwrap_err();
+        match err {
+            ExecutionError::InvalidOperation(msg) => {
+                assert!(msg.contains("UPTO"), "unexpected message: {}", msg)
+            }
+            other => panic!("expected InvalidOperation, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_find_weight_by_rejects_bidirect() {
+        let executor = create_executor();
+
+        let statement = byoridb_parser::parse(
+            "FIND SHORTEST PATH FROM 1 TO 2 OVER follow WEIGHT BY cost BIDIRECT",
+        )
+        .unwrap();
+        let plan = ExecutionPlanBuilder::build(statement).unwrap();
+
+        let err = executor.execute(plan).await.unwrap_err();
+        assert!(matches!(err, ExecutionError::InvalidOperation(_)));
     }
 
     // ===== LOOKUP Tests =====

@@ -185,6 +185,18 @@ impl PartialEq for Value {
             (Value::String(s1), Value::String(s2)) => s1 == s2,
             (Value::Vertex(v1), Value::Vertex(v2)) => v1 == v2,
             (Value::Edge(e1), Value::Edge(e2)) => e1 == e2,
+            // Structural comparison for container/temporal types. List/Map/Set
+            // compare element-wise (recursing through this impl, so nested
+            // floats keep the epsilon semantics above). Before this arm they
+            // fell through to `false`, making a value unequal to itself.
+            (Value::List(l1), Value::List(l2)) => l1.values == l2.values,
+            (Value::Map(m1), Value::Map(m2)) => m1 == m2,
+            (Value::Set(s1), Value::Set(s2)) => s1 == s2,
+            (Value::Path(p1), Value::Path(p2)) => p1 == p2,
+            (Value::Date(d1), Value::Date(d2)) => d1 == d2,
+            (Value::Time(t1), Value::Time(t2)) => t1 == t2,
+            (Value::DateTime(dt1), Value::DateTime(dt2)) => dt1 == dt2,
+            (Value::Duration(d1), Value::Duration(d2)) => d1 == d2,
             _ => false,
         }
     }
@@ -274,6 +286,22 @@ mod tests {
         assert_eq!(Value::Int(0).type_of(), ValueType::Int);
         assert_eq!(Value::Float(0.0).type_of(), ValueType::Float);
         assert_eq!(Value::String("x".into()).type_of(), ValueType::String);
+    }
+
+    #[test]
+    fn test_container_values_compare_structurally() {
+        let list = |vals: &[i64]| {
+            Value::List(List::with_values(
+                vals.iter().map(|&v| Value::Int(v)).collect(),
+            ))
+        };
+        // Regression: List/Map/Set/temporal variants used to fall through
+        // PartialEq to `false`, so a value was unequal to itself.
+        assert_eq!(list(&[1, 2, 3]), list(&[1, 2, 3]));
+        assert_ne!(list(&[1, 2, 3]), list(&[1, 2]));
+        assert_ne!(list(&[1, 2, 3]), list(&[3, 2, 1]));
+        assert_eq!(Value::Map(Map::new()), Value::Map(Map::new()));
+        assert_eq!(Value::Set(Set::new()), Value::Set(Set::new()));
     }
 
     #[test]

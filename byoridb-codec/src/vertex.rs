@@ -152,7 +152,7 @@ impl VertexCodec {
         }
 
         if data[0] == PROTO_MAGIC {
-            Self::decode_edge_dst_proto(&data[1..])
+            Self::decode_edge_vid_proto(&data[1..], 2)
         } else {
             // JSON fallback — small overhead, but JSON-encoded edges are
             // expected to be the legacy path so we accept it.
@@ -162,7 +162,26 @@ impl VertexCodec {
         }
     }
 
-    fn decode_edge_dst_proto(data: &[u8]) -> Result<i64> {
+    /// Fast-path decoder that returns only `src_vid` (proto field 1).
+    ///
+    /// Counterpart of [`decode_edge_dst`](Self::decode_edge_dst) for reverse
+    /// traversal over the in-edge index, whose values are denormalized edge
+    /// payloads: the neighbor a BFS expands to is the edge's *source*.
+    pub fn decode_edge_src(data: &[u8]) -> Result<i64> {
+        if data.is_empty() {
+            return Err(CodecError::IncorrectValue("Empty data".to_string()));
+        }
+
+        if data[0] == PROTO_MAGIC {
+            Self::decode_edge_vid_proto(&data[1..], 1)
+        } else {
+            let json: serde_json::Value = serde_json::from_slice(data)
+                .map_err(|e| CodecError::IncorrectValue(format!("JSON decode failed: {}", e)))?;
+            Ok(json.get("src").and_then(|v| v.as_i64()).unwrap_or_default())
+        }
+    }
+
+    fn decode_edge_vid_proto(data: &[u8], target_field: u64) -> Result<i64> {
         // proto field tag = (field_number << 3) | wire_type. Wire types we
         // care about: 0=varint, 2=length-delimited.
         let mut pos = 0;
@@ -172,9 +191,9 @@ impl VertexCodec {
             pos += n;
             let field_num = tag >> 3;
             let wire_type = (tag & 0x7) as u8;
-            if field_num == 2 && wire_type == 0 {
+            if field_num == target_field && wire_type == 0 {
                 let (val, _) = read_varint(&data[pos..])
-                    .ok_or_else(|| CodecError::IncorrectValue("Truncated dst_vid".to_string()))?;
+                    .ok_or_else(|| CodecError::IncorrectValue("Truncated vid field".to_string()))?;
                 return Ok(val as i64);
             }
             // Skip this field.
@@ -201,7 +220,7 @@ impl VertexCodec {
                 }
             }
         }
-        // dst_vid is proto-default (0) when omitted, which is also our
+        // The vid is proto-default (0) when omitted, which is also our
         // EdgeData default. Match decode_edge_proto's semantics.
         Ok(0)
     }
@@ -666,6 +685,33 @@ mod tests {
         let json = r#"{"src": 10, "dst": 20, "props": {"weight": 1.5}}"#;
         let dst = VertexCodec::decode_edge_dst(json.as_bytes()).unwrap();
         assert_eq!(dst, 20);
+    }
+
+    #[test]
+    fn test_decode_edge_src_proto_matches_full_decode() {
+        let edge = EdgeData {
+            src_vid: 12345,
+            dst_vid: 67890,
+            edge_type: "follow".to_string(),
+            ranking: 7,
+            properties: [("weight".to_string(), Value::Float(1.5))]
+                .into_iter()
+                .collect(),
+        };
+        let bytes = VertexCodec::encode_edge(&edge).unwrap();
+
+        let full = VertexCodec::decode_edge(&bytes).unwrap();
+        let fast = VertexCodec::decode_edge_src(&bytes).unwrap();
+
+        assert_eq!(full.src_vid, 12345);
+        assert_eq!(fast, full.src_vid);
+    }
+
+    #[test]
+    fn test_decode_edge_src_json_fallback() {
+        let json = r#"{"src": 10, "dst": 20, "props": {"weight": 1.5}}"#;
+        let src = VertexCodec::decode_edge_src(json.as_bytes()).unwrap();
+        assert_eq!(src, 10);
     }
 
     #[test]

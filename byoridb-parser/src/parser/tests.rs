@@ -629,6 +629,55 @@ fn test_parse_find_shortest_path_with_weight() {
 }
 
 #[test]
+fn test_parse_find_all_shortest_paths_bidirect_upto() {
+    let result = parse("FIND ALL SHORTEST PATHS FROM 1 TO 2 OVER knows BIDIRECT UPTO 5 STEPS");
+    assert!(result.is_ok(), "parse failed: {:?}", result);
+    match result.unwrap() {
+        Statement::Find(stmt) => {
+            assert_eq!(stmt.find_type, FindType::AllShortestPaths);
+            assert_eq!(stmt.over_edge, "knows");
+            assert!(stmt.bidirect);
+            assert_eq!(stmt.upto_steps, Some(5));
+        }
+        s => panic!("Expected Find AllShortestPaths, got {:?}", s),
+    }
+}
+
+#[test]
+fn test_parse_find_all_shortest_path_singular_keyword() {
+    // ALL SHORTEST PATH (singular) is accepted as an alias of PATHS.
+    let result = parse("FIND ALL SHORTEST PATH FROM 1 TO 2 OVER knows");
+    assert!(result.is_ok(), "parse failed: {:?}", result);
+    match result.unwrap() {
+        Statement::Find(stmt) => {
+            assert_eq!(stmt.find_type, FindType::AllShortestPaths);
+            assert!(!stmt.bidirect);
+            assert_eq!(stmt.upto_steps, None);
+        }
+        s => panic!("Expected Find AllShortestPaths, got {:?}", s),
+    }
+}
+
+#[test]
+fn test_parse_find_shortest_path_bidirect() {
+    let result = parse("FIND SHORTEST PATH FROM 1 TO 2 OVER knows BIDIRECT");
+    assert!(result.is_ok(), "parse failed: {:?}", result);
+    match result.unwrap() {
+        Statement::Find(stmt) => {
+            assert_eq!(stmt.find_type, FindType::ShortestPath);
+            assert!(stmt.bidirect);
+        }
+        s => panic!("Expected Find ShortestPath, got {:?}", s),
+    }
+}
+
+#[test]
+fn test_parse_find_upto_rejects_non_positive_steps() {
+    assert!(parse("FIND SHORTEST PATH FROM 1 TO 2 OVER knows UPTO 0 STEPS").is_err());
+    assert!(parse("FIND SHORTEST PATH FROM 1 TO 2 OVER knows UPTO x STEPS").is_err());
+}
+
+#[test]
 fn test_parse_find_path_with_where_clause() {
     let result = parse("FIND PATH FROM 1 TO 2 OVER knows WHERE knows.since > 2020");
     assert!(result.is_ok(), "parse failed: {:?}", result);

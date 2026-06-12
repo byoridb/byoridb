@@ -374,14 +374,26 @@ fn is_aggregate_expr(expr: &Expression) -> bool {
 }
 
 fn build_find(p: &crate::plan::FindPlan) -> PlanNode {
-    let algo = match (p.weight_prop.as_ref(), &p.find_type) {
+    let mut algo = match (p.weight_prop.as_ref(), &p.find_type) {
         (Some(w), _) => format!("Dijkstra (weight by {})", w),
         (None, crate::plan::FindType::ShortestPath) => "BFS shortest path".to_string(),
+        (None, crate::plan::FindType::AllShortestPaths) => "BFS all shortest paths".to_string(),
         (None, crate::plan::FindType::Path) => "BFS all paths".to_string(),
     };
+    if p.bidirect {
+        algo.push_str(" BIDIRECT");
+    }
     let neighbors = PlanNode::new(
         "GetNeighbors",
-        format!("over [{}]", p.over_edge),
+        format!(
+            "over [{}]{}",
+            p.over_edge,
+            if p.bidirect {
+                " + reverse-edge index"
+            } else {
+                ""
+            }
+        ),
         AccessPath::EdgePrefix,
     )
     .with_profile(ProfileOp::GetNeighbors);

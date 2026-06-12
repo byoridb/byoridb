@@ -11,6 +11,7 @@
 //! - Distributed query execution across multiple Storage nodes
 
 pub mod algo;
+pub mod algo_paths;
 pub mod arena;
 pub mod context;
 // Distributed execution (remote Storage via gRPC) requires tonic; gate it so

@@ -36,6 +36,10 @@ pub struct ExecutionConfig {
     /// Maximum number of GO steps allowed per query.
     /// Prevents exponential fanout from large step counts.
     pub max_go_steps: u32,
+    /// Maximum number of paths `FIND ALL SHORTEST PATHS` will enumerate.
+    /// The shortest-path DAG can hold combinatorially many distinct paths
+    /// on dense graphs; enumeration stops at this cap. `0` disables the cap.
+    pub max_find_paths: usize,
 }
 
 impl Default for ExecutionConfig {
@@ -47,6 +51,7 @@ impl Default for ExecutionConfig {
             max_traversal_nodes: 100_000,
             max_scan_limit: 100_000, // 100K rows per scan
             max_go_steps: 20,
+            max_find_paths: 1024,
         }
     }
 }

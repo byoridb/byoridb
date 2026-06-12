@@ -501,6 +501,10 @@ pub struct FindStatement {
     pub to_vid: Expression,
     pub over_edge: String,
     pub weight_prop: Option<String>,
+    /// Expand edges in both directions (`BIDIRECT`). Required for undirected
+    /// graph semantics where edges are stored single-direction (e.g. LDBC
+    /// `knows`). Reverse expansion reads the O-1 in-edge index.
+    pub bidirect: bool,
     pub upto_steps: Option<u32>,
     pub where_clause: Option<Expression>,
     pub yield_clause: Option<YieldClause>,
@@ -510,6 +514,9 @@ pub struct FindStatement {
 pub enum FindType {
     Path,
     ShortestPath,
+    /// `FIND ALL SHORTEST PATHS` — every minimum-hop path, not just one
+    /// (LDBC IC14-style path enumeration).
+    AllShortestPaths,
 }
 
 /// MATCH statement (Cypher-like)
