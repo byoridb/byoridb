@@ -159,6 +159,7 @@ impl Executor {
 }
 
 mod auth_exec;
+mod class_ddl;
 mod ddl;
 mod dml;
 mod dql;

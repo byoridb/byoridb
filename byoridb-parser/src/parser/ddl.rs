@@ -54,6 +54,10 @@ impl Parser {
                     ShowStatement::Edges
                 }
             }
+            Token::Class | Token::Classes => {
+                self.advance();
+                ShowStatement::Classes
+            }
             Token::User => {
                 self.advance();
                 ShowStatement::Users
@@ -152,9 +156,14 @@ impl Parser {
                 let name = self.consume_identifier()?;
                 DescribeStatement::Space(name)
             }
+            Token::Class => {
+                self.advance();
+                let name = self.consume_identifier()?;
+                DescribeStatement::Class(name)
+            }
             other => {
                 return Err(ParseError::UnexpectedToken(format!(
-                    "Expected TAG, EDGE, or SPACE after DESCRIBE, got {:?}",
+                    "Expected TAG, EDGE, SPACE, or CLASS after DESCRIBE, got {:?}",
                     other
                 )))
             }
@@ -179,6 +188,7 @@ impl Parser {
         let token = self.peek_token()?;
         match token {
             Token::Space => self.parse_create_space(),
+            Token::Class => self.parse_create_class(),
             Token::Tag => {
                 // `CREATE TAG INDEX …` vs `CREATE TAG name(…)`
                 let next = self
@@ -371,6 +381,35 @@ impl Parser {
                 if_not_exists,
                 name,
                 props,
+            },
+        )))
+    }
+
+    /// Parse `CREATE CLASS [IF NOT EXISTS] name(props) [SUBCLASS OF p1, p2]`.
+    fn parse_create_class(&mut self) -> ParseResult {
+        self.consume_token(Token::Class)?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let name = self.consume_identifier()?;
+
+        self.consume_token(Token::LParen)?;
+        let props = self.parse_property_specs()?;
+        self.consume_token(Token::RParen)?;
+
+        let mut superclasses = Vec::new();
+        if self.match_token(Token::Subclass) {
+            self.consume_token(Token::Of)?;
+            superclasses.push(self.consume_identifier()?);
+            while self.match_token(Token::Comma) {
+                superclasses.push(self.consume_identifier()?);
+            }
+        }
+
+        Ok(Statement::Create(CreateStatement::Class(
+            CreateClassStatement {
+                if_not_exists,
+                name,
+                props,
+                superclasses,
             },
         )))
     }
@@ -673,12 +712,24 @@ impl Parser {
         let token = self.peek_token()?;
         match token {
             Token::Space => self.parse_drop_space(),
+            Token::Class => self.parse_drop_class(),
             Token::Tag => self.parse_drop_tag(),
             Token::Edge => self.parse_drop_edge(),
             Token::Index => self.parse_drop_index(),
             Token::User => self.parse_drop_user(),
             _ => Err(ParseError::UnexpectedToken(format!("{:?}", token))),
         }
+    }
+
+    fn parse_drop_class(&mut self) -> ParseResult {
+        self.consume_token(Token::Class)?;
+        let if_exists = self.parse_if_exists()?;
+        let name = self.consume_identifier()?;
+
+        Ok(Statement::Drop(DropStatement::Class(DropClassStatement {
+            if_exists,
+            name,
+        })))
     }
 
     fn parse_drop_space(&mut self) -> ParseResult {

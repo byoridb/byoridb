@@ -76,6 +76,14 @@ pub enum Token {
     Step,
     #[token("PATHS", ignore(case))]
     Paths,
+    #[token("CLASSES", ignore(case))]
+    Classes,
+    #[token("CLASS", ignore(case))]
+    Class,
+    #[token("SUBCLASS", ignore(case))]
+    Subclass,
+    #[token("OF", ignore(case))]
+    Of,
     #[token("PATH", ignore(case))]
     Path,
     #[token("SHORTEST", ignore(case))]

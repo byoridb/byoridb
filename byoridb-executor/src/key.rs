@@ -54,6 +54,23 @@ impl SchemaKey {
         format!("space:{}:tag:", space).into_bytes()
     }
 
+    // ===== Class keys (O-3 ontology TBox) =====
+
+    /// Create a class metadata key: `space:{space}:class:{name}`.
+    ///
+    /// A class is a tag superset: the field schema lives under the normal
+    /// tag key (so INSERT/MATCH/index machinery applies unchanged) and this
+    /// key only carries the hierarchy metadata
+    /// (`{"name": ..., "superclasses": [...]}`).
+    pub fn class(space: &str, name: &str) -> Vec<u8> {
+        format!("space:{}:class:{}", space, name).into_bytes()
+    }
+
+    /// Prefix for scanning all classes in a space: `space:{space}:class:`
+    pub fn class_prefix(space: &str) -> Vec<u8> {
+        format!("space:{}:class:", space).into_bytes()
+    }
+
     // ===== Edge keys =====
 
     /// Create an edge type key: `space:{space}:edge:{name}`

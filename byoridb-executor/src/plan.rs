@@ -89,6 +89,7 @@ pub enum ShowPlan {
     Spaces,
     Tags,
     Edges,
+    Classes,
     TagIndexes,
     EdgeIndexes,
     Users,
@@ -109,6 +110,7 @@ pub enum DescribePlan {
     Space(String),
     TagIndex(String),
     EdgeIndex(String),
+    Class(String),
 }
 
 /// Balance plan for partition management
@@ -164,6 +166,13 @@ pub enum CreatePlan {
         password: String,
         role: Option<String>,
     },
+    /// Ontology class (O-3): a tag definition plus hierarchy metadata.
+    Class {
+        name: String,
+        if_not_exists: bool,
+        props: Vec<PropertyDef>,
+        superclasses: Vec<String>,
+    },
 }
 
 pub enum DropPlan {
@@ -173,6 +182,7 @@ pub enum DropPlan {
     TagIndex { name: String, if_exists: bool },
     EdgeIndex { name: String, if_exists: bool },
     User { name: String, if_exists: bool },
+    Class { name: String, if_exists: bool },
 }
 
 pub enum AlterPlan {
@@ -377,6 +387,7 @@ impl ExecutionPlanBuilder {
             Statement::Show(show) => Ok(ExecutionPlan::Show(match show {
                 byoridb_parser::ast::ShowStatement::Spaces => ShowPlan::Spaces,
                 byoridb_parser::ast::ShowStatement::Tags => ShowPlan::Tags,
+                byoridb_parser::ast::ShowStatement::Classes => ShowPlan::Classes,
                 byoridb_parser::ast::ShowStatement::Edges => ShowPlan::Edges,
                 byoridb_parser::ast::ShowStatement::TagIndexes => ShowPlan::TagIndexes,
                 byoridb_parser::ast::ShowStatement::EdgeIndexes => ShowPlan::EdgeIndexes,
@@ -397,6 +408,7 @@ impl ExecutionPlanBuilder {
                 byoridb_parser::ast::DescribeStatement::Tag(n) => DescribePlan::Tag(n),
                 byoridb_parser::ast::DescribeStatement::Edge(n) => DescribePlan::Edge(n),
                 byoridb_parser::ast::DescribeStatement::Space(n) => DescribePlan::Space(n),
+                byoridb_parser::ast::DescribeStatement::Class(n) => DescribePlan::Class(n),
                 byoridb_parser::ast::DescribeStatement::TagIndex(n) => DescribePlan::TagIndex(n),
                 byoridb_parser::ast::DescribeStatement::EdgeIndex(n) => DescribePlan::EdgeIndex(n),
             })),
@@ -457,6 +469,21 @@ impl ExecutionPlanBuilder {
                         })
                         .collect(),
                 },
+                byoridb_parser::ast::CreateStatement::Class(class) => CreatePlan::Class {
+                    name: class.name,
+                    if_not_exists: class.if_not_exists,
+                    props: class
+                        .props
+                        .into_iter()
+                        .map(|p| PropertyDef {
+                            name: p.name,
+                            data_type: p.data_type,
+                            nullable: p.nullable,
+                            default_value: p.default,
+                        })
+                        .collect(),
+                    superclasses: class.superclasses,
+                },
                 byoridb_parser::ast::CreateStatement::User(user) => CreatePlan::User {
                     name: user.username,
                     if_not_exists: user.if_not_exists,
@@ -482,6 +509,10 @@ impl ExecutionPlanBuilder {
                 byoridb_parser::ast::DropStatement::Tag(tag) => DropPlan::Tag {
                     name: tag.name,
                     if_exists: tag.if_exists,
+                },
+                byoridb_parser::ast::DropStatement::Class(class) => DropPlan::Class {
+                    name: class.name,
+                    if_exists: class.if_exists,
                 },
                 byoridb_parser::ast::DropStatement::Edge(edge) => DropPlan::Edge {
                     name: edge.name,

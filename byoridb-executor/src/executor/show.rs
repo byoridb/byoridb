@@ -11,6 +11,7 @@ impl Executor {
         match plan {
             crate::plan::ShowPlan::Spaces => self.execute_show_spaces().await,
             crate::plan::ShowPlan::Tags => self.execute_show_tags().await,
+            crate::plan::ShowPlan::Classes => self.execute_show_classes().await,
             crate::plan::ShowPlan::Edges => self.execute_show_edges().await,
             crate::plan::ShowPlan::TagIndexes => self.execute_show_tag_indexes().await,
             crate::plan::ShowPlan::EdgeIndexes => self.execute_show_edge_indexes().await,
@@ -504,6 +505,7 @@ impl Executor {
             crate::plan::DescribePlan::EdgeIndex(name) => {
                 self.execute_describe_index(&name, false).await
             }
+            crate::plan::DescribePlan::Class(name) => self.execute_describe_class(&name).await,
         }
     }
 

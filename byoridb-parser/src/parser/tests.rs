@@ -585,6 +585,60 @@ fn test_parse_drop_edge_index() {
     }
 }
 
+// ===== CLASS statements (O-3) =====
+
+#[test]
+fn test_parse_create_class_with_subclass_of() {
+    let result = parse("CREATE CLASS dog(breed STRING) SUBCLASS OF animal, pet");
+    assert!(result.is_ok(), "parse failed: {:?}", result);
+    match result.unwrap() {
+        Statement::Create(CreateStatement::Class(stmt)) => {
+            assert_eq!(stmt.name, "dog");
+            assert!(!stmt.if_not_exists);
+            assert_eq!(stmt.props.len(), 1);
+            assert_eq!(stmt.superclasses, vec!["animal", "pet"]);
+        }
+        s => panic!("Expected CreateClass, got {:?}", s),
+    }
+}
+
+#[test]
+fn test_parse_create_class_without_hierarchy() {
+    let result = parse("CREATE CLASS IF NOT EXISTS animal(name STRING)");
+    assert!(result.is_ok(), "parse failed: {:?}", result);
+    match result.unwrap() {
+        Statement::Create(CreateStatement::Class(stmt)) => {
+            assert_eq!(stmt.name, "animal");
+            assert!(stmt.if_not_exists);
+            assert!(stmt.superclasses.is_empty());
+        }
+        s => panic!("Expected CreateClass, got {:?}", s),
+    }
+}
+
+#[test]
+fn test_parse_drop_class() {
+    match parse("DROP CLASS IF EXISTS dog").unwrap() {
+        Statement::Drop(DropStatement::Class(stmt)) => {
+            assert_eq!(stmt.name, "dog");
+            assert!(stmt.if_exists);
+        }
+        s => panic!("Expected DropClass, got {:?}", s),
+    }
+}
+
+#[test]
+fn test_parse_show_classes_and_describe_class() {
+    assert!(matches!(
+        parse("SHOW CLASSES").unwrap(),
+        Statement::Show(ShowStatement::Classes)
+    ));
+    match parse("DESCRIBE CLASS dog").unwrap() {
+        Statement::Describe(DescribeStatement::Class(name)) => assert_eq!(name, "dog"),
+        s => panic!("Expected DescribeClass, got {:?}", s),
+    }
+}
+
 // ===== FIND PATH statements =====
 
 #[test]

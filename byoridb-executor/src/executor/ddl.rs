@@ -65,6 +65,15 @@ impl Executor {
                 if_not_exists,
                 props,
             } => self.handle_create_edge(name, if_not_exists, props).await,
+            crate::plan::CreatePlan::Class {
+                name,
+                if_not_exists,
+                props,
+                superclasses,
+            } => {
+                self.handle_create_class(name, if_not_exists, props, superclasses)
+                    .await
+            }
             crate::plan::CreatePlan::User {
                 name,
                 if_not_exists,
@@ -778,6 +787,21 @@ impl Executor {
                     }
                 }
 
+                // A class's tag must not be dropped out from under its
+                // hierarchy record — that would leave an orphan class.
+                if self
+                    .ctx
+                    .kvstore
+                    .get(&crate::key::SchemaKey::class(space, &name))
+                    .await?
+                    .is_some()
+                {
+                    return Err(ExecutionError::InvalidOperation(format!(
+                        "{} is a class; use DROP CLASS",
+                        name
+                    )));
+                }
+
                 // Delete tag
                 self.ctx.kvstore.delete(tag_key.as_bytes()).await?;
 
@@ -786,6 +810,9 @@ impl Executor {
                     rows: vec![],
                     latency_ms: 0,
                 })
+            }
+            crate::plan::DropPlan::Class { name, if_exists } => {
+                self.handle_drop_class(name, if_exists).await
             }
             crate::plan::DropPlan::Edge { name, if_exists } => {
                 let space = self.ctx.space.as_ref().ok_or_else(|| {

@@ -66,6 +66,8 @@ pub enum ShowStatement {
     Hosts,
     /// SHOW STATS — vertex/edge counts per type
     Stats,
+    /// SHOW CLASSES — ontology classes with their superclasses (O-3)
+    Classes,
     /// SHOW SESSIONS — active session list
     Sessions,
     /// SHOW CREATE TAG <name>
@@ -93,6 +95,8 @@ pub enum DescribeStatement {
     TagIndex(String),
     /// DESCRIBE EDGE INDEX <name>
     EdgeIndex(String),
+    /// DESCRIBE CLASS <name> — fields plus superclasses and full ancestors
+    Class(String),
 }
 
 /// USE statement
@@ -110,6 +114,18 @@ pub enum CreateStatement {
     TagIndex(CreateTagIndexStatement),
     EdgeIndex(CreateEdgeIndexStatement),
     User(CreateUserStatement),
+    /// `CREATE CLASS name(props) [SUBCLASS OF parent, ...]` — an ontology
+    /// class is a tag (instances are vertices carrying it) plus hierarchy
+    /// metadata (O-3 TBox).
+    Class(CreateClassStatement),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateClassStatement {
+    pub if_not_exists: bool,
+    pub name: String,
+    pub props: Vec<PropertySpec>,
+    pub superclasses: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -287,6 +303,15 @@ pub enum DropStatement {
     TagIndex(DropTagIndexStatement),
     EdgeIndex(DropEdgeIndexStatement),
     User(DropUserStatement),
+    /// `DROP CLASS [IF EXISTS] name` — removes the class metadata and its
+    /// tag definition. Rejected while subclasses exist (RESTRICT).
+    Class(DropClassStatement),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DropClassStatement {
+    pub if_exists: bool,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
