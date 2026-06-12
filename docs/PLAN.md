@@ -180,9 +180,40 @@ var-length 표시 확인)
 - **미해결(후속)**: Undirected 사용 데이터도 in-edge entry 필요(O-1 백필
   caveat 동일). per-path 행/edge list 바인딩은 Cypher 호환 필요 시 후속.
 
-**O-3 [P1] 클래스 계층 / TBox 모델링** ⬜ 미착수
-스키마를 "태그"가 아니라 "클래스 + subClassOf 관계"로 표현. 메타 서비스에
-클래스 계층 저장, `CREATE CLASS ... SUBCLASS OF ...` 류 DDL 설계.
+**O-3 [P1] 클래스 계층 / TBox 모델링** 🔶 설계 완료 (2026-06-12), 구현 미착수
+스키마를 "태그"가 아니라 "클래스 + subClassOf 관계"로 표현.
+
+*설계 결정 (2026-06-12):*
+- **D1. 클래스 = tag의 상위 호환(superset), 메타/스키마 평면.**
+  `CREATE CLASS dog(props...) [SUBCLASS OF animal[, pet]]`는 (1) 일반 tag
+  정의(`space:{space}:tag:dog`)를 그대로 기록하고 (2) 클래스 메타
+  `space:{space}:class:dog` → `{name, superclasses: [...]}`를 추가.
+  INSERT VERTEX / MATCH label / tag-vid 인덱스 / S-4 검증 전부 무변경
+  재사용. 기존 tag는 "계층 비참여 클래스"로 공존. (대안 기각: 별도
+  네임스페이스는 INSERT/MATCH/인덱스 중복 구현 필요.)
+- **D2. LDBC tag_class/is_subclass_of와 분리.** 그것은 사용자 데이터
+  평면(ABox 정점/엣지)이고 O-3는 스키마 평면(TBox). 데이터 레벨 계층
+  순회는 O-2 변길이 경로로 이미 가능(`-[:is_subclass_of*1..n]-`).
+  데이터 레벨 시맨틱(transitive 등)은 O-4의 edge-type 메타데이터 담당.
+- **D3. 저장/조회.** 다중 상속 허용(RDFS subClassOf 다중 가능). ancestors
+  = superclass 체인 walk(깊이 캡 16), descendants = `class:` prefix scan
+  후 메모리 역인덱스(클래스 수는 적음). 캐시는 index-def 영속화(OnceCell
+  lazy load) 패턴 재사용 — **graph 서비스가 쿼리마다 ctx를 새로 만들던
+  함정(2026-06-10 버그) 재발 주의.** standalone 우선: executor가
+  CREATE TAG와 동일하게 KV 직접 기록(분산 meta 연동은 G-2 이후).
+- **D4. DDL 표면.** `CREATE CLASS name(props) [SUBCLASS OF p1[, p2]]`
+  (+IF NOT EXISTS), `DROP CLASS [IF EXISTS]`(자식 존재 시 거부 RESTRICT),
+  `SHOW CLASSES`(name/superclasses), `DESCRIBE CLASS`(props+superclasses+
+  ancestors). ALTER CLASS(SUBCLASS 변경)는 1단계 보류.
+- **D5. 무결성.** SUBCLASS OF 부모는 *클래스*로 존재해야 함(tag 지정 시
+  에러 — tag는 계층 비참여). CREATE 시 ancestor walk로 사이클 거부
+  (자기참조 포함), 깊이 캡 초과 에러. DROP SPACE cleanup에 class 키 포함
+  (PR#9 DROP SPACE 선례).
+- **D6. 최소 회귀.** create/drop/duplicate/IF NOT EXISTS, subclass chain
+  ancestors, 다중 부모, 사이클 거부(직접+간접), 자식 있는 DROP 거부,
+  SHOW/DESCRIBE, CREATE CLASS 후 INSERT VERTEX·MATCH가 tag처럼 동작.
+- **O-7 연계(범위 외).** `MATCH (x:animal)`의 추론 포함 매칭(descendants
+  확장)은 O-5/O-7에서. O-3는 저장+DDL+introspection까지.
 
 **O-4 [P1] 시맨틱 관계 타입** ⬜ 미착수
 `subClassOf` / `subPropertyOf` / `transitiveProperty` / `inverseOf` /
