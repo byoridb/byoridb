@@ -1,13 +1,13 @@
-# Quick Start
+# 빠른 시작
 
-Get ByoriDB running in under 5 minutes.
+5분 안에 ByoriDB를 실행해 봅니다.
 
-## Prerequisites
+## 사전 요구사항
 
-- Rust 1.90+ (install via [rustup](https://rustup.rs/))
-- protobuf-compiler (for gRPC codegen)
+- Rust 1.90+ ([rustup](https://rustup.rs/)을 통해 설치)
+- protobuf-compiler (gRPC 코드 생성용)
 
-## Build from Source
+## 소스에서 빌드
 
 ```bash
 git clone https://github.com/byoridb/byoridb.git
@@ -15,27 +15,27 @@ cd byoridb
 cargo build --release
 ```
 
-## Start the Server
+## 서버 시작
 
-Run the standalone server (Meta + Storage + Graph services combined):
+독립 실행형 서버(Meta + Storage + Graph 서비스 통합)를 실행합니다:
 
 ```bash
 cargo run --bin byoridb-server --release
 ```
 
-The server starts on:
+서버는 다음에서 시작됩니다:
 - gRPC: `localhost:9669`
 - HTTP: `localhost:19669`
 
-## Connect with CLI
+## CLI로 연결
 
-In a new terminal:
+새 터미널에서:
 
 ```bash
 cargo run -p byoridb-client --bin byoridb-cli
 ```
 
-## Your First Graph
+## 첫 번째 그래프
 
 ```sql
 -- Create a space
@@ -62,8 +62,8 @@ GO FROM 1 OVER knows YIELD $$.person.name;
 FIND SHORTEST PATH FROM 1 TO 3 OVER knows;
 ```
 
-## Next Steps
+## 다음 단계
 
-- [Installation](./installation.md) - Detailed installation instructions
-- [Configuration](./configuration.md) - Configure ByoriDB for your needs
-- [nGQL Syntax](../guide/ngql-syntax.md) - Learn the query language
+- [설치](./installation.md) - 자세한 설치 안내
+- [설정](./configuration.md) - 필요에 맞게 ByoriDB 구성하기
+- [nGQL 문법](../guide/ngql-syntax.md) - 쿼리 언어 배우기

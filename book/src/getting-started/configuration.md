@@ -1,14 +1,14 @@
-# Configuration
+# 설정
 
-ByoriDB can be configured via command-line arguments or configuration files.
+ByoriDB는 명령줄 인자 또는 설정 파일을 통해 구성할 수 있습니다.
 
-## Command-Line Options
+## 명령줄 옵션
 
-### Server
+### 서버
 
-The server reads `byoridb.toml` and `BYORIDB__...` environment variables.
+서버는 `byoridb.toml`과 `BYORIDB__...` 환경변수를 읽습니다.
 
-### CLI Options
+### CLI 옵션
 
 ```bash
 byoridb-cli [OPTIONS]
@@ -20,9 +20,9 @@ Options:
   --execute <QUERY>      Execute a single query and exit
 ```
 
-## Configuration File
+## 설정 파일
 
-Create a `byoridb.toml` file:
+`byoridb.toml` 파일을 생성합니다:
 
 ```toml
 [server]
@@ -34,26 +34,26 @@ storage_addr = "0.0.0.0:44500"
 data_paths = ["/var/lib/byoridb/storage"]
 ```
 
-## Environment Variables
+## 환경변수
 
-| Variable | Description | Default |
+| 변수 | 설명 | 기본값 |
 |----------|-------------|---------|
-| `BYORIDB__SERVER__GRAPH_ADDR` | gRPC listen address | `0.0.0.0:9669` |
-| `BYORIDB__SERVER__HTTP_ADDR` | HTTP listen address | `0.0.0.0:19669` |
-| `BYORIDB__SERVER__STORAGE_ADDR` | Storage service listen address | `0.0.0.0:44500` |
-| `BYORIDB__STORAGE__DATA_PATHS` | Storage data paths | `data/storage` |
-| `BYORIDB_ROOT_PASSWORD` | Root user password | Generated and logged once if unset |
-| `BYORIDB_USER` | CLI username | none |
-| `BYORIDB_PASSWORD` | CLI password | none |
+| `BYORIDB__SERVER__GRAPH_ADDR` | gRPC 수신 주소 | `0.0.0.0:9669` |
+| `BYORIDB__SERVER__HTTP_ADDR` | HTTP 수신 주소 | `0.0.0.0:19669` |
+| `BYORIDB__SERVER__STORAGE_ADDR` | 스토리지 서비스 수신 주소 | `0.0.0.0:44500` |
+| `BYORIDB__STORAGE__DATA_PATHS` | 스토리지 데이터 경로 | `data/storage` |
+| `BYORIDB_ROOT_PASSWORD` | Root 사용자 비밀번호 | 설정하지 않으면 생성되어 한 번만 로그에 출력됨 |
+| `BYORIDB_USER` | CLI 사용자명 | 없음 |
+| `BYORIDB_PASSWORD` | CLI 비밀번호 | 없음 |
 
-## Root User
+## Root 사용자
 
-The `root` user is always created. Set `BYORIDB_ROOT_PASSWORD` before startup
-to use a known password. Without it, the server logs a generated password once.
+`root` 사용자는 항상 생성됩니다. 알려진 비밀번호를 사용하려면 시작 전에
+`BYORIDB_ROOT_PASSWORD`를 설정하세요. 설정하지 않으면 서버가 생성된 비밀번호를 한 번 로그에 출력합니다.
 
-## Directory Structure
+## 디렉터리 구조
 
-After starting the server:
+서버를 시작한 후:
 
 ```
 data/
@@ -62,11 +62,11 @@ data/
 └── wal/           # Write-ahead logs
 ```
 
-## Performance Tuning
+## 성능 튜닝
 
-### Memory Settings
+### 메모리 설정
 
-For high-performance workloads:
+고성능 워크로드의 경우:
 
 ```toml
 [storage]
@@ -75,18 +75,18 @@ write_buffer_size = "128MB"
 max_write_buffer_number = 4
 ```
 
-### Compression
+### 압축
 
-Enable compression to reduce disk usage:
+디스크 사용량을 줄이려면 압축을 활성화합니다:
 
 ```toml
 [storage]
 compression = "lz4"  # Options: none, snappy, lz4, zstd
 ```
 
-## Logging
+## 로깅
 
-ByoriDB uses structured logging. Configure log output:
+ByoriDB는 구조적 로깅(structured logging)을 사용합니다. 로그 출력을 설정하려면:
 
 ```bash
 # JSON format

@@ -1,6 +1,6 @@
-# Space Management
+# 스페이스 관리
 
-A **Space** is a logical container for graph data (similar to a database in RDBMS).
+**스페이스(Space)**는 그래프 데이터를 위한 논리적 컨테이너입니다(RDBMS의 데이터베이스와 유사).
 
 ## CREATE SPACE
 
@@ -10,8 +10,8 @@ CREATE SPACE my_graph (vid_type = INT64);
 CREATE SPACE IF NOT EXISTS my_graph (vid_type = INT64);
 ```
 
-**Parameters:**
-- `vid_type`: Vertex ID type. Currently supports `INT64`.
+**매개변수:**
+- `vid_type`: 버텍스 ID 타입. 현재 `INT64`를 지원합니다.
 
 ## USE SPACE
 

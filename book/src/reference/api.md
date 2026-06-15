@@ -1,26 +1,26 @@
-# API Reference
+# API 레퍼런스
 
-ByoriDB provides gRPC and HTTP APIs.
+ByoriDB는 gRPC와 HTTP API를 제공합니다.
 
-## Connection
+## 연결
 
-### Default Ports
+### 기본 포트
 
-| Service | gRPC Port | HTTP Port |
+| 서비스 | gRPC 포트 | HTTP 포트 |
 |---------|-----------|-----------|
 | Graph | 9669 | 19669 |
 | Meta | 9559 | - |
 | Storage | 9779 | - |
 
-### Authentication
+### 인증
 
-ByoriDB creates a `root` superuser on startup. Set `BYORIDB_ROOT_PASSWORD`
-before starting the server to make the password stable across restarts. If the
-variable is absent, the server generates a random password and logs it once.
+ByoriDB는 시작 시 `root` 슈퍼유저를 생성합니다. 재시작 후에도 비밀번호를 동일하게
+유지하려면 서버를 시작하기 전에 `BYORIDB_ROOT_PASSWORD`를 설정하세요. 이 변수가
+없으면 서버가 무작위 비밀번호를 생성하고 한 번 로그에 출력합니다.
 
 ## gRPC API
 
-### Service Definition
+### 서비스 정의
 
 ```protobuf
 service GraphService {
@@ -40,7 +40,7 @@ message ExecuteResponse {
 }
 ```
 
-### Client Connection
+### 클라이언트 연결
 
 ```rust
 use byoridb_client::Client;
@@ -54,25 +54,25 @@ let mut client = Client::connect(
 let result = client.execute("SHOW SPACES").await?;
 ```
 
-### Session Management
+### 세션 관리
 
-Sessions are created during authentication. The Rust client manages the session
-ID internally after `Client::connect`.
+세션은 인증 중에 생성됩니다. Rust 클라이언트는 `Client::connect` 이후 세션 ID를
+내부적으로 관리합니다.
 
 ## HTTP API
 
-### Endpoints
+### 엔드포인트
 
-| Endpoint | Method | Description |
+| 엔드포인트 | 메서드 | 설명 |
 |----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/metrics` | GET | Prometheus metrics |
-| `/api/v1/session` | POST | Create authenticated session |
-| `/api/v1/session/{id}` | DELETE | Close session |
-| `/api/v1/query` | POST | Execute query |
-| `/api/v1/query/json` | POST | Execute query and return JSON |
+| `/health` | GET | 헬스 체크 |
+| `/metrics` | GET | Prometheus 지표 |
+| `/api/v1/session` | POST | 인증된 세션 생성 |
+| `/api/v1/session/{id}` | DELETE | 세션 종료 |
+| `/api/v1/query` | POST | 쿼리 실행 |
+| `/api/v1/query/json` | POST | 쿼리를 실행하고 JSON 반환 |
 
-### Create Session
+### 세션 생성
 
 ```bash
 curl -X POST http://localhost:19669/api/v1/session \
@@ -83,7 +83,7 @@ curl -X POST http://localhost:19669/api/v1/session \
   }'
 ```
 
-### Execute Query
+### 쿼리 실행
 
 ```bash
 curl -X POST http://localhost:19669/api/v1/query \
@@ -94,7 +94,7 @@ curl -X POST http://localhost:19669/api/v1/query \
   }'
 ```
 
-Response:
+응답:
 
 ```json
 {
@@ -103,7 +103,7 @@ Response:
 }
 ```
 
-### Health Check
+### 헬스 체크
 
 ```bash
 curl http://localhost:19669/health
@@ -112,7 +112,7 @@ curl http://localhost:19669/health
 OK
 ```
 
-### Metrics
+### 지표(Metrics)
 
 ```bash
 curl http://localhost:19669/metrics
@@ -124,30 +124,30 @@ byoridb_query_total{type="read"} 1234
 byoridb_query_total{type="write"} 567
 ```
 
-## Error Codes
+## 에러 코드
 
-| Code | Name | Description |
+| 코드 | 이름 | 설명 |
 |------|------|-------------|
-| 0 | SUCCEEDED | Operation successful |
-| -1 | E_DISCONNECTED | Client disconnected |
-| -2 | E_FAIL_TO_CONNECT | Connection failed |
-| -3 | E_RPC_FAILURE | RPC error |
-| -4 | E_SESSION_INVALID | Invalid session |
-| -5 | E_SESSION_TIMEOUT | Session expired |
-| -6 | E_SYNTAX_ERROR | Query syntax error |
-| -7 | E_SEMANTIC_ERROR | Query semantic error |
-| -8 | E_EXECUTION_ERROR | Query execution failed |
-| -9 | E_SPACE_NOT_FOUND | Space not found |
-| -10 | E_TAG_NOT_FOUND | Tag not found |
-| -11 | E_EDGE_NOT_FOUND | Edge type not found |
-| -12 | E_VERTEX_NOT_FOUND | Vertex not found |
-| -13 | E_INDEX_NOT_FOUND | Index not found |
-| -14 | E_USER_NOT_FOUND | User not found |
-| -15 | E_BAD_USERNAME_PASSWORD | Authentication failed |
+| 0 | SUCCEEDED | 작업 성공 |
+| -1 | E_DISCONNECTED | 클라이언트 연결 끊김 |
+| -2 | E_FAIL_TO_CONNECT | 연결 실패 |
+| -3 | E_RPC_FAILURE | RPC 오류 |
+| -4 | E_SESSION_INVALID | 유효하지 않은 세션 |
+| -5 | E_SESSION_TIMEOUT | 세션 만료 |
+| -6 | E_SYNTAX_ERROR | 쿼리 구문 오류 |
+| -7 | E_SEMANTIC_ERROR | 쿼리 의미 오류 |
+| -8 | E_EXECUTION_ERROR | 쿼리 실행 실패 |
+| -9 | E_SPACE_NOT_FOUND | Space를 찾을 수 없음 |
+| -10 | E_TAG_NOT_FOUND | Tag를 찾을 수 없음 |
+| -11 | E_EDGE_NOT_FOUND | Edge 타입을 찾을 수 없음 |
+| -12 | E_VERTEX_NOT_FOUND | Vertex를 찾을 수 없음 |
+| -13 | E_INDEX_NOT_FOUND | Index를 찾을 수 없음 |
+| -14 | E_USER_NOT_FOUND | 사용자를 찾을 수 없음 |
+| -15 | E_BAD_USERNAME_PASSWORD | 인증 실패 |
 
-## Data Types
+## 데이터 타입
 
-### Protocol Buffer Types
+### Protocol Buffer 타입
 
 ```protobuf
 message Value {
@@ -182,9 +182,9 @@ message Edge {
 }
 ```
 
-### JSON Types
+### JSON 타입
 
-| nGQL Type | JSON Type |
+| nGQL 타입 | JSON 타입 |
 |-----------|-----------|
 | BOOL | boolean |
 | INT8/16/32/64 | number |
@@ -195,18 +195,18 @@ message Edge {
 | LIST | array |
 | MAP | object |
 
-## Rate Limiting
+## 속도 제한(Rate Limiting)
 
-Default limits:
+기본 제한값:
 
-| Limit | Value |
+| 제한 항목 | 값 |
 |-------|-------|
-| Max connections per IP | 100 |
-| Max queries per second | 1000 |
-| Max query size | 4 MB |
-| Query timeout | 300 seconds |
+| IP당 최대 연결 수 | 100 |
+| 초당 최대 쿼리 수 | 1000 |
+| 최대 쿼리 크기 | 4 MB |
+| 쿼리 타임아웃 | 300초 |
 
-Configure limits:
+제한값 설정:
 
 ```toml
 [limits]

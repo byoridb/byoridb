@@ -1,20 +1,20 @@
-# Deployment
+# 배포
 
-Guide for deploying ByoriDB in production environments.
+프로덕션 환경에 ByoriDB를 배포하기 위한 가이드입니다.
 
-## Deployment Modes
+## 배포 모드
 
-### Standalone Mode
+### 단독(Standalone) 모드
 
-All services in a single process - suitable for development and testing:
+모든 서비스가 단일 프로세스에서 실행됩니다 — 개발 및 테스트에 적합합니다:
 
 ```bash
 byoridb-server --data-dir /var/lib/byoridb
 ```
 
-### Distributed Mode
+### 분산(Distributed) 모드
 
-Separate services for production scalability:
+프로덕션 확장성을 위해 서비스를 분리합니다:
 
 ```bash
 # Meta Service (1-3 nodes for HA)
@@ -27,11 +27,11 @@ byoridb-storage --config /etc/byoridb/storage.toml
 byoridb --config /etc/byoridb/graph.toml
 ```
 
-## Hardware Recommendations
+## 하드웨어 권장 사양
 
 ### Meta Service
 
-| Component | Minimum | Recommended |
+| 구성 요소 | 최소 | 권장 |
 |-----------|---------|-------------|
 | CPU | 2 cores | 4 cores |
 | Memory | 4 GB | 8 GB |
@@ -39,7 +39,7 @@ byoridb --config /etc/byoridb/graph.toml
 
 ### Storage Service
 
-| Component | Minimum | Recommended |
+| 구성 요소 | 최소 | 권장 |
 |-----------|---------|-------------|
 | CPU | 4 cores | 8+ cores |
 | Memory | 8 GB | 32+ GB |
@@ -47,13 +47,13 @@ byoridb --config /etc/byoridb/graph.toml
 
 ### Graph Service
 
-| Component | Minimum | Recommended |
+| 구성 요소 | 최소 | 권장 |
 |-----------|---------|-------------|
 | CPU | 4 cores | 8+ cores |
 | Memory | 4 GB | 16 GB |
-| Disk | Minimal | Minimal |
+| Disk | 최소 | 최소 |
 
-## Docker Deployment
+## Docker 배포
 
 ### Docker Compose
 
@@ -91,15 +91,15 @@ volumes:
   storage-data:
 ```
 
-Start with:
+다음 명령으로 시작합니다:
 
 ```bash
 docker-compose up -d
 ```
 
-## Kubernetes Deployment
+## Kubernetes 배포
 
-### Basic StatefulSet
+### 기본 StatefulSet
 
 ```yaml
 apiVersion: apps/v1
@@ -135,7 +135,7 @@ spec:
           storage: 100Gi
 ```
 
-## Configuration for Production
+## 프로덕션 설정
 
 ### Meta Service
 
@@ -181,9 +181,9 @@ addrs = ["meta1:9559", "meta2:9559", "meta3:9559"]
 addrs = ["storage1:9779", "storage2:9779", "storage3:9779"]
 ```
 
-## Security
+## 보안
 
-### TLS Configuration
+### TLS 설정
 
 ```toml
 [tls]
@@ -193,26 +193,25 @@ key_file = "/etc/byoridb/server.key"
 ca_file = "/etc/byoridb/ca.crt"
 ```
 
-### Authentication
+### 인증
 
-Set the root password before startup and store it in your deployment secret
-manager:
+시작 전에 root 비밀번호를 설정하고 배포 시크릿 매니저에 저장하세요:
 
 ```bash
 export BYORIDB_ROOT_PASSWORD='strong-password'
 ```
 
-Create application users with nGQL after connecting as `root`.
+`root`로 접속한 후 nGQL로 애플리케이션 사용자를 생성하세요.
 
-## Health Checks
+## 헬스 체크
 
-### HTTP Health Endpoint
+### HTTP 헬스 엔드포인트
 
 ```bash
 curl http://localhost:19669/health
 ```
 
-### gRPC Health Check
+### gRPC 헬스 체크
 
 ```bash
 grpc_health_probe -addr=localhost:9669

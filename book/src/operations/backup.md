@@ -1,12 +1,12 @@
-# Backup & Restore
+# 백업 및 복원
 
-Protect your data with regular backups.
+정기적인 백업으로 데이터를 보호하세요.
 
-## Backup Methods
+## 백업 방법
 
-### Snapshot Backup
+### 스냅샷 백업
 
-Create consistent point-in-time snapshots:
+일관된 특정 시점(point-in-time) 스냅샷을 생성합니다:
 
 ```bash
 # Create snapshot of all spaces
@@ -16,9 +16,9 @@ byoridb-admin backup snapshot --output /backup/snapshot_$(date +%Y%m%d)
 byoridb-admin backup snapshot --space my_space --output /backup/my_space_backup
 ```
 
-### Incremental Backup
+### 증분 백업
 
-Back up changes since last backup:
+마지막 백업 이후 변경된 내용을 백업합니다:
 
 ```bash
 # First full backup
@@ -28,9 +28,9 @@ byoridb-admin backup full --output /backup/full
 byoridb-admin backup incremental --base /backup/full --output /backup/incr_1
 ```
 
-### Continuous Backup (WAL Archiving)
+### 연속 백업 (WAL 아카이빙)
 
-Archive write-ahead logs for point-in-time recovery:
+특정 시점 복구를 위해 write-ahead log를 아카이빙합니다:
 
 ```toml
 [backup]
@@ -39,21 +39,21 @@ wal_archive_path = "/backup/wal"
 wal_archive_interval_secs = 60
 ```
 
-## Backup Storage
+## 백업 저장소
 
-### Local Disk
+### 로컬 디스크
 
 ```bash
 byoridb-admin backup snapshot --output /mnt/backup/byoridb
 ```
 
-### Cloud Storage (S3)
+### 클라우드 스토리지 (S3)
 
 ```bash
 byoridb-admin backup snapshot --output s3://bucket/byoridb/backup
 ```
 
-Required environment variables:
+필요한 환경변수:
 
 ```bash
 export AWS_ACCESS_KEY_ID=your_key
@@ -61,9 +61,9 @@ export AWS_SECRET_ACCESS_KEY=your_secret
 export AWS_REGION=us-west-2
 ```
 
-## Restore
+## 복원
 
-### From Snapshot
+### 스냅샷에서 복원
 
 ```bash
 # Stop the service first
@@ -76,7 +76,7 @@ byoridb-admin restore --input /backup/snapshot_20240115 --data-dir /var/lib/byor
 systemctl start byoridb
 ```
 
-### Point-in-Time Recovery
+### 특정 시점 복구 (Point-in-Time Recovery)
 
 ```bash
 # Restore to specific point in time
@@ -87,7 +87,7 @@ byoridb-admin restore \
   --data-dir /var/lib/byoridb
 ```
 
-### Restore Specific Space
+### 특정 space 복원
 
 ```bash
 byoridb-admin restore \
@@ -96,9 +96,9 @@ byoridb-admin restore \
   --data-dir /var/lib/byoridb
 ```
 
-## Backup Schedule
+## 백업 스케줄
 
-### Using Cron
+### Cron 사용
 
 ```bash
 # /etc/cron.d/byoridb-backup
@@ -113,7 +113,7 @@ byoridb-admin restore \
 0 4 * * * root find /backup/daily -mtime +30 -delete
 ```
 
-### Backup Script
+### 백업 스크립트
 
 ```bash
 #!/bin/bash
@@ -139,9 +139,9 @@ find "${BACKUP_DIR}" -maxdepth 1 -mtime +${RETENTION_DAYS} -type d -exec rm -rf 
 echo "Backup completed: ${BACKUP_DIR}/${DATE}"
 ```
 
-## Verification
+## 검증
 
-Always verify backups:
+항상 백업을 검증하세요:
 
 ```bash
 # Verify backup integrity
@@ -151,28 +151,28 @@ byoridb-admin backup verify --input /backup/snapshot_20240115
 byoridb-admin backup list --input /backup/snapshot_20240115
 ```
 
-## Best Practices
+## 모범 사례
 
-1. **Regular Testing**: Periodically restore backups to a test environment
-2. **Off-site Storage**: Keep backups in a different location than primary data
-3. **Encryption**: Encrypt backups containing sensitive data
-4. **Monitoring**: Alert on backup failures
-5. **Documentation**: Document recovery procedures and test them
+1. **정기적인 테스트**: 주기적으로 테스트 환경에 백업을 복원해 보세요
+2. **오프사이트 저장**: 백업을 주 데이터와 다른 위치에 보관하세요
+3. **암호화**: 민감한 데이터가 포함된 백업은 암호화하세요
+4. **모니터링**: 백업 실패 시 알림을 설정하세요
+5. **문서화**: 복구 절차를 문서화하고 테스트하세요
 
-## Disaster Recovery
+## 재해 복구
 
-### Recovery Time Objective (RTO)
+### 복구 시간 목표 (RTO)
 
-| Method | Typical RTO |
+| 방법 | 일반적인 RTO |
 |--------|-------------|
-| Snapshot restore | Minutes |
-| Point-in-time recovery | Minutes to hours |
-| Full + incremental | Hours |
+| 스냅샷 복원 | 수 분 |
+| 특정 시점 복구 | 수 분에서 수 시간 |
+| 전체 + 증분 | 수 시간 |
 
-### Recovery Point Objective (RPO)
+### 복구 시점 목표 (RPO)
 
-| Method | Typical RPO |
+| 방법 | 일반적인 RPO |
 |--------|-------------|
-| Continuous WAL archive | Seconds |
-| Hourly snapshots | 1 hour |
-| Daily snapshots | 24 hours |
+| 연속 WAL 아카이브 | 수 초 |
+| 시간별 스냅샷 | 1시간 |
+| 일별 스냅샷 | 24시간 |

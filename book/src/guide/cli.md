@@ -1,8 +1,8 @@
-# CLI Usage
+# CLI 사용법
 
-The ByoriDB CLI provides an interactive shell for executing queries.
+ByoriDB CLI는 쿼리를 실행할 수 있는 대화형 셸을 제공합니다.
 
-## Starting the CLI
+## CLI 시작하기
 
 ```bash
 # Connect to local server
@@ -15,19 +15,19 @@ byoridb-cli --addr 192.168.1.100:9669
 byoridb-cli --user root --password mypassword
 ```
 
-## CLI Commands
+## CLI 명령어
 
-### Connection Commands
+### 연결 명령어
 
-| Command | Description |
+| 명령어 | 설명 |
 |---------|-------------|
-| `:help` | Show help message |
-| `:quit` or `:exit` | Exit the CLI |
-| `:clear` | Clear the screen |
+| `:help` | 도움말 메시지 표시 |
+| `:quit` 또는 `:exit` | CLI 종료 |
+| `:clear` | 화면 지우기 |
 
-### Execution
+### 실행
 
-Type nGQL statements and press Enter to execute:
+nGQL 문을 입력하고 Enter를 눌러 실행합니다:
 
 ```
 (root@localhost:9669) > CREATE SPACE test(vid_type=INT64);
@@ -40,9 +40,9 @@ Switched to space `test`
 Empty set
 ```
 
-### Multi-line Statements
+### 여러 줄 문
 
-For long queries, end lines with `\` to continue:
+긴 쿼리의 경우, 줄 끝에 `\`를 붙여 이어 입력합니다:
 
 ```
 (root@localhost:9669) [test] > INSERT VERTEX person(name, age) VALUES \
@@ -51,9 +51,9 @@ For long queries, end lines with `\` to continue:
 Execution succeeded
 ```
 
-### Query Results
+### 쿼리 결과
 
-Results are displayed in a table format:
+결과는 표 형식으로 표시됩니다:
 
 ```
 (root@localhost:9669) [test] > FETCH PROP ON person 1;
@@ -65,37 +65,37 @@ Results are displayed in a table format:
 1 row in set
 ```
 
-## Session Management
+## 세션 관리
 
-### Current Space
+### 현재 스페이스
 
-The current space is shown in the prompt:
+현재 스페이스는 프롬프트에 표시됩니다:
 
 ```
 (root@localhost:9669) [my_space] >
 ```
 
-### Switch Space
+### 스페이스 전환
 
 ```sql
 USE another_space;
 ```
 
-## Tips
+## 팁
 
-1. **Tab Completion**: Press Tab for keyword completion
-2. **History**: Use Up/Down arrows to navigate command history
-3. **Semicolons**: Optional at end of statements
-4. **Comments**: Use `--` for single-line comments
+1. **탭 자동완성**: Tab을 눌러 키워드를 자동완성합니다
+2. **히스토리**: 위/아래 화살표로 명령어 히스토리를 탐색합니다
+3. **세미콜론**: 문 끝에서 선택 사항입니다
+4. **주석**: 한 줄 주석에는 `--`를 사용합니다
 
 ```sql
 -- This is a comment
 CREATE TAG person(name STRING);  -- inline comment
 ```
 
-## Non-Interactive Mode
+## 비대화형 모드
 
-Execute queries from command line:
+명령줄에서 쿼리를 실행합니다:
 
 ```bash
 # Single query
@@ -110,14 +110,14 @@ done < queries.ngql
 byoridb-cli --addr remote.server:9669 --execute "SHOW SPACES;"
 ```
 
-## Output
+## 출력
 
 ```bash
 # Results are printed as tables in interactive mode.
 byoridb-cli
 ```
 
-## Error Messages
+## 오류 메시지
 
 ```
 (root@localhost:9669) [test] > SELECT * FROM person;

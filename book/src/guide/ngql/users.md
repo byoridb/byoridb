@@ -1,18 +1,18 @@
-# User Management
+# 사용자 관리
 
-ByoriDB provides role-based access control (RBAC) for managing users and permissions.
+ByoriDB는 사용자와 권한을 관리하기 위한 역할 기반 접근 제어(RBAC)를 제공합니다.
 
-## Users
+## 사용자
 
 ### CREATE USER
 
-Create a new user with a password and optional role:
+비밀번호와 선택적 역할을 지정하여 새 사용자를 생성합니다:
 
 ```sql
 CREATE USER <username> WITH PASSWORD '<password>' [ROLE <role>];
 ```
 
-**Examples:**
+**예시:**
 
 ```sql
 -- Create user without specifying a role (no roles assigned by default)
@@ -27,13 +27,13 @@ CREATE USER IF NOT EXISTS charlie WITH PASSWORD 'mypass';
 
 ### ALTER USER
 
-Change a user's password:
+사용자의 비밀번호를 변경합니다:
 
 ```sql
 ALTER USER <username> WITH PASSWORD '<new_password>';
 ```
 
-**Examples:**
+**예시:**
 
 ```sql
 ALTER USER alice WITH PASSWORD 'newsecure456';
@@ -41,53 +41,53 @@ ALTER USER alice WITH PASSWORD 'newsecure456';
 
 ### DROP USER
 
-Delete a user:
+사용자를 삭제합니다:
 
 ```sql
 DROP USER <username>;
 DROP USER IF EXISTS <username>;
 ```
 
-**Examples:**
+**예시:**
 
 ```sql
 DROP USER alice;
 DROP USER IF EXISTS bob;
 ```
 
-> **Note:** The `root` user cannot be deleted.
+> **참고:** `root` 사용자는 삭제할 수 없습니다.
 
-> **Note:** SHOW USERS is not yet implemented.
+> **참고:** SHOW USERS는 아직 구현되지 않았습니다.
 
-## Roles
+## 역할
 
-ByoriDB has five built-in roles with different permission levels:
+ByoriDB에는 서로 다른 권한 수준을 가진 다섯 가지 기본 제공 역할이 있습니다:
 
-| Role    | Permissions                              | Description           |
+| 역할    | 권한                                     | 설명                  |
 |---------|------------------------------------------|-----------------------|
-| GOD     | All                                      | Superuser (root only) |
-| ADMIN   | Read, Write, Create, Delete, Alter, Drop | Full administrator    |
-| DBA     | Read, Write, Create, Alter               | Database administrator|
-| USER    | Read, Write                              | Standard user         |
-| GUEST   | Read                                     | Read-only access      |
+| GOD     | All                                      | 슈퍼유저 (root 전용)  |
+| ADMIN   | Read, Write, Create, Delete, Alter, Drop | 전체 관리자           |
+| DBA     | Read, Write, Create, Alter               | 데이터베이스 관리자   |
+| USER    | Read, Write                              | 표준 사용자           |
+| GUEST   | Read                                     | 읽기 전용 접근        |
 
-### Permission Types
+### 권한 종류
 
-- **Read**: Query data (FETCH, GO, MATCH, LOOKUP)
-- **Write**: Modify data (INSERT, UPDATE, DELETE vertex/edge)
-- **Create**: Create schemas (CREATE SPACE/TAG/EDGE)
-- **Alter**: Modify schemas (ALTER TAG/EDGE)
-- **Drop**: Drop schemas (DROP SPACE/TAG/EDGE)
+- **Read**: 데이터 쿼리 (FETCH, GO, MATCH, LOOKUP)
+- **Write**: 데이터 수정 (INSERT, UPDATE, DELETE vertex/edge)
+- **Create**: 스키마 생성 (CREATE SPACE/TAG/EDGE)
+- **Alter**: 스키마 수정 (ALTER TAG/EDGE)
+- **Drop**: 스키마 삭제 (DROP SPACE/TAG/EDGE)
 
 ### GRANT ROLE
 
-Assign a role to a user:
+사용자에게 역할을 부여합니다:
 
 ```sql
 GRANT ROLE <role> TO <username>;
 ```
 
-**Examples:**
+**예시:**
 
 ```sql
 GRANT ROLE ADMIN TO alice;
@@ -97,39 +97,39 @@ GRANT ROLE GUEST TO viewer;
 
 ### REVOKE ROLE
 
-Remove a role from a user:
+사용자로부터 역할을 회수합니다:
 
 ```sql
 REVOKE ROLE <role> FROM <username>;
 ```
 
-**Examples:**
+**예시:**
 
 ```sql
 REVOKE ROLE ADMIN FROM alice;
 REVOKE ROLE USER FROM bob;
 ```
 
-> **Note:** SHOW ROLES is not yet implemented.
+> **참고:** SHOW ROLES는 아직 구현되지 않았습니다.
 
-## Default User
+## 기본 사용자
 
-ByoriDB creates a default superuser on first startup:
+ByoriDB는 첫 시작 시 기본 슈퍼유저를 생성합니다:
 
-- **Username:** `root`
-- **Password:** The value of `BYORIDB_ROOT_PASSWORD`, or a generated password logged once at startup
-- **Role:** `GOD`
+- **사용자 이름:** `root`
+- **비밀번호:** `BYORIDB_ROOT_PASSWORD`의 값, 또는 시작 시 한 번 로그에 기록되는 생성된 비밀번호
+- **역할:** `GOD`
 
-> **Security Warning:** Set `BYORIDB_ROOT_PASSWORD` from a secret manager or protected environment before production startup.
+> **보안 경고:** 프로덕션 시작 전에 시크릿 매니저나 보호된 환경에서 `BYORIDB_ROOT_PASSWORD`를 설정하세요.
 
 ```sql
 ALTER USER root WITH PASSWORD 'your_secure_password';
 ```
 
-## Best Practices
+## 모범 사례
 
-1. **Set the root password explicitly** - Provide `BYORIDB_ROOT_PASSWORD` before startup
-2. **Principle of least privilege** - Grant users only the minimum permissions they need
-3. **Use ADMIN sparingly** - Reserve ADMIN role for database administrators
-4. **Use GUEST for read-only access** - Perfect for reporting and analytics users
-5. **Regular audits** - Periodically review user accounts and roles to ensure appropriate permissions
+1. **root 비밀번호를 명시적으로 설정** - 시작 전에 `BYORIDB_ROOT_PASSWORD`를 제공하세요
+2. **최소 권한 원칙** - 사용자에게 필요한 최소한의 권한만 부여하세요
+3. **ADMIN은 아껴서 사용** - ADMIN 역할은 데이터베이스 관리자에게만 부여하세요
+4. **읽기 전용 접근에는 GUEST 사용** - 리포팅 및 분석 사용자에게 적합합니다
+5. **정기적인 감사** - 사용자 계정과 역할을 주기적으로 검토하여 적절한 권한을 유지하세요

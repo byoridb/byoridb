@@ -1,19 +1,19 @@
-# Performance
+# 성능
 
-Performance characteristics and tuning guidelines.
+성능 특성 및 튜닝 가이드라인입니다.
 
-## Benchmarks
+## 벤치마크
 
-### Test Environment
+### 테스트 환경
 
 - CPU: 8-core AMD EPYC
 - Memory: 32 GB
 - Storage: NVMe SSD
 - Dataset: 10M vertices, 100M edges
 
-### Query Performance
+### 쿼리 성능
 
-| Query Type | p50 | p95 | p99 |
+| 쿼리 유형 | p50 | p95 | p99 |
 |------------|-----|-----|-----|
 | FETCH single vertex | 0.2ms | 0.5ms | 1ms |
 | FETCH batch (100) | 2ms | 5ms | 10ms |
@@ -22,21 +22,21 @@ Performance characteristics and tuning guidelines.
 | MATCH simple | 5ms | 15ms | 30ms |
 | LOOKUP indexed | 1ms | 3ms | 5ms |
 
-### Throughput
+### 처리량(Throughput)
 
-| Operation | Single Node | 3-Node Cluster |
+| 작업 | 단일 노드 | 3노드 클러스터 |
 |-----------|-------------|----------------|
 | Point reads | 50K QPS | 150K QPS |
 | Point writes | 20K QPS | 15K QPS |
 | Mixed workload | 30K QPS | 80K QPS |
 
-## Tuning Guidelines
+## 튜닝 가이드라인
 
-### Memory Tuning
+### 메모리 튜닝
 
 #### Block Cache
 
-Increase for read-heavy workloads:
+읽기 중심 워크로드에서는 늘리세요.
 
 ```toml
 [storage]
@@ -45,7 +45,7 @@ block_cache_size = "4GB"  # 25% of available memory
 
 #### Write Buffer
 
-Increase for write-heavy workloads:
+쓰기 중심 워크로드에서는 늘리세요.
 
 ```toml
 [storage]
@@ -53,9 +53,9 @@ write_buffer_size = "128MB"
 max_write_buffer_number = 4
 ```
 
-### Query Tuning
+### 쿼리 튜닝
 
-#### Use Indexes
+#### 인덱스 사용
 
 ```sql
 -- Without index: full scan
@@ -66,7 +66,7 @@ CREATE TAG INDEX name_idx ON person(name);
 LOOKUP ON person WHERE person.name == 'Alice';
 ```
 
-#### Limit Results
+#### 결과 제한
 
 ```sql
 -- Avoid unbounded queries
@@ -76,7 +76,7 @@ MATCH (n:person) RETURN n;          -- May return millions
 MATCH (n:person) RETURN n LIMIT 100;
 ```
 
-#### Use FETCH for Known VIDs
+#### 알려진 VID에는 FETCH 사용
 
 ```sql
 -- If you know the vertex ID, use FETCH
@@ -86,11 +86,11 @@ FETCH PROP ON person 1;
 MATCH (n:person) WHERE id(n) == 1 RETURN n;
 ```
 
-### Storage Tuning
+### 스토리지 튜닝
 
-#### Compression
+#### 압축(Compression)
 
-Trade CPU for disk space:
+CPU를 소비하는 대신 디스크 공간을 절약합니다.
 
 ```toml
 [storage]
@@ -100,7 +100,7 @@ compression = "lz4"  # Good balance
 
 #### Compaction
 
-Tune for workload:
+워크로드에 맞게 조정하세요.
 
 ```toml
 [storage]
@@ -111,9 +111,9 @@ max_background_compactions = 4
 target_file_size_base = "32MB"
 ```
 
-### Network Tuning
+### 네트워크 튜닝
 
-#### Connection Pooling
+#### 커넥션 풀링
 
 ```toml
 [client]
@@ -121,7 +121,7 @@ connection_pool_size = 10
 connection_timeout_ms = 5000
 ```
 
-#### Batch Operations
+#### 배치 작업
 
 ```sql
 -- Instead of individual inserts
@@ -135,9 +135,9 @@ INSERT VERTEX person VALUES
     3:('Carol', 28);
 ```
 
-## Profiling
+## 프로파일링
 
-### Query Profiling
+### 쿼리 프로파일링
 
 ```sql
 PROFILE {
@@ -145,7 +145,7 @@ PROFILE {
 }
 ```
 
-Output:
+출력:
 ```
 +------------------+----------+-------+
 | Operator         | Time(ms) | Rows  |
@@ -156,7 +156,7 @@ Output:
 Total: 2.8ms
 ```
 
-### Explain Plan
+### 실행 계획 설명(Explain Plan)
 
 ```sql
 EXPLAIN {
@@ -166,30 +166,30 @@ EXPLAIN {
 }
 ```
 
-## Monitoring Performance
+## 성능 모니터링
 
-Key metrics to watch:
+주시해야 할 주요 지표:
 
-- `byoridb_query_latency_seconds` - Query latency
-- `byoridb_storage_bytes` - Storage usage
-- `byoridb_partition_hotspot_ratio` - Partition skew
+- `byoridb_query_latency_seconds` - 쿼리 지연 시간
+- `byoridb_storage_bytes` - 스토리지 사용량
+- `byoridb_partition_hotspot_ratio` - 파티션 편향(skew)
 
-## Common Issues
+## 자주 발생하는 문제
 
-### High Latency
+### 높은 지연 시간
 
-1. Check cache hit ratio (should be >90%)
-2. Look for full scans (use EXPLAIN)
-3. Verify indexes exist for query patterns
+1. 캐시 적중률 확인 (90% 이상이어야 함)
+2. full scan 여부 확인 (EXPLAIN 사용)
+3. 쿼리 패턴에 맞는 인덱스가 존재하는지 검증
 
-### Low Throughput
+### 낮은 처리량
 
-1. Check CPU utilization
-2. Verify connection pool size
-3. Use batch operations
+1. CPU 사용률 확인
+2. 커넥션 풀 크기 검증
+3. 배치 작업 사용
 
-### High Disk Usage
+### 높은 디스크 사용량
 
-1. Enable compression
-2. Check for old snapshots
-3. Verify compaction is running
+1. 압축 활성화
+2. 오래된 스냅샷 확인
+3. compaction이 동작 중인지 검증

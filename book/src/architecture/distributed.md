@@ -1,16 +1,16 @@
-# Distributed System
+# 분산 시스템
 
-ByoriDB is designed for distributed deployment with high availability.
+ByoriDB는 고가용성을 갖춘 분산 배포를 위해 설계되었습니다.
 
-## Raft Consensus
+## Raft 합의
 
-Each partition uses the Raft protocol for:
+각 파티션은 다음을 위해 Raft 프로토콜을 사용합니다.
 
-- **Leader Election**: Automatic failover when leader fails
-- **Log Replication**: All writes go through leader and replicate to followers
-- **Consistency**: Strong consistency within each partition
+- **Leader Election**: 리더 장애 시 자동 페일오버(failover)
+- **Log Replication**: 모든 쓰기는 리더를 거쳐 팔로워로 복제됨
+- **Consistency**: 각 파티션 내에서 강한 일관성(strong consistency) 보장
 
-### Raft States
+### Raft 상태
 
 ```
 ┌─────────┐  timeout   ┌───────────┐  majority vote  ┌────────┐
@@ -23,7 +23,7 @@ Each partition uses the Raft protocol for:
      └────────────────────────────────────────────────────┘
 ```
 
-### Configuration
+### 설정
 
 ```toml
 [raft]
@@ -33,15 +33,15 @@ snapshot_interval = 10000      # Entries before snapshot
 max_log_entries = 100000       # Max log entries to keep
 ```
 
-## Partitioning
+## 파티셔닝
 
-Data is distributed across partitions using VID-based hashing:
+데이터는 VID 기반 해싱을 사용해 여러 파티션에 분산됩니다.
 
 ```
 partition_id = hash(vid) % num_partitions
 ```
 
-### Partition Configuration
+### 파티션 설정
 
 ```sql
 CREATE SPACE my_space(
@@ -51,12 +51,12 @@ CREATE SPACE my_space(
 );
 ```
 
-| Parameter | Description | Recommendation |
+| 파라미터 | 설명 | 권장값 |
 |-----------|-------------|----------------|
-| `partition_num` | Number of partitions | 10-100 per machine |
-| `replica_factor` | Copies of each partition | 3 for production |
+| `partition_num` | 파티션 개수 | 머신당 10-100 |
+| `replica_factor` | 각 파티션의 복제본 수 | 프로덕션에서는 3 |
 
-### Partition Distribution
+### 파티션 분포
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -75,78 +75,78 @@ CREATE SPACE my_space(
 └──────────────────────────────────────────────────────────┘
 ```
 
-## Replication
+## 복제(Replication)
 
-### Write Replication
+### 쓰기 복제
 
-1. Client sends write to Graph Service
-2. Graph Service routes to partition leader
-3. Leader appends to Raft log
-4. Leader replicates to followers
-5. Once majority acknowledges, commit
-6. Apply to redb and respond
+1. 클라이언트가 Graph Service로 쓰기 요청을 보냄
+2. Graph Service가 파티션 리더로 라우팅
+3. 리더가 Raft log에 추가(append)
+4. 리더가 팔로워로 복제
+5. 과반수(majority)가 확인하면 commit
+6. redb에 적용하고 응답
 
-### Read Options
+### 읽기 옵션
 
-| Mode | Consistency | Performance |
+| 모드 | 일관성 | 성능 |
 |------|-------------|-------------|
-| Leader | Strong | Lower |
-| Follower | Eventual | Higher |
+| Leader | 강함(Strong) | 낮음 |
+| Follower | 최종적(Eventual) | 높음 |
 
-## Failure Handling
+## 장애 처리
 
-### Leader Failure
+### 리더 장애
 
-1. Followers detect missing heartbeats
-2. Election timeout triggers new election
-3. New leader elected (requires majority)
-4. Service resumes with new leader
+1. 팔로워가 heartbeat 누락을 감지
+2. election timeout이 새 선거를 트리거
+3. 새 리더 선출 (과반수 필요)
+4. 새 리더와 함께 서비스 재개
 
-**Recovery time:** ~2-3 election timeouts
+**복구 시간:** election timeout의 약 2-3배
 
-### Follower Failure
+### 팔로워 장애
 
-1. Leader detects follower is down
-2. Continues serving with remaining replicas
-3. When follower recovers, catches up via log
-4. If too far behind, snapshot transfer
+1. 리더가 팔로워의 다운을 감지
+2. 남은 복제본으로 계속 서비스
+3. 팔로워가 복구되면 log를 통해 따라잡음(catch up)
+4. 너무 많이 뒤처진 경우 snapshot 전송
 
-### Network Partition
+### 네트워크 분할(Network Partition)
 
-- Partition with majority continues serving
-- Minority partition becomes read-only
-- Automatic recovery when network heals
+- 과반수를 가진 파티션은 계속 서비스
+- 소수(minority) 파티션은 읽기 전용(read-only)이 됨
+- 네트워크가 복구되면 자동으로 복구
 
-## Cluster Management
+## 클러스터 관리
 
-### Adding Nodes
+### 노드 추가
 
 ```bash
 # Start new storage node
 byoridb-storage --join cluster-addr:port
 ```
 
-The cluster automatically:
-1. Assigns partitions to new node
-2. Rebalances data
-3. Updates partition map
+클러스터는 자동으로 다음을 수행합니다.
+1. 새 노드에 파티션 할당
+2. 데이터 리밸런싱
+3. 파티션 맵 갱신
 
-### Removing Nodes
+### 노드 제거
 
 ```bash
 # Graceful removal
 byoridb-admin node remove <node-id>
 ```
 
-1. Migrate partitions to other nodes
-2. Wait for replication to complete
-3. Remove from cluster
+1. 다른 노드로 파티션 마이그레이션
+2. 복제 완료를 대기
+3. 클러스터에서 제거
 
-### Monitoring
+### 모니터링
 
-Key metrics to monitor:
+모니터링해야 할 주요 지표:
 
-- `raft_leader_changes` - Leadership changes
-- `raft_log_entries` - Log size
-- `partition_status` - Per-partition health
-- `replication_lag` - Follower delay
+- `raft_leader_changes` - 리더십 변경
+- `raft_log_entries` - 로그 크기
+- `partition_status` - 파티션별 상태
+- `replication_lag` - 팔로워 지연

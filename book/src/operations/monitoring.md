@@ -1,48 +1,48 @@
-# Monitoring
+# 모니터링
 
-Monitor ByoriDB for performance and health.
+성능과 상태를 위해 ByoriDB를 모니터링하세요.
 
-## Metrics Endpoint
+## 메트릭 엔드포인트
 
-ByoriDB exposes Prometheus-compatible metrics:
+ByoriDB는 Prometheus 호환 메트릭을 노출합니다:
 
 ```bash
 curl http://localhost:19669/metrics
 ```
 
-## Key Metrics
+## 주요 메트릭
 
-### Query Metrics
+### 쿼리 메트릭
 
-| Metric | Type | Description |
+| 메트릭 | 타입 | 설명 |
 |--------|------|-------------|
-| `byoridb_query_total` | Counter | Total queries executed |
-| `byoridb_query_latency_seconds` | Histogram | Query latency |
-| `byoridb_query_errors_total` | Counter | Failed queries |
+| `byoridb_query_total` | Counter | 실행된 전체 쿼리 수 |
+| `byoridb_query_latency_seconds` | Histogram | 쿼리 지연 시간 |
+| `byoridb_query_errors_total` | Counter | 실패한 쿼리 수 |
 
-### Storage Metrics
+### 스토리지 메트릭
 
-| Metric | Type | Description |
+| 메트릭 | 타입 | 설명 |
 |--------|------|-------------|
-| `byoridb_storage_bytes` | Gauge | Total storage used |
+| `byoridb_storage_bytes` | Gauge | 사용 중인 전체 스토리지 |
 
-### Partition Metrics
+### 파티션 메트릭
 
-| Metric | Type | Description |
+| 메트릭 | 타입 | 설명 |
 |--------|------|-------------|
-| `byoridb_partition_requests_total` | Counter | Partition requests |
-| `byoridb_partition_hotspot_ratio` | Gauge | Hotspot ratio |
-| `byoridb_partition_count` | Gauge | Partition count |
-| `byoridb_partition_leader_count` | Gauge | Leader partition count |
+| `byoridb_partition_requests_total` | Counter | 파티션 요청 수 |
+| `byoridb_partition_hotspot_ratio` | Gauge | 핫스팟 비율 |
+| `byoridb_partition_count` | Gauge | 파티션 개수 |
+| `byoridb_partition_leader_count` | Gauge | 리더 파티션 개수 |
 
-### Session Metrics
+### 세션 메트릭
 
-| Metric | Type | Description |
+| 메트릭 | 타입 | 설명 |
 |--------|------|-------------|
-| `byoridb_active_connections` | Gauge | Active connections |
-| `byoridb_active_sessions` | Gauge | Active sessions |
+| `byoridb_active_connections` | Gauge | 활성 연결 수 |
+| `byoridb_active_sessions` | Gauge | 활성 세션 수 |
 
-## Prometheus Configuration
+## Prometheus 설정
 
 ```yaml
 # prometheus.yml
@@ -56,34 +56,34 @@ scrape_configs:
     scrape_interval: 15s
 ```
 
-## Grafana Dashboard
+## Grafana 대시보드
 
-Import the ByoriDB dashboard:
+ByoriDB 대시보드를 가져옵니다:
 
-1. Go to Grafana → Dashboards → Import
-2. Enter dashboard ID or upload JSON
-3. Select Prometheus data source
+1. Grafana → Dashboards → Import으로 이동합니다
+2. 대시보드 ID를 입력하거나 JSON을 업로드합니다
+3. Prometheus 데이터 소스를 선택합니다
 
-### Essential Panels
+### 필수 패널
 
-**Query Performance:**
-- Query rate (queries/sec)
-- Query latency (p50, p95, p99)
-- Error rate
+**쿼리 성능:**
+- 쿼리 처리율 (queries/sec)
+- 쿼리 지연 시간 (p50, p95, p99)
+- 오류율
 
-**Storage Health:**
-- Disk usage
-- Cache hit ratio
-- Compaction status
+**스토리지 상태:**
+- 디스크 사용량
+- 캐시 적중률
+- 컴팩션 상태
 
-**Cluster Status:**
-- Leader distribution
-- Replication lag
-- Node status
+**클러스터 상태:**
+- 리더 분포
+- 복제 지연(replication lag)
+- 노드 상태
 
-## Alerting
+## 알림(Alerting)
 
-### Prometheus Alert Rules
+### Prometheus 알림 규칙
 
 ```yaml
 # alerts.yml
@@ -123,9 +123,9 @@ groups:
           summary: "Error rate exceeds 1%"
 ```
 
-## Logging
+## 로깅
 
-### Log Configuration
+### 로그 설정
 
 ```toml
 [logging]
@@ -134,17 +134,17 @@ format = "json"          # json or text
 output = "/var/log/byoridb/byoridb.log"
 ```
 
-### Log Levels
+### 로그 레벨
 
-| Level | Use Case |
+| 레벨 | 사용 사례 |
 |-------|----------|
-| error | Failures requiring attention |
-| warn | Potential issues |
-| info | Normal operations |
-| debug | Troubleshooting |
-| trace | Detailed debugging |
+| error | 조치가 필요한 장애 |
+| warn | 잠재적 문제 |
+| info | 정상 운영 |
+| debug | 문제 해결 |
+| trace | 상세 디버깅 |
 
-### Structured Logging
+### 구조화된 로깅
 
 ```json
 {
@@ -158,7 +158,7 @@ output = "/var/log/byoridb/byoridb.log"
 }
 ```
 
-## Health Checks
+## 헬스 체크
 
 ### Liveness Probe
 
@@ -172,7 +172,7 @@ curl -f http://localhost:19669/health/live
 curl -f http://localhost:19669/health/ready
 ```
 
-### Kubernetes Probes
+### Kubernetes Probe
 
 ```yaml
 livenessProbe:
@@ -190,9 +190,9 @@ readinessProbe:
   periodSeconds: 5
 ```
 
-## Tracing
+## 트레이싱
 
-Enable distributed tracing with Jaeger:
+Jaeger로 분산 트레이싱을 활성화합니다:
 
 ```toml
 [tracing]

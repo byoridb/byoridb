@@ -1,16 +1,16 @@
-# Quick Start Guide
+# 빠른 시작 가이드
 
-This guide will help you get ByoriDB up and running.
+이 가이드는 ByoriDB를 설치하고 실행하는 데 도움을 줍니다.
 
-## Prerequisites
+## 사전 요구사항
 
-- **Rust**: Latest stable version (install via [rustup](https://rustup.rs/))
-- **Linux/macOS**: Windows is not currently supported
-- No C++ build tools required — storage is pure-Rust (redb)
+- **Rust**: 최신 stable 버전 ([rustup](https://rustup.rs/)을 통해 설치)
+- **Linux/macOS**: Windows는 현재 지원하지 않습니다
+- C++ 빌드 도구가 필요 없습니다 — 스토리지는 순수 Rust(redb)로 구현되었습니다
 
-## 1. Build and Run
+## 1. 빌드 및 실행
 
-Clone and build the project:
+프로젝트를 클론하고 빌드합니다:
 
 ```bash
 git clone https://github.com/byoridb/byoridb.git
@@ -18,49 +18,49 @@ cd byoridb
 cargo build --release
 ```
 
-Start the standalone server (includes Meta, Storage, and Graph services):
+독립 실행형 서버(Meta, Storage, Graph 서비스 포함)를 시작합니다:
 
 ```bash
 export BYORIDB_ROOT_PASSWORD='change-me-before-production'
 cargo run --release --bin byoridb-server
 ```
 
-Default ports:
+기본 포트:
 - **gRPC**: 9669
 - **HTTP**: 19669
 
-## 2. Connect with CLI Client
+## 2. CLI 클라이언트로 연결하기
 
 ```bash
-# In a new terminal
+# 새 터미널에서
 export BYORIDB_USER=root
 export BYORIDB_PASSWORD='change-me-before-production'
 cargo run -p byoridb-client --bin byoridb-cli
 ```
 
-ByoriDB always creates the `root` user. The root password comes from
-`BYORIDB_ROOT_PASSWORD`; if it is not set, the server generates a random
-password and logs it once at startup.
+ByoriDB는 항상 `root` 사용자를 생성합니다. root 비밀번호는
+`BYORIDB_ROOT_PASSWORD`에서 가져오며, 설정되지 않은 경우 서버가 무작위
+비밀번호를 생성하여 시작 시 한 번 로그에 기록합니다.
 
-## 3. Basic Queries (CLI)
+## 3. 기본 쿼리 (CLI)
 
-Once connected, try running the following nGQL queries:
+연결되면 다음 nGQL 쿼리를 실행해 보세요:
 
-### Create Space
+### Space 생성
 
 ```sql
 CREATE SPACE my_space(partition_num=10, replica_factor=1, vid_type=INT64);
 USE my_space;
 ```
 
-### Define Schema
+### 스키마 정의
 
 ```sql
 CREATE TAG person(name STRING, age INT64);
 CREATE EDGE follow(degree INT64);
 ```
 
-### Insert Data
+### 데이터 삽입
 
 ```sql
 INSERT VERTEX person(name, age) VALUES 100:('Tom', 20);
@@ -68,7 +68,7 @@ INSERT VERTEX person(name, age) VALUES 101:('Jerry', 22);
 INSERT EDGE follow(degree) VALUES 100->101:(95);
 ```
 
-### Query Data
+### 데이터 조회
 
 ```sql
 FETCH PROP ON person 100;
@@ -78,16 +78,16 @@ LOOKUP ON person WHERE person.age > 20;
 
 ## 4. HTTP REST API
 
-You can also use the HTTP API directly:
+HTTP API를 직접 사용할 수도 있습니다:
 
-### Health Check
+### 헬스 체크
 
 ```bash
 curl http://localhost:19669/health
 # OK
 ```
 
-### Create Session
+### 세션 생성
 
 ```bash
 curl -X POST http://localhost:19669/api/v1/session \
@@ -96,25 +96,25 @@ curl -X POST http://localhost:19669/api/v1/session \
 # {"session_id":1,"time_zone":"UTC"}
 ```
 
-### Execute Query
+### 쿼리 실행
 
 ```bash
-# Create space
+# Space 생성
 curl -X POST http://localhost:19669/api/v1/query \
   -H "Content-Type: application/json" \
   -d '{"session_id": 1, "query": "CREATE SPACE test(partition_num=10, replica_factor=1)"}'
 
-# Use space
+# Space 사용
 curl -X POST http://localhost:19669/api/v1/query \
   -H "Content-Type: application/json" \
   -d '{"session_id": 1, "query": "USE test"}'
 
-# Create tag
+# Tag 생성
 curl -X POST http://localhost:19669/api/v1/query \
   -H "Content-Type: application/json" \
   -d '{"session_id": 1, "query": "CREATE TAG person(name STRING, age INT64)"}'
 
-# Insert vertex
+# Vertex 삽입
 curl -X POST http://localhost:19669/api/v1/query \
   -H "Content-Type: application/json" \
   -d '{"session_id": 1, "query": "INSERT VERTEX person(name, age) VALUES 1:(\"Alice\", 30)"}'
@@ -125,25 +125,25 @@ curl -X POST http://localhost:19669/api/v1/query \
   -d '{"session_id": 1, "query": "LOOKUP ON person"}'
 ```
 
-### Prometheus Metrics
+### Prometheus 메트릭
 
 ```bash
 curl http://localhost:19669/metrics
 ```
 
-## 5. Configuration
+## 5. 설정
 
-### Environment Variables
+### 환경 변수
 
-| Variable | Default | Description |
+| 변수 | 기본값 | 설명 |
 |----------|---------|-------------|
-| `BYORIDB__SERVER__GRAPH_ADDR` | `0.0.0.0:9669` | gRPC server address |
-| `BYORIDB__SERVER__HTTP_ADDR` | `0.0.0.0:19669` | HTTP server address |
-| `BYORIDB__STORAGE__DATA_PATHS` | `data/storage` | Data directory |
+| `BYORIDB__SERVER__GRAPH_ADDR` | `0.0.0.0:9669` | gRPC 서버 주소 |
+| `BYORIDB__SERVER__HTTP_ADDR` | `0.0.0.0:19669` | HTTP 서버 주소 |
+| `BYORIDB__STORAGE__DATA_PATHS` | `data/storage` | 데이터 디렉터리 |
 
-### Config File
+### 설정 파일
 
-Create `byoridb.toml`:
+`byoridb.toml`을 생성합니다:
 
 ```toml
 [server]
@@ -154,15 +154,15 @@ http_addr = "0.0.0.0:19669"
 data_paths = ["data/storage"]
 ```
 
-Run with config:
+설정과 함께 실행합니다:
 
 ```bash
 cargo run --release --bin byoridb-server
 ```
 
-## 6. Backup and Restore
+## 6. 백업 및 복원
 
-### Create Backup
+### 백업 생성
 
 ```bash
 cargo run --release --bin byoridb-backup -- create \
@@ -171,7 +171,7 @@ cargo run --release --bin byoridb-backup -- create \
   --label "daily"
 ```
 
-### Restore Backup
+### 백업 복원
 
 ```bash
 cargo run --release --bin byoridb-backup -- restore \
@@ -180,8 +180,8 @@ cargo run --release --bin byoridb-backup -- restore \
   --target /path/to/restore
 ```
 
-## Next Steps
+## 다음 단계
 
-- Read [Architecture Overview](book/src/architecture/overview.md) to understand how it works
-- Check [nGQL Syntax](book/src/guide/ngql-syntax.md) for complete query reference
-- See [Contributing](CONTRIBUTING.md) to help improve the project
+- [아키텍처 개요](book/src/architecture/overview.md)를 읽고 동작 방식을 이해하세요
+- 전체 쿼리 레퍼런스는 [nGQL 문법](book/src/guide/ngql-syntax.md)을 확인하세요
+- 프로젝트 개선에 참여하려면 [기여하기](CONTRIBUTING.md)를 참고하세요

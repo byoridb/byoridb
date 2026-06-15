@@ -1,16 +1,16 @@
-# Data Query
+# 데이터 쿼리
 
-Query and traverse your graph data.
+그래프 데이터를 쿼리하고 순회합니다.
 
 ## FETCH PROP
 
-Retrieve properties of specific vertices:
+특정 버텍스의 속성을 조회합니다:
 
 ```sql
 FETCH PROP ON <tag_name> <vid> [, <vid>, ...];
 ```
 
-**Examples:**
+**예시:**
 
 ```sql
 -- Single vertex
@@ -23,9 +23,9 @@ FETCH PROP ON person 1, 2, 3;
 FETCH PROP ON * 1;
 ```
 
-## GO (Graph Traversal)
+## GO (그래프 순회)
 
-Traverse the graph following edges:
+엣지를 따라 그래프를 순회합니다:
 
 ```sql
 GO FROM <vid> [, <vid>, ...]
@@ -34,7 +34,7 @@ OVER <edge_name> [, <edge_name>, ...]
 [YIELD <expression> [AS <alias>], ...];
 ```
 
-**Basic traversal:**
+**기본 순회:**
 
 ```sql
 -- Find who user 1 follows
@@ -47,7 +47,7 @@ GO FROM 1 OVER follow, knows;
 GO FROM 1 OVER follow REVERSELY;
 ```
 
-**Multi-hop traversal:**
+**멀티홉 순회:**
 
 ```sql
 -- 2-hop traversal
@@ -57,7 +57,7 @@ GO 2 STEPS FROM 1 OVER follow;
 GO 1 TO 3 STEPS FROM 1 OVER follow;
 ```
 
-**With YIELD:**
+**YIELD 사용:**
 
 ```sql
 GO FROM 1 OVER follow
@@ -67,17 +67,17 @@ GO FROM 1 OVER purchase
 YIELD properties(edge).quantity AS qty, properties(edge).price AS price;
 ```
 
-**Special variables:**
+**특수 변수:**
 
-| Variable | Description |
+| 변수 | 설명 |
 |----------|-------------|
-| `$$` | Destination vertex |
-| `$^` | Source vertex |
-| `$-` | Input from pipe |
+| `$$` | 대상 버텍스 |
+| `$^` | 출발 버텍스 |
+| `$-` | 파이프로부터의 입력 |
 
-## MATCH (Pattern Matching)
+## MATCH (패턴 매칭)
 
-Cypher-style pattern matching:
+Cypher 스타일의 패턴 매칭:
 
 ```sql
 MATCH <pattern>
@@ -87,7 +87,7 @@ RETURN <expression> [AS <alias>], ...
 [LIMIT <n>];
 ```
 
-**Find vertices:**
+**버텍스 찾기:**
 
 ```sql
 -- All persons
@@ -100,7 +100,7 @@ MATCH (n:person) WHERE n.age > 25 RETURN n.name, n.age;
 MATCH (n:person) RETURN n LIMIT 10;
 ```
 
-**Find paths:**
+**경로 찾기:**
 
 ```sql
 -- One-hop
@@ -118,9 +118,9 @@ WHERE a.name = 'Alice'
 RETURN b.name;
 ```
 
-## LOOKUP (Index Query)
+## LOOKUP (인덱스 쿼리)
 
-Query vertices or edges using indexes:
+인덱스를 사용하여 버텍스나 엣지를 쿼리합니다:
 
 ```sql
 LOOKUP ON <tag_name|edge_name>
@@ -128,7 +128,7 @@ LOOKUP ON <tag_name|edge_name>
 [YIELD <expression>, ...];
 ```
 
-**Examples:**
+**예시:**
 
 ```sql
 -- Find by indexed property
@@ -145,11 +145,11 @@ WHERE follow.since > 1609459200
 YIELD src(edge), dst(edge);
 ```
 
-> **Note:** LOOKUP requires an index on the queried property.
+> **참고:** LOOKUP은 쿼리 대상 속성에 인덱스가 필요합니다.
 
 ## FIND PATH
 
-Find paths between vertices:
+버텍스 사이의 경로를 찾습니다:
 
 ```sql
 FIND SHORTEST PATH FROM <src_vid> TO <dst_vid> OVER <edge_name>;
@@ -157,7 +157,7 @@ FIND SHORTEST PATH FROM <src_vid> TO <dst_vid> OVER <edge_name> WEIGHT BY <prope
 FIND ALL PATH FROM <src_vid> TO <dst_vid> OVER <edge_name>;
 ```
 
-**Examples:**
+**예시:**
 
 ```sql
 -- Shortest path
@@ -173,9 +173,9 @@ FIND ALL PATH FROM 1 TO 100 OVER follow UPTO 5 STEPS;
 FIND SHORTEST PATH FROM 1 TO 100 OVER follow, knows;
 ```
 
-## Aggregations
+## 집계
 
-Use with YIELD or RETURN:
+YIELD 또는 RETURN과 함께 사용합니다:
 
 ```sql
 -- Count
@@ -189,9 +189,9 @@ WHERE n.age > 20
 RETURN avg(n.age), max(n.age), min(n.age);
 ```
 
-## Combining Queries (Pipe)
+## 쿼리 결합 (파이프)
 
-Chain queries with pipe operator:
+파이프 연산자로 쿼리를 연결합니다:
 
 ```sql
 GO FROM 1 OVER follow YIELD dst(edge) AS id

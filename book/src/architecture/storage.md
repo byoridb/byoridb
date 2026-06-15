@@ -1,12 +1,12 @@
-# Storage Engine
+# 스토리지 엔진
 
-ByoriDB uses **redb**, a pure-Rust embedded key-value store, as its underlying
-storage engine. There is no C++ toolchain dependency.
+ByoriDB는 순수 Rust로 구현된 임베디드 키-값 저장소인 **redb**를 기반
+스토리지 엔진으로 사용합니다. C++ 툴체인 의존성이 없습니다.
 
-## redb Architecture
+## redb 아키텍처
 
-redb is a single-file, copy-on-write **B-tree** store with full ACID
-transactions and MVCC — not an LSM tree.
+redb는 단일 파일 기반의 copy-on-write **B-tree** 저장소로, 완전한 ACID
+트랜잭션과 MVCC를 지원합니다. LSM 트리가 아닙니다.
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -23,47 +23,48 @@ transactions and MVCC — not an LSM tree.
 └─────────────────────────────────────────────┘
 ```
 
-All rows live in a single redb table (`"kv"`) keyed by raw bytes; prefix scans
-are range queries over that ordered keyspace.
+모든 행(row)은 원시 바이트(raw bytes)를 키로 하는 단일 redb 테이블(`"kv"`)에
+저장되며, prefix scan은 정렬된 키 공간(keyspace)에 대한 범위 쿼리로 처리됩니다.
 
-## Key Encoding
+## 키 인코딩
 
-### Vertex Key
+### Vertex 키
 
 ```
 [space_id:4][partition:4][tag_id:4][vid:8]
 ```
 
-### Edge Key
+### Edge 키
 
 ```
 [space_id:4][partition:4][edge_type:4][src_vid:8][rank:8][dst_vid:8]
 ```
 
-### Value Encoding
+### 값 인코딩
 
 ```
 [schema_version:4][null_bitmap:N][field_values:...]
 ```
 
-The schema version enables lazy migration for online schema changes.
+schema version은 온라인 스키마 변경 시 지연(lazy) 마이그레이션을 가능하게 합니다.
 
-## Performance Tuning
+## 성능 튜닝
 
-redb exposes a small surface. The main knob is the page cache size:
+redb는 노출하는 설정 표면이 작습니다. 주요 조정 항목은 page cache 크기입니다.
 
 ```toml
 [storage]
 cache_size = "256MB"  # redb page cache; increase for read-heavy workloads
 ```
 
-Durability is `Immediate` by default — every commit is fsynced and checksummed,
-giving crash safety without a separate write-ahead log. (redb has no LSM
-memtable/bloom-filter/compression knobs; those were RocksDB-specific.)
+내구성(Durability)은 기본값이 `Immediate`로, 모든 commit이 fsync되고 체크섬으로
+검증되어 별도의 write-ahead log 없이도 크래시 안전성을 제공합니다. (redb에는 LSM의
+memtable/bloom-filter/compression 조정 항목이 없습니다. 그것들은 RocksDB 고유의
+기능이었습니다.)
 
-## Data Layout
+## 데이터 레이아웃
 
-### Vertex Storage
+### Vertex 저장
 
 ```
 Tag Data:
@@ -73,9 +74,9 @@ Tag Data:
 └─────────────────────────────────────────────┘
 ```
 
-### Edge Storage
+### Edge 저장
 
-Edges are stored in both directions for efficient traversal:
+효율적인 탐색(traversal)을 위해 Edge는 양방향으로 저장됩니다.
 
 ```
 Out-Edge:
@@ -91,7 +92,7 @@ In-Edge (for reverse traversal):
 └─────────────────────────────────────────────┘
 ```
 
-### Index Storage
+### Index 저장
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -100,9 +101,9 @@ In-Edge (for reverse traversal):
 └─────────────────────────────────────────────┘
 ```
 
-## Schema Version Handling
+## 스키마 버전 처리
 
-For online schema changes, the storage layer handles multiple schema versions:
+온라인 스키마 변경을 위해 스토리지 계층은 여러 스키마 버전을 처리합니다.
 
 ```
 Read Path:
@@ -117,20 +118,20 @@ Read Path:
    - Return data
 ```
 
-This lazy migration approach:
-- No downtime during schema changes
-- Rows updated on next write
-- Gradual migration over time
+이러한 지연(lazy) 마이그레이션 방식은:
+- 스키마 변경 중 다운타임 없음
+- 다음 쓰기 시점에 행이 갱신됨
+- 시간이 지나면서 점진적으로 마이그레이션됨
 
-## Space Reclamation
+## 공간 회수(Space Reclamation)
 
-redb has no LSM compaction. As a copy-on-write B-tree it tracks free pages and
-reuses them on subsequent writes automatically, so deleted keys' space is
-reclaimed without a background compaction process.
+redb에는 LSM compaction이 없습니다. copy-on-write B-tree이므로 free page를 추적하고
+이후 쓰기 시 자동으로 재사용하므로, 삭제된 키의 공간은 별도의 백그라운드 compaction
+프로세스 없이 회수됩니다.
 
-## Snapshots
+## 스냅샷
 
-Point-in-time consistent snapshots:
+특정 시점(point-in-time)의 일관된 스냅샷:
 
 ```bash
 # Create snapshot
@@ -143,5 +144,5 @@ byoridb-admin snapshot list
 byoridb-admin snapshot restore --id <snapshot_id>
 ```
 
-Snapshots are taken by opening a read transaction (an MVCC snapshot) on the
-single redb file and copying it into a self-contained backup file.
+스냅샷은 단일 redb 파일에 대해 읽기 트랜잭션(MVCC 스냅샷)을 열고 이를 독립적인
+백업 파일로 복사하여 생성됩니다.

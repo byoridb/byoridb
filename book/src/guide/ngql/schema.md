@@ -1,8 +1,8 @@
-# Schema Definition
+# 스키마 정의
 
-Define the structure of your graph with Tags (vertex types) and Edges.
+태그(버텍스 타입)와 엣지로 그래프의 구조를 정의합니다.
 
-## Tags (Vertex Types)
+## 태그 (버텍스 타입)
 
 ### CREATE TAG
 
@@ -13,7 +13,7 @@ CREATE TAG <tag_name> (
 );
 ```
 
-**Examples:**
+**예시:**
 
 ```sql
 CREATE TAG person(name STRING, age INT64);
@@ -28,13 +28,13 @@ CREATE TAG product(
 
 ### ALTER TAG
 
-Add new properties to existing tags (online schema change):
+기존 태그에 새 속성을 추가합니다(온라인 스키마 변경):
 
 ```sql
 ALTER TAG <tag_name> ADD (<property_name> <data_type> [NULL | DEFAULT <value>]);
 ```
 
-**Examples:**
+**예시:**
 
 ```sql
 -- Add nullable column
@@ -44,7 +44,7 @@ ALTER TAG person ADD (email STRING NULL);
 ALTER TAG player ADD (level INT64 DEFAULT 1);
 ```
 
-> **Note:** New columns must be either nullable (`NULL`) or have a default value. Existing vertices will return `NULL` or the default value for the new property.
+> **참고:** 새 컬럼은 nullable(`NULL`)이거나 기본값을 가져야 합니다. 기존 버텍스는 새 속성에 대해 `NULL` 또는 기본값을 반환합니다.
 
 ### SHOW TAGS
 
@@ -67,7 +67,7 @@ DROP TAG person;
 DROP TAG IF EXISTS person;
 ```
 
-## Edge Types
+## 엣지 타입
 
 ### CREATE EDGE
 
@@ -78,7 +78,7 @@ CREATE EDGE <edge_name> (
 );
 ```
 
-**Examples:**
+**예시:**
 
 ```sql
 CREATE EDGE knows();
@@ -92,13 +92,13 @@ CREATE EDGE purchase(
 
 ### ALTER EDGE
 
-Add new properties to existing edge types:
+기존 엣지 타입에 새 속성을 추가합니다:
 
 ```sql
 ALTER EDGE <edge_name> ADD (<property_name> <data_type> [NULL | DEFAULT <value>]);
 ```
 
-**Examples:**
+**예시:**
 
 ```sql
 ALTER EDGE follow ADD (weight DOUBLE NULL);
@@ -126,18 +126,18 @@ DROP EDGE knows;
 DROP EDGE IF EXISTS knows;
 ```
 
-## Indexes
+## 인덱스
 
 ### CREATE INDEX
 
-Create index for faster lookups:
+더 빠른 조회를 위해 인덱스를 생성합니다:
 
 ```sql
 CREATE TAG INDEX <index_name> ON <tag_name>(<property_name>);
 CREATE EDGE INDEX <index_name> ON <edge_name>(<property_name>);
 ```
 
-**Examples:**
+**예시:**
 
 ```sql
 CREATE TAG INDEX person_name_idx ON person(name);
@@ -158,9 +158,9 @@ DROP TAG INDEX <index_name>;
 DROP EDGE INDEX <index_name>;
 ```
 
-## Schema Best Practices
+## 스키마 모범 사례
 
-1. **Choose appropriate data types** - Use `INT64` for IDs, `STRING` for text, `DOUBLE` for decimals
-2. **Use defaults wisely** - Set sensible defaults to simplify inserts
-3. **Plan for schema evolution** - Use nullable columns for optional data
-4. **Create indexes** - Index frequently queried properties for performance
+1. **적절한 데이터 타입 선택** - ID에는 `INT64`, 텍스트에는 `STRING`, 소수에는 `DOUBLE`을 사용하세요
+2. **기본값을 현명하게 사용** - 합리적인 기본값을 설정하여 삽입을 단순화하세요
+3. **스키마 진화를 계획** - 선택적 데이터에는 nullable 컬럼을 사용하세요
+4. **인덱스 생성** - 성능을 위해 자주 쿼리하는 속성에 인덱스를 생성하세요
