@@ -344,12 +344,21 @@ embedding) 공통. 후보를 점수순 정렬 후, 방출 시 정점 디코드�
 통과분만 top-k 방출(`load_candidate_props` + `passes_filter`). 술어 평가 오류는
 해당 후보 드롭(쿼리 전체 실패 아님). **WHERE 없으면 정점 디코드 0 (R-1/R-2a
 핫패스 불변)**. 회귀: 파서 2(임베딩/neighbors WHERE) + 실행기 2(채널 필터
-full-pipeline·neighbors 필터). 한계: 필터는 *후보 vertex 속성*만 — 시드 상대
-비교(`channel != $seed.channel`)나 추론 포함 클래스 매칭(O-5/O-7)은 후속.
+full-pipeline·neighbors 필터).
+**시드 상대 비교 추가 (2026-06-16):** 시드 정점 속성을 `seed` 변수로 바인딩 →
+`WHERE channel != seed.channel`("시드와 다른 채널")처럼 값 하드코딩 없이 비교.
+`passes_filter`가 current=후보 + variable `seed`=시드 props로 EvalContext 구성.
+회귀 1(`embedding_seed_relative_filter_different_channel`). 한계(후속): 추론 포함
+클래스 매칭(`WHERE c IS-A ...`)은 O-5/O-7 선결.
+**caveat (리뷰 F-002):** 공유 evaluator의 bare-식별자 분기가 current에 없으면
+변수까지 폴백 → 후보에 *결측*인 prop을 bare로 참조하면 시드 값으로 해석될 수
+있음(명시 `seed.prop`는 결정적). evaluator는 GO/MATCH 공용이라 미수정(고위험).
+결측 prop을 항상 드롭하려면 single-id 폴백을 current-only로 좁히는 별도 정리 필요.
 
 **R-3b [P2] 재랭킹·점수 결합·온톨로지 제약** ⬜ 미착수
-벡터 점수 + 공유속성 가산점 결합, O-3 클래스 계층 인지 필터(`WHERE c IS-A ...`),
-시드 상대 비교. R-2b(HNSW)·O-5(추론)와 함께.
+벡터 점수 + 공유속성 가산점 결합, O-3 클래스 계층 인지 필터(`WHERE c IS-A ...`,
+추론 포함 매칭 — O-5 선결). R-2b(HNSW)·O-5(추론)와 함께. (시드 상대 비교는
+R-3a에서 선반영 완료.)
 
 ### S. 보안 강화 (P0, 즉시 — 2026-05-13 심층 분석 결과)
 

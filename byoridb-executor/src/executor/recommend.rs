@@ -133,14 +133,20 @@ impl Executor {
             return Ok(neighbors_result(scored));
         }
 
-        // R-3a filter: keep only candidates whose vertex satisfies the predicate.
+        // R-3a/R-3b filter: keep only candidates whose vertex satisfies the
+        // predicate. The seed's own properties are bound as `seed` so the
+        // predicate can compare against the source (e.g. `channel != seed.channel`).
+        let seed_props = self
+            .load_candidate_props(space, src_vid)
+            .await?
+            .unwrap_or_default();
         let mut out = Vec::new();
         for (vid, score, shared) in scored {
             if out.len() >= limit {
                 break;
             }
             if let Some(props) = self.load_candidate_props(space, vid).await? {
-                if passes_filter(filter, &props) {
+                if passes_filter(filter, &props, &seed_props) {
                     out.push((vid, score, shared));
                 }
             }
@@ -195,6 +201,16 @@ impl Executor {
         // Rank: cosine desc, then vid asc (deterministic).
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 
+        // Seed properties for seed-relative predicates (e.g. `channel != seed.channel`),
+        // loaded once. Only needed when a filter is present.
+        let seed_props = if filter.is_some() {
+            self.load_candidate_props(space, src_vid)
+                .await?
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
         // Emit top-k. Bounded by `limit` live+matching results, off the scan
         // hot path. No filter → lightweight existence check (a get, no decode),
         // preserving R-2a's hot path; with a filter → decode once for the
@@ -212,7 +228,7 @@ impl Executor {
                     .is_some()
             } else {
                 match self.load_candidate_props(space, vid).await? {
-                    Some(props) => passes_filter(filter, &props),
+                    Some(props) => passes_filter(filter, &props, &seed_props),
                     None => false, // stale (deleted) vid
                 }
             };
@@ -254,14 +270,22 @@ impl Executor {
     }
 }
 
-/// Evaluate the optional R-3a filter against a candidate's properties. No
-/// filter → always passes; an evaluation error is treated as "does not pass"
-/// (the candidate is dropped rather than failing the whole query).
-fn passes_filter(filter: Option<&Expression>, props: &HashMap<String, Value>) -> bool {
+/// Evaluate the optional filter against a candidate's properties. Bare property
+/// names resolve to the candidate; `seed.<prop>` resolves to the source vertex
+/// (R-3b seed-relative comparison, e.g. `channel != seed.channel`). No filter →
+/// always passes; an evaluation error is treated as "does not pass" (the
+/// candidate is dropped rather than failing the whole query).
+fn passes_filter(
+    filter: Option<&Expression>,
+    props: &HashMap<String, Value>,
+    seed_props: &HashMap<String, Value>,
+) -> bool {
     match filter {
         None => true,
         Some(expr) => {
-            let ctx = EvalContext::new().with_current(props.clone());
+            let ctx = EvalContext::new()
+                .with_current(props.clone())
+                .with_variable("seed", seed_props.clone());
             Evaluator::evaluate_condition(expr, &ctx).unwrap_or(false)
         }
     }
@@ -623,6 +647,33 @@ mod tests {
             })
             .collect();
         // naver:2 (closest) excluded by filter; coupang 3 (closer) before 4.
+        assert_eq!(vids, vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn embedding_seed_relative_filter_different_channel() {
+        // "items similar to seed but in a DIFFERENT channel" — no hardcoded value.
+        let executor = create_executor();
+        put_product(&executor, 1, &[1.0, 0.0], "naver").await; // seed, naver
+        put_product(&executor, 2, &[1.0, 0.0], "naver").await; // closest, same channel → excluded
+        put_product(&executor, 3, &[0.9, 0.1], "coupang").await;
+        put_product(&executor, 4, &[0.5, 0.5], "coupang").await;
+
+        let stmt = byoridb_parser::parse(
+            "RECOMMEND SIMILAR TO 1 BY EMBEDDING emb WHERE channel != seed.channel",
+        )
+        .unwrap();
+        let plan = crate::ExecutionPlanBuilder::build(stmt).unwrap();
+        let result = executor.execute(plan).await.unwrap();
+        let vids: Vec<i64> = result
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int(v) => v,
+                _ => panic!(),
+            })
+            .collect();
+        // naver:2 excluded (same channel as seed); coupang 3 (closer) before 4.
         assert_eq!(vids, vec![3, 4]);
     }
 
