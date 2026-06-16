@@ -290,8 +290,33 @@ landmine 없음). R-2b는 `instant-distance`(더 가벼움, serde 영속화) 우
   - **R-2a flat 정확 KNN** ✅ 구현 완료 (2026-06-16). 의존성 0. dense f32
     사이드 스토어 prefix scan → 코사인 → top-k. 수만 벡터까지 정확·충분.
     R-1과 같은 "정확한 것 먼저" 규율.
-  - **R-2b HNSW 근사** ⬜ — `instant-distance` 도입, redb 영속화(serde bytes),
-    증분 insert, tombstone 삭제. 대규모 차별화. R-2a 위에 인덱스 레이어로.
+  - **R-2b HNSW 근사** ⬜ 설계 확정 (2026-06-16), 구현은 go/no-go 대기.
+    대규모 차별화. R-2a dense 사이드 스토어 위에 ANN 인덱스 레이어로.
+
+    *왜 별도 결정이 필요한가:* R-1~R-3a는 모두 읽기경로 쿼리 기능이었으나,
+    R-2b는 **새 프로덕션 의존성 + ANN 인덱스 생명주기(영속/증분/staleness)**가
+    걸려 리스크 등급이 다름. 승인 게이트 없는 main 자동배포 환경이라 명시적
+    go/no-go 후 진행.
+
+    *설계 결정 (2026-06-16):*
+    - **D8. 크레이트.** 증분 insert가 DB에 중요 → `hnsw_rs 0.3.4`(insert +
+      file dump/load 지원)가 `instant-distance 0.6.1`(build-once, serde)보다
+      적합 가능성. 단 hnsw_rs는 deps 무거움(mmap-rs/sysctl/cpu-time). 둘 다
+      1.90 컴파일 실측 OK. **구현 시 instant-distance의 증분 insert 한계
+      재확인 후 택1** (build-once면 쓰기마다 재빌드 비용).
+    - **D9. 인덱스 생명주기 (핵심 fork).**
+      - (A) **영속 인덱스**: HNSW를 redb에 직렬화, 시작 시 로드 + INSERT/UPDATE
+        증분 insert + DELETE tombstone. 정확·빠르나 **새 온디스크 포맷 + 증분
+        유지 복잡도**.
+      - (B) **lazy in-memory 재빌드**: dense 스토어에서 첫 쿼리 시 빌드·캐시
+        (OnceCell/RwLock), 쓰기 시 무효화. 온디스크 포맷 0, 단순하나 쓰기 후
+        첫 쿼리에 재빌드 비용 + 캐시 무효화 정합성 주의. **권장: (B)부터**
+        (dense 스토어가 source of truth 유지, R-2a 폴백 자명).
+    - **D10. 정확성/폴백.** HNSW는 근사 → flat(R-2a)을 always-correct 폴백·
+      검증 기준으로 유지. 인덱스 없거나 N 작으면 flat 사용(임계값). 쿼리 표면은
+      R-2a와 동일(`BY EMBEDDING`), 내부에서 인덱스 유무로 분기 — 사용자 무변경.
+    - **D11. staleness.** (B) 채택 시 INSERT/UPDATE/DELETE가 해당 prop 인덱스
+      캐시를 무효화(다음 쿼리 재빌드). dense 스토어는 R-2a 픽스대로 항상 정합.
 
 *R-2a 구현 메모 (2026-06-16, 커밋 예정):*
 - **D1 조정**: blast radius 통제를 위해 `Value::Vector` 신규 variant는 **보류**
