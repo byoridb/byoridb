@@ -378,6 +378,8 @@ pub enum LookupType {
 pub struct RecommendPlan {
     pub src_vid: i64,
     pub by: byoridb_parser::ast::RecommendBy,
+    /// Optional predicate over candidate vertex properties (R-3a hybrid filter).
+    pub filter: Option<Expression>,
     pub limit: usize,
 }
 
@@ -932,6 +934,7 @@ impl ExecutionPlanBuilder {
             Statement::Recommend(rec) => Ok(ExecutionPlan::Recommend(RecommendPlan {
                 src_vid: rec.src_vid,
                 by: rec.by,
+                filter: rec.filter,
                 limit: rec.limit,
             })),
             Statement::Find(find_stmt) => Ok(ExecutionPlan::Find(FindPlan {

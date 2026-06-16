@@ -63,6 +63,13 @@ impl Parser {
             }
         };
 
+        // Optional WHERE filter over candidate vertex properties (R-3a).
+        let filter = if self.match_token(Token::Where) {
+            Some(self.parse_expression()?)
+        } else {
+            None
+        };
+
         let limit = if self.match_token(Token::Limit) {
             let n = self.consume_integer()?;
             if n <= 0 {
@@ -78,6 +85,7 @@ impl Parser {
         Ok(Statement::Recommend(RecommendStatement {
             src_vid,
             by,
+            filter,
             limit,
         }))
     }

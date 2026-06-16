@@ -1224,6 +1224,31 @@ fn test_parse_recommend_rejects_unknown_mode() {
 }
 
 #[test]
+fn test_parse_recommend_with_where_filter() {
+    match parse("RECOMMEND SIMILAR TO 1 BY EMBEDDING emb WHERE channel = \"coupang\" LIMIT 5")
+        .unwrap()
+    {
+        Statement::Recommend(s) => {
+            assert_eq!(s.limit, 5);
+            assert!(s.filter.is_some(), "WHERE filter should be captured");
+            assert!(matches!(s.by, RecommendBy::Embedding { .. }));
+        }
+        other => panic!("Expected Recommend, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_recommend_neighbors_with_where() {
+    match parse("RECOMMEND SIMILAR TO 1 OVER knows WHERE channel = \"x\"").unwrap() {
+        Statement::Recommend(s) => {
+            assert!(s.filter.is_some());
+            assert!(matches!(s.by, RecommendBy::Neighbors { .. }));
+        }
+        other => panic!("Expected Recommend, got {:?}", other),
+    }
+}
+
+#[test]
 fn test_parse_insert_vector_literal() {
     // List literal with negatives — the embedding ingestion path.
     let r = parse("INSERT VERTEX product(emb) VALUES 1:([0.1, -0.2, 0.3])");

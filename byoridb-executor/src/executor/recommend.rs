@@ -28,10 +28,11 @@
 use super::{Executor, ExecutorResult};
 use crate::algo;
 use crate::error::Result;
+use crate::evaluator::{EvalContext, Evaluator};
 use crate::key::SchemaKey;
 use byoridb_common::Value;
-use byoridb_parser::ast::{RecommendBy, SimilarityMetric};
-use std::collections::HashSet;
+use byoridb_parser::ast::{Expression, RecommendBy, SimilarityMetric};
+use std::collections::{HashMap, HashSet};
 
 impl Executor {
     pub(super) async fn execute_recommend(
@@ -39,13 +40,21 @@ impl Executor {
         plan: crate::plan::RecommendPlan,
     ) -> Result<ExecutorResult> {
         let space = self.require_space()?.to_string();
-        match plan.by {
+        let filter = plan.filter.as_ref();
+        match &plan.by {
             RecommendBy::Neighbors { over_edges, metric } => {
-                self.recommend_neighbors(&space, plan.src_vid, &over_edges, metric, plan.limit)
-                    .await
+                self.recommend_neighbors(
+                    &space,
+                    plan.src_vid,
+                    over_edges,
+                    *metric,
+                    filter,
+                    plan.limit,
+                )
+                .await
             }
             RecommendBy::Embedding { prop } => {
-                self.recommend_embedding(&space, plan.src_vid, &prop, plan.limit)
+                self.recommend_embedding(&space, plan.src_vid, prop, filter, plan.limit)
                     .await
             }
         }
@@ -58,6 +67,7 @@ impl Executor {
         src_vid: i64,
         over_edges: &[String],
         metric: SimilarityMetric,
+        filter: Option<&Expression>,
         limit: usize,
     ) -> Result<ExecutorResult> {
         let cap = self.ctx.config.max_traversal_nodes;
@@ -109,7 +119,6 @@ impl Executor {
 
         // Rank: score desc, then shared-count desc, then vid asc (deterministic).
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
-        scored.truncate(limit);
 
         if cap_reached {
             tracing::warn!(
@@ -118,7 +127,25 @@ impl Executor {
             );
         }
 
-        Ok(neighbors_result(scored))
+        // No filter → fast path (no vertex decode), preserving R-1 behavior.
+        if filter.is_none() {
+            scored.truncate(limit);
+            return Ok(neighbors_result(scored));
+        }
+
+        // R-3a filter: keep only candidates whose vertex satisfies the predicate.
+        let mut out = Vec::new();
+        for (vid, score, shared) in scored {
+            if out.len() >= limit {
+                break;
+            }
+            if let Some(props) = self.load_candidate_props(space, vid).await? {
+                if passes_filter(filter, &props) {
+                    out.push((vid, score, shared));
+                }
+            }
+        }
+        Ok(neighbors_result(out))
     }
 
     /// R-2a embedding cosine KNN over the dense side-store.
@@ -127,6 +154,7 @@ impl Executor {
         space: &str,
         src_vid: i64,
         prop: &str,
+        filter: Option<&Expression>,
         limit: usize,
     ) -> Result<ExecutorResult> {
         // Seed embedding from the dense store; absent → empty result.
@@ -167,20 +195,28 @@ impl Executor {
         // Rank: cosine desc, then vid asc (deterministic).
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 
-        // Emit top-k, skipping stale entries whose vertex was deleted. Bounded
-        // by `limit` live results, off the scan hot path.
+        // Emit top-k. Bounded by `limit` live+matching results, off the scan
+        // hot path. No filter → lightweight existence check (a get, no decode),
+        // preserving R-2a's hot path; with a filter → decode once for the
+        // predicate (the decode doubles as the stale-entry guard).
         let mut rows = Vec::new();
         for (vid, score) in scored {
             if rows.len() >= limit {
                 break;
             }
-            if self
-                .ctx
-                .kvstore
-                .get(&SchemaKey::vertex(space, vid))
-                .await?
-                .is_some()
-            {
+            let keep = if filter.is_none() {
+                self.ctx
+                    .kvstore
+                    .get(&SchemaKey::vertex(space, vid))
+                    .await?
+                    .is_some()
+            } else {
+                match self.load_candidate_props(space, vid).await? {
+                    Some(props) => passes_filter(filter, &props),
+                    None => false, // stale (deleted) vid
+                }
+            };
+            if keep {
                 rows.push(vec![Value::Int(vid), Value::Float(score as f64)]);
             }
         }
@@ -190,6 +226,44 @@ impl Executor {
             rows,
             latency_ms: 0,
         })
+    }
+
+    /// Load a candidate vertex's flattened properties for R-3a filtering.
+    /// Returns `None` if the vertex no longer exists (stale dense entry from a
+    /// deleted vid). Each property is inserted under both its bare name and
+    /// `{tag}.{prop}` so either form resolves in the predicate.
+    async fn load_candidate_props(
+        &self,
+        space: &str,
+        vid: i64,
+    ) -> Result<Option<HashMap<String, Value>>> {
+        let data = match self.ctx.kvstore.get(&SchemaKey::vertex(space, vid)).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let vertex = byoridb_codec::VertexCodec::decode_vertex(&data)
+            .map_err(|e| crate::error::ExecutionError::Io(std::io::Error::other(e.to_string())))?;
+        let mut props = HashMap::new();
+        for tag in vertex.tags {
+            for (k, v) in tag.properties {
+                props.insert(format!("{}.{}", tag.name, k), v.clone());
+                props.insert(k, v);
+            }
+        }
+        Ok(Some(props))
+    }
+}
+
+/// Evaluate the optional R-3a filter against a candidate's properties. No
+/// filter → always passes; an evaluation error is treated as "does not pass"
+/// (the candidate is dropped rather than failing the whole query).
+fn passes_filter(filter: Option<&Expression>, props: &HashMap<String, Value>) -> bool {
+    match filter {
+        None => true,
+        Some(expr) => {
+            let ctx = EvalContext::new().with_current(props.clone());
+            Evaluator::evaluate_condition(expr, &ctx).unwrap_or(false)
+        }
     }
 }
 
@@ -300,6 +374,7 @@ mod tests {
                 over_edges: edges.iter().map(|e| e.to_string()).collect(),
                 metric: SimilarityMetric::Jaccard,
             },
+            filter: None,
             limit,
         }
     }
@@ -401,6 +476,7 @@ mod tests {
             by: RecommendBy::Embedding {
                 prop: prop.to_string(),
             },
+            filter: None,
             limit,
         }
     }
@@ -487,6 +563,92 @@ mod tests {
             .unwrap();
         assert!(result.rows.is_empty());
         assert_eq!(result.columns, vec!["vid", "score"]);
+    }
+
+    /// Dense embedding entry + a vertex blob carrying a `channel` property,
+    /// for R-3a hybrid-filter tests.
+    async fn put_product(executor: &Executor, vid: i64, vec: &[f32], channel: &str) {
+        let value = Value::List(byoridb_common::datatypes::list::List::from(
+            vec.iter()
+                .map(|f| Value::Float(*f as f64))
+                .collect::<Vec<_>>(),
+        ));
+        let bytes = pack_embedding(&value).unwrap();
+        executor
+            .ctx
+            .kvstore
+            .put(&SchemaKey::vec_data("default", "emb", vid), &bytes)
+            .await
+            .unwrap();
+        let mut props = std::collections::HashMap::new();
+        props.insert("channel".to_string(), Value::String(channel.to_string()));
+        let vertex = byoridb_codec::VertexData {
+            vid,
+            tags: vec![byoridb_codec::TagData {
+                name: "product".to_string(),
+                properties: props,
+            }],
+        };
+        let data = VertexCodec::encode_vertex(&vertex).unwrap();
+        executor
+            .ctx
+            .kvstore
+            .put(&SchemaKey::vertex("default", vid), &data)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn embedding_with_channel_filter_via_full_pipeline() {
+        // The original use case: "items similar to naver:1, but on coupang".
+        let executor = create_executor();
+        put_product(&executor, 1, &[1.0, 0.0], "naver").await; // seed
+        put_product(&executor, 2, &[1.0, 0.0], "naver").await; // closest, but same channel → filtered
+        put_product(&executor, 3, &[0.9, 0.1], "coupang").await; // similar, coupang
+        put_product(&executor, 4, &[0.0, 1.0], "coupang").await; // less similar, coupang
+
+        let stmt = byoridb_parser::parse(
+            "RECOMMEND SIMILAR TO 1 BY EMBEDDING emb WHERE channel = \"coupang\"",
+        )
+        .unwrap();
+        let plan = crate::ExecutionPlanBuilder::build(stmt).unwrap();
+        let result = executor.execute(plan).await.unwrap();
+
+        let vids: Vec<i64> = result
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int(v) => v,
+                _ => panic!(),
+            })
+            .collect();
+        // naver:2 (closest) excluded by filter; coupang 3 (closer) before 4.
+        assert_eq!(vids, vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn neighbors_filter_excludes_nonmatching() {
+        let executor = create_executor();
+        seed_catalog(&executor).await; // 1,2,3 share neighbors; vids are products
+                                       // Give 2 and 3 a channel property; 1 is the seed.
+        put_product(&executor, 2, &[1.0], "naver").await;
+        put_product(&executor, 3, &[1.0], "coupang").await;
+
+        let stmt =
+            byoridb_parser::parse("RECOMMEND SIMILAR TO 1 OVER has WHERE channel = \"coupang\"")
+                .unwrap();
+        let plan = crate::ExecutionPlanBuilder::build(stmt).unwrap();
+        let result = executor.execute(plan).await.unwrap();
+        let vids: Vec<i64> = result
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int(v) => v,
+                _ => panic!(),
+            })
+            .collect();
+        // Of structural matches {2,3}, only coupang:3 survives the filter.
+        assert_eq!(vids, vec![3]);
     }
 
     #[test]

@@ -331,10 +331,25 @@ landmine 없음). R-2b는 `instant-distance`(더 가벼움, serde 영속화) 우
 - **D7. R-3 연계.** WHERE 절로 그래프/온톨로지 제약(다른 채널, O-3 같은 클래스)
   → ANN 후보 + 그래프 필터 = 하이브리드(R-3).
 
-**R-3 [P1] 하이브리드 온톨로지 인지 추천** ⬜ 미착수
+**R-3 [P1] 하이브리드 온톨로지 인지 추천** 🟡 R-3a 구현 완료 (2026-06-16)
 R-2 ANN으로 후보 → 그래프/온톨로지 제약으로 필터·재랭킹(다른 채널 한정, O-3
 클래스 계층상 같은 상위 카테고리, 공유 브랜드 노드 가산점). 순수 벡터DB·순수
 그래프DB가 못 하는 영역 = `owl:sameAs` 후보 발견. O-3·R-1·R-2 선결.
+
+**R-3a [P1] WHERE 속성 필터** ✅ 구현 완료 (2026-06-16). 사용자 원래 예시
+("네이버 A와 유사한 **쿠팡** 상품")를 완성: `RECOMMEND SIMILAR TO <vid>
+(OVER ...|BY EMBEDDING ...) WHERE <predicate> [LIMIT k]`. 양 모드(neighbors,
+embedding) 공통. 후보를 점수순 정렬 후, 방출 시 정점 디코드→속성 평탄화
+(bare + `{tag}.{prop}` 양형)→기존 `Evaluator::evaluate_condition`로 술어 평가,
+통과분만 top-k 방출(`load_candidate_props` + `passes_filter`). 술어 평가 오류는
+해당 후보 드롭(쿼리 전체 실패 아님). **WHERE 없으면 정점 디코드 0 (R-1/R-2a
+핫패스 불변)**. 회귀: 파서 2(임베딩/neighbors WHERE) + 실행기 2(채널 필터
+full-pipeline·neighbors 필터). 한계: 필터는 *후보 vertex 속성*만 — 시드 상대
+비교(`channel != $seed.channel`)나 추론 포함 클래스 매칭(O-5/O-7)은 후속.
+
+**R-3b [P2] 재랭킹·점수 결합·온톨로지 제약** ⬜ 미착수
+벡터 점수 + 공유속성 가산점 결합, O-3 클래스 계층 인지 필터(`WHERE c IS-A ...`),
+시드 상대 비교. R-2b(HNSW)·O-5(추론)와 함께.
 
 ### S. 보안 강화 (P0, 즉시 — 2026-05-13 심층 분석 결과)
 

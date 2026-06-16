@@ -49,6 +49,9 @@ pub enum Statement {
 pub struct RecommendStatement {
     pub src_vid: i64,
     pub by: RecommendBy,
+    /// Optional `WHERE <predicate>` over candidate vertex properties (R-3a
+    /// hybrid filter) — e.g. recommend similar items in a *different* channel.
+    pub filter: Option<Expression>,
     pub limit: usize,
 }
 
