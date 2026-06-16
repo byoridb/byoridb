@@ -70,6 +70,7 @@ impl Executor {
             ExecutionPlan::Fetch(fetch_plan) => self.execute_fetch(fetch_plan).await?,
             ExecutionPlan::Go(go_plan) => self.execute_go(go_plan).await?,
             ExecutionPlan::Lookup(lookup_plan) => self.execute_lookup(lookup_plan).await?,
+            ExecutionPlan::Recommend(rec_plan) => self.execute_recommend(rec_plan).await?,
             ExecutionPlan::Match(match_plan) => {
                 use crate::match_impl::MatchExecutor;
                 let match_executor = MatchExecutor::new(self.ctx.clone());
@@ -163,6 +164,7 @@ mod class_ddl;
 mod ddl;
 mod dml;
 mod dql;
+mod recommend;
 mod show;
 
 #[cfg(test)]

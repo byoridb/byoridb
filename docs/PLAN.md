@@ -241,6 +241,44 @@ validation 참고.
 nGQL 확장으로 추론 쿼리 노출(예: `MATCH ... WHERE c IS-A Animal`처럼
 추론 포함 매칭). SPARQL 호환은 별도 검토(하이브리드 모델 아님 — 보류).
 
+### R. 유사도 / 추천 (P1 — 차별화 기능, 2026-06-15 신설)
+
+"어떤 노드와 가장 유사한 노드 top-k 추천" — 채널 간 동일 상품 후보 발견
+(entity resolution) 같은 use case. **O-시리즈(논리적 추론)와 다른 축**: 규칙으로
+A=B를 *단언*하는 대신, 가까운 후보를 *발견*한다. 실질적으로 O-0이 "가장 비싸서
+마지막으로 미룬" `owl:sameAs` 동치를 우회하는 실용 경로. **하이브리드(벡터+그래프+
+온톨로지)가 최종 목표이며, 구조→벡터→온톨로지 결합 순으로 단계 구축.**
+
+**R-1 [P1] 구조적 유사도 (Jaccard, 무-임베딩)** ✅ 구현 완료 (2026-06-15)
+`RECOMMEND SIMILAR TO <vid> OVER <edges>|* [LIMIT k]`. 공유 이웃 겹침으로
+유사도 계산: `sim(a,b) = |N(a)∩N(b)| / |N(a)∪N(b)|`. N(v)=v의 out-neighbor
+집합(edge 타입 필터, `*`=전체). 신규 `executor/recommend.rs`(executor.rs 비대화
+회피). **후보 생성**은 시드의 각 이웃을 O-1 역방향 인덱스로 거슬러 올라가
+공유 이웃 ≥1인 정점만 수집(전체 스캔 회피, `max_traversal_nodes` 캡). 결과
+컬럼 `vid/score/shared`, 랭킹 score desc→shared desc→vid asc.
+- 토큰 RECOMMEND/SIMILAR(2개), AST `RecommendStatement`+`SimilarityMetric`,
+  plan `RecommendPlan`, graph 서비스 RBAC(Read)+QueryType(Recommend) 매핑,
+  EXPLAIN plan_kind arm 추가.
+- 회귀: 파서 4(기본/다중edge·기본limit/`*`/limit 0 거부) + 실행기 4(Jaccard
+  랭킹·0겹침 제외/limit truncate/이웃 없는 시드 빈결과+스키마/edge 타입 스코프).
+  워크스페이스 전체 통과, fmt·clippy(변경 크레이트) 클린.
+- **caveat**: 후보 생성이 역방향 인덱스 의존 → O-1 이전 로드된 space는 재로드
+  필요(reverse GO/BIDIRECT와 동일). 원시 텍스트 차이(제목 표기 차이)는 못 잡음
+  → 공유 속성 노드로 정규화돼 있어야 동작. 그래서 R-2 필요.
+- 미착수: 배포·프로덕션 스모크, 분산 meta 연동(G-2 이후).
+
+**R-2 [P1] 벡터 임베딩 유사도 (ANN)** ⬜ 미착수
+정점에 임베딩 벡터 속성 저장 + 코사인/L2 최근접 이웃을 HNSW 인덱스로 검색.
+채널마다 제목이 달라도 의미가 가까우면 매칭 → 사용자 핵심 use case 해결.
+필요: Vector 타입(또는 `LIST<DOUBLE>` 재사용), 순수 Rust ANN(예: instant-distance,
+1.90 컴파일·순수 Rust 제약 충족), redb 영속화, `RECOMMEND ... NEAREST ... BY
+EMBEDDING COSINE` 표면. **임베딩 생성은 DB 밖(외부 모델), DB는 저장·검색만.**
+
+**R-3 [P1] 하이브리드 온톨로지 인지 추천** ⬜ 미착수
+R-2 ANN으로 후보 → 그래프/온톨로지 제약으로 필터·재랭킹(다른 채널 한정, O-3
+클래스 계층상 같은 상위 카테고리, 공유 브랜드 노드 가산점). 순수 벡터DB·순수
+그래프DB가 못 하는 영역 = `owl:sameAs` 후보 발견. O-3·R-1·R-2 선결.
+
 ### S. 보안 강화 (P0, 즉시 — 2026-05-13 심층 분석 결과)
 
 2026-05-13 코드 심층 분석에서 발견된 이슈. Critical/High 우선 순서로 진행.

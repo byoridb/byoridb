@@ -65,6 +65,9 @@ pub enum ExecutionPlan {
     /// LOOKUP query
     Lookup(LookupPlan),
 
+    /// RECOMMEND — top-k similar vertices by shared-neighbor overlap.
+    Recommend(RecommendPlan),
+
     /// Compound query — a sequence of clauses where each may bind its
     /// `ExecutorResult` to a variable consumed by subsequent clauses.
     /// The final non-assignment clause's result is the query output.
@@ -368,6 +371,15 @@ pub struct LookupPlan {
 pub enum LookupType {
     Tag(String),
     Edge(String),
+}
+
+/// Plan for `RECOMMEND SIMILAR TO <vid> OVER <edges> [LIMIT k]` (PLAN.md R-1).
+pub struct RecommendPlan {
+    pub src_vid: i64,
+    /// Edge types defining the neighborhood. Empty = all edge types.
+    pub over_edges: Vec<String>,
+    pub metric: byoridb_parser::ast::SimilarityMetric,
+    pub limit: usize,
 }
 
 #[derive(Serialize)]
@@ -917,6 +929,12 @@ impl ExecutionPlanBuilder {
                 },
                 limit: lookup.limit,
                 offset: lookup.offset,
+            })),
+            Statement::Recommend(rec) => Ok(ExecutionPlan::Recommend(RecommendPlan {
+                src_vid: rec.src_vid,
+                over_edges: rec.over_edges,
+                metric: rec.metric,
+                limit: rec.limit,
             })),
             Statement::Find(find_stmt) => Ok(ExecutionPlan::Find(FindPlan {
                 find_type: match find_stmt.find_type {

@@ -412,7 +412,8 @@ impl GraphService {
             | Statement::Go(_)
             | Statement::Match(_)
             | Statement::Lookup(_)
-            | Statement::Find(_) => Permission::Read,
+            | Statement::Find(_)
+            | Statement::Recommend(_) => Permission::Read,
             // Write
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => Permission::Write,
             // Create / schema
@@ -448,6 +449,7 @@ impl GraphService {
             Statement::Match(_) => QueryType::Match,
             Statement::Lookup(_) => QueryType::Lookup,
             Statement::Find(_) => QueryType::Find,
+            Statement::Recommend(_) => QueryType::Recommend,
             Statement::Grant(_) => QueryType::Create, // User management uses Create metrics
             Statement::Revoke(_) => QueryType::Create,
             Statement::Balance(_) => QueryType::Show, // Admin commands use Show metrics

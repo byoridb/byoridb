@@ -24,6 +24,7 @@ pub enum Statement {
     Match(MatchStatement),
     Go(GoStatement),
     Lookup(LookupStatement),
+    Recommend(RecommendStatement),
     Grant(GrantStatement),
     Revoke(RevokeStatement),
     Balance(BalanceStatement),
@@ -39,6 +40,27 @@ pub enum Statement {
         profile: bool,
         statement: Box<Statement>,
     },
+}
+
+/// `RECOMMEND SIMILAR TO <vid> OVER <edges>|* [LIMIT k]` — neighbor-overlap
+/// similarity recommendation (PLAN.md R-1, structural phase). Returns the
+/// top-k vertices most similar to `src_vid` by shared-neighbor overlap over
+/// the chosen edge types.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecommendStatement {
+    pub src_vid: i64,
+    /// Edge types defining the neighborhood. Empty = all edge types (`OVER *`).
+    pub over_edges: Vec<String>,
+    pub metric: SimilarityMetric,
+    pub limit: usize,
+}
+
+/// Similarity measure for [`RecommendStatement`]. Phase 1 ships structural
+/// (graph-topology) similarity only; vector/embedding measures follow in R-2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SimilarityMetric {
+    /// Jaccard overlap of out-neighbor sets: |N(a) ∩ N(b)| / |N(a) ∪ N(b)|.
+    Jaccard,
 }
 
 /// One clause inside a [`Statement::Compound`]. `var` is `Some(name)` for an

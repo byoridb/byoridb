@@ -14,6 +14,50 @@ use crate::parser::ParseResult;
 use std::collections::HashMap;
 
 impl Parser {
+    // ===== RECOMMEND statement =====
+
+    /// Parse: `RECOMMEND SIMILAR TO <vid> OVER edge[, edge ...]|* [LIMIT k]`
+    ///
+    /// Structural similarity recommendation (PLAN.md R-1). `OVER *` selects all
+    /// edge types (empty `over_edges`). Default LIMIT is 10. The seed vid must
+    /// be an integer literal, matching GO/FETCH's vid handling.
+    pub(crate) fn parse_recommend(&mut self) -> ParseResult {
+        self.consume_token(Token::Recommend)?;
+        self.consume_token(Token::Similar)?;
+        self.consume_token(Token::To)?;
+        let src_vid = self.consume_integer()?;
+
+        self.consume_token(Token::Over)?;
+        let over_edges = if self.match_token(Token::Star) {
+            Vec::new()
+        } else {
+            let mut edges = vec![self.consume_identifier()?];
+            while self.match_token(Token::Comma) {
+                edges.push(self.consume_identifier()?);
+            }
+            edges
+        };
+
+        let limit = if self.match_token(Token::Limit) {
+            let n = self.consume_integer()?;
+            if n <= 0 {
+                return Err(ParseError::UnexpectedToken(
+                    "RECOMMEND LIMIT must be a positive integer".to_string(),
+                ));
+            }
+            n as usize
+        } else {
+            10
+        };
+
+        Ok(Statement::Recommend(RecommendStatement {
+            src_vid,
+            over_edges,
+            metric: SimilarityMetric::Jaccard,
+            limit,
+        }))
+    }
+
     // ===== FETCH statement =====
 
     /// Parse: `FETCH PROP ON tag_name vid1, vid2, ...` (vertex fetch)

@@ -769,6 +769,7 @@ fn plan_kind(plan: &ExecutionPlan) -> &'static str {
         ExecutionPlan::Match(_) => "Match",
         ExecutionPlan::Go(_) => "Go",
         ExecutionPlan::Lookup(_) => "Lookup",
+        ExecutionPlan::Recommend(_) => "Recommend",
         ExecutionPlan::Compound(_) => "Compound",
         ExecutionPlan::Explain { .. } => "Explain",
     }

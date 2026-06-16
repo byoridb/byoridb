@@ -62,6 +62,7 @@ pub enum QueryType {
     Match,
     Lookup,
     Find,
+    Recommend,
     Unknown,
 }
 
@@ -81,6 +82,7 @@ impl QueryType {
             QueryType::Match => "match",
             QueryType::Lookup => "lookup",
             QueryType::Find => "find",
+            QueryType::Recommend => "recommend",
             QueryType::Unknown => "unknown",
         }
     }

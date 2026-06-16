@@ -166,6 +166,7 @@ impl Parser {
             Token::Match => self.parse_match(),
             Token::Go => self.parse_go(),
             Token::Lookup => self.parse_lookup(),
+            Token::Recommend => self.parse_recommend(),
             // EXPLAIN / PROFILE
             tok @ (Token::Explain | Token::Profile) => {
                 let profile = matches!(tok, Token::Profile);

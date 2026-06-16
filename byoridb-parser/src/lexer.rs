@@ -60,6 +60,10 @@ pub enum Token {
     Find,
     #[token("LOOKUP", ignore(case))]
     Lookup,
+    #[token("RECOMMEND", ignore(case))]
+    Recommend,
+    #[token("SIMILAR", ignore(case))]
+    Similar,
     #[token("MATCH", ignore(case))]
     Match,
     #[token("GO", ignore(case))]
