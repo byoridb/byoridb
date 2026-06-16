@@ -70,6 +70,21 @@ impl Executor {
                             format!("{}:tagvid:{}:{}", effective_space, tag.name, vertex.vid);
                         batch.push((tagvid_key.into_bytes(), Vec::new()));
                     }
+                    // Dense embedding side-store (PLAN.md R-2a): any numeric-list
+                    // property is mirrored as packed f32 under {space}:vec:{prop}:{vid}
+                    // so cosine KNN scans packed floats instead of decoding vertices.
+                    for tag in &codec_vertex.tags {
+                        for (prop, value) in &tag.properties {
+                            if let Some(bytes) = crate::executor::recommend::pack_embedding(value) {
+                                let vkey = crate::key::SchemaKey::vec_data(
+                                    &effective_space,
+                                    prop,
+                                    vertex.vid,
+                                );
+                                batch.push((vkey, bytes));
+                            }
+                        }
+                    }
                     for index in &tag_indexes {
                         for tag in codec_vertex
                             .tags
@@ -340,6 +355,19 @@ impl Executor {
             .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
 
         self.ctx.kvstore.put(key.as_bytes(), &encoded_data).await?;
+
+        // Keep the dense embedding side-store consistent (PLAN.md R-2a): an
+        // updated numeric-list property is re-mirrored; a property that is no
+        // longer a numeric list has its stale dense entry removed. Without this,
+        // embedding KNN would silently score the old vector (the read-path
+        // existence check can't catch it — the vertex is still live).
+        for (k, v) in &plan.updates {
+            let vkey = crate::key::SchemaKey::vec_data(&effective_space, k, vid);
+            match crate::executor::recommend::pack_embedding(v) {
+                Some(bytes) => self.ctx.kvstore.put(&vkey, &bytes).await?,
+                None => self.ctx.kvstore.delete(&vkey).await?,
+            }
+        }
 
         Ok(ExecutorResult {
             columns: vec!["Updated".to_string()],

@@ -42,21 +42,31 @@ pub enum Statement {
     },
 }
 
-/// `RECOMMEND SIMILAR TO <vid> OVER <edges>|* [LIMIT k]` — neighbor-overlap
-/// similarity recommendation (PLAN.md R-1, structural phase). Returns the
-/// top-k vertices most similar to `src_vid` by shared-neighbor overlap over
-/// the chosen edge types.
+/// `RECOMMEND SIMILAR TO <vid> ... [LIMIT k]` — top-k similar-vertex
+/// recommendation (PLAN.md R track). The `by` clause selects the similarity
+/// definition: structural neighbor overlap (R-1) or embedding cosine (R-2a).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecommendStatement {
     pub src_vid: i64,
-    /// Edge types defining the neighborhood. Empty = all edge types (`OVER *`).
-    pub over_edges: Vec<String>,
-    pub metric: SimilarityMetric,
+    pub by: RecommendBy,
     pub limit: usize,
 }
 
-/// Similarity measure for [`RecommendStatement`]. Phase 1 ships structural
-/// (graph-topology) similarity only; vector/embedding measures follow in R-2.
+/// How [`RecommendStatement`] measures similarity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum RecommendBy {
+    /// R-1 structural: shared out-neighbor overlap over the given edge types
+    /// (empty = all edge types, `OVER *`).
+    Neighbors {
+        over_edges: Vec<String>,
+        metric: SimilarityMetric,
+    },
+    /// R-2a embedding: cosine over a stored embedding property (a list of
+    /// numbers). `prop` names the vector-valued vertex property.
+    Embedding { prop: String },
+}
+
+/// Similarity measure for the structural ([`RecommendBy::Neighbors`]) mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SimilarityMetric {
     /// Jaccard overlap of out-neighbor sets: |N(a) ∩ N(b)| / |N(a) ∪ N(b)|.

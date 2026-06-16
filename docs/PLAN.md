@@ -267,12 +267,69 @@ A=B를 *단언*하는 대신, 가까운 후보를 *발견*한다. 실질적으�
   → 공유 속성 노드로 정규화돼 있어야 동작. 그래서 R-2 필요.
 - 미착수: 배포·프로덕션 스모크, 분산 meta 연동(G-2 이후).
 
-**R-2 [P1] 벡터 임베딩 유사도 (ANN)** ⬜ 미착수
-정점에 임베딩 벡터 속성 저장 + 코사인/L2 최근접 이웃을 HNSW 인덱스로 검색.
-채널마다 제목이 달라도 의미가 가까우면 매칭 → 사용자 핵심 use case 해결.
-필요: Vector 타입(또는 `LIST<DOUBLE>` 재사용), 순수 Rust ANN(예: instant-distance,
-1.90 컴파일·순수 Rust 제약 충족), redb 영속화, `RECOMMEND ... NEAREST ... BY
-EMBEDDING COSINE` 표면. **임베딩 생성은 DB 밖(외부 모델), DB는 저장·검색만.**
+**R-2 [P1] 벡터 임베딩 유사도 (ANN)** 🟡 R-2a 구현 완료 (2026-06-16), R-2b 미착수
+정점에 임베딩 벡터 속성 저장 + 코사인/L2 최근접 이웃 검색. 채널마다 제목이
+달라도 의미가 가까우면 매칭 → 사용자 핵심 use case 해결. **R-1(구조적)이 못 잡는
+원시 텍스트 차이를 푸는 단계.**
+
+**리서치 확정 (2026-06-16):** 순수 Rust ANN 크레이트 `instant-distance 0.6.1`,
+`hnsw_rs 0.3.4` 둘 다 **Rust 1.90 클린 컴파일 실측 완료** (openraft/validit 같은
+landmine 없음). R-2b는 `instant-distance`(더 가벼움, serde 영속화) 우선.
+
+*설계 결정 (2026-06-16):*
+- **D1. 벡터 타입.** 신규 `Value::Vector(Vec<f32>)` (List<Float(f64)> 재사용
+  기각 — f32로 메모리 절반/타입 안전/차원 검증). `byoridb_common::Value` +
+  codec `PropertyType` + meta `DataType`에 각각 `Vector(dim)` variant 추가.
+  **Value enum 확장은 blast radius 큼** — type_of/accessor/PartialEq/serde/
+  to_string 전부 갱신 필요. (Value::PartialEq가 List/Map 등에서 무조건 false였던
+  O-2 버그 선례 주의 — Vector도 구조 비교 명시.)
+- **D2. 임베딩 생성은 DB 밖.** 클라이언트가 외부 모델로 만든 f32 벡터를
+  INSERT VERTEX 속성으로 전달. DB는 저장·검색만(ML 모델 미내장). *확정.*
+- **D3. 거리.** 코사인(기본, 정규화 텍스트 임베딩) + L2 옵션, 인덱스별 선언.
+- **D4. 단계 분할 (flat 먼저 — 2026-06-16 결정).**
+  - **R-2a flat 정확 KNN** ✅ 구현 완료 (2026-06-16). 의존성 0. dense f32
+    사이드 스토어 prefix scan → 코사인 → top-k. 수만 벡터까지 정확·충분.
+    R-1과 같은 "정확한 것 먼저" 규율.
+  - **R-2b HNSW 근사** ⬜ — `instant-distance` 도입, redb 영속화(serde bytes),
+    증분 insert, tombstone 삭제. 대규모 차별화. R-2a 위에 인덱스 레이어로.
+
+*R-2a 구현 메모 (2026-06-16, 커밋 예정):*
+- **D1 조정**: blast radius 통제를 위해 `Value::Vector` 신규 variant는 **보류**
+  (Value enum은 type_of/PartialEq/serde/codec/JSON 등 전역 exhaustive match
+  20+곳 — prod 자동배포 리스크). 대신 임베딩은 **`Value::List<Float>` 속성으로
+  재사용**, **dense f32 사이드 스토어**(`{space}:vec:{prop}:{vid}` → packed LE
+  f32, `SchemaKey::vec_data`)가 INSERT 시 함께 기록돼 성능(메모리·스캔)을 담당.
+  INSERT VERTEX가 **모든 숫자-리스트 속성**을 자동 미러링(`recommend::pack_embedding`).
+- **신규 파싱**: `[...]` 리스트 리터럴(expr.rs) + `expr_to_value`의 List·단항
+  Neg folding(음수 임베딩값). `BY`/`EMBEDDING` 토큰(EMBEDDING은 keyword_to_string에
+  등록해 속성명으로도 사용 가능).
+- **쿼리**: `RECOMMEND SIMILAR TO <vid> BY EMBEDDING <prop> [LIMIT k]` (D6 vid 기준).
+  결과 컬럼 vid/score(코사인). 시드 벡터 없으면 빈결과.
+- **성능**: 스캔은 packed f32만 읽음(정점 디코드 회피), 시드 norm 1회 선계산,
+  단일 패스 dot+norm. 정점 존재 확인은 방출 top-k에만(stale 삭제 거름, k회 get).
+- **UPDATE 일관성** (리뷰 F-001 수정): UPDATE VERTEX도 갱신된 숫자-리스트 속성을
+  dense 스토어에 재미러링(리스트→비리스트면 dense 삭제). 없으면 KMM이 옛 벡터로
+  조용히 채점(정점 살아있어 존재확인 통과 못 함). 회귀 테스트 추가.
+- **caveat**: DELETE VERTEX는 dense 엔트리 미정리(prop 모름) → stale 가능 →
+  방출 top-k 존재 확인으로 보정. 차원 불일치/제로벡터 스킵. dense 미러는 숫자
+  리스트 전부 대상(비-임베딩 숫자 리스트도 저장될 수 있음, 낭비 허용).
+- **알려진 한계** (리뷰 F-002): dense 키가 `{space}:vec:{prop}:{vid}`로 tag 미포함
+  → 한 vid의 두 tag가 동명 숫자-리스트 prop을 가지면 마지막이 덮어씀(단일-tag
+  임베딩 패턴에선 무해). 다중 tag 동명 벡터 지원 시 키에 tag 포함 검토.
+- **회귀**: 파서 9(임베딩 파싱·리스트 리터럴·빈리스트·모드 거부 등) + 실행기 9
+  (Jaccard 3 + 임베딩 코사인 랭킹/limit·차원불일치/stale 삭제/시드없음 + pack/unpack
+  round-trip + UPDATE 재미러링) + plan 1(List·단항Neg folding). 워크스페이스 통과.
+- **D5. 인덱스 메타.** `CREATE VECTOR INDEX <name> ON <tag>(<prop>) DIM <n>
+  METRIC cosine`. `IndexType::Vector` + dimension + metric을 `IndexDef`
+  (byoridb-storage/src/index.rs)에 추가, `__meta:index_def:` JSON 패턴 재사용.
+  R-2a는 인덱스 없이도 동작(flat scan), 인덱스는 R-2b 가속용.
+- **D6. 쿼리 표면 (vid 기준만 먼저 — 2026-06-16 결정).**
+  `RECOMMEND SIMILAR TO <vid> BY EMBEDDING [METRIC cosine] [LIMIT k]` — 존재
+  정점의 저장된 벡터를 쿼리로 써서 가장 가까운 다른 정점 top-k. R-1 RECOMMEND
+  동사 재사용(`BY EMBEDDING` vs R-1 기본 Jaccard). 원시 벡터리터럴 쿼리
+  (`NEAREST TO <vec>`, 텍스트 검색용)는 후속.
+- **D7. R-3 연계.** WHERE 절로 그래프/온톨로지 제약(다른 채널, O-3 같은 클래스)
+  → ANN 후보 + 그래프 필터 = 하이브리드(R-3).
 
 **R-3 [P1] 하이브리드 온톨로지 인지 추천** ⬜ 미착수
 R-2 ANN으로 후보 → 그래프/온톨로지 제약으로 필터·재랭킹(다른 채널 한정, O-3

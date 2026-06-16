@@ -64,6 +64,8 @@ pub enum Token {
     Recommend,
     #[token("SIMILAR", ignore(case))]
     Similar,
+    #[token("EMBEDDING", ignore(case))]
+    Embedding,
     #[token("MATCH", ignore(case))]
     Match,
     #[token("GO", ignore(case))]

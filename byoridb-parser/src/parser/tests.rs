@@ -1146,9 +1146,14 @@ fn test_parse_recommend_basic() {
     match parse("RECOMMEND SIMILAR TO 100 OVER follows LIMIT 5").unwrap() {
         Statement::Recommend(s) => {
             assert_eq!(s.src_vid, 100);
-            assert_eq!(s.over_edges, vec!["follows".to_string()]);
             assert_eq!(s.limit, 5);
-            assert_eq!(s.metric, SimilarityMetric::Jaccard);
+            match s.by {
+                RecommendBy::Neighbors { over_edges, metric } => {
+                    assert_eq!(over_edges, vec!["follows".to_string()]);
+                    assert_eq!(metric, SimilarityMetric::Jaccard);
+                }
+                other => panic!("Expected Neighbors, got {:?}", other),
+            }
         }
         other => panic!("Expected Recommend, got {:?}", other),
     }
@@ -1158,11 +1163,14 @@ fn test_parse_recommend_basic() {
 fn test_parse_recommend_multi_edge_default_limit() {
     match parse("RECOMMEND SIMILAR TO 1 OVER has_brand, in_category").unwrap() {
         Statement::Recommend(s) => {
-            assert_eq!(
-                s.over_edges,
-                vec!["has_brand".to_string(), "in_category".to_string()]
-            );
             assert_eq!(s.limit, 10); // default
+            match s.by {
+                RecommendBy::Neighbors { over_edges, .. } => assert_eq!(
+                    over_edges,
+                    vec!["has_brand".to_string(), "in_category".to_string()]
+                ),
+                other => panic!("Expected Neighbors, got {:?}", other),
+            }
         }
         other => panic!("Expected Recommend, got {:?}", other),
     }
@@ -1171,7 +1179,10 @@ fn test_parse_recommend_multi_edge_default_limit() {
 #[test]
 fn test_parse_recommend_star_means_all_edges() {
     match parse("RECOMMEND SIMILAR TO 7 OVER *").unwrap() {
-        Statement::Recommend(s) => assert!(s.over_edges.is_empty()),
+        Statement::Recommend(s) => match s.by {
+            RecommendBy::Neighbors { over_edges, .. } => assert!(over_edges.is_empty()),
+            other => panic!("Expected Neighbors, got {:?}", other),
+        },
         other => panic!("Expected Recommend, got {:?}", other),
     }
 }
@@ -1179,4 +1190,48 @@ fn test_parse_recommend_star_means_all_edges() {
 #[test]
 fn test_parse_recommend_rejects_zero_limit() {
     assert!(parse("RECOMMEND SIMILAR TO 1 OVER e LIMIT 0").is_err());
+}
+
+#[test]
+fn test_parse_recommend_by_embedding() {
+    match parse("RECOMMEND SIMILAR TO 42 BY EMBEDDING vec LIMIT 8").unwrap() {
+        Statement::Recommend(s) => {
+            assert_eq!(s.src_vid, 42);
+            assert_eq!(s.limit, 8);
+            match s.by {
+                RecommendBy::Embedding { prop } => assert_eq!(prop, "vec"),
+                other => panic!("Expected Embedding, got {:?}", other),
+            }
+        }
+        other => panic!("Expected Recommend, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_recommend_embedding_default_limit() {
+    match parse("RECOMMEND SIMILAR TO 1 BY EMBEDDING embedding").unwrap() {
+        Statement::Recommend(s) => {
+            assert_eq!(s.limit, 10);
+            assert!(matches!(s.by, RecommendBy::Embedding { .. }));
+        }
+        other => panic!("Expected Recommend, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_recommend_rejects_unknown_mode() {
+    assert!(parse("RECOMMEND SIMILAR TO 1 FROM x").is_err());
+}
+
+#[test]
+fn test_parse_insert_vector_literal() {
+    // List literal with negatives — the embedding ingestion path.
+    let r = parse("INSERT VERTEX product(emb) VALUES 1:([0.1, -0.2, 0.3])");
+    assert!(r.is_ok(), "vector literal should parse: {:?}", r);
+}
+
+#[test]
+fn test_parse_empty_list_literal() {
+    let r = parse("INSERT VERTEX product(tags) VALUES 1:([])");
+    assert!(r.is_ok(), "empty list should parse: {:?}", r);
 }

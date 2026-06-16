@@ -16,26 +16,51 @@ use std::collections::HashMap;
 impl Parser {
     // ===== RECOMMEND statement =====
 
-    /// Parse: `RECOMMEND SIMILAR TO <vid> OVER edge[, edge ...]|* [LIMIT k]`
+    /// Parse: `RECOMMEND SIMILAR TO <vid> ( OVER edge[, ...]|* | BY EMBEDDING <prop> ) [LIMIT k]`
     ///
-    /// Structural similarity recommendation (PLAN.md R-1). `OVER *` selects all
-    /// edge types (empty `over_edges`). Default LIMIT is 10. The seed vid must
-    /// be an integer literal, matching GO/FETCH's vid handling.
+    /// Two modes (PLAN.md R track):
+    /// - `OVER ...` → structural Jaccard over shared neighbors (R-1). `OVER *`
+    ///   = all edge types.
+    /// - `BY EMBEDDING <prop>` → cosine over the stored embedding property (R-2a).
+    ///
+    /// Default LIMIT is 10. The seed vid must be an integer literal, matching
+    /// GO/FETCH's vid handling.
     pub(crate) fn parse_recommend(&mut self) -> ParseResult {
         self.consume_token(Token::Recommend)?;
         self.consume_token(Token::Similar)?;
         self.consume_token(Token::To)?;
         let src_vid = self.consume_integer()?;
 
-        self.consume_token(Token::Over)?;
-        let over_edges = if self.match_token(Token::Star) {
-            Vec::new()
-        } else {
-            let mut edges = vec![self.consume_identifier()?];
-            while self.match_token(Token::Comma) {
-                edges.push(self.consume_identifier()?);
+        let by = match self.peek_token()? {
+            Token::Over => {
+                self.advance();
+                let over_edges = if self.match_token(Token::Star) {
+                    Vec::new()
+                } else {
+                    let mut edges = vec![self.consume_identifier()?];
+                    while self.match_token(Token::Comma) {
+                        edges.push(self.consume_identifier()?);
+                    }
+                    edges
+                };
+                RecommendBy::Neighbors {
+                    over_edges,
+                    metric: SimilarityMetric::Jaccard,
+                }
             }
-            edges
+            Token::By => {
+                self.advance();
+                self.consume_token(Token::Embedding)?;
+                let prop = self.consume_identifier()?;
+                RecommendBy::Embedding { prop }
+            }
+            other => {
+                return Err(ParseError::UnexpectedToken(format!(
+                "expected OVER or BY EMBEDDING after RECOMMEND SIMILAR TO <vid>, found {:?} at {}",
+                other,
+                self.err_location()
+            )))
+            }
         };
 
         let limit = if self.match_token(Token::Limit) {
@@ -52,8 +77,7 @@ impl Parser {
 
         Ok(Statement::Recommend(RecommendStatement {
             src_vid,
-            over_edges,
-            metric: SimilarityMetric::Jaccard,
+            by,
             limit,
         }))
     }

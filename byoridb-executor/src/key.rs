@@ -128,6 +128,28 @@ impl SchemaKey {
         format!("{}:in-edge:{}:", space, dst).into_bytes()
     }
 
+    // ===== Dense embedding vector store (PLAN.md R-2a) =====
+
+    /// Dense embedding entry: `{space}:vec:{prop}:{vid}` → packed little-endian
+    /// f32 bytes. Written by INSERT VERTEX alongside the vertex blob for any
+    /// numeric-list property, so cosine KNN scans only the packed floats instead
+    /// of decoding full vertices.
+    pub fn vec_data(space: &str, prop: &str, vid: i64) -> Vec<u8> {
+        format!("{}:vec:{}:{}", space, prop, vid).into_bytes()
+    }
+
+    /// Prefix for all embedding entries of one property: `{space}:vec:{prop}:`
+    pub fn vec_data_prop_prefix(space: &str, prop: &str) -> Vec<u8> {
+        format!("{}:vec:{}:", space, prop).into_bytes()
+    }
+
+    /// Extract the trailing vid from a `vec_data` key. Property names are nGQL
+    /// identifiers (no `:`), so the vid is always the final colon-delimited segment.
+    pub fn vec_data_vid_from_key(key: &[u8]) -> Option<i64> {
+        let s = std::str::from_utf8(key).ok()?;
+        s.rsplit(':').next()?.parse::<i64>().ok()
+    }
+
     // ===== Index keys =====
 
     /// Create a tag index key: `space:{space}:tag_index:{name}`

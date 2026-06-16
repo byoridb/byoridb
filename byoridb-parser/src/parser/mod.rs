@@ -288,6 +288,10 @@ impl Parser {
             Token::Time => "time",
             Token::Step => "step",
             Token::Steps => "steps",
+            // Recommend keywords — `embedding` is a natural property name.
+            Token::Recommend => "recommend",
+            Token::Similar => "similar",
+            Token::Embedding => "embedding",
             // Role keywords (used as identifiers in GRANT/REVOKE)
             Token::Admin => "ADMIN",
             Token::God => "GOD",

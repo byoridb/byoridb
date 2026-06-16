@@ -373,12 +373,11 @@ pub enum LookupType {
     Edge(String),
 }
 
-/// Plan for `RECOMMEND SIMILAR TO <vid> OVER <edges> [LIMIT k]` (PLAN.md R-1).
+/// Plan for `RECOMMEND SIMILAR TO <vid> ... [LIMIT k]` (PLAN.md R track).
+/// `by` selects structural (R-1) or embedding (R-2a) similarity.
 pub struct RecommendPlan {
     pub src_vid: i64,
-    /// Edge types defining the neighborhood. Empty = all edge types.
-    pub over_edges: Vec<String>,
-    pub metric: byoridb_parser::ast::SimilarityMetric,
+    pub by: byoridb_parser::ast::RecommendBy,
     pub limit: usize,
 }
 
@@ -932,8 +931,7 @@ impl ExecutionPlanBuilder {
             })),
             Statement::Recommend(rec) => Ok(ExecutionPlan::Recommend(RecommendPlan {
                 src_vid: rec.src_vid,
-                over_edges: rec.over_edges,
-                metric: rec.metric,
+                by: rec.by,
                 limit: rec.limit,
             })),
             Statement::Find(find_stmt) => Ok(ExecutionPlan::Find(FindPlan {
@@ -1000,6 +998,28 @@ impl ExecutionPlanBuilder {
                 byoridb_parser::ast::Literal::Null => byoridb_common::Value::null(),
             },
             byoridb_parser::ast::Expression::Identifier(s) => byoridb_common::Value::String(s),
+            // List literal, e.g. an embedding vector `[0.1, -0.2, ...]`.
+            byoridb_parser::ast::Expression::List(items) => {
+                let values = items
+                    .into_iter()
+                    .map(Self::expr_to_value)
+                    .collect::<Result<Vec<_>>>()?;
+                byoridb_common::Value::List(byoridb_common::datatypes::list::List::from(values))
+            }
+            // Negative numeric literals arrive as `-(N)` after parsing.
+            byoridb_parser::ast::Expression::UnaryOp {
+                op: byoridb_parser::ast::UnaryOperator::Neg,
+                operand,
+            } => match Self::expr_to_value(*operand)? {
+                byoridb_common::Value::Int(i) => byoridb_common::Value::Int(-i),
+                byoridb_common::Value::Float(f) => byoridb_common::Value::Float(-f),
+                other => {
+                    return Err(crate::error::ExecutionError::InvalidOperation(format!(
+                        "Unary minus requires a number, got {:?}",
+                        other
+                    )))
+                }
+            },
             _ => {
                 return Err(crate::error::ExecutionError::InvalidOperation(format!(
                     "Expression not supported: {:?}",
@@ -1017,6 +1037,33 @@ mod tests {
 
     fn build(stmt: Statement) -> ExecutionPlan {
         ExecutionPlanBuilder::build(stmt).expect("plan build")
+    }
+
+    #[test]
+    fn expr_to_value_folds_list_and_unary_minus() {
+        use byoridb_parser::ast::{Expression, Literal, UnaryOperator};
+        // An embedding literal `[0.1, -0.2, -3]` — negatives arrive as UnaryOp.
+        let expr = Expression::List(vec![
+            Expression::Literal(Literal::Float(0.1)),
+            Expression::UnaryOp {
+                op: UnaryOperator::Neg,
+                operand: Box::new(Expression::Literal(Literal::Float(0.2))),
+            },
+            Expression::UnaryOp {
+                op: UnaryOperator::Neg,
+                operand: Box::new(Expression::Literal(Literal::Int(3))),
+            },
+        ]);
+        match ExecutionPlanBuilder::expr_to_value(expr).unwrap() {
+            byoridb_common::Value::List(l) => {
+                assert_eq!(l.values.len(), 3);
+                assert!(
+                    matches!(l.values[1], byoridb_common::Value::Float(f) if (f + 0.2).abs() < 1e-9)
+                );
+                assert!(matches!(l.values[2], byoridb_common::Value::Int(-3)));
+            }
+            other => panic!("expected list, got {:?}", other),
+        }
     }
 
     #[test]

@@ -476,6 +476,22 @@ impl Parser {
                 self.consume_token(Token::RParen)?;
                 Ok(expr)
             }
+            Token::LBracket => {
+                // List literal: `[e1, e2, ...]` (empty `[]` allowed). Used for
+                // embedding vectors, e.g. `INSERT VERTEX p(vec) VALUES 1:([0.1, 0.2])`.
+                self.advance();
+                let mut items = Vec::new();
+                if self.peek_token()? != Token::RBracket {
+                    loop {
+                        items.push(self.parse_expression()?);
+                        if !self.match_token(Token::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.consume_token(Token::RBracket)?;
+                Ok(Expression::List(items))
+            }
             _ => {
                 // Allow keywords to be used as identifiers in expressions
                 if let Some(keyword_str) = self.keyword_to_string(&token) {
