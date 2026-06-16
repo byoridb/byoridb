@@ -25,7 +25,7 @@ Password: value of BYORIDB_ROOT_PASSWORD, or the generated password logged at st
 |----------|------------|
 | DDL | `CREATE SPACE`, `DROP SPACE`, `CREATE TAG`, `ALTER TAG`, `DROP TAG`, `CREATE EDGE`, `ALTER EDGE`, `DROP EDGE` |
 | DML | `INSERT VERTEX`, `UPDATE VERTEX`, `DELETE VERTEX`, `INSERT EDGE`, `DELETE EDGE` |
-| DQL | `FETCH PROP`, `GO`, `MATCH`, `LOOKUP`, `FIND PATH` |
+| DQL | `FETCH PROP`, `GO`, `MATCH`, `LOOKUP`, `FIND PATH`, `RECOMMEND` |
 
 ## 데이터 타입
 
