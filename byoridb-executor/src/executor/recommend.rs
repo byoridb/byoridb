@@ -172,34 +172,16 @@ impl Executor {
         if seed.is_empty() {
             return Ok(embedding_result(Vec::new()));
         }
-        let seed_norm = dot(&seed, &seed).sqrt();
-        if seed_norm == 0.0 {
-            return Ok(embedding_result(Vec::new()));
-        }
 
-        // Scan packed f32 entries for this property — no vertex decode on the
-        // hot path. Cosine vs the seed; dim mismatches / zero vectors skipped.
-        let prefix = SchemaKey::vec_data_prop_prefix(space, prop);
-        let entries = self.ctx.kvstore.scan_prefix(&prefix).await?;
-        let mut scored: Vec<(i64, f32)> = Vec::with_capacity(entries.len());
-        for (key, bytes) in entries {
-            let vid = match SchemaKey::vec_data_vid_from_key(&key) {
-                Some(v) if v != src_vid => v,
-                _ => continue,
-            };
-            let cand = unpack_embedding(&bytes);
-            if cand.len() != seed.len() {
-                continue; // incompatible dimension
-            }
-            let cand_norm = dot(&cand, &cand).sqrt();
-            if cand_norm == 0.0 {
-                continue;
-            }
-            scored.push((vid, dot(&seed, &cand) / (seed_norm * cand_norm)));
-        }
-
-        // Rank: cosine desc, then vid asc (deterministic).
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        // Candidate scoring: persisted HNSW index for large catalogs (R-2b),
+        // exact flat KNN below the threshold (R-2a). Both return (vid, cosine)
+        // sorted by score desc; the seed itself is excluded here.
+        let scored: Vec<(i64, f32)> = self
+            .scored_embedding_candidates(space, prop, &seed)
+            .await?
+            .into_iter()
+            .filter(|(vid, _)| *vid != src_vid)
+            .collect();
 
         // Seed properties for seed-relative predicates (e.g. `channel != seed.channel`),
         // loaded once. Only needed when a filter is present.
@@ -314,16 +296,11 @@ pub(crate) fn pack_embedding(value: &Value) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-fn unpack_embedding(bytes: &[u8]) -> Vec<f32> {
+pub(super) fn unpack_embedding(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
-}
-
-#[inline]
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 /// Neighbors-mode result table (vid/score/shared), stable schema even when empty.

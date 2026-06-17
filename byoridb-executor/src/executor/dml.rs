@@ -41,6 +41,10 @@ impl Executor {
                 };
                 let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                 let mut inserted = 0i64;
+                // Properties whose dense vectors changed → their persisted HNSW
+                // index (R-2b) is now stale and must be rebuilt on next query.
+                let mut dirty_vec_props: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 for vertex in vertices {
                     // Schema validation: verify each tag and its fields exist
                     for tag in &vertex.tags {
@@ -82,6 +86,7 @@ impl Executor {
                                     vertex.vid,
                                 );
                                 batch.push((vkey, bytes));
+                                dirty_vec_props.insert(prop.clone());
                             }
                         }
                     }
@@ -112,6 +117,11 @@ impl Executor {
                 }
                 if !batch.is_empty() {
                     self.ctx.kvstore.batch_put(batch).await?;
+                }
+                // Invalidate persisted vector indexes (R-2b) for embedding props
+                // touched by this INSERT — rebuilt lazily on next BY EMBEDDING query.
+                for prop in &dirty_vec_props {
+                    self.mark_vector_index_dirty(&effective_space, prop).await?;
                 }
                 Ok(ExecutorResult {
                     columns: vec!["Inserted".to_string()],
@@ -364,7 +374,11 @@ impl Executor {
         for (k, v) in &plan.updates {
             let vkey = crate::key::SchemaKey::vec_data(&effective_space, k, vid);
             match crate::executor::recommend::pack_embedding(v) {
-                Some(bytes) => self.ctx.kvstore.put(&vkey, &bytes).await?,
+                Some(bytes) => {
+                    self.ctx.kvstore.put(&vkey, &bytes).await?;
+                    // Persisted HNSW index (R-2b) is now stale for this property.
+                    self.mark_vector_index_dirty(&effective_space, k).await?;
+                }
                 None => self.ctx.kvstore.delete(&vkey).await?,
             }
         }

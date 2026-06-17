@@ -150,6 +150,20 @@ impl SchemaKey {
         s.rsplit(':').next()?.parse::<i64>().ok()
     }
 
+    /// Persisted HNSW index blob for one embedding property (PLAN.md R-2b):
+    /// `{space}:vecidx:{prop}` → bincode(HnswMap). Built from the dense store,
+    /// loaded for ANN search, rebuilt when the dirty marker is present.
+    pub fn vec_index(space: &str, prop: &str) -> Vec<u8> {
+        format!("{}:vecidx:{}", space, prop).into_bytes()
+    }
+
+    /// Dirty marker for a vector index: `{space}:vecidx-dirty:{prop}`. Present
+    /// (empty value) iff the persisted index is stale w.r.t. the dense store.
+    /// Set by INSERT/UPDATE of a numeric-list property; cleared on rebuild.
+    pub fn vec_index_dirty(space: &str, prop: &str) -> Vec<u8> {
+        format!("{}:vecidx-dirty:{}", space, prop).into_bytes()
+    }
+
     // ===== Index keys =====
 
     /// Create a tag index key: `space:{space}:tag_index:{name}`

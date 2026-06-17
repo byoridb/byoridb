@@ -290,13 +290,26 @@ landmine 없음). R-2b는 `instant-distance`(더 가벼움, serde 영속화) 우
   - **R-2a flat 정확 KNN** ✅ 구현 완료 (2026-06-16). 의존성 0. dense f32
     사이드 스토어 prefix scan → 코사인 → top-k. 수만 벡터까지 정확·충분.
     R-1과 같은 "정확한 것 먼저" 규율.
-  - **R-2b HNSW 근사** ⬜ 설계 확정 (2026-06-16), 구현은 go/no-go 대기.
-    대규모 차별화. R-2a dense 사이드 스토어 위에 ANN 인덱스 레이어로.
+  - **R-2b HNSW 근사** ✅ 구현 완료 (2026-06-17). 영속 인덱스 방식(사용자
+    go + D9-A 선택). 대규모 차별화. R-2a dense 사이드 스토어 위에 ANN 레이어.
+    신규 `executor/vector_index.rs` + 의존성 `instant-distance 0.6`(with-serde).
 
-    *왜 별도 결정이 필요한가:* R-1~R-3a는 모두 읽기경로 쿼리 기능이었으나,
-    R-2b는 **새 프로덕션 의존성 + ANN 인덱스 생명주기(영속/증분/staleness)**가
-    걸려 리스크 등급이 다름. 승인 게이트 없는 main 자동배포 환경이라 명시적
-    go/no-go 후 진행.
+    *구현 (2026-06-17):*
+    - **영속 인덱스**: `{space}:vecidx:{prop}` → `bincode(HnswMap<Emb,vid>)`.
+      HnswMap이 point→vid 매핑 내장 → 검색이 vid 직접 반환. 커스텀 `Emb` Point가
+      코사인 distance(`1-cos`). `{space}:vecidx-dirty:{prop}` 마커로 stale 추적.
+    - **임계값**: `config.vector_index_min`(기본 1000) 이하면 인덱스 없이 exact
+      flat KNN(R-2a) — instant-distance가 build-once(증분 insert 없음)라 rebuild가
+      O(N)이므로, 대규모 카탈로그(벌크 적재→다수 쿼리)에서만 인덱스가 이득.
+      깨끗한 인덱스 쿼리는 풀스캔 0(load+search). dirty/없음 → 1회 재빌드.
+    - **쿼리 표면 무변경**: `BY EMBEDDING`이 내부에서 인덱스 유무로 ANN/flat 분기.
+      flat은 always-correct 폴백·검증 기준. ANN은 근사(recommendation 허용).
+    - **무효화**: INSERT/UPDATE의 숫자-리스트 prop → `mark_vector_index_dirty`.
+      DELETE는 prop 모름 → 인덱스 미정리, 방출 시 정점 존재확인으로 stale vid 거름.
+    - **회귀**: vector_index 3(ANN 영속·랭킹 / dirty 재빌드 / 임계값 flat).
+      기존 임베딩 테스트 12건은 기본 임계값으로 flat 유지(정확) → 무회귀.
+    - **D8 후속**: 진짜 증분 insert가 필요하면 `hnsw_rs`(insert+file dump) 검토.
+      instant-distance는 redb-bytes 직렬화엔 맞으나 rebuild-on-write가 한계.
 
     *설계 결정 (2026-06-16):*
     - **D8. 크레이트.** 증분 insert가 DB에 중요 → `hnsw_rs 0.3.4`(insert +

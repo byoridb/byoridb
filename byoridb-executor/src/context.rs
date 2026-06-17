@@ -40,6 +40,10 @@ pub struct ExecutionConfig {
     /// The shortest-path DAG can hold combinatorially many distinct paths
     /// on dense graphs; enumeration stops at this cap. `0` disables the cap.
     pub max_find_paths: usize,
+    /// Minimum vector count before `RECOMMEND ... BY EMBEDDING` builds and uses
+    /// a persisted HNSW index (PLAN.md R-2b). At or below this, exact flat KNN
+    /// is used (no index overhead, exact results). Above it, the ANN index wins.
+    pub vector_index_min: usize,
 }
 
 impl Default for ExecutionConfig {
@@ -52,6 +56,7 @@ impl Default for ExecutionConfig {
             max_scan_limit: 100_000, // 100K rows per scan
             max_go_steps: 20,
             max_find_paths: 1024,
+            vector_index_min: 1000,
         }
     }
 }

@@ -166,6 +166,7 @@ mod dml;
 mod dql;
 mod recommend;
 mod show;
+mod vector_index;
 
 #[cfg(test)]
 mod tests {
