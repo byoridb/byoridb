@@ -334,6 +334,16 @@ impl Parser {
                 self.advance();
                 Ok(PartitionStrategySpec::Modulo)
             }
+            // `RANGE` now lexes as a keyword token (O-5 edge RANGE), but it also
+            // names a partition strategy here. Accept both the keyword and a
+            // legacy `range` identifier.
+            Token::Range => {
+                self.advance();
+                self.consume_token(Token::LParen)?;
+                let boundaries = self.parse_integer_list()?;
+                self.consume_token(Token::RParen)?;
+                Ok(PartitionStrategySpec::Range { boundaries })
+            }
             Token::Identifier(ref s) if s.to_uppercase() == "RANGE" => {
                 self.advance();
                 self.consume_token(Token::LParen)?;
@@ -445,6 +455,14 @@ impl Parser {
                     self.advance();
                     self.consume_token(Token::Of)?;
                     semantics.subproperty_of = Some(self.consume_identifier()?);
+                }
+                Token::Domain => {
+                    self.advance();
+                    semantics.domain = Some(self.consume_identifier()?);
+                }
+                Token::Range => {
+                    self.advance();
+                    semantics.range = Some(self.consume_identifier()?);
                 }
                 _ => break,
             }

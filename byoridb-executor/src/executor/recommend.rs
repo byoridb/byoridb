@@ -366,9 +366,10 @@ impl Executor {
     /// `{tag}.{prop}` so either form resolves in the predicate.
     ///
     /// When `compute_isa` is set, also injects `__isa__` — the vertex's class
-    /// set (its tags ∪ their transitive O-3 superclasses) — so `is_a("...")`
-    /// predicates can match subclasses. Only computed when the filter uses
-    /// `is_a`, so the per-candidate ancestor walk is skipped otherwise.
+    /// set (tags ∪ inferred O-5 types, each expanded with O-3 superclasses) via
+    /// the shared [`crate::ontology::vertex_class_set`] — so `is_a("...")`
+    /// predicates match subclasses and inferred types. Only computed when the
+    /// filter uses `is_a`, so the class walk is skipped otherwise.
     async fn load_candidate_props(
         &self,
         space: &str,
@@ -381,7 +382,6 @@ impl Executor {
         };
         let vertex = byoridb_codec::VertexCodec::decode_vertex(&data)
             .map_err(|e| crate::error::ExecutionError::Io(std::io::Error::other(e.to_string())))?;
-        let tag_names: Vec<String> = vertex.tags.iter().map(|t| t.name.clone()).collect();
         let mut props = HashMap::new();
         for tag in vertex.tags {
             for (k, v) in tag.properties {
@@ -390,14 +390,10 @@ impl Executor {
             }
         }
         if compute_isa {
-            let mut isa: HashSet<String> = HashSet::new();
-            for tag in &tag_names {
-                isa.insert(tag.clone());
-                for ancestor in self.class_ancestors(space, tag).await? {
-                    isa.insert(ancestor);
-                }
-            }
-            let list: Vec<Value> = isa.into_iter().map(Value::String).collect();
+            let set = crate::ontology::vertex_class_set(&self.ctx, space, vid)
+                .await?
+                .unwrap_or_default();
+            let list: Vec<Value> = set.into_iter().map(Value::String).collect();
             props.insert(
                 "__isa__".to_string(),
                 Value::List(byoridb_common::datatypes::list::List::from(list)),

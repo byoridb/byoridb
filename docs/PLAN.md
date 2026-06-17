@@ -240,13 +240,22 @@ inference.rs`. INSERT EDGE가 커밋 후 entailed edge를 **fixpoint(worklist)�
   cascading 완전 폐포(예: subPropertyOf→transitive 초프로퍼티). `RelMeta` 인덱스
   로드 + 증분 worklist(seeds=삽입 triple, 기존 그래프와 결합). `max_traversal_nodes`
   write 캡(pathological closure 가드, warn).
-- **scope(phase 1)**: **insertion-only**(삭제 retraction은 후속 B/F 알고리즘). 시맨틱은
+- **scope**: **insertion-only**(삭제 retraction은 후속 B/F 알고리즘). 시맨틱은
   INSERT 전에 선언(`CREATE EDGE ... TRANSITIVE` → `INSERT`). 기존 데이터에 시맨틱
   후행 추가 시 재-materialization 필요(미구현, O-1 백필 caveat과 동일 성격).
-- **미착수(후속)**: subclass type 전파/domain·range(vertex-level, ABox 타입 모델 필요),
-  `sameAs`(최난도), 삭제 증분(B/F), 분산 materialization(먼 마일스톤).
-- 회귀 7: symmetric/inverseOf 양방향/subPropertyOf/transitive 체인/cascading/
-  no-semantics/추론 edge 순회 가시성.
+
+**O-5 phase 2: domain/range → vertex 타입 추론 ✅ 구현 완료 (2026-06-17)**
+`CREATE EDGE <e>(...) [DOMAIN <class>] [RANGE <class>]`. `(a)-p->(b)`에서 p domain
+C ⟹ a is-a C, p range D ⟹ b is-a D. 추론 타입을 **`{space}:vtype:{vid}:{class}`**
+키스페이스에 저장(정점 blob 미변경). `ontology::vertex_class_set`가 vtype를 소비 +
+조상클래스 확장 → `is_a`(MATCH/RECOMMEND)가 추론 타입을 자동 인지. 신규 토큰
+DOMAIN/RANGE(RANGE는 PARTITION BY RANGE와 공존 — 파서 양쪽 처리). materialization
+worklist가 처리하는 매 triple(asserted+inferred edge)에 domain/range 적용 → 추론
+edge에도 타입 전파. CREATE 시 domain/range 대상 class(tag/class) 존재 검증.
+회귀: domain/range 타입 추론(서브클래스 조상 + MATCH is_a 가시) + 검증 + 파서.
+- **미착수(후속)**: `sameAs`(최난도), 삭제 증분(B/F), 분산 materialization(먼 마일스톤).
+- 회귀 누적: 규칙(symmetric/inverseOf 양방향/subPropertyOf/transitive/cascading/
+  no-semantics/순회 가시성) + domain/range + MATCH is_a.
 - **후속 최적화(리뷰 F-001, 비차단)**: 시맨틱 미선언 space도 INSERT EDGE마다
   `load_rel_meta`가 edge 스키마 프리픽스를 1회 스캔(비용은 edge *타입* 수에 비례,
   보통 수십 이하). bidirectional inverse 정확성상 전체 스캔이 필요 — 핫패스 최적화

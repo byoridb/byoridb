@@ -128,6 +128,26 @@ impl SchemaKey {
         format!("{}:in-edge:{}:", space, dst).into_bytes()
     }
 
+    // ===== Inferred vertex type membership (PLAN.md O-5 domain/range) =====
+
+    /// Inferred class membership for a vertex: `{space}:vtype:{vid}:{class}` →
+    /// empty. Written by domain/range materialization; consulted by
+    /// `ontology::vertex_class_set` so `is_a(...)` sees inferred types.
+    pub fn vtype(space: &str, vid: i64, class: &str) -> Vec<u8> {
+        format!("{}:vtype:{}:{}", space, vid, class).into_bytes()
+    }
+
+    /// Prefix for all inferred classes of a vertex: `{space}:vtype:{vid}:`
+    pub fn vtype_prefix(space: &str, vid: i64) -> Vec<u8> {
+        format!("{}:vtype:{}:", space, vid).into_bytes()
+    }
+
+    /// Extract the trailing class name from a `vtype` key.
+    pub fn vtype_class_from_key(key: &[u8]) -> Option<String> {
+        let s = std::str::from_utf8(key).ok()?;
+        s.rsplit(':').next().map(|c| c.to_string())
+    }
+
     // ===== Dense embedding vector store (PLAN.md R-2a) =====
 
     /// Dense embedding entry: `{space}:vec:{prop}:{vid}` → packed little-endian

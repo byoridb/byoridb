@@ -227,6 +227,10 @@ pub struct SemanticFlags {
     pub inverse_of: Option<String>,
     /// `SUBPROPERTY OF q`: `(a)-p->(b) ⟹ (a)-q->(b)`.
     pub subproperty_of: Option<String>,
+    /// `DOMAIN C`: `(a)-p->(b) ⟹ a is-a C` (subject vertex type inference).
+    pub domain: Option<String>,
+    /// `RANGE D`: `(a)-p->(b) ⟹ b is-a D` (object vertex type inference).
+    pub range: Option<String>,
 }
 
 impl SemanticFlags {
@@ -236,6 +240,8 @@ impl SemanticFlags {
             && !self.symmetric
             && self.inverse_of.is_none()
             && self.subproperty_of.is_none()
+            && self.domain.is_none()
+            && self.range.is_none()
     }
 }
 

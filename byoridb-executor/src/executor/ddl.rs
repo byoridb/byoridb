@@ -469,6 +469,31 @@ impl Executor {
             }
         }
 
+        // DOMAIN / RANGE reference a *class* (vertex type) — validate it exists
+        // as a tag or class so type inference (O-5) resolves it.
+        for (clause, target) in [("DOMAIN", &semantics.domain), ("RANGE", &semantics.range)] {
+            if let Some(target) = target {
+                let is_class = self
+                    .ctx
+                    .kvstore
+                    .get(&SchemaKey::class(&space, target))
+                    .await?
+                    .is_some();
+                let is_tag = self
+                    .ctx
+                    .kvstore
+                    .get(&SchemaKey::tag(&space, target))
+                    .await?
+                    .is_some();
+                if !is_class && !is_tag {
+                    return Err(ExecutionError::InvalidOperation(format!(
+                        "{} target class '{}' does not exist",
+                        clause, target
+                    )));
+                }
+            }
+        }
+
         let edge_data = serde_json::json!({
             "name": name,
             "properties": props,

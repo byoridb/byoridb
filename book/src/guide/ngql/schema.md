@@ -101,7 +101,19 @@ CREATE EDGE <edge_name> (<properties>)
     [TRANSITIVE]              -- (a)-p->(b) ∧ (b)-p->(c) ⟹ (a)-p->(c)
     [SYMMETRIC]               -- (a)-p->(b) ⟹ (b)-p->(a)
     [INVERSE OF <edge>]       -- (a)-p->(b) ⟹ (b)-q->(a) (양방향)
-    [SUBPROPERTY OF <edge>];  -- (a)-p->(b) ⟹ (a)-q->(b)
+    [SUBPROPERTY OF <edge>]   -- (a)-p->(b) ⟹ (a)-q->(b)
+    [DOMAIN <class>]          -- (a)-p->(b) ⟹ a is-a <class> (주어 타입 추론)
+    [RANGE <class>];          -- (a)-p->(b) ⟹ b is-a <class> (목적어 타입 추론)
+```
+
+`DOMAIN`/`RANGE`는 정점의 클래스(타입)를 추론합니다. 추론된 타입은 `is_a(...)`로
+조회됩니다(서브클래스 계층도 자동 확장).
+
+```sql
+-- bornIn의 목적어는 City: alice-[bornIn]->seoul 삽입 시 seoul이 City로 추론
+CREATE CLASS city();
+CREATE EDGE bornIn() RANGE city;
+-- 이후 MATCH (n) WHERE is_a(n, "city") 가 seoul을 매칭
 ```
 
 ```sql

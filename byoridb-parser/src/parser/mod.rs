@@ -297,6 +297,8 @@ impl Parser {
             Token::Symmetric => "symmetric",
             Token::Inverse => "inverse",
             Token::Subproperty => "subproperty",
+            Token::Domain => "domain",
+            Token::Range => "range",
             // Role keywords (used as identifiers in GRANT/REVOKE)
             Token::Admin => "ADMIN",
             Token::God => "GOD",

@@ -53,6 +53,10 @@ pub(super) struct RelMeta {
     inverse: HashMap<String, Vec<String>>,
     /// edge type → its direct superproperties.
     superprops: HashMap<String, Vec<String>>,
+    /// edge type → domain class (subject vertex type).
+    domain: HashMap<String, String>,
+    /// edge type → range class (object vertex type).
+    range: HashMap<String, String>,
 }
 
 impl RelMeta {
@@ -61,6 +65,8 @@ impl RelMeta {
             && self.symmetric.is_empty()
             && self.inverse.is_empty()
             && self.superprops.is_empty()
+            && self.domain.is_empty()
+            && self.range.is_empty()
     }
 }
 
@@ -116,6 +122,12 @@ impl Executor {
             if let Some(q) = sem.subproperty_of {
                 meta.superprops.entry(name.clone()).or_default().push(q);
             }
+            if let Some(c) = sem.domain {
+                meta.domain.insert(name.clone(), c);
+            }
+            if let Some(c) = sem.range {
+                meta.range.insert(name.clone(), c);
+            }
         }
         Ok(meta)
     }
@@ -163,6 +175,27 @@ impl Executor {
                 for n in algo::get_incoming_neighbors(&self.ctx, space, s, &etype).await? {
                     derived.push((n.dst, p.clone(), d));
                 }
+            }
+
+            // domain/range ⟹ vertex type inference (subject is-a domain,
+            // object is-a range). Types do not entail further edges, so they
+            // are written but not enqueued.
+            if let Some(class) = meta.domain.get(&p) {
+                if self.assert_vertex_type(space, s, class).await? {
+                    written += 1;
+                }
+            }
+            if let Some(class) = meta.range.get(&p) {
+                if self.assert_vertex_type(space, d, class).await? {
+                    written += 1;
+                }
+            }
+            if written >= cap {
+                tracing::warn!(
+                    cap,
+                    "O-5 materialization hit max_traversal_nodes; closure may be partial"
+                );
+                return Ok(());
             }
 
             for triple in derived {
@@ -223,6 +256,18 @@ impl Executor {
         let in_key = SchemaKey::in_edge_data(space, d, p, s, 0);
         self.ctx.kvstore.put(&in_key, &data).await?;
         Ok(())
+    }
+
+    /// Record inferred class membership `{space}:vtype:{vid}:{class}` (from
+    /// domain/range). Returns `true` if newly written, `false` if already
+    /// present (so the caller counts only new inferences against the cap).
+    async fn assert_vertex_type(&self, space: &str, vid: i64, class: &str) -> Result<bool> {
+        let key = SchemaKey::vtype(space, vid, class);
+        if self.ctx.kvstore.get(&key).await?.is_some() {
+            return Ok(false);
+        }
+        self.ctx.kvstore.put(&key, &[]).await?;
+        Ok(true)
     }
 }
 
@@ -342,6 +387,53 @@ mod tests {
         assert!(
             !has(&e, 2, "plain", 1).await,
             "no reverse without SYMMETRIC"
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_range_infers_vertex_types() {
+        let e = create_executor();
+        ok(&e, "CREATE CLASS person()").await;
+        ok(&e, "CREATE CLASS location()").await;
+        ok(&e, "CREATE CLASS city() SUBCLASS OF location").await;
+        ok(&e, "CREATE TAG place()").await; // neutral tag for the object vertex
+        ok(&e, "CREATE EDGE bornIn() DOMAIN person RANGE city").await;
+        ok(&e, "INSERT VERTEX person() VALUES 1:()").await;
+        ok(&e, "INSERT VERTEX place() VALUES 2:()").await; // tagged place, NOT city
+        ok(&e, "INSERT EDGE bornIn() VALUES 1->2:()").await;
+
+        // RANGE city ⟹ object vertex 2 is-a city, and via SUBCLASS OF, location.
+        let set2 = crate::ontology::vertex_class_set(&e.ctx, "default", 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(set2.contains("city"), "range inferred city type");
+        assert!(
+            set2.contains("location"),
+            "inferred type's ancestor included"
+        );
+        // DOMAIN person ⟹ subject vertex 1 is-a person (already tagged).
+        let set1 = crate::ontology::vertex_class_set(&e.ctx, "default", 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(set1.contains("person"));
+
+        // MATCH sees the inferred type: vertex 2 (tagged place) is-a city.
+        let r = run(&e, "MATCH (n:place) WHERE is_a(n, \"city\") RETURN id(n)")
+            .await
+            .unwrap();
+        assert_eq!(r.rows.len(), 1, "inferred city type visible to MATCH is_a");
+    }
+
+    #[tokio::test]
+    async fn create_edge_rejects_unknown_domain_class() {
+        let e = create_executor();
+        assert!(
+            run(&e, "CREATE EDGE bad() DOMAIN nonexistent_class")
+                .await
+                .is_err(),
+            "DOMAIN of unknown class must error"
         );
     }
 

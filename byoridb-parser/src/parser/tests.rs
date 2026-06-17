@@ -1264,6 +1264,13 @@ fn test_parse_create_edge_semantics() {
         }
         other => panic!("Expected Create Edge, got {:?}", other),
     }
+    match parse("CREATE EDGE bornIn() DOMAIN person RANGE city").unwrap() {
+        Statement::Create(CreateStatement::Edge(e)) => {
+            assert_eq!(e.semantics.domain.as_deref(), Some("person"));
+            assert_eq!(e.semantics.range.as_deref(), Some("city"));
+        }
+        other => panic!("Expected Create Edge, got {:?}", other),
+    }
     // No semantic clause → all default off.
     match parse("CREATE EDGE plain()").unwrap() {
         Statement::Create(CreateStatement::Edge(e)) => assert!(e.semantics.is_empty()),

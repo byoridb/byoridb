@@ -77,6 +77,10 @@ pub enum Token {
     Inverse,
     #[token("SUBPROPERTY", ignore(case))]
     Subproperty,
+    #[token("DOMAIN", ignore(case))]
+    Domain,
+    #[token("RANGE", ignore(case))]
+    Range,
     #[token("MATCH", ignore(case))]
     Match,
     #[token("GO", ignore(case))]

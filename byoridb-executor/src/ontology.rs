@@ -71,8 +71,9 @@ pub(crate) async fn class_ancestors_of(
     }
 }
 
-/// The set of classes a vertex belongs to: each of its tags plus their
-/// transitive superclasses. `None` if the vertex does not exist. Used by
+/// The set of classes a vertex belongs to: its tags **and** any inferred types
+/// (O-5 domain/range, stored under `{space}:vtype:{vid}:`), each expanded with
+/// their transitive superclasses. `None` if the vertex does not exist. Used by
 /// `is_a(...)` ontology filters in RECOMMEND and MATCH.
 pub(crate) async fn vertex_class_set(
     ctx: &ExecutionContext,
@@ -84,11 +85,22 @@ pub(crate) async fn vertex_class_set(
     };
     let vertex = VertexCodec::decode_vertex(&blob)
         .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
+
+    // Direct classes = declared tags ∪ inferred types.
+    let mut direct: Vec<String> = vertex.tags.iter().map(|t| t.name.clone()).collect();
+    let vtype_prefix = SchemaKey::vtype_prefix(space, vid);
+    for (key, _) in ctx.kvstore.scan_prefix(&vtype_prefix).await? {
+        if let Some(class) = SchemaKey::vtype_class_from_key(&key) {
+            direct.push(class);
+        }
+    }
+
     let mut set = HashSet::new();
-    for tag in &vertex.tags {
-        set.insert(tag.name.clone());
-        for ancestor in class_ancestors_of(ctx, space, &tag.name).await? {
-            set.insert(ancestor);
+    for class in direct {
+        if set.insert(class.clone()) {
+            for ancestor in class_ancestors_of(ctx, space, &class).await? {
+                set.insert(ancestor);
+            }
         }
     }
     Ok(Some(set))
