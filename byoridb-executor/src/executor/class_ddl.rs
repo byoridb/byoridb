@@ -19,10 +19,6 @@ use crate::error::{ExecutionError, Result};
 use crate::key::SchemaKey;
 use serde::{Deserialize, Serialize};
 
-/// Hard cap on hierarchy depth, both at creation time and during ancestor
-/// walks. Real ontologies are shallow; this guards corrupt metadata.
-const MAX_CLASS_DEPTH: usize = 16;
-
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct ClassDef {
     pub name: String,
@@ -223,39 +219,10 @@ impl Executor {
     }
 
     /// All transitive superclasses of `name` (BFS, deduped, excludes `name`).
-    /// Errors when the walk exceeds [`MAX_CLASS_DEPTH`] — either corrupt
-    /// metadata or a hierarchy deeper than the supported cap.
+    /// Delegates to the shared [`crate::ontology`] helper so RECOMMEND, DESCRIBE
+    /// CLASS and the MATCH `is_a` filter share one implementation.
     pub(super) async fn class_ancestors(&self, space: &str, name: &str) -> Result<Vec<String>> {
-        let mut ancestors: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> =
-            std::collections::HashSet::from([name.to_string()]);
-        let mut frontier = vec![name.to_string()];
-
-        for _depth in 0..MAX_CLASS_DEPTH {
-            if frontier.is_empty() {
-                return Ok(ancestors);
-            }
-            let mut next = Vec::new();
-            for current in frontier {
-                let Some(def) = self.load_class(space, &current).await? else {
-                    continue;
-                };
-                for parent in def.superclasses {
-                    if seen.insert(parent.clone()) {
-                        ancestors.push(parent.clone());
-                        next.push(parent);
-                    }
-                }
-            }
-            frontier = next;
-        }
-        if frontier.is_empty() {
-            return Ok(ancestors);
-        }
-        Err(ExecutionError::InvalidOperation(format!(
-            "class hierarchy of {} exceeds the maximum depth of {}",
-            name, MAX_CLASS_DEPTH
-        )))
+        crate::ontology::class_ancestors_of(&self.ctx, space, name).await
     }
 
     pub(super) async fn load_class(&self, space: &str, name: &str) -> Result<Option<ClassDef>> {

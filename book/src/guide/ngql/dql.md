@@ -118,6 +118,17 @@ WHERE a.name = 'Alice'
 RETURN b.name;
 ```
 
+**온톨로지 클래스 매칭 (`is_a`):**
+
+`is_a(<변수>, "<클래스>")`는 변수에 바인딩된 정점의 tag가 해당 클래스이거나 그
+**하위 클래스**(O-3 `SUBCLASS OF` 계층)면 참입니다. label은 정확 매칭이므로,
+계층 인지 매칭은 `WHERE is_a(...)`로 표현합니다.
+
+```sql
+-- dog SUBCLASS OF animal 이면, dog 정점도 animal로 매칭
+MATCH (n:dog) WHERE is_a(n, "animal") RETURN id(n);
+```
+
 ## LOOKUP (인덱스 쿼리)
 
 인덱스를 사용하여 버텍스나 엣지를 쿼리합니다:

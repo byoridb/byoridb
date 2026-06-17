@@ -694,6 +694,26 @@ impl MatchExecutor {
                 byoridb_common::Value::Null(byoridb_common::NullType::Null)
             }
 
+            // is_a(v, "Class") — ontology class membership incl. SUBCLASS OF
+            // ancestors (PLAN.md O-7). True iff v's tags ∪ their transitive
+            // superclasses contain the named class.
+            Expression::FunctionCall { name, args } if name.to_lowercase() == "is_a" => {
+                if let (
+                    Some(Expression::Identifier(var)),
+                    Some(Expression::Literal(Literal::String(class))),
+                ) = (args.first(), args.get(1))
+                {
+                    if let Some(byoridb_common::Value::Int(vid)) = bindings.get(var) {
+                        if let Ok(Some(set)) =
+                            crate::ontology::vertex_class_set(&self.ctx, space, *vid).await
+                        {
+                            return byoridb_common::Value::Bool(set.contains(class));
+                        }
+                    }
+                }
+                byoridb_common::Value::Bool(false)
+            }
+
             _ => byoridb_common::Value::Null(byoridb_common::NullType::Null),
         }
     }
@@ -911,6 +931,11 @@ impl MatchExecutor {
                         compare_values(&lv, &rv, op)
                     }
                 },
+                // Boolean-valued function (e.g. `WHERE is_a(n, "Animal")`).
+                Expression::FunctionCall { .. } => matches!(
+                    self.eval_return_expr(expr, bindings, space).await,
+                    byoridb_common::Value::Bool(true)
+                ),
                 _ => false,
             }
         })

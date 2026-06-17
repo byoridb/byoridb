@@ -346,6 +346,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn match_where_is_a_uses_class_hierarchy() {
+        // O-7: ontology-aware matching in the main query language.
+        let e = create_executor();
+        ok(&e, "CREATE CLASS animal()").await;
+        ok(&e, "CREATE CLASS dog() SUBCLASS OF animal").await;
+        ok(&e, "CREATE TAG cat()").await;
+        ok(&e, "INSERT VERTEX dog() VALUES 1:()").await;
+        ok(&e, "INSERT VERTEX dog() VALUES 2:()").await;
+        ok(&e, "INSERT VERTEX cat() VALUES 3:()").await;
+
+        // dog ⊂ animal → both dog vertices match is_a("animal").
+        let r = run(&e, "MATCH (n:dog) WHERE is_a(n, \"animal\") RETURN id(n)")
+            .await
+            .unwrap();
+        assert_eq!(r.rows.len(), 2, "dog vertices are animals (subclass)");
+
+        // cat is unrelated → no match.
+        let r2 = run(&e, "MATCH (n:cat) WHERE is_a(n, \"animal\") RETURN id(n)")
+            .await
+            .unwrap();
+        assert!(r2.rows.is_empty(), "cat is not an animal");
+
+        // Negative class → no match even for dogs.
+        let r3 = run(&e, "MATCH (n:dog) WHERE is_a(n, \"plant\") RETURN id(n)")
+            .await
+            .unwrap();
+        assert!(r3.rows.is_empty(), "dog is not a plant");
+    }
+
+    #[tokio::test]
     async fn create_edge_rejects_unknown_and_self_reference() {
         let e = create_executor();
         assert!(

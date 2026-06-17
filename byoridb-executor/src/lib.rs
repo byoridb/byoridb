@@ -24,6 +24,7 @@ pub mod executor;
 pub mod explain;
 pub mod key;
 pub mod match_impl;
+pub(crate) mod ontology;
 pub mod plan;
 pub mod profile;
 #[cfg(feature = "distributed")]

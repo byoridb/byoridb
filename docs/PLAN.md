@@ -256,9 +256,17 @@ inference.rs`. INSERT EDGE가 커밋 후 entailed edge를 **fixpoint(worklist)�
 온톨로지 모순 탐지(disjoint class 위반, domain/range 위반 등). SHACL/OWL
 validation 참고.
 
-**O-7 [P2] 시맨틱 쿼리 표면** ⬜ 미착수
-nGQL 확장으로 추론 쿼리 노출(예: `MATCH ... WHERE c IS-A Animal`처럼
-추론 포함 매칭). SPARQL 호환은 별도 검토(하이브리드 모델 아님 — 보류).
+**O-7 [P2] 시맨틱 쿼리 표면** 🟡 `is_a` 매칭 구현 완료 (2026-06-17)
+nGQL에서 추론/클래스 계층 인지 쿼리 노출. **`MATCH (n:dog) WHERE is_a(n, "animal")
+RETURN n`** — 후보 정점의 tag가 해당 클래스이거나 그 subclass(O-3 계층)면 매칭.
+RECOMMEND WHERE의 `is_a`(R-3b)를 주 질의 언어 MATCH까지 확장. 신규 공유 모듈
+`src/ontology.rs`(`class_ancestors_of` + `vertex_class_set`)로 RECOMMEND·DESCRIBE
+CLASS·MATCH가 한 구현 공유(class_ddl::class_ancestors도 위임). match_executor의
+eval_return_expr에 2-arg `is_a(<var>, "<class>")` 함수 + eval_condition에 bool-valued
+FunctionCall 처리 추가. 회귀: MATCH is_a(subclass 매칭/cat 제외/negative).
+- **미착수(후속)**: 추론 edge 기반 매칭(이미 inferred edge가 GO/MATCH에 보이므로
+  일부 자동 충족), SPARQL 호환(보류), `MATCH (n:animal)` label 자체의 subclass
+  확장(현재는 label 정확 매칭 + WHERE is_a로 해결).
 
 ### R. 유사도 / 추천 (P1 — 차별화 기능, 2026-06-15 신설)
 
