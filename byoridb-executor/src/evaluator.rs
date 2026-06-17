@@ -300,6 +300,24 @@ impl Evaluator {
         let args = evaluated_args?;
 
         match name.to_uppercase().as_str() {
+            // Ontology class membership (PLAN.md R-3b): true iff the current
+            // vertex's class set (`__isa__`, its tags ∪ transitive superclasses,
+            // injected by the caller) contains the named class. Lets a RECOMMEND
+            // WHERE express subclass-aware filters like `is_a("animal")`.
+            "IS_A" | "ISA" => {
+                let target = match args.first() {
+                    Some(Value::String(s)) => s,
+                    Some(Value::Null(_)) => return Ok(Value::null()),
+                    _ => {
+                        return Err(ExecutionError::InvalidOperation(
+                            "is_a requires a class-name string argument".to_string(),
+                        ))
+                    }
+                };
+                let member = matches!(ctx.get_property("__isa__"), Some(Value::List(l))
+                    if l.values.iter().any(|v| matches!(v, Value::String(s) if s == target)));
+                Ok(Value::Bool(member))
+            }
             // String functions
             "LOWER" | "TOLOWER" => match args.first() {
                 Some(Value::String(s)) => Ok(Value::String(s.to_lowercase())),
@@ -629,5 +647,77 @@ mod tests {
             Evaluator::evaluate_with_context(&expr, &ctx).unwrap(),
             Value::Bool(true)
         );
+    }
+
+    // ----- is_a (R-3b ontology class membership) -----
+
+    fn is_a(class: &str) -> Expression {
+        Expression::FunctionCall {
+            name: "is_a".to_string(),
+            args: vec![Expression::Literal(Literal::String(class.to_string()))],
+        }
+    }
+
+    fn ctx_with_isa(classes: &[&str]) -> EvalContext {
+        let list = byoridb_common::datatypes::list::List::from(
+            classes
+                .iter()
+                .map(|c| Value::String(c.to_string()))
+                .collect::<Vec<_>>(),
+        );
+        let mut props = HashMap::new();
+        props.insert("__isa__".to_string(), Value::List(list));
+        EvalContext::new().with_current(props)
+    }
+
+    #[test]
+    fn is_a_true_when_class_in_isa_set() {
+        let ctx = ctx_with_isa(&["dog", "animal"]);
+        assert_eq!(
+            Evaluator::evaluate_with_context(&is_a("animal"), &ctx).unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn is_a_false_when_class_absent() {
+        let ctx = ctx_with_isa(&["dog", "animal"]);
+        assert_eq!(
+            Evaluator::evaluate_with_context(&is_a("plant"), &ctx).unwrap(),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn is_a_false_when_no_isa_injected() {
+        // GO/MATCH/LOOKUP contexts never inject `__isa__` → is_a is false, not error.
+        let ctx = EvalContext::new();
+        assert_eq!(
+            Evaluator::evaluate_with_context(&is_a("animal"), &ctx).unwrap(),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn is_a_null_arg_yields_null() {
+        let ctx = ctx_with_isa(&["dog"]);
+        let expr = Expression::FunctionCall {
+            name: "is_a".to_string(),
+            args: vec![Expression::Literal(Literal::Null)],
+        };
+        assert!(matches!(
+            Evaluator::evaluate_with_context(&expr, &ctx).unwrap(),
+            Value::Null(_)
+        ));
+    }
+
+    #[test]
+    fn is_a_non_string_arg_errors() {
+        let ctx = ctx_with_isa(&["dog"]);
+        let expr = Expression::FunctionCall {
+            name: "is_a".to_string(),
+            args: vec![Expression::Literal(Literal::Int(1))],
+        };
+        assert!(Evaluator::evaluate_with_context(&expr, &ctx).is_err());
     }
 }

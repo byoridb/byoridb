@@ -314,9 +314,12 @@ landmine 없음). R-2b는 `instant-distance`(더 가벼움, serde 영속화) 우
       LIMIT+32), `ANN_SEARCH_BUDGET_MAX=4096` 상한. heavy WHERE+큰 LIMIT under-return 완화.
     - **회귀**: vector_index 3(ANN 영속·랭킹 / dirty 재빌드 / 임계값 flat) +
       recommend DELETE 정리 1. 기존 임베딩 12건 flat 유지(무회귀).
-    - **D8 후속(미완, 조건부)**: 진짜 증분 insert가 필요하면 `hnsw_rs`(insert+file
-      dump) 검토. instant-distance는 redb-bytes 직렬화엔 맞으나 rebuild-on-write가
-      한계 — 현재 영속+dirty 재빌드로 동작하므로 쓰기 빈도가 문제될 때만 전환.
+    - **D8 종결 (2026-06-17)**: hnsw_rs(증분 insert) vs instant-distance 택일 →
+      **instant-distance로 종결.** 사유: 사용자가 고른 D9-A(redb-bytes 직렬화)와
+      hnsw_rs의 **파일 기반 영속이 근본 충돌** — hnsw_rs 도입은 D9-A 결정을 되돌리는
+      것. 현재 영속+dirty 재빌드로 동작하며 rebuild-on-write(O(N))는 벌크적재→다수
+      쿼리 워크로드에서 수용 가능. 쓰기가 실제 병목이 되면 그때 별도 트랙으로
+      재평가(아키텍처 변경 동반이라 자율 전환 대상 아님).
 
     *설계 결정 (2026-06-16):*
     - **D8. 크레이트.** 증분 insert가 DB에 중요 → `hnsw_rs 0.3.4`(insert +
@@ -394,17 +397,27 @@ full-pipeline·neighbors 필터).
 **시드 상대 비교 추가 (2026-06-16):** 시드 정점 속성을 `seed` 변수로 바인딩 →
 `WHERE channel != seed.channel`("시드와 다른 채널")처럼 값 하드코딩 없이 비교.
 `passes_filter`가 current=후보 + variable `seed`=시드 props로 EvalContext 구성.
-회귀 1(`embedding_seed_relative_filter_different_channel`). 한계(후속): 추론 포함
-클래스 매칭(`WHERE c IS-A ...`)은 O-5/O-7 선결.
+회귀 1(`embedding_seed_relative_filter_different_channel`).
 **caveat (리뷰 F-002):** 공유 evaluator의 bare-식별자 분기가 current에 없으면
 변수까지 폴백 → 후보에 *결측*인 prop을 bare로 참조하면 시드 값으로 해석될 수
 있음(명시 `seed.prop`는 결정적). evaluator는 GO/MATCH 공용이라 미수정(고위험).
 결측 prop을 항상 드롭하려면 single-id 폴백을 current-only로 좁히는 별도 정리 필요.
 
-**R-3b [P2] 재랭킹·점수 결합·온톨로지 제약** ⬜ 미착수
-벡터 점수 + 공유속성 가산점 결합, O-3 클래스 계층 인지 필터(`WHERE c IS-A ...`,
-추론 포함 매칭 — O-5 선결). R-2b(HNSW)·O-5(추론)와 함께. (시드 상대 비교는
-R-3a에서 선반영 완료.)
+**R-3b [P2] 클래스 계층 인지 필터 / 재랭킹** 🟡 클래스 필터 구현 완료 (2026-06-17)
+
+**클래스 계층 인지 필터 ✅ (2026-06-17):** `RECOMMEND ... WHERE is_a("animal")` —
+후보 정점의 tag가 `animal`이거나 그 **subclass**면 통과. **O-3 클래스 계층만으로
+구현**(전체 추론 엔진 O-5 불필요 — transitive subclass면 충분). `load_candidate_props`가
+필터에 `is_a`가 있을 때만 후보의 is-a 집합(태그 ∪ O-3 `class_ancestors` 전이 상위)을
+계산해 `__isa__`로 주입, evaluator의 신규 `is_a` 함수가 멤버십 검사. 회귀 1
+(`embedding_isa_filter_matches_subclasses`: dog⊂animal 매칭, cat 제외).
+
+**미착수 (별도 트랙):**
+- **점수 결합 재랭킹**: 벡터 코사인 + 공유속성 가산점 블렌딩 → 가중치가 제품
+  결정 사항이라 사용자 스코핑 필요(임의 가중치 자율 구현 보류).
+- **추론 포함 매칭(subclass 초과)**: `inverseOf`/`transitiveProperty`/`sameAs` 등
+  RDFS-Plus 추론 기반 필터는 **O-5(추론 엔진) 선결**. is_a(subclass)는 O-3로
+  충분하나, 그 이상의 시맨틱 추론은 O-5 영역.
 
 ### S. 보안 강화 (P0, 즉시 — 2026-05-13 심층 분석 결과)
 

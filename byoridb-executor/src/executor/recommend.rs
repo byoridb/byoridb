@@ -137,8 +137,10 @@ impl Executor {
         // R-3a/R-3b filter: keep only candidates whose vertex satisfies the
         // predicate. The seed's own properties are bound as `seed` so the
         // predicate can compare against the source (e.g. `channel != seed.channel`).
+        // Class sets (`is_a`) are computed per candidate only when the filter uses it.
+        let needs_isa = filter.is_some_and(filter_uses_isa);
         let seed_props = self
-            .load_candidate_props(space, src_vid)
+            .load_candidate_props(space, src_vid, false)
             .await?
             .unwrap_or_default();
         let mut out = Vec::new();
@@ -146,7 +148,7 @@ impl Executor {
             if out.len() >= limit {
                 break;
             }
-            if let Some(props) = self.load_candidate_props(space, vid).await? {
+            if let Some(props) = self.load_candidate_props(space, vid, needs_isa).await? {
                 if passes_filter(filter, &props, &seed_props) {
                     out.push((vid, score, shared));
                 }
@@ -193,9 +195,11 @@ impl Executor {
             .collect();
 
         // Seed properties for seed-relative predicates (e.g. `channel != seed.channel`),
-        // loaded once. Only needed when a filter is present.
+        // loaded once. Only needed when a filter is present. Class sets (`is_a`)
+        // are computed per candidate only when the filter uses it.
+        let needs_isa = filter.is_some_and(filter_uses_isa);
         let seed_props = if filter.is_some() {
-            self.load_candidate_props(space, src_vid)
+            self.load_candidate_props(space, src_vid, false)
                 .await?
                 .unwrap_or_default()
         } else {
@@ -218,7 +222,7 @@ impl Executor {
                     .await?
                     .is_some()
             } else {
-                match self.load_candidate_props(space, vid).await? {
+                match self.load_candidate_props(space, vid, needs_isa).await? {
                     Some(props) => passes_filter(filter, &props, &seed_props),
                     None => false, // stale (deleted) vid
                 }
@@ -235,14 +239,20 @@ impl Executor {
         })
     }
 
-    /// Load a candidate vertex's flattened properties for R-3a filtering.
+    /// Load a candidate vertex's flattened properties for R-3a/R-3b filtering.
     /// Returns `None` if the vertex no longer exists (stale dense entry from a
     /// deleted vid). Each property is inserted under both its bare name and
     /// `{tag}.{prop}` so either form resolves in the predicate.
+    ///
+    /// When `compute_isa` is set, also injects `__isa__` — the vertex's class
+    /// set (its tags ∪ their transitive O-3 superclasses) — so `is_a("...")`
+    /// predicates can match subclasses. Only computed when the filter uses
+    /// `is_a`, so the per-candidate ancestor walk is skipped otherwise.
     async fn load_candidate_props(
         &self,
         space: &str,
         vid: i64,
+        compute_isa: bool,
     ) -> Result<Option<HashMap<String, Value>>> {
         let data = match self.ctx.kvstore.get(&SchemaKey::vertex(space, vid)).await? {
             Some(d) => d,
@@ -250,6 +260,7 @@ impl Executor {
         };
         let vertex = byoridb_codec::VertexCodec::decode_vertex(&data)
             .map_err(|e| crate::error::ExecutionError::Io(std::io::Error::other(e.to_string())))?;
+        let tag_names: Vec<String> = vertex.tags.iter().map(|t| t.name.clone()).collect();
         let mut props = HashMap::new();
         for tag in vertex.tags {
             for (k, v) in tag.properties {
@@ -257,7 +268,37 @@ impl Executor {
                 props.insert(k, v);
             }
         }
+        if compute_isa {
+            let mut isa: HashSet<String> = HashSet::new();
+            for tag in &tag_names {
+                isa.insert(tag.clone());
+                for ancestor in self.class_ancestors(space, tag).await? {
+                    isa.insert(ancestor);
+                }
+            }
+            let list: Vec<Value> = isa.into_iter().map(Value::String).collect();
+            props.insert(
+                "__isa__".to_string(),
+                Value::List(byoridb_common::datatypes::list::List::from(list)),
+            );
+        }
         Ok(Some(props))
+    }
+}
+
+/// True if the filter expression references the `is_a(...)` ontology predicate,
+/// so the caller knows whether to compute each candidate's class set.
+fn filter_uses_isa(expr: &Expression) -> bool {
+    match expr {
+        Expression::FunctionCall { name, args } => {
+            let n = name.to_uppercase();
+            n == "IS_A" || n == "ISA" || args.iter().any(filter_uses_isa)
+        }
+        Expression::BinaryOp { left, right, .. } => filter_uses_isa(left) || filter_uses_isa(right),
+        Expression::UnaryOp { operand, .. } => filter_uses_isa(operand),
+        Expression::List(items) => items.iter().any(filter_uses_isa),
+        Expression::Map(m) => m.values().any(filter_uses_isa),
+        _ => false,
     }
 }
 
@@ -661,6 +702,85 @@ mod tests {
             .collect();
         // naver:2 excluded (same channel as seed); coupang 3 (closer) before 4.
         assert_eq!(vids, vec![3, 4]);
+    }
+
+    /// Write a class def `{name, superclasses}` the way CREATE CLASS (O-3) would.
+    async fn put_class(executor: &Executor, name: &str, supers: &[&str]) {
+        let json = serde_json::json!({ "name": name, "superclasses": supers });
+        executor
+            .ctx
+            .kvstore
+            .put(
+                &SchemaKey::class("default", name),
+                &serde_json::to_vec(&json).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A vertex with a single `tag` label and an `emb` embedding (blob + dense).
+    async fn put_classified(executor: &Executor, vid: i64, tag: &str, vec: &[f32]) {
+        let emb = Value::List(byoridb_common::datatypes::list::List::from(
+            vec.iter()
+                .map(|f| Value::Float(*f as f64))
+                .collect::<Vec<_>>(),
+        ));
+        let mut props = std::collections::HashMap::new();
+        props.insert("emb".to_string(), emb.clone());
+        let vertex = byoridb_codec::VertexData {
+            vid,
+            tags: vec![byoridb_codec::TagData {
+                name: tag.to_string(),
+                properties: props,
+            }],
+        };
+        executor
+            .ctx
+            .kvstore
+            .put(
+                &SchemaKey::vertex("default", vid),
+                &VertexCodec::encode_vertex(&vertex).unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .ctx
+            .kvstore
+            .put(
+                &SchemaKey::vec_data("default", "emb", vid),
+                &pack_embedding(&emb).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn embedding_isa_filter_matches_subclasses() {
+        // O-3 hierarchy: dog SUBCLASS OF animal; cat is unrelated (plain tag).
+        let executor = create_executor();
+        put_class(&executor, "animal", &[]).await;
+        put_class(&executor, "dog", &["animal"]).await;
+        put_classified(&executor, 1, "dog", &[1.0, 0.0]).await; // seed
+        put_classified(&executor, 2, "dog", &[0.9, 0.1]).await; // is_a animal (subclass)
+        put_classified(&executor, 3, "cat", &[0.95, 0.05]).await; // NOT animal
+        put_classified(&executor, 4, "animal", &[0.8, 0.2]).await; // is_a animal (self)
+
+        let stmt =
+            byoridb_parser::parse("RECOMMEND SIMILAR TO 1 BY EMBEDDING emb WHERE is_a(\"animal\")")
+                .unwrap();
+        let plan = crate::ExecutionPlanBuilder::build(stmt).unwrap();
+        let result = executor.execute(plan).await.unwrap();
+
+        let vids: Vec<i64> = result
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int(v) => v,
+                _ => panic!(),
+            })
+            .collect();
+        // dog(2, subclass) and animal(4, self) match; cat(3) excluded. Cosine order.
+        assert_eq!(vids, vec![2, 4]);
     }
 
     #[tokio::test]
