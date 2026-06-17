@@ -81,6 +81,12 @@ pub enum Token {
     Domain,
     #[token("RANGE", ignore(case))]
     Range,
+    #[token("DISJOINT", ignore(case))]
+    Disjoint,
+    #[token("CHECK", ignore(case))]
+    Check,
+    #[token("CONSISTENCY", ignore(case))]
+    Consistency,
     #[token("MATCH", ignore(case))]
     Match,
     #[token("GO", ignore(case))]

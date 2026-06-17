@@ -261,9 +261,18 @@ edge에도 타입 전파. CREATE 시 domain/range 대상 class(tag/class) 존재
   보통 수십 이하). bidirectional inverse 정확성상 전체 스캔이 필요 — 핫패스 최적화
   필요 시 RelMeta를 space별 캐시(CREATE/ALTER EDGE에서 무효화)로 개선.
 
-**O-6 [P2] 일관성 검사 (consistency / validation)** ⬜ 미착수
-온톨로지 모순 탐지(disjoint class 위반, domain/range 위반 등). SHACL/OWL
-validation 참고.
+**O-6 [P2] 일관성 검사 (consistency / validation)** ✅ disjoint 검사 구현 완료 (2026-06-17)
+`CHECK CONSISTENCY` → disjoint 클래스 위반(한 정점이 서로소 선언된 두 클래스에 동시
+소속) 탐지. `CREATE CLASS x() [DISJOINT WITH c1[, c2]]`로 선언(대칭, 클래스 메타
+`disjoint`에 저장, 대상 존재+자기참조 검증). 신규 `executor/consistency.rs`:
+모든 클래스의 disjoint 맵(대칭) 구성 → 정점 스캔하며 `vertex_class_set`(tags ∪
+O-5 추론타입 ∪ O-3 조상)에서 disjoint 쌍 동시 소속 시 위반 보고. **subclass·
+domain/range 추론으로 생긴 간접 위반도 탐지**. 결과 컬럼 vid/class_a/class_b
+(쌍 정렬 dedup), 빈 결과 = 일관됨. 신규 토큰 DISJOINT/CHECK/CONSISTENCY + 신규
+`Statement::CheckConsistency` 전 경로(파서/plan/executor/graph RBAC=Read).
+회귀: disjoint 위반(추론타입 경유)·clean·DDL 검증·파서.
+- **open-world 주의**: domain/range는 *추론적*(타입 추가)이라 위반 아님 — disjoint만
+  검사. SHACL식 cardinality/closed-world 제약은 별도(미착수).
 
 **O-7 [P2] 시맨틱 쿼리 표면** 🟡 `is_a` 매칭 구현 완료 (2026-06-17)
 nGQL에서 추론/클래스 계층 인지 쿼리 노출. **`MATCH (n:dog) WHERE is_a(n, "animal")

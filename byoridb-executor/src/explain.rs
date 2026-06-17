@@ -770,6 +770,7 @@ fn plan_kind(plan: &ExecutionPlan) -> &'static str {
         ExecutionPlan::Go(_) => "Go",
         ExecutionPlan::Lookup(_) => "Lookup",
         ExecutionPlan::Recommend(_) => "Recommend",
+        ExecutionPlan::CheckConsistency => "CheckConsistency",
         ExecutionPlan::Compound(_) => "Compound",
         ExecutionPlan::Explain { .. } => "Explain",
     }

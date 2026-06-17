@@ -74,8 +74,9 @@ impl Executor {
                 if_not_exists,
                 props,
                 superclasses,
+                disjoint,
             } => {
-                self.handle_create_class(name, if_not_exists, props, superclasses)
+                self.handle_create_class(name, if_not_exists, props, superclasses, disjoint)
                     .await
             }
             crate::plan::CreatePlan::User {

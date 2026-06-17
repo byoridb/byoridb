@@ -25,6 +25,8 @@ pub enum Statement {
     Go(GoStatement),
     Lookup(LookupStatement),
     Recommend(RecommendStatement),
+    /// `CHECK CONSISTENCY` — report ontology consistency violations (O-6).
+    CheckConsistency,
     Grant(GrantStatement),
     Revoke(RevokeStatement),
     Balance(BalanceStatement),
@@ -170,6 +172,9 @@ pub struct CreateClassStatement {
     pub name: String,
     pub props: Vec<PropertySpec>,
     pub superclasses: Vec<String>,
+    /// Classes this class is disjoint with (O-6): no vertex may belong to both.
+    /// Symmetric — registered both ways at consistency-check time.
+    pub disjoint: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -1249,6 +1249,27 @@ fn test_parse_recommend_neighbors_with_where() {
 }
 
 #[test]
+fn test_parse_create_class_disjoint() {
+    match parse("CREATE CLASS person() DISJOINT WITH building, vehicle").unwrap() {
+        Statement::Create(CreateStatement::Class(c)) => {
+            assert_eq!(
+                c.disjoint,
+                vec!["building".to_string(), "vehicle".to_string()]
+            );
+        }
+        other => panic!("Expected Create Class, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_check_consistency() {
+    assert!(matches!(
+        parse("CHECK CONSISTENCY").unwrap(),
+        Statement::CheckConsistency
+    ));
+}
+
+#[test]
 fn test_parse_create_edge_semantics() {
     match parse("CREATE EDGE ancestor() TRANSITIVE").unwrap() {
         Statement::Create(CreateStatement::Edge(e)) => {

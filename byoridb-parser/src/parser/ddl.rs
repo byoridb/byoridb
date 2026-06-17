@@ -414,12 +414,23 @@ impl Parser {
             }
         }
 
+        // Optional `DISJOINT WITH c1[, c2 ...]` (O-6).
+        let mut disjoint = Vec::new();
+        if self.match_token(Token::Disjoint) {
+            self.consume_token(Token::With)?;
+            disjoint.push(self.consume_identifier()?);
+            while self.match_token(Token::Comma) {
+                disjoint.push(self.consume_identifier()?);
+            }
+        }
+
         Ok(Statement::Create(CreateStatement::Class(
             CreateClassStatement {
                 if_not_exists,
                 name,
                 props,
                 superclasses,
+                disjoint,
             },
         )))
     }

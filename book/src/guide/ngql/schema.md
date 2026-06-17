@@ -173,6 +173,39 @@ DROP EDGE knows;
 DROP EDGE IF EXISTS knows;
 ```
 
+## 온톨로지 클래스 & 일관성
+
+클래스는 태그의 상위 호환으로, 계층(`SUBCLASS OF`)과 서로소(`DISJOINT WITH`)를
+선언할 수 있습니다. 클래스를 만들면 같은 이름의 태그가 함께 생성됩니다.
+
+```sql
+CREATE CLASS <name> (<properties>)
+    [SUBCLASS OF <class>[, <class> ...]]
+    [DISJOINT WITH <class>[, <class> ...]];
+```
+
+```sql
+CREATE CLASS animal();
+CREATE CLASS dog() SUBCLASS OF animal;       -- dog ⊑ animal
+CREATE CLASS building();
+CREATE CLASS person() DISJOINT WITH building; -- 한 정점이 둘 다일 수 없음
+```
+
+- `SUBCLASS OF`: `MATCH ... WHERE is_a(n, "animal")` 가 dog 정점도 매칭.
+- `DISJOINT WITH`: 모순(한 정점이 서로소 두 클래스에 동시 소속)을 `CHECK
+  CONSISTENCY` 로 탐지.
+
+### CHECK CONSISTENCY
+
+선언된 disjoint 제약 위반을 보고합니다. 클래스 멤버십은 태그뿐 아니라 추론된
+타입(domain/range)과 상위 클래스까지 포함하므로, 간접적으로 생긴 모순도 잡습니다.
+빈 결과는 일관됨을 뜻합니다.
+
+```sql
+CHECK CONSISTENCY;
+-- 결과 컬럼: vid | class_a | class_b  (위반 정점과 충돌한 disjoint 클래스 쌍)
+```
+
 ## 인덱스
 
 ### CREATE INDEX

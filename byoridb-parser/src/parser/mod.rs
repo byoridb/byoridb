@@ -167,6 +167,12 @@ impl Parser {
             Token::Go => self.parse_go(),
             Token::Lookup => self.parse_lookup(),
             Token::Recommend => self.parse_recommend(),
+            // CHECK CONSISTENCY (O-6 ontology validation)
+            Token::Check => {
+                self.advance();
+                self.consume_token(Token::Consistency)?;
+                Ok(Statement::CheckConsistency)
+            }
             // EXPLAIN / PROFILE
             tok @ (Token::Explain | Token::Profile) => {
                 let profile = matches!(tok, Token::Profile);
@@ -299,6 +305,9 @@ impl Parser {
             Token::Subproperty => "subproperty",
             Token::Domain => "domain",
             Token::Range => "range",
+            Token::Disjoint => "disjoint",
+            Token::With => "with",
+            Token::Consistency => "consistency",
             // Role keywords (used as identifiers in GRANT/REVOKE)
             Token::Admin => "ADMIN",
             Token::God => "GOD",

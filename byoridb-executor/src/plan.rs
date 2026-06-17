@@ -68,6 +68,9 @@ pub enum ExecutionPlan {
     /// RECOMMEND — top-k similar vertices by shared-neighbor overlap.
     Recommend(RecommendPlan),
 
+    /// CHECK CONSISTENCY — report ontology consistency violations (O-6).
+    CheckConsistency,
+
     /// Compound query — a sequence of clauses where each may bind its
     /// `ExecutorResult` to a variable consumed by subsequent clauses.
     /// The final non-assignment clause's result is the query output.
@@ -176,6 +179,7 @@ pub enum CreatePlan {
         if_not_exists: bool,
         props: Vec<PropertyDef>,
         superclasses: Vec<String>,
+        disjoint: Vec<String>,
     },
 }
 
@@ -498,6 +502,7 @@ impl ExecutionPlanBuilder {
                         })
                         .collect(),
                     superclasses: class.superclasses,
+                    disjoint: class.disjoint,
                 },
                 byoridb_parser::ast::CreateStatement::User(user) => CreatePlan::User {
                     name: user.username,
@@ -939,6 +944,7 @@ impl ExecutionPlanBuilder {
                 filter: rec.filter,
                 limit: rec.limit,
             })),
+            Statement::CheckConsistency => Ok(ExecutionPlan::CheckConsistency),
             Statement::Find(find_stmt) => Ok(ExecutionPlan::Find(FindPlan {
                 find_type: match find_stmt.find_type {
                     byoridb_parser::ast::FindType::Path => FindType::Path,

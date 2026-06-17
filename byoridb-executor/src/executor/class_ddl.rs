@@ -23,6 +23,9 @@ use serde::{Deserialize, Serialize};
 pub(super) struct ClassDef {
     pub name: String,
     pub superclasses: Vec<String>,
+    /// Disjoint classes (O-6). `#[serde(default)]` keeps pre-O-6 records loadable.
+    #[serde(default)]
+    pub disjoint: Vec<String>,
 }
 
 impl Executor {
@@ -32,6 +35,7 @@ impl Executor {
         if_not_exists: bool,
         props: Vec<crate::plan::PropertyDef>,
         superclasses: Vec<String>,
+        disjoint: Vec<String>,
     ) -> Result<ExecutorResult> {
         let space = self.require_space()?.to_string();
 
@@ -95,6 +99,32 @@ impl Executor {
             }
         }
 
+        // Dedup disjoint targets; each must be an existing class and not self.
+        let mut disjoint_classes: Vec<String> = Vec::new();
+        for target in disjoint {
+            if target == name {
+                return Err(ExecutionError::InvalidOperation(format!(
+                    "Class {} cannot be DISJOINT WITH itself",
+                    name
+                )));
+            }
+            if self
+                .ctx
+                .kvstore
+                .get(&SchemaKey::class(&space, &target))
+                .await?
+                .is_none()
+            {
+                return Err(ExecutionError::InvalidOperation(format!(
+                    "DISJOINT WITH {} does not exist as a class",
+                    target
+                )));
+            }
+            if !disjoint_classes.contains(&target) {
+                disjoint_classes.push(target);
+            }
+        }
+
         let tag_data = serde_json::json!({
             "name": name,
             "properties": props,
@@ -102,6 +132,7 @@ impl Executor {
         let class_def = ClassDef {
             name: name.clone(),
             superclasses: parents,
+            disjoint: disjoint_classes,
         };
 
         // One transaction: the tag schema and the class record must not be
