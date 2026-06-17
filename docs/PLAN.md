@@ -1,6 +1,7 @@
 # ByoriDB 플랜
 
-마지막 업데이트: 2026-05-29 (프로젝트 방향 = 온톨로지 DB 확정. O 섹션 신설)
+마지막 업데이트: 2026-06-17 (온톨로지 핵심 O-1~O-7 + 유사도 추천 R-1~R-3b 구현·배포
+완료. 상세는 O/R 섹션. 남은 건 고급 추론(sameAs/삭제 retraction/분산)과 운영.)
 
 이전의 `ROADMAP.md` / `docs/NEXT_STEPS.md` / `docs/MOCK_REMEDIATION_PLAN.md` /
 `docs/GRAPH_ALGORITHM_OPTIMIZATION_PLAN.md` 4개 문서를 통합한 **단일 진실원**.
@@ -24,8 +25,12 @@
   Apache Jena, Virtuoso). 단, property graph 성능 자체(MATCH/GO)는 온톨로지
   추론의 하부 연산이므로 NebulaGraph 대비 개선은 계속 유효하다.
 
-이 방향에서 **온톨로지 핵심 기능은 현재 0% 구현**이다(추론/클래스계층/시맨틱관계
-코드 전무). 남은 작업 **O 섹션**이 최우선 신규 트랙이다.
+**진척 (2026-06-17 갱신):** 온톨로지 핵심이 구현·배포 완료됐다 — 클래스 계층(O-3),
+시맨틱 관계 타입(O-4), 추론 엔진(O-5: edge materialization + domain/range vertex
+타입 추론), 일관성 검사(O-6: disjoint), 시맨틱 쿼리(O-7: `is_a`). 별도 차별화
+트랙으로 유사도 추천(R-1~R-3b: 구조/임베딩 flat·HNSW/하이브리드)도 완료. 남은
+온톨로지 작업은 고급 추론(`sameAs` 동치, 삭제 retraction=B/F, 분산 materialization)
+뿐 — 각각 난이도·리스크 최상이라 별도 결정 필요. 상세·미착수는 **O/R 섹션** 참조.
 
 ---
 
