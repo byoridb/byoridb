@@ -211,6 +211,32 @@ pub struct CreateEdgeStatement {
     pub if_not_exists: bool,
     pub name: String,
     pub props: Vec<PropertySpec>,
+    pub semantics: SemanticFlags,
+}
+
+/// Ontology semantic relation metadata for an edge type (PLAN.md O-4). Drives
+/// the O-5 forward-chaining materialization. All default off / `None`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SemanticFlags {
+    /// `(a)-p->(b) ∧ (b)-p->(c) ⟹ (a)-p->(c)` (transitive closure).
+    pub transitive: bool,
+    /// `(a)-p->(b) ⟹ (b)-p->(a)`.
+    pub symmetric: bool,
+    /// `INVERSE OF q`: `(a)-p->(b) ⟹ (b)-q->(a)` (and vice versa — owl:inverseOf
+    /// is symmetric, so both directions are registered at materialization).
+    pub inverse_of: Option<String>,
+    /// `SUBPROPERTY OF q`: `(a)-p->(b) ⟹ (a)-q->(b)`.
+    pub subproperty_of: Option<String>,
+}
+
+impl SemanticFlags {
+    /// True when no semantic relation is declared (skip materialization).
+    pub fn is_empty(&self) -> bool {
+        !self.transitive
+            && !self.symmetric
+            && self.inverse_of.is_none()
+            && self.subproperty_of.is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

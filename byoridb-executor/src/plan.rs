@@ -152,6 +152,7 @@ pub enum CreatePlan {
         name: String,
         if_not_exists: bool,
         props: Vec<PropertyDef>,
+        semantics: byoridb_parser::ast::SemanticFlags,
     },
     TagIndex {
         name: String,
@@ -481,6 +482,7 @@ impl ExecutionPlanBuilder {
                             default_value: p.default,
                         })
                         .collect(),
+                    semantics: edge.semantics,
                 },
                 byoridb_parser::ast::CreateStatement::Class(class) => CreatePlan::Class {
                     name: class.name,

@@ -64,7 +64,11 @@ impl Executor {
                 name,
                 if_not_exists,
                 props,
-            } => self.handle_create_edge(name, if_not_exists, props).await,
+                semantics,
+            } => {
+                self.handle_create_edge(name, if_not_exists, props, semantics)
+                    .await
+            }
             crate::plan::CreatePlan::Class {
                 name,
                 if_not_exists,
@@ -421,9 +425,10 @@ impl Executor {
         name: String,
         if_not_exists: bool,
         props: Vec<crate::plan::PropertyDef>,
+        semantics: byoridb_parser::ast::SemanticFlags,
     ) -> Result<ExecutorResult> {
-        let space = self.require_space()?;
-        let edge_key = SchemaKey::edge(space, &name);
+        let space = self.require_space()?.to_string();
+        let edge_key = SchemaKey::edge(&space, &name);
 
         if self.ctx.kvstore.get(&edge_key).await?.is_some() {
             if if_not_exists {
@@ -435,9 +440,39 @@ impl Executor {
             )));
         }
 
+        // O-4: validate referenced edge types exist (INVERSE OF / SUBPROPERTY OF).
+        // The target must be an already-declared edge so materialization (O-5)
+        // resolves it; self-reference is rejected as meaningless.
+        for (clause, target) in [
+            ("INVERSE OF", &semantics.inverse_of),
+            ("SUBPROPERTY OF", &semantics.subproperty_of),
+        ] {
+            if let Some(target) = target {
+                if target == &name {
+                    return Err(ExecutionError::InvalidOperation(format!(
+                        "Edge {} cannot be {} itself",
+                        name, clause
+                    )));
+                }
+                if self
+                    .ctx
+                    .kvstore
+                    .get(&SchemaKey::edge(&space, target))
+                    .await?
+                    .is_none()
+                {
+                    return Err(ExecutionError::InvalidOperation(format!(
+                        "{} target edge type '{}' does not exist",
+                        clause, target
+                    )));
+                }
+            }
+        }
+
         let edge_data = serde_json::json!({
             "name": name,
             "properties": props,
+            "semantics": semantics,
         });
 
         self.ctx

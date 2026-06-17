@@ -293,6 +293,10 @@ impl Parser {
             Token::Similar => "similar",
             Token::Embedding => "embedding",
             Token::Blend => "blend",
+            Token::Transitive => "transitive",
+            Token::Symmetric => "symmetric",
+            Token::Inverse => "inverse",
+            Token::Subproperty => "subproperty",
             // Role keywords (used as identifiers in GRANT/REVOKE)
             Token::Admin => "ADMIN",
             Token::God => "GOD",

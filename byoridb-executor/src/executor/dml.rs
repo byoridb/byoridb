@@ -151,6 +151,8 @@ impl Executor {
                 };
                 let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                 let mut inserted = 0i64;
+                // Asserted triples to feed ontology materialization (O-5) after commit.
+                let mut new_triples: Vec<(i64, String, i64)> = Vec::new();
                 for edge in edges {
                     // Schema validation: verify edge type and its fields exist
                     let edge_type_name = edge.edge_type.clone();
@@ -208,11 +210,18 @@ impl Executor {
                         );
                         batch.push((idx_key, Vec::new()));
                     }
+                    new_triples.push((edge.src, edge_type_name.clone(), edge.dst));
                     inserted += 1;
                 }
                 if !batch.is_empty() {
                     self.ctx.kvstore.batch_put(batch).await?;
                 }
+                // Ontology forward-chaining materialization (O-5): derive and
+                // persist entailed edges. No-op if the space declares no
+                // semantic relations. Runs after the asserted edges are
+                // committed so the closure reads them.
+                self.materialize_inserted_edges(&effective_space, new_triples)
+                    .await?;
                 Ok(ExecutorResult {
                     columns: vec!["Inserted".to_string()],
                     rows: vec![vec![byoridb_common::Value::Int(inserted)]],

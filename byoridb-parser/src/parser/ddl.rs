@@ -423,11 +423,39 @@ impl Parser {
         let props = self.parse_property_specs()?;
         self.consume_token(Token::RParen)?;
 
+        // Optional ontology semantic clauses (PLAN.md O-4), any order:
+        //   [TRANSITIVE] [SYMMETRIC] [INVERSE OF <edge>] [SUBPROPERTY OF <edge>]
+        let mut semantics = SemanticFlags::default();
+        loop {
+            match self.peek_token()? {
+                Token::Transitive => {
+                    self.advance();
+                    semantics.transitive = true;
+                }
+                Token::Symmetric => {
+                    self.advance();
+                    semantics.symmetric = true;
+                }
+                Token::Inverse => {
+                    self.advance();
+                    self.consume_token(Token::Of)?;
+                    semantics.inverse_of = Some(self.consume_identifier()?);
+                }
+                Token::Subproperty => {
+                    self.advance();
+                    self.consume_token(Token::Of)?;
+                    semantics.subproperty_of = Some(self.consume_identifier()?);
+                }
+                _ => break,
+            }
+        }
+
         Ok(Statement::Create(CreateStatement::Edge(
             CreateEdgeStatement {
                 if_not_exists,
                 name,
                 props,
+                semantics,
             },
         )))
     }

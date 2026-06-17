@@ -90,6 +90,41 @@ CREATE EDGE purchase(
 );
 ```
 
+#### 시맨틱 관계 타입 (온톨로지 추론)
+
+엣지 타입에 온톨로지 시맨틱을 선언하면, INSERT 시 함의되는 엣지가 자동으로
+도출·저장되어(forward-chaining materialization) MATCH/GO에서 추론 없이 그대로
+조회됩니다. 속성 목록 뒤에 다음 절을 (순서 무관, 복수) 붙입니다:
+
+```sql
+CREATE EDGE <edge_name> (<properties>)
+    [TRANSITIVE]              -- (a)-p->(b) ∧ (b)-p->(c) ⟹ (a)-p->(c)
+    [SYMMETRIC]               -- (a)-p->(b) ⟹ (b)-p->(a)
+    [INVERSE OF <edge>]       -- (a)-p->(b) ⟹ (b)-q->(a) (양방향)
+    [SUBPROPERTY OF <edge>];  -- (a)-p->(b) ⟹ (a)-q->(b)
+```
+
+```sql
+-- ancestor는 추이적: 1->2, 2->3 삽입 시 1->3 자동 도출
+CREATE EDGE ancestor() TRANSITIVE;
+
+-- knows는 대칭: 1->2 삽입 시 2->1 자동 도출
+CREATE EDGE knows() SYMMETRIC;
+
+-- child INVERSE OF parent: child 1->2 ⟹ parent 2->1 (그 반대도)
+CREATE EDGE parent();
+CREATE EDGE child() INVERSE OF parent;
+
+-- knows ⊑ related: knows 1->2 ⟹ related 1->2
+CREATE EDGE related();
+CREATE EDGE knows2() SUBPROPERTY OF related;
+```
+
+> **주의 (현재 단계):** materialization은 **삽입 전용**입니다. 시맨틱은 데이터를
+> 넣기 *전*에 선언하세요(`CREATE EDGE ... TRANSITIVE` → `INSERT EDGE`). 삭제는
+> 아직 추론을 철회하지 않습니다(후속 단계). `INVERSE OF`/`SUBPROPERTY OF` 대상
+> 엣지 타입은 미리 존재해야 합니다.
+
 ### ALTER EDGE
 
 기존 엣지 타입에 새 속성을 추가합니다:

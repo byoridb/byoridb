@@ -68,6 +68,15 @@ pub enum Token {
     Embedding,
     #[token("BLEND", ignore(case))]
     Blend,
+    // Ontology semantic relation types (PLAN.md O-4)
+    #[token("TRANSITIVE", ignore(case))]
+    Transitive,
+    #[token("SYMMETRIC", ignore(case))]
+    Symmetric,
+    #[token("INVERSE", ignore(case))]
+    Inverse,
+    #[token("SUBPROPERTY", ignore(case))]
+    Subproperty,
     #[token("MATCH", ignore(case))]
     Match,
     #[token("GO", ignore(case))]

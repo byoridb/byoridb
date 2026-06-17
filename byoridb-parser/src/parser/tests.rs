@@ -1249,6 +1249,29 @@ fn test_parse_recommend_neighbors_with_where() {
 }
 
 #[test]
+fn test_parse_create_edge_semantics() {
+    match parse("CREATE EDGE ancestor() TRANSITIVE").unwrap() {
+        Statement::Create(CreateStatement::Edge(e)) => {
+            assert!(e.semantics.transitive);
+            assert!(!e.semantics.symmetric);
+        }
+        other => panic!("Expected Create Edge, got {:?}", other),
+    }
+    match parse("CREATE EDGE child() INVERSE OF parent SUBPROPERTY OF related").unwrap() {
+        Statement::Create(CreateStatement::Edge(e)) => {
+            assert_eq!(e.semantics.inverse_of.as_deref(), Some("parent"));
+            assert_eq!(e.semantics.subproperty_of.as_deref(), Some("related"));
+        }
+        other => panic!("Expected Create Edge, got {:?}", other),
+    }
+    // No semantic clause → all default off.
+    match parse("CREATE EDGE plain()").unwrap() {
+        Statement::Create(CreateStatement::Edge(e)) => assert!(e.semantics.is_empty()),
+        other => panic!("Expected Create Edge, got {:?}", other),
+    }
+}
+
+#[test]
 fn test_parse_recommend_blend() {
     match parse(
         "RECOMMEND SIMILAR TO 1 BLEND EMBEDDING emb 0.7 OVER has_brand, in_category 0.3 LIMIT 5",

@@ -164,6 +164,7 @@ mod class_ddl;
 mod ddl;
 mod dml;
 mod dql;
+mod inference;
 mod recommend;
 mod show;
 mod vector_index;

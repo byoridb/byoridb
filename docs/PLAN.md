@@ -222,16 +222,35 @@ ALTER CLASS(SUBCLASS 변경)·분산 meta 연동(G-2 이후)·추론 포함 매�
 - **O-7 연계(범위 외).** `MATCH (x:animal)`의 추론 포함 매칭(descendants
   확장)은 O-5/O-7에서. O-3는 저장+DDL+introspection까지.
 
-**O-4 [P1] 시맨틱 관계 타입** ⬜ 미착수
-`subClassOf` / `subPropertyOf` / `transitiveProperty` / `inverseOf` /
-`sameAs` 등 메타 관계를 1급 시민으로. O-3 클래스 계층과 함께 설계.
+**O-4 [P1] 시맨틱 관계 타입** ✅ 구현 완료 (2026-06-17)
+edge-type에 시맨틱 관계를 1급 메타데이터로: `CREATE EDGE <e>(...) [TRANSITIVE]
+[SYMMETRIC] [INVERSE OF <e>] [SUBPROPERTY OF <e>]`. 시맨틱 플래그를 edge 스키마
+JSON(`space:{space}:edge:{name}` → `"semantics": {...}`)에 저장. AST `SemanticFlags`,
+신규 토큰 TRANSITIVE/SYMMETRIC/INVERSE/SUBPROPERTY(+OF 재사용). CREATE 시 INVERSE
+OF/SUBPROPERTY OF 대상 edge 존재 검증 + 자기참조 거부. `subClassOf`는 O-3에서
+이미 제공. `domain`/`range`(vertex 타이핑)·`sameAs`는 후속(ABox 타입 모델/최난도).
+회귀: 파서 1(DDL 시맨틱 파싱) + 실행기 검증.
 
-**O-5 [P1] 추론 엔진 (O-0 결정 반영)** ⬜ 미착수
-O-0 결정에 따라 **RDFS-Plus 규칙의 forward-chaining materialization**으로 시작.
-edge를 datalog-style 규칙으로 추론 → 결과를 KV에 미리 저장. transitive
-closure(O-2 변길이 경로 활용), subclass/subproperty, inverse/symmetric,
-domain/range 순. **증분 갱신은 insertion-only부터, 삭제는 후속(B/F 알고리즘).**
-`sameAs`는 마지막. 분산 materialization은 별도 먼 마일스톤. O-1·O-2가 선결.
+**O-5 [P1] 추론 엔진 (O-0 결정 반영)** 🟡 phase 1 (edge-level, insertion-only) 완료 (2026-06-17)
+O-0 결정대로 **RDFS-Plus forward-chaining materialization**. 신규 `executor/
+inference.rs`. INSERT EDGE가 커밋 후 entailed edge를 **fixpoint(worklist)까지** 도출해
+같은 `{space}:edge:`/`in-edge:` 키스페이스에 `__inferred__` 마킹·ranking 0으로 저장
+→ MATCH/GO가 추론 edge를 질의타임 추론 없이 그대로 봄(end-to-end 테스트로 확인).
+- **규칙(edge-level)**: symmetric, inverseOf(양방향), subPropertyOf, transitive.
+  cascading 완전 폐포(예: subPropertyOf→transitive 초프로퍼티). `RelMeta` 인덱스
+  로드 + 증분 worklist(seeds=삽입 triple, 기존 그래프와 결합). `max_traversal_nodes`
+  write 캡(pathological closure 가드, warn).
+- **scope(phase 1)**: **insertion-only**(삭제 retraction은 후속 B/F 알고리즘). 시맨틱은
+  INSERT 전에 선언(`CREATE EDGE ... TRANSITIVE` → `INSERT`). 기존 데이터에 시맨틱
+  후행 추가 시 재-materialization 필요(미구현, O-1 백필 caveat과 동일 성격).
+- **미착수(후속)**: subclass type 전파/domain·range(vertex-level, ABox 타입 모델 필요),
+  `sameAs`(최난도), 삭제 증분(B/F), 분산 materialization(먼 마일스톤).
+- 회귀 7: symmetric/inverseOf 양방향/subPropertyOf/transitive 체인/cascading/
+  no-semantics/추론 edge 순회 가시성.
+- **후속 최적화(리뷰 F-001, 비차단)**: 시맨틱 미선언 space도 INSERT EDGE마다
+  `load_rel_meta`가 edge 스키마 프리픽스를 1회 스캔(비용은 edge *타입* 수에 비례,
+  보통 수십 이하). bidirectional inverse 정확성상 전체 스캔이 필요 — 핫패스 최적화
+  필요 시 RelMeta를 space별 캐시(CREATE/ALTER EDGE에서 무효화)로 개선.
 
 **O-6 [P2] 일관성 검사 (consistency / validation)** ⬜ 미착수
 온톨로지 모순 탐지(disjoint class 위반, domain/range 위반 등). SHACL/OWL
