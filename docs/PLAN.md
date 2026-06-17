@@ -403,18 +403,24 @@ full-pipeline·neighbors 필터).
 있음(명시 `seed.prop`는 결정적). evaluator는 GO/MATCH 공용이라 미수정(고위험).
 결측 prop을 항상 드롭하려면 single-id 폴백을 current-only로 좁히는 별도 정리 필요.
 
-**R-3b [P2] 클래스 계층 인지 필터 / 재랭킹** 🟡 클래스 필터 구현 완료 (2026-06-17)
+**R-3b [P2] 클래스 계층 인지 필터 / 재랭킹** 🟡 클래스 필터 + BLEND 완료 (2026-06-17)
 
 **클래스 계층 인지 필터 ✅ (2026-06-17):** `RECOMMEND ... WHERE is_a("animal")` —
 후보 정점의 tag가 `animal`이거나 그 **subclass**면 통과. **O-3 클래스 계층만으로
 구현**(전체 추론 엔진 O-5 불필요 — transitive subclass면 충분). `load_candidate_props`가
 필터에 `is_a`가 있을 때만 후보의 is-a 집합(태그 ∪ O-3 `class_ancestors` 전이 상위)을
-계산해 `__isa__`로 주입, evaluator의 신규 `is_a` 함수가 멤버십 검사. 회귀 1
-(`embedding_isa_filter_matches_subclasses`: dog⊂animal 매칭, cat 제외).
+계산해 `__isa__`로 주입, evaluator의 신규 `is_a` 함수가 멤버십 검사. 회귀: 실행기 1
+(`embedding_isa_filter_matches_subclasses`: dog⊂animal 매칭, cat 제외) + evaluator 5.
+
+**점수 결합 재랭킹 (BLEND) ✅ (2026-06-17):** 사용자 결정 = 가중치를 쿼리 인자로
+노출. `RECOMMEND SIMILAR TO <vid> BLEND EMBEDDING <prop> <w_emb> OVER <edges>
+<w_struct> [WHERE] [LIMIT k]` → `score = w_emb·max(0,cosine) + w_struct·jaccard`.
+두 신호의 합집합 후보(없는 신호=0 기여), cosine은 [0,1] 클램프(음수=비유사)로
+0..1 스케일 통일. 결과 컬럼 vid/score/emb/struct. `structural_scores` 헬퍼 추출
+(neighbors와 공유), `consume_number`(음수 거부), `RecommendBy::Blend`. WHERE/is_a/
+seed 필터 전부 호환. 회귀: 파서 2(blend 파싱·음수 거부) + 실행기 1(가중치별 랭킹 역전).
 
 **미착수 (별도 트랙):**
-- **점수 결합 재랭킹**: 벡터 코사인 + 공유속성 가산점 블렌딩 → 가중치가 제품
-  결정 사항이라 사용자 스코핑 필요(임의 가중치 자율 구현 보류).
 - **추론 포함 매칭(subclass 초과)**: `inverseOf`/`transitiveProperty`/`sameAs` 등
   RDFS-Plus 추론 기반 필터는 **O-5(추론 엔진) 선결**. is_a(subclass)는 O-3로
   충분하나, 그 이상의 시맨틱 추론은 O-5 영역.

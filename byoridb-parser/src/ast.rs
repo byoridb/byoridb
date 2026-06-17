@@ -67,6 +67,15 @@ pub enum RecommendBy {
     /// R-2a embedding: cosine over a stored embedding property (a list of
     /// numbers). `prop` names the vector-valued vertex property.
     Embedding { prop: String },
+    /// R-3b blend: weighted combination of embedding cosine and structural
+    /// Jaccard. `score = embedding_weight·cosine + structural_weight·jaccard`.
+    /// Weights are query arguments so callers tune the mix per query.
+    Blend {
+        embedding_prop: String,
+        embedding_weight: f64,
+        over_edges: Vec<String>,
+        structural_weight: f64,
+    },
 }
 
 /// Similarity measure for the structural ([`RecommendBy::Neighbors`]) mode.

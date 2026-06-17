@@ -292,6 +292,7 @@ impl Parser {
             Token::Recommend => "recommend",
             Token::Similar => "similar",
             Token::Embedding => "embedding",
+            Token::Blend => "blend",
             // Role keywords (used as identifiers in GRANT/REVOKE)
             Token::Admin => "ADMIN",
             Token::God => "GOD",
@@ -335,6 +336,30 @@ impl Parser {
                 token
             ))),
         }
+    }
+
+    /// Consume a non-negative number literal (int or float) as `f64`.
+    /// Used for RECOMMEND BLEND weights.
+    pub(crate) fn consume_number(&mut self) -> Result<f64> {
+        let token = self.peek_token()?;
+        let n = match token {
+            Token::Integer(n) => n as f64,
+            Token::FloatLiteral(f) => f,
+            other => {
+                return Err(ParseError::UnexpectedToken(format!(
+                    "number expected, found {:?} at {}",
+                    other,
+                    self.err_location()
+                )))
+            }
+        };
+        if n < 0.0 {
+            return Err(ParseError::UnexpectedToken(
+                "weight must be non-negative".to_string(),
+            ));
+        }
+        self.advance();
+        Ok(n)
     }
 }
 

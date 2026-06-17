@@ -66,6 +66,8 @@ pub enum Token {
     Similar,
     #[token("EMBEDDING", ignore(case))]
     Embedding,
+    #[token("BLEND", ignore(case))]
+    Blend,
     #[token("MATCH", ignore(case))]
     Match,
     #[token("GO", ignore(case))]

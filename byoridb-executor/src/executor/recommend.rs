@@ -32,7 +32,7 @@ use crate::error::Result;
 use crate::evaluator::{EvalContext, Evaluator};
 use crate::key::SchemaKey;
 use byoridb_common::Value;
-use byoridb_parser::ast::{Expression, RecommendBy, SimilarityMetric};
+use byoridb_parser::ast::{Expression, RecommendBy};
 use std::collections::{HashMap, HashSet};
 
 impl Executor {
@@ -43,48 +43,52 @@ impl Executor {
         let space = self.require_space()?.to_string();
         let filter = plan.filter.as_ref();
         match &plan.by {
-            RecommendBy::Neighbors { over_edges, metric } => {
-                self.recommend_neighbors(
-                    &space,
-                    plan.src_vid,
-                    over_edges,
-                    *metric,
-                    filter,
-                    plan.limit,
-                )
-                .await
+            RecommendBy::Neighbors { over_edges, .. } => {
+                self.recommend_neighbors(&space, plan.src_vid, over_edges, filter, plan.limit)
+                    .await
             }
             RecommendBy::Embedding { prop } => {
                 self.recommend_embedding(&space, plan.src_vid, prop, filter, plan.limit)
                     .await
             }
+            RecommendBy::Blend {
+                embedding_prop,
+                embedding_weight,
+                over_edges,
+                structural_weight,
+            } => {
+                self.recommend_blend(
+                    &space,
+                    plan.src_vid,
+                    embedding_prop,
+                    *embedding_weight,
+                    over_edges,
+                    *structural_weight,
+                    filter,
+                    plan.limit,
+                )
+                .await
+            }
         }
     }
 
-    /// R-1 structural Jaccard over shared neighbors.
-    async fn recommend_neighbors(
+    /// Shared-neighbor Jaccard candidate scores `(vid, jaccard, shared_count)`,
+    /// unsorted; empty if the seed has no neighbors. Candidates are vertices
+    /// sharing ≥1 neighbor with the seed (found via the O-1 reverse-edge index),
+    /// excluding the seed, capped at `max_traversal_nodes`.
+    async fn structural_scores(
         &self,
         space: &str,
         src_vid: i64,
         over_edges: &[String],
-        metric: SimilarityMetric,
-        filter: Option<&Expression>,
-        limit: usize,
-    ) -> Result<ExecutorResult> {
+    ) -> Result<Vec<(i64, f64, usize)>> {
         let cap = self.ctx.config.max_traversal_nodes;
-
-        // N(seed): distinct out-neighbors over the chosen edge types.
         let seed_neighbors = algo::get_neighbors(&self.ctx, space, src_vid, over_edges).await?;
         let seed_set: HashSet<i64> = seed_neighbors.iter().map(|n| n.dst).collect();
-
-        // No neighborhood → nothing to compare against.
         if seed_set.is_empty() {
-            return Ok(neighbors_result(Vec::new()));
+            return Ok(Vec::new());
         }
 
-        // Candidates = vertices sharing ≥1 neighbor with the seed, discovered by
-        // walking each shared neighbor back through the reverse-edge index.
-        // Excludes the seed itself. Capped at `max_traversal_nodes`.
         let mut candidates: HashSet<i64> = HashSet::new();
         let mut cap_reached = false;
         'gather: for feature in &seed_set {
@@ -102,7 +106,6 @@ impl Executor {
             }
         }
 
-        // Score each candidate by Jaccard over its own out-neighborhood.
         let mut scored: Vec<(i64, f64, usize)> = Vec::with_capacity(candidates.len());
         for cand in candidates {
             let cand_neighbors = algo::get_neighbors(&self.ctx, space, cand, over_edges).await?;
@@ -112,21 +115,30 @@ impl Executor {
                 continue;
             }
             let union = seed_set.len() + cand_set.len() - inter;
-            let score = match metric {
-                SimilarityMetric::Jaccard => inter as f64 / union as f64,
-            };
-            scored.push((cand, score, inter));
+            scored.push((cand, inter as f64 / union as f64, inter));
         }
-
-        // Rank: score desc, then shared-count desc, then vid asc (deterministic).
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
-
         if cap_reached {
             tracing::warn!(
                 cap,
                 "RECOMMEND candidate set hit max_traversal_nodes; results may be partial"
             );
         }
+        Ok(scored)
+    }
+
+    /// R-1 structural Jaccard over shared neighbors.
+    async fn recommend_neighbors(
+        &self,
+        space: &str,
+        src_vid: i64,
+        over_edges: &[String],
+        filter: Option<&Expression>,
+        limit: usize,
+    ) -> Result<ExecutorResult> {
+        let mut scored = self.structural_scores(space, src_vid, over_edges).await?;
+
+        // Rank: score desc, then shared-count desc, then vid asc (deterministic).
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
 
         // No filter → fast path (no vertex decode), preserving R-1 behavior.
         if filter.is_none() {
@@ -234,6 +246,115 @@ impl Executor {
 
         Ok(ExecutorResult {
             columns: vec!["vid".to_string(), "score".to_string()],
+            rows,
+            latency_ms: 0,
+        })
+    }
+
+    /// R-3b blended re-ranking: `score = w_emb·max(0,cosine) + w_struct·jaccard`.
+    /// Candidates are the union of the embedding and structural signals (a
+    /// missing signal contributes 0). Cosine is clamped to `[0,1]` (negative =
+    /// dissimilar) so both 0..1 signals combine on one scale; weights are caller-
+    /// supplied. Result columns: vid / score / emb (cosine) / struct (jaccard).
+    #[allow(clippy::too_many_arguments)]
+    async fn recommend_blend(
+        &self,
+        space: &str,
+        src_vid: i64,
+        prop: &str,
+        w_emb: f64,
+        over_edges: &[String],
+        w_struct: f64,
+        filter: Option<&Expression>,
+        limit: usize,
+    ) -> Result<ExecutorResult> {
+        // Embedding cosine per candidate (vid → cosine), seed excluded.
+        let emb_scores: HashMap<i64, f32> = match self
+            .ctx
+            .kvstore
+            .get(&SchemaKey::vec_data(space, prop, src_vid))
+            .await?
+        {
+            Some(bytes) => {
+                let seed = unpack_embedding(&bytes);
+                if seed.is_empty() {
+                    HashMap::new()
+                } else {
+                    let budget = limit.saturating_mul(16).max(256);
+                    self.scored_embedding_candidates(space, prop, &seed, budget)
+                        .await?
+                        .into_iter()
+                        .filter(|(vid, _)| *vid != src_vid)
+                        .collect()
+                }
+            }
+            None => HashMap::new(),
+        };
+
+        // Structural Jaccard per candidate (vid → jaccard).
+        let struct_scores: HashMap<i64, f64> = self
+            .structural_scores(space, src_vid, over_edges)
+            .await?
+            .into_iter()
+            .map(|(vid, jac, _)| (vid, jac))
+            .collect();
+
+        // Union of both signals, blended.
+        let mut candidates: HashSet<i64> = HashSet::new();
+        candidates.extend(emb_scores.keys().copied());
+        candidates.extend(struct_scores.keys().copied());
+        let mut scored: Vec<(i64, f64, f64, f64)> = candidates
+            .into_iter()
+            .map(|vid| {
+                let cos = (emb_scores.get(&vid).copied().unwrap_or(0.0) as f64).max(0.0);
+                let jac = struct_scores.get(&vid).copied().unwrap_or(0.0);
+                (vid, w_emb * cos + w_struct * jac, cos, jac)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        // Filter (WHERE + is_a) + existence + top-k.
+        let needs_isa = filter.is_some_and(filter_uses_isa);
+        let seed_props = if filter.is_some() {
+            self.load_candidate_props(space, src_vid, false)
+                .await?
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        let mut rows = Vec::new();
+        for (vid, blended, cos, jac) in scored {
+            if rows.len() >= limit {
+                break;
+            }
+            let keep = if filter.is_none() {
+                self.ctx
+                    .kvstore
+                    .get(&SchemaKey::vertex(space, vid))
+                    .await?
+                    .is_some()
+            } else {
+                match self.load_candidate_props(space, vid, needs_isa).await? {
+                    Some(props) => passes_filter(filter, &props, &seed_props),
+                    None => false,
+                }
+            };
+            if keep {
+                rows.push(vec![
+                    Value::Int(vid),
+                    Value::Float(blended),
+                    Value::Float(cos),
+                    Value::Float(jac),
+                ]);
+            }
+        }
+        Ok(ExecutorResult {
+            columns: vec![
+                "vid".to_string(),
+                "score".to_string(),
+                "emb".to_string(),
+                "struct".to_string(),
+            ],
             rows,
             latency_ms: 0,
         })
@@ -752,6 +873,43 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    async fn run_blend(executor: &Executor, w_emb: f64, w_struct: f64) -> Vec<i64> {
+        let q = format!(
+            "RECOMMEND SIMILAR TO 1 BLEND EMBEDDING emb {} OVER has {}",
+            w_emb, w_struct
+        );
+        let stmt = byoridb_parser::parse(&q).unwrap();
+        let plan = crate::ExecutionPlanBuilder::build(stmt).unwrap();
+        let result = executor.execute(plan).await.unwrap();
+        assert_eq!(result.columns, vec!["vid", "score", "emb", "struct"]);
+        result
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int(v) => v,
+                _ => panic!(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn blend_weights_shift_ranking() {
+        let executor = create_executor();
+        put_vec(&executor, 1, "emb", &[1.0, 0.0]).await; // seed
+        put_vec(&executor, 2, "emb", &[1.0, 0.0]).await; // embedding match, no structure
+        put_vec(&executor, 3, "emb", &[0.0, 1.0]).await; // embedding orthogonal
+        link(&executor, 1, 100, "has").await;
+        link(&executor, 3, 100, "has").await; // 1 & 3 share neighbor 100
+
+        // Embedding-dominant weight → vid 2 (cosine 1) tops.
+        let emb_first = run_blend(&executor, 1.0, 0.0).await;
+        assert_eq!(emb_first[0], 2, "embedding-weighted: vid 2 first");
+
+        // Structure-dominant weight → vid 3 (shares a neighbor) tops.
+        let struct_first = run_blend(&executor, 0.0, 1.0).await;
+        assert_eq!(struct_first[0], 3, "structure-weighted: vid 3 first");
     }
 
     #[tokio::test]

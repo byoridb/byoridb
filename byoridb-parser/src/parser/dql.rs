@@ -54,9 +54,28 @@ impl Parser {
                 let prop = self.consume_identifier()?;
                 RecommendBy::Embedding { prop }
             }
+            // BLEND EMBEDDING <prop> <w_emb> OVER <edge>[, ...] <w_struct>
+            Token::Blend => {
+                self.advance();
+                self.consume_token(Token::Embedding)?;
+                let embedding_prop = self.consume_identifier()?;
+                let embedding_weight = self.consume_number()?;
+                self.consume_token(Token::Over)?;
+                let mut over_edges = vec![self.consume_identifier()?];
+                while self.match_token(Token::Comma) {
+                    over_edges.push(self.consume_identifier()?);
+                }
+                let structural_weight = self.consume_number()?;
+                RecommendBy::Blend {
+                    embedding_prop,
+                    embedding_weight,
+                    over_edges,
+                    structural_weight,
+                }
+            }
             other => {
                 return Err(ParseError::UnexpectedToken(format!(
-                "expected OVER or BY EMBEDDING after RECOMMEND SIMILAR TO <vid>, found {:?} at {}",
+                "expected OVER, BY EMBEDDING, or BLEND after RECOMMEND SIMILAR TO <vid>, found {:?} at {}",
                 other,
                 self.err_location()
             )))

@@ -175,11 +175,18 @@ FIND SHORTEST PATH FROM 1 TO 100 OVER follow, knows;
 
 ## RECOMMEND (유사 버텍스 추천)
 
-특정 버텍스와 가장 유사한 버텍스 top-k를 추천합니다. 유사도 정의는 두 가지입니다.
+특정 버텍스와 가장 유사한 버텍스 top-k를 추천합니다. 유사도 정의는 세 가지(구조적 ·
+임베딩 · 둘의 가중 결합)이며, 모두 `WHERE` 필터와 조합할 수 있습니다.
 
 ```sql
+-- 구조적 (공유 이웃 Jaccard)
 RECOMMEND SIMILAR TO <vid> OVER <edge>[, <edge> ...]|* [WHERE <조건>] [LIMIT k];
+-- 임베딩 (코사인 최근접 이웃)
 RECOMMEND SIMILAR TO <vid> BY EMBEDDING <prop> [WHERE <조건>] [LIMIT k];
+-- 블렌드 (가중 결합)
+RECOMMEND SIMILAR TO <vid>
+  BLEND EMBEDDING <prop> <w_emb> OVER <edge>[, ...] <w_struct>
+  [WHERE <조건>] [LIMIT k];
 ```
 
 기본 `LIMIT`은 10입니다.
@@ -210,10 +217,29 @@ INSERT VERTEX product(emb) VALUES 1001:([0.12, -0.04, 0.88, ...]);
 RECOMMEND SIMILAR TO 1001 BY EMBEDDING emb LIMIT 5;
 ```
 
+벡터 수가 적으면 정확한 전수 코사인(flat)으로, 많아지면 영속 HNSW 근사 인덱스로
+자동 전환됩니다(쿼리 구문은 동일). INSERT/UPDATE/DELETE 시 인덱스는 자동 갱신됩니다.
+
+### 블렌드 (BLEND) — 임베딩 + 구조 가중 결합
+
+임베딩 코사인과 구조적 Jaccard를 **쿼리별 가중치**로 결합해 재랭킹합니다:
+`score = w_emb · max(0, 코사인) + w_struct · jaccard`. 두 신호의 합집합을 후보로
+삼고(한쪽 신호만 있으면 그 신호 0 기여), 코사인은 [0,1]로 클램프해 두 0..1 신호를
+같은 스케일에서 더합니다. 결과 컬럼은 `vid / score / emb / struct`.
+
+```sql
+-- 임베딩 0.7 : 구조 0.3 비중으로 결합
+RECOMMEND SIMILAR TO 1001 BLEND EMBEDDING emb 0.7 OVER has_brand 0.3 LIMIT 5;
+```
+
 ### WHERE 필터 (하이브리드)
 
-후보를 속성 술어로 필터링합니다. `seed.<prop>`은 시드(기준) 버텍스의 속성을
-가리키므로 "시드와 다른 채널" 같은 상대 비교를 값 하드코딩 없이 표현할 수 있습니다.
+세 모드 모두 후보를 속성 술어로 필터링할 수 있습니다.
+
+- `seed.<prop>`은 시드(기준) 버텍스의 속성을 가리켜 "시드와 다른 채널" 같은
+  상대 비교를 값 하드코딩 없이 표현합니다.
+- `is_a("<class>")`는 후보의 tag가 해당 클래스이거나 그 **하위 클래스**(O-3
+  `SUBCLASS OF` 계층)면 참입니다 — 온톨로지 클래스 계층 인지 필터.
 
 ```sql
 -- 1001과 유사하되 'coupang' 채널인 상품
@@ -221,6 +247,9 @@ RECOMMEND SIMILAR TO 1001 BY EMBEDDING emb WHERE channel = "coupang" LIMIT 5;
 
 -- 1001과 유사하되 시드와 '다른' 채널인 상품
 RECOMMEND SIMILAR TO 1001 BY EMBEDDING emb WHERE channel != seed.channel LIMIT 5;
+
+-- 1001과 유사하되 animal(또는 그 하위 클래스, 예: dog)인 상품
+RECOMMEND SIMILAR TO 1001 BY EMBEDDING emb WHERE is_a("animal") LIMIT 5;
 ```
 
 ## 집계

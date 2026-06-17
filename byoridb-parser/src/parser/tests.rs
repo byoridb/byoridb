@@ -1249,6 +1249,42 @@ fn test_parse_recommend_neighbors_with_where() {
 }
 
 #[test]
+fn test_parse_recommend_blend() {
+    match parse(
+        "RECOMMEND SIMILAR TO 1 BLEND EMBEDDING emb 0.7 OVER has_brand, in_category 0.3 LIMIT 5",
+    )
+    .unwrap()
+    {
+        Statement::Recommend(s) => {
+            assert_eq!(s.limit, 5);
+            match s.by {
+                RecommendBy::Blend {
+                    embedding_prop,
+                    embedding_weight,
+                    over_edges,
+                    structural_weight,
+                } => {
+                    assert_eq!(embedding_prop, "emb");
+                    assert!((embedding_weight - 0.7).abs() < 1e-9);
+                    assert_eq!(
+                        over_edges,
+                        vec!["has_brand".to_string(), "in_category".to_string()]
+                    );
+                    assert!((structural_weight - 0.3).abs() < 1e-9);
+                }
+                other => panic!("Expected Blend, got {:?}", other),
+            }
+        }
+        other => panic!("Expected Recommend, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_recommend_blend_rejects_negative_weight() {
+    assert!(parse("RECOMMEND SIMILAR TO 1 BLEND EMBEDDING emb -0.5 OVER e 0.3").is_err());
+}
+
+#[test]
 fn test_parse_insert_vector_literal() {
     // List literal with negatives — the embedding ingestion path.
     let r = parse("INSERT VERTEX product(emb) VALUES 1:([0.1, -0.2, 0.3])");
