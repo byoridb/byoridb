@@ -24,10 +24,11 @@
 //! flat KNN — no index cost, exact results. The index only earns its keep on
 //! large catalogs (bulk-ingest then many queries).
 //!
-//! **Deletes / staleness.** DELETE VERTEX cannot mark the index dirty (it does
-//! not decode props), so the index may hold tombstone-less stale vids; the
-//! caller's emit-time vertex-existence check drops them. Approximate recall is
-//! acceptable for recommendation; exact flat remains the fallback.
+//! **Deletes / staleness.** DELETE VERTEX removes the deleted vid's dense
+//! entries and marks the affected indexes dirty, so the next query rebuilds
+//! without the deleted points (no tombstone accumulation). The caller's
+//! emit-time vertex-existence check covers any window before that rebuild.
+//! Approximate recall is acceptable for recommendation; exact flat is the fallback.
 
 use super::Executor;
 use crate::error::{ExecutionError, Result};
@@ -60,10 +61,9 @@ impl Point for Emb {
     }
 }
 
-/// How many candidates an ANN search returns. Generous so the caller's
-/// existence + WHERE filtering still has enough to fill `LIMIT`. Heavy
-/// filtering on huge catalogs may under-return — raise LIMIT or use flat.
-const ANN_SEARCH_BUDGET: usize = 256;
+/// Hard ceiling on ANN candidates fetched per query, regardless of `LIMIT` —
+/// bounds work on pathological `LIMIT` values.
+const ANN_SEARCH_BUDGET_MAX: usize = 4096;
 
 impl Executor {
     /// Mark a property's persisted vector index stale (rebuilt on next query).
@@ -84,7 +84,9 @@ impl Executor {
         space: &str,
         prop: &str,
         seed: &[f32],
+        budget: usize,
     ) -> Result<Vec<(i64, f32)>> {
+        let budget = budget.clamp(1, ANN_SEARCH_BUDGET_MAX);
         let idx_key = SchemaKey::vec_index(space, prop);
         let dirty = self
             .ctx
@@ -96,7 +98,7 @@ impl Executor {
 
         // Fast path: a fresh persisted index → load + ANN search, no full scan.
         if has_index && !dirty {
-            return self.ann_query(&idx_key, seed).await;
+            return self.ann_query(&idx_key, seed, budget).await;
         }
 
         // Otherwise scan the dense store once to decide: (re)build the index for
@@ -113,7 +115,7 @@ impl Executor {
 
         if points.len() > self.ctx.config.vector_index_min {
             self.persist_index(space, prop, &points).await?;
-            self.ann_query(&idx_key, seed).await
+            self.ann_query(&idx_key, seed, budget).await
         } else {
             // Small catalog: drop any stale index, exact flat KNN.
             self.ctx.kvstore.delete(&idx_key).await?;
@@ -150,7 +152,12 @@ impl Executor {
 
     /// Load the persisted index and ANN-search for the seed. Returns
     /// `(vid, cosine_score)` sorted by score descending.
-    async fn ann_query(&self, idx_key: &[u8], seed: &[f32]) -> Result<Vec<(i64, f32)>> {
+    async fn ann_query(
+        &self,
+        idx_key: &[u8],
+        seed: &[f32],
+        budget: usize,
+    ) -> Result<Vec<(i64, f32)>> {
         let bytes = match self.ctx.kvstore.get(idx_key).await? {
             Some(b) => b,
             None => return Ok(Vec::new()),
@@ -161,7 +168,7 @@ impl Executor {
         let mut search = Search::default();
         let mut out: Vec<(i64, f32)> = map
             .search(&query, &mut search)
-            .take(ANN_SEARCH_BUDGET)
+            .take(budget)
             .map(|item| (*item.value, 1.0 - item.distance)) // distance = 1 - cosine
             .collect();
         // search yields by increasing distance == decreasing score already, but
@@ -247,7 +254,7 @@ mod tests {
         put_dense(&exec, 3, &[0.0, 1.0]).await;
 
         let scored = exec
-            .scored_embedding_candidates("default", "emb", &[1.0, 0.0])
+            .scored_embedding_candidates("default", "emb", &[1.0, 0.0], 256)
             .await
             .unwrap();
 
@@ -280,7 +287,7 @@ mod tests {
         put_dense(&exec, 2, &[0.0, 1.0]).await;
         // First query builds the index over {1,2}.
         let _ = exec
-            .scored_embedding_candidates("default", "emb", &[1.0, 0.0])
+            .scored_embedding_candidates("default", "emb", &[1.0, 0.0], 256)
             .await
             .unwrap();
 
@@ -291,7 +298,7 @@ mod tests {
             .unwrap();
 
         let scored = exec
-            .scored_embedding_candidates("default", "emb", &[1.0, 0.0])
+            .scored_embedding_candidates("default", "emb", &[1.0, 0.0], 256)
             .await
             .unwrap();
         let vids: std::collections::HashSet<i64> = scored.iter().map(|(v, _)| *v).collect();
@@ -308,7 +315,7 @@ mod tests {
         put_dense(&exec, 2, &[0.9, 0.1]).await;
 
         let scored = exec
-            .scored_embedding_candidates("default", "emb", &[1.0, 0.0])
+            .scored_embedding_candidates("default", "emb", &[1.0, 0.0], 256)
             .await
             .unwrap();
         assert_eq!(

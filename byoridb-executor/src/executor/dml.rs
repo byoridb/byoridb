@@ -416,13 +416,32 @@ impl Executor {
         // Batch check existence
         let results = self.ctx.kvstore.batch_get(&keys).await?;
 
-        // Collect keys that exist for deletion
+        // Collect keys that exist for deletion. For each deleted vertex, also
+        // remove its dense embedding entries and invalidate the affected vector
+        // indexes (R-2a/R-2b) — otherwise the deleted vector lingers in the
+        // dense store and is re-indexed on the next HNSW rebuild, degrading recall.
         let mut deleted = 0;
-        for (key, exists) in keys.iter().zip(results.iter()) {
-            if exists.is_some() {
-                self.ctx.kvstore.delete(key).await?;
-                deleted += 1;
+        let mut dirty_vec_props: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for (vid, (key, exists)) in plan.vids.iter().zip(keys.iter().zip(results.iter())) {
+            let Some(data) = exists else { continue };
+            self.ctx.kvstore.delete(key).await?;
+            deleted += 1;
+            if let Ok(vertex) = VertexCodec::decode_vertex(data) {
+                for tag in &vertex.tags {
+                    for (prop, value) in &tag.properties {
+                        if crate::executor::recommend::pack_embedding(value).is_some() {
+                            let vkey =
+                                crate::key::SchemaKey::vec_data(&effective_space, prop, *vid);
+                            self.ctx.kvstore.delete(&vkey).await?;
+                            dirty_vec_props.insert(prop.clone());
+                        }
+                    }
+                }
             }
+        }
+        for prop in &dirty_vec_props {
+            self.mark_vector_index_dirty(&effective_space, prop).await?;
         }
 
         Ok(ExecutorResult {

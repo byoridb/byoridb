@@ -19,11 +19,12 @@
 //!   a full vertex on the hot path. This catches cross-channel matches that the
 //!   structural mode can't (different titles, same meaning).
 //!
-//! **Caveat.** The embedding side-store is written on INSERT but not removed on
-//! DELETE VERTEX (delete doesn't decode props), so a deleted vid can leave a
-//! stale dense entry. To stay correct, the embedding path verifies that each
-//! emitted top-k vid still has a live vertex — a bounded `k` lookups, off the
-//! scan hot path.
+//! **Deletes.** DELETE VERTEX decodes the vertex it removes, deletes the dense
+//! entries for its numeric-list properties, and marks the affected vector
+//! indexes dirty — so a deleted vid leaves no stale dense entry or index point.
+//! As a belt-and-suspenders guard the embedding path still verifies that each
+//! emitted top-k vid has a live vertex (a bounded `k` lookups, off the scan hot
+//! path), covering any window before an index rebuild.
 
 use super::{Executor, ExecutorResult};
 use crate::algo;
@@ -176,8 +177,16 @@ impl Executor {
         // Candidate scoring: persisted HNSW index for large catalogs (R-2b),
         // exact flat KNN below the threshold (R-2a). Both return (vid, cosine)
         // sorted by score desc; the seed itself is excluded here.
+        //
+        // ANN over-fetch budget scales with LIMIT, with extra headroom when a
+        // WHERE filter may discard candidates (flat ignores it — returns all).
+        let budget = if filter.is_some() {
+            limit.saturating_mul(16).max(256)
+        } else {
+            limit.saturating_add(32)
+        };
         let scored: Vec<(i64, f32)> = self
-            .scored_embedding_candidates(space, prop, &seed)
+            .scored_embedding_candidates(space, prop, &seed, budget)
             .await?
             .into_iter()
             .filter(|(vid, _)| *vid != src_vid)
@@ -677,6 +686,71 @@ mod tests {
             .collect();
         // Of structural matches {2,3}, only coupang:3 survives the filter.
         assert_eq!(vids, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn delete_vertex_cleans_dense_and_marks_index_dirty() {
+        // DELETE must remove the dense entry and invalidate the vector index so
+        // the deleted vid is not re-indexed on rebuild (recall correctness).
+        let executor = create_executor();
+        // Vertex blob carries `emb` as a numeric list (as a real INSERT would),
+        // plus the dense side-store entry.
+        let emb = Value::List(byoridb_common::datatypes::list::List::from(vec![
+            Value::Float(1.0),
+            Value::Float(0.0),
+        ]));
+        let mut props = std::collections::HashMap::new();
+        props.insert("emb".to_string(), emb.clone());
+        let vertex = byoridb_codec::VertexData {
+            vid: 1,
+            tags: vec![byoridb_codec::TagData {
+                name: "product".to_string(),
+                properties: props,
+            }],
+        };
+        executor
+            .ctx
+            .kvstore
+            .put(
+                &SchemaKey::vertex("default", 1),
+                &VertexCodec::encode_vertex(&vertex).unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .ctx
+            .kvstore
+            .put(
+                &SchemaKey::vec_data("default", "emb", 1),
+                &pack_embedding(&emb).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        executor
+            .execute_delete(crate::plan::DeletePlan {
+                space: "default".to_string(),
+                vids: vec![1],
+                conditions: None,
+            })
+            .await
+            .unwrap();
+
+        // Dense entry removed; vector index marked dirty for rebuild.
+        assert!(executor
+            .ctx
+            .kvstore
+            .get(&SchemaKey::vec_data("default", "emb", 1))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(executor
+            .ctx
+            .kvstore
+            .get(&SchemaKey::vec_index_dirty("default", "emb"))
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[test]

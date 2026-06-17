@@ -305,11 +305,18 @@ landmine 없음). R-2b는 `instant-distance`(더 가벼움, serde 영속화) 우
     - **쿼리 표면 무변경**: `BY EMBEDDING`이 내부에서 인덱스 유무로 ANN/flat 분기.
       flat은 always-correct 폴백·검증 기준. ANN은 근사(recommendation 허용).
     - **무효화**: INSERT/UPDATE의 숫자-리스트 prop → `mark_vector_index_dirty`.
-      DELETE는 prop 모름 → 인덱스 미정리, 방출 시 정점 존재확인으로 stale vid 거름.
-    - **회귀**: vector_index 3(ANN 영속·랭킹 / dirty 재빌드 / 임계값 flat).
-      기존 임베딩 테스트 12건은 기본 임계값으로 flat 유지(정확) → 무회귀.
-    - **D8 후속**: 진짜 증분 insert가 필요하면 `hnsw_rs`(insert+file dump) 검토.
-      instant-distance는 redb-bytes 직렬화엔 맞으나 rebuild-on-write가 한계.
+    - **DELETE 정리 (후속 완료 2026-06-17):** DELETE VERTEX가 삭제 정점을 디코드해
+      숫자-리스트 prop의 dense 엔트리를 삭제 + 해당 인덱스 dirty 마킹 → 다음 쿼리
+      재빌드가 삭제 점을 제외(tombstone 누적·recall 저하 caveat 해소). 방출 시
+      정점 존재확인은 belt-and-suspenders로 유지. (이전 caveat 제거됨.)
+    - **ANN budget LIMIT 연동 (후속 완료 2026-06-17):** 고정 256 폐기 →
+      `BY EMBEDDING`이 LIMIT·필터 유무로 over-fetch budget 산출(필터 시 ×16, 무필터
+      LIMIT+32), `ANN_SEARCH_BUDGET_MAX=4096` 상한. heavy WHERE+큰 LIMIT under-return 완화.
+    - **회귀**: vector_index 3(ANN 영속·랭킹 / dirty 재빌드 / 임계값 flat) +
+      recommend DELETE 정리 1. 기존 임베딩 12건 flat 유지(무회귀).
+    - **D8 후속(미완, 조건부)**: 진짜 증분 insert가 필요하면 `hnsw_rs`(insert+file
+      dump) 검토. instant-distance는 redb-bytes 직렬화엔 맞으나 rebuild-on-write가
+      한계 — 현재 영속+dirty 재빌드로 동작하므로 쓰기 빈도가 문제될 때만 전환.
 
     *설계 결정 (2026-06-16):*
     - **D8. 크레이트.** 증분 insert가 DB에 중요 → `hnsw_rs 0.3.4`(insert +
@@ -348,9 +355,10 @@ landmine 없음). R-2b는 `instant-distance`(더 가벼움, serde 영속화) 우
 - **UPDATE 일관성** (리뷰 F-001 수정): UPDATE VERTEX도 갱신된 숫자-리스트 속성을
   dense 스토어에 재미러링(리스트→비리스트면 dense 삭제). 없으면 KMM이 옛 벡터로
   조용히 채점(정점 살아있어 존재확인 통과 못 함). 회귀 테스트 추가.
-- **caveat**: DELETE VERTEX는 dense 엔트리 미정리(prop 모름) → stale 가능 →
-  방출 top-k 존재 확인으로 보정. 차원 불일치/제로벡터 스킵. dense 미러는 숫자
-  리스트 전부 대상(비-임베딩 숫자 리스트도 저장될 수 있음, 낭비 허용).
+- **DELETE 정리 (후속 완료 2026-06-17)**: DELETE VERTEX가 삭제 정점을 디코드해
+  dense 엔트리 삭제 + 인덱스 dirty 마킹(이전의 "dense 미정리→stale" caveat 해소).
+  방출 top-k 존재 확인은 belt-and-suspenders로 유지. 차원 불일치/제로벡터 스킵.
+  dense 미러는 숫자 리스트 전부 대상(비-임베딩 숫자 리스트도 저장될 수 있음, 낭비 허용).
 - **알려진 한계** (리뷰 F-002): dense 키가 `{space}:vec:{prop}:{vid}`로 tag 미포함
   → 한 vid의 두 tag가 동명 숫자-리스트 prop을 가지면 마지막이 덮어씀(단일-tag
   임베딩 패턴에선 무해). 다중 tag 동명 벡터 지원 시 키에 tag 포함 검토.
