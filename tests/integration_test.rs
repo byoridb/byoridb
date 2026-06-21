@@ -1501,3 +1501,100 @@ async fn test_drop_space_purges_data_for_name_reuse() {
         lookup.rows
     );
 }
+
+/// End-to-end owl:sameAs canonical merge (PLAN.md O-8). Asserting `sameAs`
+/// collapses two nodes onto the min-id representative; reads of the merged-away
+/// vid (GO source, FETCH) normalize to it, and the irreversible merge blocks
+/// deletion of the merged node and the sameAs edge.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sameas_merges_nodes_and_blocks_deletion() {
+    let (service, _temp_dir) = create_test_service();
+
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE sameas_test").await;
+    execute(&service, session_id, "USE sameas_test").await;
+    execute(
+        &service,
+        session_id,
+        "CREATE TAG product(name STRING, channel STRING)",
+    )
+    .await;
+    execute(&service, session_id, "CREATE EDGE sameAs()").await;
+    execute(&service, session_id, "CREATE EDGE sells()").await;
+
+    // Two channel listings of the same real product; a buyer (9) points at vid 5.
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX product(name, channel) VALUES 2:("Widget", "naver"), 5:("widget", "coupang")"#,
+    )
+    .await;
+    execute(&service, session_id, "INSERT EDGE sells() VALUES 9->5:()").await;
+
+    // Assert equivalence: 5 sameAs 2 ⟹ winner = min-id 2, vid 5 collapses into it.
+    execute(&service, session_id, "INSERT EDGE sameAs() VALUES 5->2:()").await;
+
+    // GO from the buyer now reaches the representative (2), not merged-away 5.
+    let go = execute(
+        &service,
+        session_id,
+        "GO FROM 9 OVER sells YIELD sells._dst AS dst",
+    )
+    .await;
+    let dsts: Vec<i64> = go
+        .rows
+        .iter()
+        .filter_map(|r| match r.last() {
+            Some(Value::Int(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        dsts.contains(&2),
+        "sells edge rewritten onto representative 2, got {:?}",
+        dsts
+    );
+    assert!(!dsts.contains(&5), "merged-away vid 5 must not appear");
+
+    // FETCH of the merged-away vid 5 normalizes to representative 2.
+    let fetch = execute(&service, session_id, "FETCH PROP ON product 5").await;
+    let ids: Vec<i64> = fetch
+        .rows
+        .iter()
+        .filter_map(|r| match r.first() {
+            Some(Value::Int(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec![2], "FETCH of 5 returns representative 2");
+
+    // Irreversibility (D7): deleting the merged node / representative / sameAs edge
+    // is rejected — owl:sameAs merges cannot be undone in an insertion-only engine.
+    assert!(
+        service
+            .execute(session_id, "DELETE VERTEX 5".to_string())
+            .await
+            .is_err(),
+        "deleting a merged-away node must be rejected"
+    );
+    assert!(
+        service
+            .execute(session_id, "DELETE VERTEX 2".to_string())
+            .await
+            .is_err(),
+        "deleting a representative with members must be rejected"
+    );
+    assert!(
+        service
+            .execute(session_id, "DELETE EDGE sameAs 5->2".to_string())
+            .await
+            .is_err(),
+        "deleting a sameAs edge must be rejected"
+    );
+
+    service.sign_out(session_id, session_id).await;
+}

@@ -66,11 +66,18 @@ impl MatchExecutor {
         // Instead of scanning all start-node candidates and traversing forward,
         // we call get_incoming_neighbors(X) once — an O(in-degree) reverse-edge
         // index lookup vs N forward prefix scans (N = candidate count, 100K+).
-        let id_bindings = plan
+        let mut id_bindings = plan
             .where_clause
             .as_ref()
             .map(extract_id_eq_bindings)
             .unwrap_or_default();
+
+        // O-8 D5: normalize `id(n) == X` constraints to the owl:sameAs
+        // representative so a match on a merged-away vid resolves to the
+        // surviving node that holds the facts.
+        for vid in id_bindings.values_mut() {
+            *vid = crate::ontology::representative_of(&self.ctx, &space, *vid).await?;
+        }
 
         let used_reverse = if flat.edges.len() == 1 && plan.optional_patterns.is_empty() {
             let end_node = flat.nodes[0];

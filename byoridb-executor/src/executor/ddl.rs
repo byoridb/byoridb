@@ -876,6 +876,15 @@ impl Executor {
                 self.handle_drop_class(name, if_exists).await
             }
             crate::plan::DropPlan::Edge { name, if_exists } => {
+                // O-8 D7: the sameAs reserved type underpins irreversible merges;
+                // dropping it would strand the canonical-representative map.
+                if name == crate::executor::sameas::SAMEAS_EDGE {
+                    return Err(ExecutionError::InvalidOperation(
+                        "the reserved sameAs edge type cannot be dropped — \
+                         owl:sameAs merges are irreversible (insertion-only)"
+                            .to_string(),
+                    ));
+                }
                 let space = self.ctx.space.as_ref().ok_or_else(|| {
                     ExecutionError::InvalidOperation("No space selected".to_string())
                 })?;

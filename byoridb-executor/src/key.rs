@@ -148,6 +148,48 @@ impl SchemaKey {
         s.rsplit(':').next().map(|c| c.to_string())
     }
 
+    // ===== Tag-vid secondary index (label-only MATCH acceleration) =====
+
+    /// Tag-vid index entry: `{space}:tagvid:{tag}:{vid}` → empty. Written by
+    /// INSERT VERTEX so label-only MATCH can prefix-scan by tag instead of
+    /// scanning every vertex. Note `vid` is the trailing segment, so a single
+    /// vertex's tagvid entries cannot be gathered by one prefix — reconstruct
+    /// them from the vertex blob's tags (see O-8 merge).
+    pub fn tagvid(space: &str, tag: &str, vid: i64) -> Vec<u8> {
+        format!("{}:tagvid:{}:{}", space, tag, vid).into_bytes()
+    }
+
+    // ===== owl:sameAs canonical-representative map (PLAN.md O-8) =====
+
+    /// Union-find representative pointer for a vertex: `{space}:sameas:{vid}` →
+    /// the canonical (min-id) vertex of its owl:sameAs equivalence class. Absent
+    /// for vertices that have never been merged (they are their own representative).
+    /// Consulted by `ontology::representative_of` to normalize GO/FETCH/MATCH vids.
+    pub fn sameas(space: &str, vid: i64) -> Vec<u8> {
+        format!("{}:sameas:{}", space, vid).into_bytes()
+    }
+
+    /// Reverse membership entry: `{space}:sameas-members:{rep}:{member}` → empty.
+    /// Lets a representative enumerate the non-representative vids collapsed into
+    /// it (used by DELETE guards and introspection). Note the `sameas-members:`
+    /// infix keeps this keyspace disjoint from the `sameas:` pointer prefix.
+    pub fn sameas_member(space: &str, rep: i64, member: i64) -> Vec<u8> {
+        format!("{}:sameas-members:{}:{}", space, rep, member).into_bytes()
+    }
+
+    /// Prefix for all members collapsed into a representative:
+    /// `{space}:sameas-members:{rep}:`
+    pub fn sameas_members_prefix(space: &str, rep: i64) -> Vec<u8> {
+        format!("{}:sameas-members:{}:", space, rep).into_bytes()
+    }
+
+    /// Extract the trailing member vid from a `sameas_member` key. The member vid
+    /// is always the final colon-delimited segment.
+    pub fn sameas_member_from_key(key: &[u8]) -> Option<i64> {
+        let s = std::str::from_utf8(key).ok()?;
+        s.rsplit(':').next()?.parse::<i64>().ok()
+    }
+
     // ===== Dense embedding vector store (PLAN.md R-2a) =====
 
     /// Dense embedding entry: `{space}:vec:{prop}:{vid}` → packed little-endian
@@ -290,6 +332,25 @@ mod tests {
         assert_eq!(
             SchemaKey::edge_data_src_prefix("my_space", 1),
             b"my_space:edge:1:".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_sameas_keys() {
+        assert_eq!(SchemaKey::sameas("s", 5), b"s:sameas:5".to_vec());
+        assert_eq!(
+            SchemaKey::sameas_member("s", 1, 5),
+            b"s:sameas-members:1:5".to_vec()
+        );
+        assert_eq!(
+            SchemaKey::sameas_members_prefix("s", 1),
+            b"s:sameas-members:1:".to_vec()
+        );
+        // The pointer prefix must not collide with the members keyspace.
+        assert!(!SchemaKey::sameas_member("s", 1, 5).starts_with(b"s:sameas:"));
+        assert_eq!(
+            SchemaKey::sameas_member_from_key(b"s:sameas-members:1:42"),
+            Some(42)
         );
     }
 

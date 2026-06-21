@@ -176,6 +176,13 @@ impl Executor {
             plan.vids.clone()
         };
 
+        // O-8 D5: normalize to sameAs representatives so a fetch of a merged-away
+        // vid returns the surviving node that holds the facts.
+        let mut resolved_vids = resolved_vids;
+        for vid in resolved_vids.iter_mut() {
+            *vid = crate::ontology::representative_of(&self.ctx, effective_space, *vid).await?;
+        }
+
         // Vertex fetch: batch-get all vertex keys
         let profiling = self.ctx.profiling();
         let fetch_start = std::time::Instant::now();
@@ -457,6 +464,14 @@ impl Executor {
             .space
             .as_ref()
             .ok_or_else(|| ExecutionError::InvalidOperation("No space selected".to_string()))?;
+
+        // O-8 D5: normalize source vids to their owl:sameAs representatives so the
+        // traversal starts from the node that actually holds the merged facts.
+        let mut from_vids = from_vids;
+        for vid in from_vids.iter_mut() {
+            *vid = crate::ontology::representative_of(&self.ctx, space, *vid).await?;
+        }
+
         let (min_steps, max_steps) = match plan.to_clause.steps {
             crate::plan::StepClause::Exactly(n) => (n, n),
             crate::plan::StepClause::Range(min, max) => (min, max),

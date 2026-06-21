@@ -216,11 +216,21 @@ impl Executor {
                 if !batch.is_empty() {
                     self.ctx.kvstore.batch_put(batch).await?;
                 }
+                // owl:sameAs node-equivalence merge (O-8): collapse equivalence
+                // classes onto a canonical representative *before* O-5 so
+                // forward-chaining runs over the canonicalized graph (D10).
+                self.merge_sameas_triples(&effective_space, &new_triples)
+                    .await?;
                 // Ontology forward-chaining materialization (O-5): derive and
                 // persist entailed edges. No-op if the space declares no
                 // semantic relations. Runs after the asserted edges are
-                // committed so the closure reads them.
-                self.materialize_inserted_edges(&effective_space, new_triples)
+                // committed so the closure reads them. sameAs triples are
+                // handled by the merge above, not by O-5 rules — exclude them.
+                let onto_triples: Vec<_> = new_triples
+                    .into_iter()
+                    .filter(|(_, p, _)| p != crate::executor::sameas::SAMEAS_EDGE)
+                    .collect();
+                self.materialize_inserted_edges(&effective_space, onto_triples)
                     .await?;
                 Ok(ExecutorResult {
                     columns: vec!["Inserted".to_string()],
@@ -415,6 +425,31 @@ impl Executor {
             plan.space.clone()
         };
 
+        // O-8 D7: owl:sameAs merges are irreversible (insertion-only), so refuse
+        // to delete a vertex entangled in one — either a non-representative
+        // member (its facts moved elsewhere) or a representative that absorbed
+        // others. Allowing it would orphan or lose the merged class.
+        for vid in &plan.vids {
+            let rep = crate::ontology::representative_of(&self.ctx, &effective_space, *vid).await?;
+            if rep != *vid {
+                return Err(ExecutionError::InvalidOperation(format!(
+                    "vertex {} was merged into representative {} via owl:sameAs; \
+                     deletion is unsupported (insertion-only)",
+                    vid, rep
+                )));
+            }
+            if !crate::ontology::members_of(&self.ctx, &effective_space, *vid)
+                .await?
+                .is_empty()
+            {
+                return Err(ExecutionError::InvalidOperation(format!(
+                    "vertex {} is a sameAs representative with merged members; \
+                     deletion is unsupported (insertion-only)",
+                    vid
+                )));
+            }
+        }
+
         // Build all keys at once
         let keys: Vec<Vec<u8>> = plan
             .vids
@@ -473,6 +508,16 @@ impl Executor {
         } else {
             plan.space.clone()
         };
+
+        // O-8 D7: a sameAs edge is what triggered an irreversible merge — deleting
+        // it cannot un-merge the equivalence class, so reject rather than mislead.
+        if plan.edge_name == crate::executor::sameas::SAMEAS_EDGE {
+            return Err(ExecutionError::InvalidOperation(
+                "deleting a sameAs edge is unsupported — owl:sameAs merges are \
+                 irreversible (insertion-only)"
+                    .to_string(),
+            ));
+        }
 
         let mut deleted = 0i64;
         for (src, dst, ranking) in &plan.edge_refs {

@@ -224,7 +224,7 @@ impl Executor {
     }
 
     /// True if any edge `(s)-p->(d)` exists at any ranking (asserted or inferred).
-    async fn triple_exists(&self, space: &str, s: i64, p: &str, d: i64) -> Result<bool> {
+    pub(super) async fn triple_exists(&self, space: &str, s: i64, p: &str, d: i64) -> Result<bool> {
         // Trailing colon prevents dst prefix collisions (`:1:` vs `:10:`).
         let prefix = format!("{}:edge:{}:{}:{}:", space, s, p, d);
         let hits = self

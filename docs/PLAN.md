@@ -1,7 +1,8 @@
 # ByoriDB 플랜
 
-마지막 업데이트: 2026-06-17 (온톨로지 핵심 O-1~O-7 + 유사도 추천 R-1~R-3b 구현·배포
-완료. 상세는 O/R 섹션. 남은 건 고급 추론(sameAs/삭제 retraction/분산)과 운영.)
+마지막 업데이트: 2026-06-22 (온톨로지 핵심 O-1~O-8 + 유사도 추천 R-1~R-3b 구현 완료.
+O-8 owl:sameAs 노드 동치(write-time canonical merge) 구현·검증 완료, 2026-06-22 main
+머지 → AKS 자동배포. 상세는 O/R 섹션. 남은 건 고급 추론(삭제 retraction/분산)과 운영.)
 
 이전의 `ROADMAP.md` / `docs/NEXT_STEPS.md` / `docs/MOCK_REMEDIATION_PLAN.md` /
 `docs/GRAPH_ALGORITHM_OPTIMIZATION_PLAN.md` 4개 문서를 통합한 **단일 진실원**.
@@ -290,6 +291,53 @@ FunctionCall 처리 추가. 회귀: MATCH is_a(subclass 매칭/cat 제외/negati
 - **미착수(후속)**: 추론 edge 기반 매칭(이미 inferred edge가 GO/MATCH에 보이므로
   일부 자동 충족), SPARQL 호환(보류), `MATCH (n:animal)` label 자체의 subclass
   확장(현재는 label 정확 매칭 + WHERE is_a로 해결).
+
+**O-8 [P1] owl:sameAs 노드 동치 추론 (write-time canonical merge)** ✅ 구현·검증
+완료 (2026-06-19), 2026-06-22 main 머지 → AKS 자동배포
+
+O-0이 "가장 비싼 outlier라 마지막"으로 미룬 동치 추론. **2026-06-19 deep-research**
+(25 claim 전부 3-0 confirmed): sameAs를 congruence relation으로 full materialize하면
+조합 폭발(크기 n 클래스 → n² triple을 2n³ derivation; 실측 3,930-member = 600억
+derivation·4h+). 모든 production RDF store(GraphDB·RDFox·Stardog·Oracle)의 표준은
+**canonical-representative rewriting**(대표 노드 UnionFind + 쿼리타임 expansion,
+triple 7.8×·시간 31.1× 절감). LPG 선례는 전무(Neo4j n10s = sameAs 미지원). retraction이
+결정적 난제(2015 B/F≈까지 미해결) — insertion-only는 merge 비가역.
+
+*설계 결정 (D1~D10, 사용자 = write-time canonical merge 선택):*
+- **D1. 예약 edge type `sameAs`.** `CREATE EDGE sameAs()` → `INSERT EDGE sameAs()
+  VALUES a->b:()`. instance-level이라 owl 의미론에 맞고 parser 무변경. O-4 시맨틱
+  플래그 붙이지 말 것(merge 전담, O-5 규칙 대상 아님).
+- **D2. 대표 = min vertex ID, UnionFind.** 사이드스토어 `{space}:sameas:{vid}`→대표
+  (i64 LE), `{space}:sameas-members:{rep}:{member}`→역방향 멤버 열거. `sameas-`
+  infix로 두 키스페이스 분리.
+- **D3. write-time merge.** 비대표 loser→대표 winner로 out/in-edge(정·역 인덱스
+  동기), vtype, tagvid(블롭 tags로 키 재구성), vec dense(dirty 마킹), vertex blob
+  rewrite 후 loser 키 삭제. self-loop는 winner→winner로.
+- **D4. 비가역·원본 미보존(lossy).** insertion-only이므로 retraction 미지원. 대표에만
+  fact를 남겨 읽기는 입력 정규화만(저비용). **trade-off: 동치 오선언 시 되돌리기
+  불가** → D7 가드.
+- **D5. 읽기 = 입력 vid 정규화(expand 아님).** GO `from_vids`(execute_go_local)·FETCH
+  `resolved_vids`·MATCH `id(n)==X` 바인딩을 신규 `ontology::representative_of`로 대표
+  치환. merge로 비대표 blob이 삭제되므로 MATCH 후보 스캔은 자동 suppress(명시 필터
+  불요). O-5 materialization 내부 algo는 raw vid 유지(정규화는 진입점만).
+- **D6. 속성 충돌 = 대표(min-id) 우선.** loser prop은 winner에 없는 것만 추가.
+- **D7. DELETE 가드.** merged 노드(비대표 멤버 or 멤버 가진 대표) DELETE VERTEX 거부,
+  sameAs DELETE EDGE 거부, DROP EDGE sameAs 거부 — 전부 `InvalidOperation`.
+- **D8. read-side 폭발 방어.** 입력 정규화라 결과가 대표 1개로 수렴(Stardog식 자동).
+- **D9. write cap.** merge 횟수에 `max_traversal_nodes` cap(O-5 패턴, warn).
+- **D10. O-5 순서.** INSERT EDGE 직후 **merge 먼저** → 그 다음 O-5 materialization
+  (canonicalized 그래프 위 추론). sameAs triple은 O-5에 안 넘김.
+
+*구현:* 신규 `executor/sameas.rs`(merge 엔진, `merge_sameas_triples`+rewrite 헬퍼) +
+`ontology.rs`(`representative_of`/`members_of`/`encode_repr`) + `key.rs`(sameas/tagvid
+빌더). 훅: `dml.rs` INSERT EDGE(merge→필터→materialize)·DELETE 가드, `dql.rs`
+GO/FETCH 정규화, `match_executor.rs` id() 정규화, `ddl.rs` DROP EDGE 가드. 회귀:
+sameas 유닛 6(대표선출/out·in-edge rewrite·역인덱스/속성충돌/idempotent·union/self-loop)
++ key 1 + integration 1(end-to-end merge·GO/FETCH 정규화·3종 DELETE 거부). 워크스페이스
+762 lib + 46 integration 통과, fmt·clippy 클린.
+- **후속**: 프로덕션 스모크(배포 후), 삭제 retraction(B/F — 별도 최난도 트랙),
+  분산 materialization(G-2 선결). RECOMMEND가 sameAs 대표를 후보로 인지하는 R-트랙
+  연계(sameAs 우회 경로의 역방향)는 후속 검토.
 
 ### R. 유사도 / 추천 (P1 — 차별화 기능, 2026-06-15 신설)
 

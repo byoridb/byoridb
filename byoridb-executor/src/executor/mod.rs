@@ -168,6 +168,7 @@ mod dml;
 mod dql;
 mod inference;
 mod recommend;
+mod sameas;
 mod show;
 mod vector_index;
 
