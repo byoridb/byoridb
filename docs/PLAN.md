@@ -2,8 +2,8 @@
 
 마지막 업데이트: 2026-06-22 (온톨로지 핵심 O-1~O-9 + 유사도 추천 R-1~R-3b 구현 완료.
 O-8 owl:sameAs(write-time canonical merge)·O-9 삭제 retraction(full re-materialization)
-구현·검증 완료. O-8 배포됨, O-9 미배포. 상세는 O/R 섹션. 남은 건 retraction B/F 최적화·
-분산 materialization·운영.)
+구현·검증 완료. O-8·O-9 모두 AKS 배포 완료(sha-1994c43) + 프로덕션 스모크 통과.
+상세는 O/R 섹션. 남은 건 retraction B/F 최적화·분산 materialization·운영.)
 
 이전의 `ROADMAP.md` / `docs/NEXT_STEPS.md` / `docs/MOCK_REMEDIATION_PLAN.md` /
 `docs/GRAPH_ALGORITHM_OPTIMIZATION_PLAN.md` 4개 문서를 통합한 **단일 진실원**.
@@ -347,8 +347,8 @@ sameas 유닛 6(대표선출/out·in-edge rewrite·역인덱스/속성충돌/ide
   (merged-away 시드가 대표 임베딩으로 추천).
 - **후속**: 삭제 retraction → **O-9에서 1단계 완료**, 분산 materialization(G-2 선결).
 
-**O-9 [P1] 삭제 retraction (full re-materialization)** ✅ 구현·검증 완료 (2026-06-22,
-미배포)
+**O-9 [P1] 삭제 retraction (full re-materialization)** ✅ 구현·검증·배포 완료 (2026-06-22,
+AKS sha-1994c43)
 
 O-5 추론이 insertion-only라 DELETE EDGE/VERTEX가 stale 추론을 남기던 한계 해소
 (예: `ancestor` TRANSITIVE에서 1→2,2→3 ⟹ 1→3 inferred인데 2→3 삭제해도 1→3 잔존).
@@ -368,6 +368,10 @@ O-0이 정한 **"1단계 full re-materialization → 2단계 B/F, DRed 회피"**
 - **D5. 비용 = O(graph)/delete** (시맨틱 space만). O-0 인정 1단계. B/F(2단계)는 후속.
 - 회귀(inference.rs 5): transitive/symmetric retract, 다른 경로 지원 시 보존,
   domain/range vtype retract, 시맨틱 미선언 no-op. executor lib 187 + integration 46 통과.
+- **프로덕션 스모크 ✅ (2026-06-22)**: AKS(`20.249.128.19`, sha-1994c43)에서 일회용
+  space로 검증. `ancestor` TRANSITIVE에 `1->2`,`2->3` INSERT → `GO FROM 1`이 추론 `1->3`
+  포함 {2,3} 반환. `DELETE EDGE 2->3` 후 `GO FROM 1`이 {2}만 반환(추론 `1->3` retract 확인,
+  insertion-only였다면 잔존). HTTP API로 기대대로 통과.
 - **후속**: B/F 증분(O-0 2단계, deep-research 선행), DELETE VERTEX edge cascade(별개 이슈).
 
 ### R. 유사도 / 추천 (P1 — 차별화 기능, 2026-06-15 신설)
