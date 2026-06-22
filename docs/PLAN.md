@@ -79,6 +79,8 @@ Phase 1–10이 모두 완료되었고, mock/hardcoded 청산(PR 1–10) 및 그
 - **label-only MATCH tag-vid 인덱스** ✅ 적용 완료 (2026-05-29): INSERT VERTEX 시 `{space}:tagvid:{tag_name}:{vid}` 보조 인덱스 작성. label-only MATCH 패턴 (`MATCH (p:product)`) 에서 전체 vertex 스캔 대신 tag-vid prefix scan 사용. 기존 데이터(인덱스 기록 전 삽입)는 빈 scan → 풀스캔 폴백 보장. NebulaGraph 벤치마크 대비 MATCH 157배 지연 원인이었음.
 - **`byoridb-server` bin standalone 한계**: `src/main.rs`/`src/config.rs`가 Storage+Graph+HTTP를 같은 프로세스로 standalone 실행만 노출. 분산 클러스터(Raft/peer/cluster ID) 설정을 binary 레벨에서 받지 않음. 라이브러리에는 Raft 합의 구현이 있고 PLAN.md 검증된 기능에도 분산이 포함되어 있으나, `byoridb-server`를 그대로 multi-replica로 배포하면 실제로는 독립된 N개 단일 노드가 됨(docker-compose.yml의 3 컨테이너도 마찬가지). 분산 배포가 필요하면 G-2 작업 선결 필요.
 - **빌드 환경 MSRV**: `base64ct 1.8.3`(transitive)이 Rust edition2024를 요구해 Rust ≥ 1.85 필요. Dockerfile은 2026-05-13에 `1.80 → 1.86`으로 갱신됨. MSRV가 어디에도 명시되어 있지 않아 CI/Docker 환경 드리프트 시 다시 깨질 수 있음.
+- **nGQL 문자열 escape** ✅ 해소 (2026-06-22): lexer 정규식 `"[^"]*"`/`'[^']*'`가 escape·내부 따옴표·백슬래시를 못 받아, 값에 `"`나 `\`가 있으면 토큰이 끊겨 "Unexpected end of input"으로 실패했음(예: `Chef's`는 OK지만 `6\" pan`, `C:\dir`은 깨짐). `"([^"\\]|\\.)*"`로 확장 + `parser::unquote`가 `\"`/`\\`/`\n`/`\t` 등 해석(흩어진 5개 호출처 통합). **nexprice 도그푸딩으로 발견** — LDBC(INT64·따옴표 없는 VID)만 검증해 와 드러나지 않았던 갭.
+- **INSERT 실행기 문자열 VID 미지원** (미해결): `CREATE SPACE ... vid_type=FIXED_STRING`은 파서·메타가 받지만, `plan.rs`가 INSERT VERTEX/EDGE의 VID를 `Literal::Int`(i64)로 강제(`"Vertex ID must be an integer literal"`)해 문자열 VID 스페이스엔 한 건도 못 넣는다. 우회: 애플리케이션이 문자열 id를 결정적 해시(blake2b 63bit 양수) INT64로 매핑하고 원본 id는 속성으로 보존. 근본 수정은 VID 타입(i64|String) 전파 필요(plan/executor/codec/key 전반, blast radius 큼). nexprice 도그푸딩으로 발견.
 
 ---
 

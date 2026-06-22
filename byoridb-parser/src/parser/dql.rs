@@ -585,7 +585,7 @@ impl Parser {
                     ));
                 }
                 self.advance();
-                Literal::String(s[1..s.len() - 1].to_string())
+                Literal::String(super::unquote(&s))
             }
             Token::True => {
                 if negate {

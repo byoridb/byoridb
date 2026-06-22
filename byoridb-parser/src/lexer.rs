@@ -348,9 +348,14 @@ pub enum Token {
     Dollar,
 
     // Literals
-    #[regex(r#""[^"]*""#, |lex| lex.slice().to_string())]
+    // `\"`/`\\`/`\n` etc. are accepted inside the quotes (the `\\.` alternative),
+    // so a quote or backslash can appear in the value. The raw slice (quotes +
+    // escapes intact) is stored; `parser::unquote` strips quotes and interprets
+    // the escapes. Without `\\.`, a value containing the delimiter quote or a
+    // backslash truncated the token (the LDBC-only/integer-VID blind spot).
+    #[regex(r#""([^"\\]|\\.)*""#, |lex| lex.slice().to_string())]
     StringLiteral(std::string::String),
-    #[regex(r"'[^']*'", |lex| lex.slice().to_string())]
+    #[regex(r"'([^'\\]|\\.)*'", |lex| lex.slice().to_string())]
     SingleQuotedString(std::string::String),
     #[regex(r"-?[0-9]+", |lex| lex.slice().parse().ok(), priority = 2)]
     Integer(i64),
@@ -492,6 +497,27 @@ mod tests {
         assert_eq!(
             tokens[3].token,
             Token::SingleQuotedString("'world'".to_string())
+        );
+    }
+
+    #[test]
+    fn test_string_with_escapes_stays_one_token() {
+        // A double-quoted value containing an escaped quote, a backslash, and a
+        // bare single quote must remain a SINGLE token (the old `[^"]*` regex
+        // truncated at the inner quote/backslash — the dogfooding gap).
+        let lexer = Lexer::new(r#""a\"b\\c 'x'""#);
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens.len(), 1, "escapes/quotes must not split the token");
+        assert_eq!(
+            tokens[0].token,
+            Token::StringLiteral(r#""a\"b\\c 'x'""#.to_string())
+        );
+        // Symmetric case for single-quoted strings with an escaped quote.
+        let tokens = Lexer::new(r"'it\'s'").tokenize().unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(
+            tokens[0].token,
+            Token::SingleQuotedString(r"'it\'s'".to_string())
         );
     }
 

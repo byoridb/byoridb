@@ -1347,3 +1347,30 @@ fn test_parse_empty_list_literal() {
     let r = parse("INSERT VERTEX product(tags) VALUES 1:([])");
     assert!(r.is_ok(), "empty list should parse: {:?}", r);
 }
+
+#[test]
+fn test_unquote_interprets_escapes() {
+    // Bare value, no escapes (fast path).
+    assert_eq!(unquote(r#""hello""#), "hello");
+    // A single quote needs no escape inside a double-quoted value.
+    assert_eq!(unquote(r#""Chef's""#), "Chef's");
+    // Escaped delimiter quote, backslash, and a control escape.
+    assert_eq!(unquote(r#""a\"b""#), "a\"b");
+    assert_eq!(unquote(r#""C:\\path""#), "C:\\path");
+    assert_eq!(unquote(r#""line\nbreak""#), "line\nbreak");
+    // Single-quoted string with an escaped single quote.
+    assert_eq!(unquote(r"'it\'s'"), "it's");
+    // Unknown escape drops the backslash, keeps the char.
+    assert_eq!(unquote(r#""x\qy""#), "xqy");
+}
+
+#[test]
+fn test_parse_string_with_quotes_and_backslash() {
+    // Dogfooding gap (nexprice load): product/brand names with apostrophes or
+    // quotes (KIEHL'S, 6\" pan, C:\dir) must parse. The old `[^"]*` lexer regex
+    // truncated the token at the inner quote/backslash → "Unexpected end of
+    // input". All three must now parse cleanly.
+    assert!(parse(r#"INSERT VERTEX p(name) VALUES 1:("Chef's")"#).is_ok());
+    assert!(parse(r#"INSERT VERTEX p(name) VALUES 1:("a\"b")"#).is_ok());
+    assert!(parse(r#"INSERT VERTEX p(name) VALUES 1:("C:\\dir")"#).is_ok());
+}

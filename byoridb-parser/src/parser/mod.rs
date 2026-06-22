@@ -324,8 +324,7 @@ impl Parser {
         match token {
             Token::StringLiteral(s) => {
                 self.advance();
-                // Remove quotes
-                Ok(s[1..s.len() - 1].to_string())
+                Ok(unquote(&s))
             }
             _ => Err(ParseError::UnexpectedToken(format!(
                 "String literal expected, found {:?}",
@@ -379,6 +378,39 @@ impl Parser {
 }
 
 /// Convenience function to parse a query string
+/// Strip the surrounding quotes from a lexer string token and interpret escape
+/// sequences (`\"` `\'` `\\` `\n` `\t` `\r` `\0`). The lexer accepts escapes via
+/// its `\\.` regex branch but stores the raw slice (quotes + escapes intact);
+/// this turns a raw `"a\"b"` token into the value `a"b`. An unknown escape drops
+/// the backslash and keeps the following character. Shared by every string-token
+/// consumer so escape handling lives in exactly one place.
+pub(crate) fn unquote(s: &str) -> String {
+    let inner = &s[1..s.len() - 1]; // the lexer guarantees the surrounding quotes
+    if !inner.contains('\\') {
+        return inner.to_string(); // fast path: no escapes to interpret
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('\'') => out.push('\''),
+            Some(other) => out.push(other), // unknown escape: keep the char
+            None => out.push('\\'),         // dangling backslash (lexer disallows)
+        }
+    }
+    out
+}
+
 pub fn parse(input: &str) -> ParseResult {
     let mut parser = Parser::new(input);
     parser.parse()
