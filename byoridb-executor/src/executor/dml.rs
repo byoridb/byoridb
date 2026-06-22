@@ -488,6 +488,10 @@ impl Executor {
             self.mark_vector_index_dirty(&effective_space, prop).await?;
         }
 
+        // O-9 retraction: re-materialize so any inferred vertex types / edges
+        // tied to the removed vertices are retracted. No-op without semantics.
+        self.rematerialize_space(&effective_space).await?;
+
         Ok(ExecutorResult {
             columns: vec!["Deleted".to_string()],
             rows: vec![vec![byoridb_common::Value::Int(deleted)]],
@@ -540,6 +544,11 @@ impl Executor {
                 deleted += 1;
             }
         }
+
+        // O-9 retraction: re-materialize the ontology closure so entailments
+        // that depended on the deleted edge(s) are retracted. No-op for spaces
+        // without semantic relations.
+        self.rematerialize_space(&effective_space).await?;
 
         Ok(ExecutorResult {
             columns: vec!["Deleted".to_string()],

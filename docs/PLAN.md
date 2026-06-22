@@ -1,8 +1,9 @@
 # ByoriDB 플랜
 
-마지막 업데이트: 2026-06-22 (온톨로지 핵심 O-1~O-8 + 유사도 추천 R-1~R-3b 구현 완료.
-O-8 owl:sameAs 노드 동치(write-time canonical merge) 구현·검증 완료, 2026-06-22 main
-머지 → AKS 자동배포. 상세는 O/R 섹션. 남은 건 고급 추론(삭제 retraction/분산)과 운영.)
+마지막 업데이트: 2026-06-22 (온톨로지 핵심 O-1~O-9 + 유사도 추천 R-1~R-3b 구현 완료.
+O-8 owl:sameAs(write-time canonical merge)·O-9 삭제 retraction(full re-materialization)
+구현·검증 완료. O-8 배포됨, O-9 미배포. 상세는 O/R 섹션. 남은 건 retraction B/F 최적화·
+분산 materialization·운영.)
 
 이전의 `ROADMAP.md` / `docs/NEXT_STEPS.md` / `docs/MOCK_REMEDIATION_PLAN.md` /
 `docs/GRAPH_ALGORITHM_OPTIMIZATION_PLAN.md` 4개 문서를 통합한 **단일 진실원**.
@@ -342,7 +343,30 @@ sameas 유닛 6(대표선출/out·in-edge rewrite·역인덱스/속성충돌/ide
   이미 대표로 collapse하므로 후보·결과 정규화는 불필요(자동). 유사도로 후보를 *발견*→
   sameAs로 *단언*하는 entity resolution 루프의 역방향 완성. 회귀: recommend 유닛 1
   (merged-away 시드가 대표 임베딩으로 추천).
-- **후속**: 삭제 retraction(B/F — 별도 최난도 트랙), 분산 materialization(G-2 선결).
+- **후속**: 삭제 retraction → **O-9에서 1단계 완료**, 분산 materialization(G-2 선결).
+
+**O-9 [P1] 삭제 retraction (full re-materialization)** ✅ 구현·검증 완료 (2026-06-22,
+미배포)
+
+O-5 추론이 insertion-only라 DELETE EDGE/VERTEX가 stale 추론을 남기던 한계 해소
+(예: `ancestor` TRANSITIVE에서 1→2,2→3 ⟹ 1→3 inferred인데 2→3 삭제해도 1→3 잔존).
+O-0이 정한 **"1단계 full re-materialization → 2단계 B/F, DRed 회피"** 중 사용자가
+1단계 선택.
+
+*설계 (D1~D5):*
+- **D1. 트리거 = DELETE EDGE/VERTEX 후, 시맨틱 선언 space만.** `load_rel_meta` empty면
+  스캔 전 조기 no-op → 시맨틱 미사용 space는 비용 0·무회귀(INSERT 대칭).
+- **D2. full re-mat (기존 inference.rs 재활용).** 신규 `Executor::rematerialize_space`:
+  `{space}:edge:` 스캔 → `__inferred__` edge는 정·역 삭제, asserted는 seed 수집 →
+  `{space}:vtype:` 전부 삭제 → `run_materialization(asserted)` 재실행.
+- **D3. 멱등·완전.** inferred 전부 폐기 후 asserted로 재도출 → overdeletion/잔존 없음
+  (DRed 회피 이점). 다른 경로로도 도출되는 inferred(또는 asserted 중복)는 재도출되어 유지.
+- **D4. sameAs 상호작용 없음.** asserted edge·vtype은 이미 대표로 rewrite돼 있어 재mat가
+  대표 기준 재도출. sameAs 맵(`{space}:sameas:`)은 비가역이라 불변.
+- **D5. 비용 = O(graph)/delete** (시맨틱 space만). O-0 인정 1단계. B/F(2단계)는 후속.
+- 회귀(inference.rs 5): transitive/symmetric retract, 다른 경로 지원 시 보존,
+  domain/range vtype retract, 시맨틱 미선언 no-op. executor lib 187 + integration 46 통과.
+- **후속**: B/F 증분(O-0 2단계, deep-research 선행), DELETE VERTEX edge cascade(별개 이슈).
 
 ### R. 유사도 / 추천 (P1 — 차별화 기능, 2026-06-15 신설)
 

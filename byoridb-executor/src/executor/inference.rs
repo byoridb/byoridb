@@ -22,11 +22,16 @@
 //! (e.g. `subPropertyOf` into a `transitive` superproperty, or `inverseOf`
 //! composed with `symmetric`) are fully closed.
 //!
-//! **Scope (O-0 phase 1): insertion-only.** Deletes do not retract inferences
-//! (the B/F retraction algorithm is a later phase). Declare semantics *before*
-//! inserting edges (`CREATE EDGE ... TRANSITIVE` then `INSERT EDGE`); each
-//! insert extends the closure incrementally over the current graph. A write cap
-//! (`max_traversal_nodes`) guards pathological closures and logs if hit.
+//! **Inserts: incremental.** Declare semantics *before* inserting edges
+//! (`CREATE EDGE ... TRANSITIVE` then `INSERT EDGE`); each insert extends the
+//! closure over the current graph. A write cap (`max_traversal_nodes`) guards
+//! pathological closures and logs if hit.
+//!
+//! **Deletes: full re-materialization (O-9).** DELETE EDGE/VERTEX calls
+//! [`Executor::rematerialize_space`], which drops all inferred facts and
+//! re-derives them from the surviving asserted edges — so stale entailments are
+//! retracted (O-0 phase 1; incremental B/F is a later optimization). Cost is
+//! O(graph) per delete in a semantic space.
 
 use super::Executor;
 use crate::algo;
@@ -84,6 +89,64 @@ impl Executor {
             return Ok(());
         }
         self.run_materialization(space, triples, &meta).await
+    }
+
+    /// Full re-materialization of a space's ontology closure (PLAN.md O-9, the
+    /// O-0 phase-1 retraction strategy). No-op when the space declares no
+    /// semantic relations. Called by DELETE EDGE/VERTEX after the assertion is
+    /// removed: it discards **all** materialized facts (`__inferred__` edges and
+    /// every `vtype`) and re-derives them from the surviving asserted edges, so a
+    /// deleted fact's stale entailments disappear while entailments still
+    /// supported by other paths are re-derived. Idempotent and complete (no
+    /// DRed-style overdeletion).
+    ///
+    /// Cost is O(graph) per call (full `{space}:edge:`/`{space}:vtype:` scans);
+    /// the empty-meta guard keeps semantic-free spaces at zero cost. Incremental
+    /// (B/F) retraction is a later optimization (O-0 phase 2).
+    pub(super) async fn rematerialize_space(&self, space: &str) -> Result<()> {
+        let meta = self.load_rel_meta(space).await?;
+        if meta.is_empty() {
+            return Ok(());
+        }
+
+        // Partition the edge keyspace into asserted (kept as re-derivation seeds)
+        // and inferred (deleted, both directions).
+        let edge_prefix = format!("{}:edge:", space);
+        let entries = self.ctx.kvstore.scan_prefix(edge_prefix.as_bytes()).await?;
+        let mut asserted: Vec<Triple> = Vec::new();
+        for (key, value) in entries {
+            let Ok(edge) = VertexCodec::decode_edge(&value) else {
+                continue; // tolerate a non-edge / legacy blob under the prefix
+            };
+            if edge.properties.contains_key(INFERRED_MARKER) {
+                self.ctx.kvstore.delete(&key).await?;
+                let in_key = SchemaKey::in_edge_data(
+                    space,
+                    edge.dst_vid,
+                    &edge.edge_type,
+                    edge.src_vid,
+                    edge.ranking,
+                );
+                self.ctx.kvstore.delete(&in_key).await?;
+            } else {
+                asserted.push((edge.src_vid, edge.edge_type.clone(), edge.dst_vid));
+            }
+        }
+
+        // Drop all inferred vertex types (domain/range only produces these), to
+        // be re-derived by the run below.
+        let vtype_prefix = format!("{}:vtype:", space);
+        for (key, _) in self
+            .ctx
+            .kvstore
+            .scan_prefix(vtype_prefix.as_bytes())
+            .await?
+        {
+            self.ctx.kvstore.delete(&key).await?;
+        }
+
+        // Re-derive the full closure from the surviving asserted edges.
+        self.run_materialization(space, asserted, &meta).await
     }
 
     /// Load every edge schema's `semantics` and build the [`RelMeta`] index.
@@ -465,6 +528,83 @@ mod tests {
             .await
             .unwrap();
         assert!(r3.rows.is_empty(), "dog is not a plant");
+    }
+
+    // ---- O-9 retraction (full re-materialization on DELETE) ----
+
+    #[tokio::test]
+    async fn delete_retracts_transitive_inference() {
+        let e = create_executor();
+        ok(&e, "CREATE EDGE ancestor() TRANSITIVE").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 2->3:()").await;
+        assert!(has(&e, 1, "ancestor", 3).await, "1->3 inferred");
+        // Removing 2->3 must retract the inferred 1->3, keep asserted 1->2.
+        ok(&e, "DELETE EDGE ancestor 2->3").await;
+        assert!(!has(&e, 2, "ancestor", 3).await, "asserted 2->3 gone");
+        assert!(!has(&e, 1, "ancestor", 3).await, "inferred 1->3 retracted");
+        assert!(has(&e, 1, "ancestor", 2).await, "asserted 1->2 kept");
+    }
+
+    #[tokio::test]
+    async fn delete_retracts_symmetric_inference() {
+        let e = create_executor();
+        ok(&e, "CREATE EDGE knows() SYMMETRIC").await;
+        ok(&e, "INSERT EDGE knows() VALUES 1->2:()").await;
+        assert!(has(&e, 2, "knows", 1).await, "symmetric 2->1 inferred");
+        ok(&e, "DELETE EDGE knows 1->2").await;
+        assert!(!has(&e, 1, "knows", 2).await, "asserted 1->2 gone");
+        assert!(!has(&e, 2, "knows", 1).await, "inferred 2->1 retracted");
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_inference_still_supported_by_another_path() {
+        // 1->3 is BOTH asserted and inferable (transitive via 1->2->3). Deleting
+        // 2->3 retracts the transitive support, but asserted 1->3 must survive.
+        let e = create_executor();
+        ok(&e, "CREATE EDGE ancestor() TRANSITIVE").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 2->3:()").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 1->3:()").await; // asserted
+        ok(&e, "DELETE EDGE ancestor 2->3").await;
+        assert!(has(&e, 1, "ancestor", 3).await, "asserted 1->3 survives");
+        assert!(!has(&e, 2, "ancestor", 3).await, "2->3 gone");
+    }
+
+    #[tokio::test]
+    async fn delete_retracts_domain_range_vertex_type() {
+        let e = create_executor();
+        ok(&e, "CREATE CLASS person()").await;
+        ok(&e, "CREATE CLASS city()").await;
+        ok(&e, "CREATE TAG place()").await;
+        ok(&e, "CREATE EDGE bornIn() DOMAIN person RANGE city").await;
+        ok(&e, "INSERT VERTEX place() VALUES 2:()").await;
+        ok(&e, "INSERT EDGE bornIn() VALUES 1->2:()").await;
+        // RANGE city ⟹ vertex 2 is-a city (inferred vtype).
+        let set = crate::ontology::vertex_class_set(&e.ctx, "default", 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(set.contains("city"), "range inferred city type");
+        // Deleting the edge retracts the inferred type.
+        ok(&e, "DELETE EDGE bornIn 1->2").await;
+        let set2 = crate::ontology::vertex_class_set(&e.ctx, "default", 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!set2.contains("city"), "inferred city type retracted");
+    }
+
+    #[tokio::test]
+    async fn delete_without_semantics_is_noop_rematerialize() {
+        // A space with no semantic edges must not be perturbed by retraction.
+        let e = create_executor();
+        ok(&e, "CREATE EDGE plain()").await;
+        ok(&e, "INSERT EDGE plain() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE plain() VALUES 1->3:()").await;
+        ok(&e, "DELETE EDGE plain 1->2").await;
+        assert!(!has(&e, 1, "plain", 2).await, "deleted edge gone");
+        assert!(has(&e, 1, "plain", 3).await, "untouched edge kept");
     }
 
     #[tokio::test]
