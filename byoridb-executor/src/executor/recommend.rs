@@ -41,14 +41,20 @@ impl Executor {
         plan: crate::plan::RecommendPlan,
     ) -> Result<ExecutorResult> {
         let space = self.require_space()?.to_string();
+        // O-8 D5: recommend from the owl:sameAs representative. If the seed was
+        // merged away, its edges/embedding now live on the representative, so a
+        // RECOMMEND on the merged-away vid normalizes to the surviving node —
+        // consistent with GO/FETCH/MATCH. Candidates need no normalization: the
+        // merge already collapsed non-representative edges/vectors onto the rep.
+        let src_vid = crate::ontology::representative_of(&self.ctx, &space, plan.src_vid).await?;
         let filter = plan.filter.as_ref();
         match &plan.by {
             RecommendBy::Neighbors { over_edges, .. } => {
-                self.recommend_neighbors(&space, plan.src_vid, over_edges, filter, plan.limit)
+                self.recommend_neighbors(&space, src_vid, over_edges, filter, plan.limit)
                     .await
             }
             RecommendBy::Embedding { prop } => {
-                self.recommend_embedding(&space, plan.src_vid, prop, filter, plan.limit)
+                self.recommend_embedding(&space, src_vid, prop, filter, plan.limit)
                     .await
             }
             RecommendBy::Blend {
@@ -59,7 +65,7 @@ impl Executor {
             } => {
                 self.recommend_blend(
                     &space,
-                    plan.src_vid,
+                    src_vid,
                     embedding_prop,
                     *embedding_weight,
                     over_edges,
@@ -1025,6 +1031,55 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn recommend_seed_normalized_to_sameas_representative() {
+        // O-8 connection: a RECOMMEND seeded with a merged-away vid normalizes
+        // to its sameAs representative, so it recommends from the surviving
+        // node's embedding (the entity-resolution loop's reverse direction).
+        let executor = create_executor();
+        let exec = |q: &str| {
+            let stmt = byoridb_parser::parse(q).expect("parse");
+            crate::ExecutionPlanBuilder::build(stmt).expect("build")
+        };
+        executor
+            .execute(exec("CREATE EDGE sameAs()"))
+            .await
+            .unwrap();
+
+        // Embedding catalog around representative 2.
+        put_vec(&executor, 2, "emb", &[1.0, 0.0]).await; // representative seed
+        put_vec(&executor, 3, "emb", &[1.0, 0.0]).await; // cos 1 with rep
+        put_vec(&executor, 4, "emb", &[0.0, 1.0]).await; // cos 0 with rep
+
+        // Merge 5 → representative 2 (5 has no facts of its own).
+        executor
+            .execute(exec("INSERT EDGE sameAs() VALUES 5->2:()"))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::ontology::representative_of(&executor.ctx, "default", 5)
+                .await
+                .unwrap(),
+            2
+        );
+
+        // RECOMMEND from the merged-away vid 5 → resolves to 2's embedding.
+        let result = executor
+            .execute(exec("RECOMMEND SIMILAR TO 5 BY EMBEDDING emb"))
+            .await
+            .unwrap();
+        let vids: Vec<i64> = result
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int(v) => v,
+                _ => panic!(),
+            })
+            .collect();
+        // 3 (cos 1) before 4 (cos 0); representative 2 excluded as the seed.
+        assert_eq!(vids, vec![3, 4], "seed 5 normalized to representative 2");
     }
 
     #[test]

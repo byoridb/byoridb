@@ -335,9 +335,14 @@ GO/FETCH 정규화, `match_executor.rs` id() 정규화, `ddl.rs` DROP EDGE 가�
 sameas 유닛 6(대표선출/out·in-edge rewrite·역인덱스/속성충돌/idempotent·union/self-loop)
 + key 1 + integration 1(end-to-end merge·GO/FETCH 정규화·3종 DELETE 거부). 워크스페이스
 762 lib + 46 integration 통과, fmt·clippy 클린.
-- **후속**: 프로덕션 스모크(배포 후), 삭제 retraction(B/F — 별도 최난도 트랙),
-  분산 materialization(G-2 선결). RECOMMEND가 sameAs 대표를 후보로 인지하는 R-트랙
-  연계(sameAs 우회 경로의 역방향)는 후속 검토.
+- **프로덕션 스모크 ✅ (2026-06-22)**: AKS(`20.249.128.19`, sha-13d3e70)에서 merge·
+  GO/FETCH 정규화·DELETE 3종 거부 전부 기대대로 통과(HTTP API).
+- **RECOMMEND × sameAs 연계 ✅ (2026-06-22)**: `execute_recommend`가 시드 vid를
+  `representative_of`로 정규화(GO/FETCH/MATCH와 일관, D5). merge가 후보(edge/vec)를
+  이미 대표로 collapse하므로 후보·결과 정규화는 불필요(자동). 유사도로 후보를 *발견*→
+  sameAs로 *단언*하는 entity resolution 루프의 역방향 완성. 회귀: recommend 유닛 1
+  (merged-away 시드가 대표 임베딩으로 추천).
+- **후속**: 삭제 retraction(B/F — 별도 최난도 트랙), 분산 materialization(G-2 선결).
 
 ### R. 유사도 / 추천 (P1 — 차별화 기능, 2026-06-15 신설)
 
