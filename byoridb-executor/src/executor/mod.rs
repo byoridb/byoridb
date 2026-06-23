@@ -165,6 +165,8 @@ mod class_ddl;
 mod consistency;
 mod ddl;
 mod dml;
+#[cfg(test)]
+mod dogfood_regression;
 mod dql;
 mod inference;
 mod recommend;

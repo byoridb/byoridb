@@ -337,13 +337,29 @@ impl MatchExecutor {
                 .collect();
 
             let has_agg = return_cols.iter().any(|c| is_aggregate_expr(&c.expression));
-            let has_group_by = plan.group_by.is_some();
 
-            if has_group_by {
-                // GROUP BY + (optional) aggregate:
+            // Grouping keys: explicit GROUP BY, else — when aggregates are present
+            // without one — implicitly the non-aggregate RETURN columns
+            // (Cypher/SQL semantics). So `RETURN ch, COUNT(*)` groups by `ch`
+            // instead of collapsing to a single row. Pure `RETURN COUNT(*)` (no
+            // non-aggregate column) stays a single global aggregate.
+            let group_exprs: Option<Vec<Expression>> = match &plan.group_by {
+                Some(g) => Some(g.clone()),
+                None if has_agg => {
+                    let implicit: Vec<Expression> = return_cols
+                        .iter()
+                        .filter(|c| !is_aggregate_expr(&c.expression))
+                        .map(|c| c.expression.clone())
+                        .collect();
+                    (!implicit.is_empty()).then_some(implicit)
+                }
+                None => None,
+            };
+
+            if let Some(group_exprs) = group_exprs {
+                // GROUP BY (explicit or implicit) + (optional) aggregate:
                 // 1. Group filtered binding rows by key expressions
                 // 2. For each group, project non-agg columns + compute agg columns
-                let group_exprs = plan.group_by.as_ref().unwrap();
 
                 // Group raw binding rows (not yet projected) by key values
                 let mut groups: std::collections::BTreeMap<
@@ -352,7 +368,7 @@ impl MatchExecutor {
                 > = std::collections::BTreeMap::new();
                 for row_bindings in &filtered {
                     let mut key_parts = Vec::new();
-                    for key_expr in group_exprs {
+                    for key_expr in &group_exprs {
                         let v = self.eval_return_expr(key_expr, row_bindings, &space).await;
                         key_parts.push(format!("{:?}", v)); // stable key
                     }
@@ -1224,9 +1240,20 @@ impl MatchExecutor {
             .unwrap_or_else(|| "__anon_0__".to_string());
 
         // WHERE id(start_var)==X shortcut: skip the full candidate scan and
-        // use the single bound VID directly.
+        // use the single bound VID directly. But a bound id must still satisfy
+        // the start node's label/property filters — otherwise `(n:product)
+        // WHERE id(n)==X` would match a vertex of any tag (bug: the override
+        // bypassed `matches_node`).
         let candidates = if let Some(vid) = start_vid_override {
-            vec![vid]
+            if flat.start.labels.is_empty() && flat.start.props.is_empty() {
+                vec![vid]
+            } else {
+                let key = format!("{}:vertex:{}", space, vid);
+                match self.ctx.kvstore.get(key.as_bytes()).await? {
+                    Some(blob) if matcher.matches_node(&blob, flat.start)? => vec![vid],
+                    _ => vec![],
+                }
+            }
         } else {
             self.find_node_candidates(space, flat.start, matcher)
                 .await?

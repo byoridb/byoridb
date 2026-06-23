@@ -111,11 +111,25 @@ impl Executor {
         // Convert VertexData to rows
         let mut rows = Vec::new();
         for vertex in vertices {
+            // Tag membership: only emit vertices carrying a requested tag, and
+            // only the requested tags' data (mirrors execute_fetch_local).
+            if !plan.tags.is_empty()
+                && !vertex
+                    .tags
+                    .iter()
+                    .any(|t| plan.tags.iter().any(|req| req == &t.tag_name))
+            {
+                continue;
+            }
+
             let mut row = Vec::new();
             row.push(byoridb_common::Value::Int(vertex.vid));
 
             // Extract tags and their properties
             for tag_data in &vertex.tags {
+                if !plan.tags.is_empty() && !plan.tags.iter().any(|req| req == &tag_data.tag_name) {
+                    continue;
+                }
                 let tag_json = serde_json::json!({
                     "name": tag_data.tag_name,
                     "props": tag_data.properties.iter().map(|(k, v)| {
@@ -197,10 +211,26 @@ impl Executor {
         for (vid, data_opt) in resolved_vids.iter().zip(results.iter()) {
             if let Some(data) = data_opt {
                 if let Ok(vertex_data) = VertexCodec::decode_vertex(data) {
+                    // Tag membership: when specific tags are requested, only emit
+                    // vertices that actually carry one of them — and only the
+                    // requested tags' data. Without this, `FETCH PROP ON product
+                    // <vid>` would return a vertex holding only a `sku` tag (bug).
+                    if !plan.tags.is_empty()
+                        && !vertex_data
+                            .tags
+                            .iter()
+                            .any(|tag| plan.tags.iter().any(|req| req == &tag.name))
+                    {
+                        continue;
+                    }
+
                     let mut row = Vec::new();
                     row.push(byoridb_common::Value::Int(*vid));
 
                     for tag in &vertex_data.tags {
+                        if !plan.tags.is_empty() && !plan.tags.iter().any(|req| req == &tag.name) {
+                            continue;
+                        }
                         let tag_json = VertexCodec::vertex_to_json(&CodecVertexData {
                             vid: *vid,
                             tags: vec![tag.clone()],
@@ -625,6 +655,10 @@ impl Executor {
                     Expression::Identifier(name) => name.clone(),
                     Expression::PropRef { object, prop } => format!("{}.{}", object, prop),
                     Expression::DstVertexProp { tag, prop } => format!("{}.{}", tag, prop),
+                    Expression::FunctionCall { name, args } => match args.first() {
+                        Some(Expression::Identifier(a)) => format!("{}({})", name, a),
+                        _ => name.clone(),
+                    },
                     other => format!("{:?}", other),
                 }
             })
@@ -690,6 +724,21 @@ impl Executor {
                         _ => byoridb_common::Value::Null(byoridb_common::NullType::Null),
                     }
                 }
+                // `edge` refers to the edge currently being traversed. Needed for
+                // `OVER *` where a typed prefix like `has_brand._dst` isn't usable
+                // (the edge type varies per row). Serialised as JSON like `vertex`.
+                "edge" => match last_edge {
+                    Some(e) => byoridb_common::Value::String(
+                        serde_json::json!({
+                            "src": e.src_vid,
+                            "dst": e.dst_vid,
+                            "type": e.edge_type,
+                            "rank": e.ranking,
+                        })
+                        .to_string(),
+                    ),
+                    None => byoridb_common::Value::Null(byoridb_common::NullType::Null),
+                },
                 _ => byoridb_common::Value::Null(byoridb_common::NullType::Null),
             },
             Expression::PropRef { object: _, prop } => {
@@ -735,6 +784,20 @@ impl Executor {
                 Literal::Bool(b) => byoridb_common::Value::Bool(*b),
                 Literal::Null => byoridb_common::Value::Null(byoridb_common::NullType::Null),
             },
+            // Edge accessor functions in a GO row context: type(edge), dst(edge),
+            // src(edge), rank(edge). The argument identifies the edge but in GO
+            // there is exactly one edge per row (`last_edge`), so it is implicit.
+            // Previously these fell through to the catch-all and yielded NULL —
+            // breaking `OVER * YIELD type(edge)`.
+            Expression::FunctionCall { name, .. } => {
+                match (name.to_lowercase().as_str(), last_edge) {
+                    ("type", Some(e)) => byoridb_common::Value::String(e.edge_type.clone()),
+                    ("dst", Some(e)) => byoridb_common::Value::Int(e.dst_vid),
+                    ("src", Some(e)) => byoridb_common::Value::Int(e.src_vid),
+                    ("rank" | "ranking", Some(e)) => byoridb_common::Value::Int(e.ranking),
+                    _ => byoridb_common::Value::Null(byoridb_common::NullType::Null),
+                }
+            }
             _ => byoridb_common::Value::Null(byoridb_common::NullType::Null),
         }
     }
