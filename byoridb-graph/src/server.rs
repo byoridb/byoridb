@@ -458,12 +458,17 @@ fn value_to_json(value: &byoridb_common::Value) -> serde_json::Value {
     }
 }
 
-/// Truncate query for logging
+/// Truncate query for logging — to the first 100 *characters*, not bytes.
+///
+/// Slicing at a fixed byte offset (`&query[..100]`) panics when byte 100 lands
+/// inside a multi-byte UTF-8 sequence (e.g. Korean text in a long INSERT). That
+/// panic happened in the request handler *after* the query succeeded, so the
+/// connection was dropped before the response was sent — surfacing to clients
+/// as a connection reset. Char-based truncation is always on a valid boundary.
 fn truncate_query(query: &str) -> &str {
-    if query.len() > 100 {
-        &query[..100]
-    } else {
-        query
+    match query.char_indices().nth(100) {
+        Some((idx, _)) => &query[..idx],
+        None => query,
     }
 }
 
@@ -498,4 +503,38 @@ struct QueryResponse {
 struct ErrorResponse {
     error: String,
     code: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_query;
+
+    #[test]
+    fn truncate_query_short_is_unchanged() {
+        assert_eq!(
+            truncate_query("INSERT VERTEX t() VALUES 1:()"),
+            "INSERT VERTEX t() VALUES 1:()"
+        );
+    }
+
+    #[test]
+    fn truncate_query_does_not_panic_on_multibyte_boundary() {
+        // Long Korean query: each '한' is 3 bytes, so byte offset 100 lands inside
+        // a character — `&query[..100]` used to panic here (dogfooding: nexprice
+        // product INSERT with long Korean prod_name → server reset).
+        let q = format!(
+            "INSERT VERTEX product() VALUES 1:(\"{}\")",
+            "한".repeat(200)
+        );
+        let t = truncate_query(&q); // must not panic
+        assert!(q.starts_with(t), "truncation is a prefix");
+        assert!(t.chars().count() <= 100, "at most 100 chars");
+        assert!(q.is_char_boundary(t.len()), "ends on a char boundary");
+    }
+
+    #[test]
+    fn truncate_query_keeps_first_100_chars() {
+        let q = "a".repeat(250);
+        assert_eq!(truncate_query(&q).len(), 100);
+    }
 }
