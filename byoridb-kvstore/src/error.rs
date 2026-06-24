@@ -23,6 +23,9 @@ pub enum KVStoreError {
     #[error("redb commit error: {0}")]
     RedbCommit(#[from] redb::CommitError),
 
+    #[error("redb set-durability error: {0}")]
+    RedbSetDurability(#[from] redb::SetDurabilityError),
+
     #[error("Key not found: {0:?}")]
     KeyNotFound(Vec<u8>),
 

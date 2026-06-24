@@ -47,6 +47,13 @@ spec:
             # Requires a node large enough to hold it (dbpoolv2 / E16s_v5 128GB).
             - name: BYORIDB_CACHE_SIZE_MB
               value: "65536"
+            # BULK LOAD ONLY — relaxed durability (Durability::None + periodic
+            # checkpoint every 64 commits) for fast ingestion. A crash loses the
+            # last <=64 commits, recovered by re-loading (idempotent VIDs).
+            # REMOVE this once bulk loading is done — steady-state serving needs
+            # Immediate (fsync) durability. Delete the var → defaults to fsync.
+            - name: BYORIDB_DURABILITY
+              value: "none"
           ports:
             - { containerPort: 9669,  name: grpc }
             - { containerPort: 19669, name: http }

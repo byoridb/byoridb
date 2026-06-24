@@ -5,8 +5,9 @@
 use crate::error::Result;
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
-use redb::{Builder, Database, ReadableDatabase, TableDefinition};
+use redb::{Builder, Database, Durability, ReadableDatabase, TableDefinition};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
@@ -22,17 +23,17 @@ pub type ScanStreamItem = Result<(Vec<u8>, Vec<u8>)>;
 /// Options for opening a [`RedbKVStore`].
 ///
 /// redb is a pure-Rust embedded store with built-in ACID durability, so the
-/// surface is far smaller than the old RocksDB options. Only `create_if_missing`
-/// and `cache_size` have effect today; `use_fsync` is retained for callers and
-/// reserved for a future `Durability::Eventual` toggle (commits currently always
-/// use `Durability::Immediate`, which fsyncs on every commit).
+/// surface is far smaller than the old RocksDB options.
 #[derive(Debug, Clone)]
 pub struct KVStoreOptions {
     pub create_if_missing: bool,
     /// redb page cache size in bytes (256MB default).
     pub cache_size: usize,
-    /// Reserved: when false, commits could map to `Durability::Eventual`.
-    /// Today every commit uses `Durability::Immediate` regardless.
+    /// When true (default), every write commit uses `Durability::Immediate`
+    /// (fsync per commit). When false, writes use relaxed durability
+    /// (`Durability::None`, no per-commit fsync) with a periodic `Immediate`
+    /// checkpoint — much faster for bulk loads, but a crash loses recent
+    /// commits. Only set false for re-loadable bulk imports.
     pub use_fsync: bool,
 }
 
@@ -41,7 +42,7 @@ impl Default for KVStoreOptions {
         KVStoreOptions {
             create_if_missing: true,
             cache_size: 256 * 1024 * 1024, // 256MB page cache
-            use_fsync: false,
+            use_fsync: true,               // Immediate durability (fsync per commit) by default
         }
     }
 }
@@ -150,7 +151,19 @@ pub trait KVStore: Send + Sync {
 /// reads use MVCC read transactions that never block writers.
 pub struct RedbKVStore {
     db: Arc<Database>,
+    /// When true, write commits use `Durability::None` (no per-commit fsync) for
+    /// fast bulk loading, with a periodic `Immediate` checkpoint to bound crash
+    /// loss. Set via `KVStoreOptions::use_fsync = false`. Default false (safe:
+    /// every commit is `Immediate`).
+    relaxed_durability: bool,
+    /// Commit counter for periodic checkpointing under relaxed durability.
+    commit_count: Arc<AtomicU64>,
 }
+
+/// Under relaxed (`Durability::None`) writes, force an `Immediate` (fsync)
+/// commit every Nth write so a crash loses at most ~N commits' worth of data
+/// (the data layer is idempotent/checkpointed, so re-load recovers it).
+const CHECKPOINT_EVERY: u64 = 64;
 
 impl RedbKVStore {
     /// Open (or create) a store. `path` is treated as a **directory**; the redb
@@ -182,12 +195,35 @@ impl RedbKVStore {
             file,
             opts.cache_size / (1024 * 1024)
         );
-        Ok(RedbKVStore { db: Arc::new(db) })
+        Ok(RedbKVStore {
+            db: Arc::new(db),
+            relaxed_durability: !opts.use_fsync,
+            commit_count: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     /// Construct from an already-open database (used by tooling/tests).
     pub fn with_db(db: Arc<Database>) -> Self {
-        RedbKVStore { db }
+        RedbKVStore {
+            db,
+            relaxed_durability: false,
+            commit_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Durability for the next write commit. `Immediate` (fsync) by default;
+    /// under relaxed durability, `None` (no fsync) except every Nth commit which
+    /// stays `Immediate` as a checkpoint.
+    fn next_durability(&self) -> Durability {
+        if !self.relaxed_durability {
+            return Durability::Immediate;
+        }
+        let n = self.commit_count.fetch_add(1, Ordering::Relaxed);
+        if n.is_multiple_of(CHECKPOINT_EVERY) {
+            Durability::Immediate
+        } else {
+            Durability::None
+        }
     }
 }
 
@@ -208,8 +244,10 @@ impl KVStore for RedbKVStore {
         let db = Arc::clone(&self.db);
         let key = key.to_vec();
         let value = value.to_vec();
+        let durability = self.next_durability();
         tokio::task::spawn_blocking(move || {
-            let wtx = db.begin_write()?;
+            let mut wtx = db.begin_write()?;
+            wtx.set_durability(durability)?;
             {
                 let mut table = wtx.open_table(KV_TABLE)?;
                 table.insert(key.as_slice(), value.as_slice())?;
@@ -223,8 +261,10 @@ impl KVStore for RedbKVStore {
     async fn delete(&self, key: &[u8]) -> Result<()> {
         let db = Arc::clone(&self.db);
         let key = key.to_vec();
+        let durability = self.next_durability();
         tokio::task::spawn_blocking(move || {
-            let wtx = db.begin_write()?;
+            let mut wtx = db.begin_write()?;
+            wtx.set_durability(durability)?;
             {
                 let mut table = wtx.open_table(KV_TABLE)?;
                 table.remove(key.as_slice())?;
@@ -238,8 +278,10 @@ impl KVStore for RedbKVStore {
     /// All pairs are written in a single transaction → atomic all-or-nothing.
     async fn batch_put(&self, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
         let db = Arc::clone(&self.db);
+        let durability = self.next_durability();
         tokio::task::spawn_blocking(move || {
-            let wtx = db.begin_write()?;
+            let mut wtx = db.begin_write()?;
+            wtx.set_durability(durability)?;
             {
                 let mut table = wtx.open_table(KV_TABLE)?;
                 for (key, value) in &pairs {
@@ -256,8 +298,10 @@ impl KVStore for RedbKVStore {
     /// no-ops. Used by DROP SPACE to purge a space's key ranges efficiently.
     async fn batch_delete(&self, keys: Vec<Vec<u8>>) -> Result<()> {
         let db = Arc::clone(&self.db);
+        let durability = self.next_durability();
         tokio::task::spawn_blocking(move || {
-            let wtx = db.begin_write()?;
+            let mut wtx = db.begin_write()?;
+            wtx.set_durability(durability)?;
             {
                 let mut table = wtx.open_table(KV_TABLE)?;
                 for key in &keys {
@@ -560,7 +604,7 @@ mod tests {
     fn test_kvstore_options_default() {
         let opts = KVStoreOptions::default();
         assert!(opts.create_if_missing);
-        assert!(!opts.use_fsync);
+        assert!(opts.use_fsync); // Immediate durability (fsync) by default
         assert_eq!(opts.cache_size, 256 * 1024 * 1024);
     }
 

@@ -91,7 +91,22 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&mb| mb > 0)
         .unwrap_or(256);
-    info!("redb page cache: {} MB", cache_size_mb);
+    // BYORIDB_DURABILITY=none|relaxed → relaxed durability (no per-commit fsync,
+    // periodic checkpoint) for fast bulk loading. Default: Immediate (fsync per
+    // commit). Crash under relaxed loses recent commits — only safe for
+    // re-loadable bulk imports, NOT steady-state serving.
+    let relaxed_durability = std::env::var("BYORIDB_DURABILITY")
+        .map(|v| matches!(v.to_lowercase().as_str(), "none" | "relaxed" | "eventual"))
+        .unwrap_or(false);
+    info!(
+        "redb page cache: {} MB, durability: {}",
+        cache_size_mb,
+        if relaxed_durability {
+            "relaxed (bulk load)"
+        } else {
+            "immediate"
+        }
+    );
     let storage_config = byoridb_storage::env::StorageEnvConfig {
         data_paths: config
             .storage
@@ -103,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         listener_path: None,
         kvstore_opts: byoridb_kvstore::KVStoreOptions {
             cache_size: cache_size_mb * 1024 * 1024,
+            use_fsync: !relaxed_durability,
             ..Default::default()
         },
     };
