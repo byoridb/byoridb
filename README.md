@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">ByoriDB</h1>
-  <p align="center">Rust로 작성된 분산 그래프 데이터베이스 — nGQL 호환 쿼리 언어 지원</p>
+  <p align="center">Rust로 작성된 분산 그래프 데이터베이스 — nGQL 호환 + 온톨로지 추론(RDFS-Plus) 레이어</p>
 </p>
 
 <p align="center">
@@ -23,6 +23,7 @@
 - **분산 설계** — Raft 합의, consistent hashing, 수평 확장을 처음부터 염두에 둔 설계
 - **모던 스택** — Tokio 비동기 런타임 + redb(순수 Rust 임베디드 KV). JVM 튜닝이나 GC 정지 없음
 - **nGQL 호환** — 친숙한 그래프 쿼리 언어 + 확장되는 Cypher 스타일 지원
+- **온톨로지 추론** — property graph 코어 위에 얹은 시맨틱 레이어: 클래스 계층, 시맨틱 관계 타입(transitive/symmetric/inverse/…), RDFS-Plus forward-chaining materialization, `owl:sameAs` 동치 — 단순 그래프DB를 넘어 온톨로지 DB 를 지향
 
 ## 빠른 시작
 
@@ -97,6 +98,8 @@ SHOW TAG INDEXES;
 | **MATCH** | 패턴 매칭, `WHERE` (AND/OR/NOT/CONTAINS/STARTS WITH/ENDS WITH/=~), `RETURN v/e` 객체, `OPTIONAL MATCH`, `GROUP BY`, `ORDER BY … ASC/DESC`, `LIMIT/OFFSET` |
 | **함수** | `id(v)`, `properties(v/e)`, `tags(v)` / `labels(v)`, `COUNT/SUM/AVG/MAX/MIN`, `LOWER/UPPER/LENGTH/CONTAINS/STARTS_WITH/ENDS_WITH` |
 | **관리** | `SHOW SPACES/TAGS/EDGES/INDEXES/STATS/SESSIONS/CREATE TAG`, `EXPLAIN/PROFILE`, `REBUILD INDEX`, `BALANCE`, `GRANT/REVOKE` |
+| **온톨로지** | `CREATE CLASS … SUBCLASS OF … [DISJOINT WITH …]`, `SHOW/DESCRIBE CLASS`, `CREATE EDGE … TRANSITIVE/SYMMETRIC/INVERSE OF/SUBPROPERTY OF/DOMAIN/RANGE`, `INSERT EDGE sameAs()`, `CHECK CONSISTENCY`, `is_a(v, "class")` |
+| **추천** | `RECOMMEND SIMILAR TO <vid> ( OVER <edges> \| BY EMBEDDING <prop> \| BLEND … ) [WHERE …] [LIMIT k]`, `CREATE VECTOR INDEX` |
 
 ### Cypher 스타일 MATCH (v0.2.x 이후)
 
@@ -130,6 +133,51 @@ GROUP BY n.person.city ORDER BY cnt DESC LIMIT 5;
 -- 복합 문장 (compound statement)
 $f = GO FROM 1 OVER follows YIELD follows._dst AS dst;
 FETCH PROP ON person $f.dst;
+```
+
+### 온톨로지 / 시맨틱 레이어
+
+property graph 코어 위에 얹은 시맨틱 레이어. 쓰기 시 함의(entailment)를 미리 계산(forward-chaining materialization)해 두므로 읽기는 추론 비용 없이 빠릅니다.
+
+```sql
+-- 클래스 계층 (TBox) — 다중 상속 + disjoint
+CREATE CLASS animal(name STRING);
+CREATE CLASS dog(breed STRING) SUBCLASS OF animal;
+CREATE CLASS cat() SUBCLASS OF animal DISJOINT WITH dog;
+
+-- 시맨틱 관계 타입
+CREATE EDGE ancestor() TRANSITIVE;
+CREATE EDGE spouse() SYMMETRIC;
+CREATE EDGE parent_of() INVERSE OF child_of;
+CREATE EDGE located_in() DOMAIN place RANGE region;   -- vertex 타입 추론
+
+-- RDFS-Plus forward chaining: INSERT 시 함의된 edge/타입을 자동 도출·저장
+INSERT EDGE ancestor() VALUES 1->2:(), 2->3:();
+GO FROM 1 OVER ancestor;          -- 추론된 1->3 도 함께 조회됨
+
+-- owl:sameAs 노드 동치 (write-time canonical merge)
+CREATE EDGE sameAs();
+INSERT EDGE sameAs() VALUES 100->200:();   -- 두 노드를 대표 노드로 병합
+
+-- 일관성 검사 + 클래스 계층 인지 쿼리
+CHECK CONSISTENCY;                              -- disjoint 위반 탐지
+MATCH (n:dog) WHERE is_a(n, "animal") RETURN n; -- subclass 까지 매칭
+```
+
+지원 규칙(RDFS-Plus): `subClassOf`/`subPropertyOf` 전이, `owl:TransitiveProperty`, `owl:inverseOf`, `owl:SymmetricProperty`, `domain`/`range` vertex 타입 추론, `owl:sameAs` 동치. 삭제 시에는 더 이상 도출되지 않는 추론을 re-materialization 으로 제거합니다(retraction).
+
+### 유사도 / 추천
+
+```sql
+-- 구조적 유사도 (공유 이웃 Jaccard)
+RECOMMEND SIMILAR TO 1 OVER follows LIMIT 10;
+
+-- 벡터 임베딩 유사도 (코사인, 대규모는 HNSW ANN 인덱스)
+RECOMMEND SIMILAR TO 1 BY EMBEDDING vec LIMIT 10;
+
+-- 하이브리드(벡터+구조) + 온톨로지 인지 필터
+RECOMMEND SIMILAR TO 1 BLEND EMBEDDING vec 0.7 OVER follows 0.3
+  WHERE is_a("product") LIMIT 10;
 ```
 
 ### 분산 시스템
@@ -182,6 +230,9 @@ FETCH PROP ON person $f.dst;
 | **쿼리 정확성 수정 (4건)** | ① `WHERE id(n)==X` 바인딩 경로에서 노드 라벨 필터가 무시되던 문제 ② `FETCH PROP ON <tag>` 가 태그 소속을 검증하지 않고 다른 태그 데이터를 반환하던 문제 ③ `GO … OVER *` 에서 `type(edge)`/`dst(edge)`/`src(edge)` 등 edge 함수가 NULL 을 반환하던 문제 ④ 집계 시 암묵 `GROUP BY`(비집계 RETURN 컬럼으로 자동 그룹화) 미동작 — 실데이터 도그푸딩으로 발견·수정 |
 | **대량 쓰기 안정성 (UTF-8 로깅 패닉)** | 긴 비ASCII(한글 등) 쿼리를 로깅할 때 UTF-8 문자 경계가 아닌 고정 바이트 위치에서 잘라 서버가 패닉하던 문제 수정. 대량 INSERT 중 간헐적 connection reset 의 근본 원인이었음 |
 | **nGQL 문자열 escape** | 문자열 리터럴 내 `\"` / `\\` / `\n` 등 escape 시퀀스 처리 — 값에 따옴표·백슬래시가 포함된 데이터 적재 가능 |
+| **온톨로지: `owl:sameAs` 동치 + 삭제 retraction (O-8/O-9)** | 노드 동치(`sameAs`)를 write-time canonical merge(대표 노드 병합)로 처리. 삭제 시 더 이상 도출되지 않는 추론을 full re-materialization 으로 제거 |
+| **온톨로지: 추론 엔진 + 클래스 계층 (O-3~O-7)** | 클래스 계층(`SUBCLASS OF`), 시맨틱 관계 타입, RDFS-Plus forward-chaining materialization(transitive/symmetric/inverse/subPropertyOf + domain/range 타입 추론), `CHECK CONSISTENCY`, `is_a()` 시맨틱 쿼리 |
+| **유사도 추천 (R-트랙)** | `RECOMMEND SIMILAR TO` — 구조적 Jaccard / 벡터 임베딩(HNSW ANN) / 하이브리드 BLEND + 온톨로지 인지 필터 |
 | **역방향 edge 인덱스 (O-1)** | `GO … REVERSELY` 등 incoming 탐색이 전체 엣지 풀스캔 O(E) → `{space}:in-edge:{dst}:…` 인덱스 prefix scan **O(in-degree)** 로. INSERT/DELETE EDGE가 양방향 기록. LDBC Q8 `reply_of REVERSELY` 의 120초 timeout 블로커 해소 |
 | **문자열 리터럴 내 `;` 처리 수정** | `"Alice; Bob"` 같은 리터럴 안의 세미콜론을 compound separator로 오인하던 버그 제거. compound 쿼리는 파서의 정식 `Statement::Compound` 경로로 위임 |
 | **DROP SPACE 완전 정리** | `DROP SPACE` 가 데이터/스키마/인덱스를 모두 purge → 동일 이름 재사용 가능 (반복 벤치 차단 요소 제거) |
