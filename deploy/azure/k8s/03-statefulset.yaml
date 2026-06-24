@@ -41,6 +41,12 @@ spec:
                 name: byoridb-config
             - secretRef:
                 name: byoridb-root
+          env:
+            # redb page cache, sized near the working set (data ~11-20GB) so
+            # reads stay in memory and bulk loads don't hit the disk-IOPS wall.
+            # Requires a node large enough to hold it (dbpoolv2 / E16s_v5 128GB).
+            - name: BYORIDB_CACHE_SIZE_MB
+              value: "65536"
           ports:
             - { containerPort: 9669,  name: grpc }
             - { containerPort: 19669, name: http }
@@ -58,8 +64,8 @@ spec:
             periodSeconds: 15
             failureThreshold: 4
           resources:
-            requests: { cpu: "500m", memory: "2Gi" }
-            limits:   { cpu: "1500m", memory: "6Gi" }
+            requests: { cpu: "2", memory: "8Gi" }
+            limits:   { cpu: "14", memory: "100Gi" }
           volumeMounts:
             - { name: data, mountPath: /app/data }
   volumeClaimTemplates:

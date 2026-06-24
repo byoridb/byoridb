@@ -83,6 +83,15 @@ async fn main() -> anyhow::Result<()> {
 
     // 4. Start Storage Server
     let mut storage_server = byoridb_storage::StorageServer::new();
+    // redb page cache size, overridable via BYORIDB_CACHE_SIZE_MB (default 256MB).
+    // Sizing the cache near the working set keeps reads in memory and avoids the
+    // disk-IOPS wall that throttles bulk loads once data exceeds the cache.
+    let cache_size_mb: usize = std::env::var("BYORIDB_CACHE_SIZE_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or(256);
+    info!("redb page cache: {} MB", cache_size_mb);
     let storage_config = byoridb_storage::env::StorageEnvConfig {
         data_paths: config
             .storage
@@ -92,7 +101,10 @@ async fn main() -> anyhow::Result<()> {
             .collect(),
         wal_path: None,
         listener_path: None,
-        kvstore_opts: byoridb_kvstore::KVStoreOptions::default(),
+        kvstore_opts: byoridb_kvstore::KVStoreOptions {
+            cache_size: cache_size_mb * 1024 * 1024,
+            ..Default::default()
+        },
     };
 
     storage_server.start(storage_config).await?;
