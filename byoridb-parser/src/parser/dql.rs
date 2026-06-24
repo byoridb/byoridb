@@ -345,25 +345,23 @@ impl Parser {
             None
         };
 
-        // ORDER BY — consume and discard (sorting not yet implemented, but
-        // must be parsed so LIMIT can still be reached).
-        // Handles: ORDER BY col [ASC|DESC] [, col2 [ASC|DESC] ...]
+        // ORDER BY col [ASC|DESC] [, col2 [ASC|DESC] ...]
+        let mut order_by = Vec::new();
         if self.match_token(Token::Order) {
-            let _ = self.consume_token(Token::By);
-            loop {
-                // Parse sort expression
-                if self.parse_expression().is_err() {
-                    break;
-                }
-                // Optional direction: DESC token or ASC identifier
-                if self.match_token(Token::Desc) {
-                    // consumed
-                } else if let Ok(Token::Identifier(ref s)) = self.peek_token() {
-                    if s.eq_ignore_ascii_case("ASC") {
-                        self.advance();
+            self.consume_token(Token::By)?;
+            while let Ok(expr) = self.parse_expression() {
+                // Optional direction: DESC token or ASC identifier (ASC default).
+                let descending = if self.match_token(Token::Desc) {
+                    true
+                } else {
+                    if let Ok(Token::Identifier(ref s)) = self.peek_token() {
+                        if s.eq_ignore_ascii_case("ASC") {
+                            self.advance();
+                        }
                     }
-                }
-                // Continue if comma
+                    false
+                };
+                order_by.push(OrderByItem { expr, descending });
                 if !self.match_token(Token::Comma) {
                     break;
                 }
@@ -400,6 +398,7 @@ impl Parser {
             optional_patterns,
             return_clause,
             group_by,
+            order_by,
             limit,
             offset,
         }))

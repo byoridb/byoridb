@@ -111,15 +111,19 @@ impl MatchExecutor {
             // satisfy LIMIT after OFFSET without materializing all candidates.
             // Only safe when there is no WHERE clause (post-filter could reduce
             // the count) and not a multi-pattern join.
-            let row_limit = if plan.where_clause.is_none() && !is_multiple {
-                match (plan.offset, plan.limit) {
-                    (Some(off), Some(lim)) => Some(off + lim),
-                    (None, Some(lim)) => Some(lim),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+            // ORDER BY needs the full result set before truncating, so the
+            // early-exit limit only applies when there is no ordering (and no
+            // WHERE post-filter / multi-pattern join).
+            let row_limit =
+                if plan.where_clause.is_none() && !is_multiple && plan.order_by.is_empty() {
+                    match (plan.offset, plan.limit) {
+                        (Some(off), Some(lim)) => Some(off + lim),
+                        (None, Some(lim)) => Some(lim),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
             // If WHERE id(start_var)==X, skip the full candidate scan.
             let start_var_name = flat.start.variable.as_deref().unwrap_or("");
             let start_vid_override = id_bindings.get(start_var_name).copied();
@@ -479,8 +483,12 @@ impl MatchExecutor {
             );
         }
 
-        // OFFSET — skip rows before LIMIT
+        // ORDER BY — sort the projected rows before OFFSET/LIMIT truncation.
         let mut rows = rows;
+        if !plan.order_by.is_empty() {
+            sort_rows_by_order(&mut rows, &columns, &plan.order_by);
+        }
+        // OFFSET — skip rows before LIMIT
         if let Some(offset) = plan.offset {
             rows = rows.into_iter().skip(offset).collect();
         }
@@ -1757,6 +1765,65 @@ fn expr_to_col_name(expr: &Expression) -> String {
         Expression::PropRef { object, prop } => format!("{}.{}", object, prop),
         Expression::DstVertexProp { tag, prop } => format!("{}.{}", tag, prop),
         _ => "value".to_string(),
+    }
+}
+
+/// Sort projected rows in place by ORDER BY keys (before OFFSET/LIMIT). Each
+/// key is matched to a result column by RETURN alias or expression name; keys
+/// that don't match any column are skipped.
+fn sort_rows_by_order(
+    rows: &mut [Vec<byoridb_common::Value>],
+    columns: &[String],
+    order_by: &[byoridb_parser::ast::OrderByItem],
+) {
+    let keys: Vec<(usize, bool)> = order_by
+        .iter()
+        .filter_map(|item| {
+            let name = match &item.expr {
+                Expression::Identifier(s) => s.clone(),
+                other => expr_to_col_name(other),
+            };
+            columns
+                .iter()
+                .position(|c| c == &name)
+                .map(|idx| (idx, item.descending))
+        })
+        .collect();
+    if keys.is_empty() {
+        return;
+    }
+    rows.sort_by(|a, b| {
+        for &(idx, desc) in &keys {
+            let ord = match (a.get(idx), b.get(idx)) {
+                (Some(x), Some(y)) => value_sort_cmp(x, y),
+                _ => std::cmp::Ordering::Equal,
+            };
+            let ord = if desc { ord.reverse() } else { ord };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+/// Total-order comparison of two Values for ORDER BY. Numbers compare
+/// numerically (int/float mixed); strings/bools naturally; NULLs sort last
+/// (ascending). Non-comparable types are treated as equal.
+fn value_sort_cmp(a: &byoridb_common::Value, b: &byoridb_common::Value) -> std::cmp::Ordering {
+    use byoridb_common::Value::{Bool, Float, Int, Null, String as VStr};
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Int(x), Int(y)) => x.cmp(y),
+        (Float(x), Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Int(x), Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Float(x), Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal),
+        (VStr(x), VStr(y)) => x.cmp(y),
+        (Bool(x), Bool(y)) => x.cmp(y),
+        (Null(_), Null(_)) => Ordering::Equal,
+        (Null(_), _) => Ordering::Greater,
+        (_, Null(_)) => Ordering::Less,
+        _ => Ordering::Equal,
     }
 }
 

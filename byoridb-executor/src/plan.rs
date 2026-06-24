@@ -327,6 +327,7 @@ pub struct MatchPlan {
     pub optional_patterns: Vec<byoridb_parser::ast::Pattern>,
     pub return_clause: Option<Vec<MatchReturnColumn>>,
     pub group_by: Option<Vec<Expression>>,
+    pub order_by: Vec<byoridb_parser::ast::OrderByItem>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
@@ -974,6 +975,7 @@ impl ExecutionPlanBuilder {
                         .collect()
                 }),
                 group_by: match_stmt.group_by,
+                order_by: match_stmt.order_by,
                 limit: match_stmt.limit,
                 offset: match_stmt.offset,
             })),

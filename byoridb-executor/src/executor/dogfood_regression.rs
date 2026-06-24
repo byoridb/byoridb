@@ -120,4 +120,74 @@ mod tests {
         assert_eq!(counts.get("a"), Some(&2), "channel a has 2");
         assert_eq!(counts.get("b"), Some(&1), "channel b has 1");
     }
+
+    /// ORDER BY: previously parsed-and-discarded (no-op) so TOP-K returned
+    /// arbitrary rows. Must actually sort projected results before LIMIT.
+    #[tokio::test]
+    async fn match_order_by_sorts_aggregate_and_topk() {
+        let e = create_executor();
+        run(&e, "CREATE TAG p(ch STRING)").await;
+        // counts: a=3, b=1, c=2
+        for (vid, ch) in [(1, "a"), (2, "a"), (3, "a"), (4, "b"), (5, "c"), (6, "c")] {
+            run(&e, &format!("INSERT VERTEX p(ch) VALUES {vid}:(\"{ch}\")")).await;
+        }
+
+        // ORDER BY count DESC → a(3), c(2), b(1)
+        let r = run(
+            &e,
+            "MATCH (n:p) RETURN n.p.ch AS ch, COUNT(*) AS cnt GROUP BY n.p.ch ORDER BY cnt DESC",
+        )
+        .await;
+        let order: Vec<String> = r
+            .rows
+            .iter()
+            .filter_map(|row| match &row[0] {
+                byoridb_common::Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["a", "c", "b"], "descending by count");
+
+        // TOP-1
+        let r = run(
+            &e,
+            "MATCH (n:p) RETURN n.p.ch AS ch, COUNT(*) AS cnt GROUP BY n.p.ch ORDER BY cnt DESC LIMIT 1",
+        )
+        .await;
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], byoridb_common::Value::String("a".to_string()));
+
+        // ASC → b(1) first
+        let r = run(
+            &e,
+            "MATCH (n:p) RETURN n.p.ch AS ch, COUNT(*) AS cnt GROUP BY n.p.ch ORDER BY cnt ASC",
+        )
+        .await;
+        assert_eq!(r.rows[0][0], byoridb_common::Value::String("b".to_string()));
+    }
+
+    /// ORDER BY on a plain (non-aggregate) projection + LIMIT.
+    #[tokio::test]
+    async fn match_order_by_plain_projection() {
+        let e = create_executor();
+        run(&e, "CREATE TAG p(ch STRING)").await;
+        for vid in 1..=6 {
+            run(&e, &format!("INSERT VERTEX p(ch) VALUES {vid}:(\"x\")")).await;
+        }
+        // id(n) DESC LIMIT 3 → 6, 5, 4
+        let r = run(
+            &e,
+            "MATCH (n:p) RETURN id(n) AS vid ORDER BY vid DESC LIMIT 3",
+        )
+        .await;
+        let vids: Vec<i64> = r
+            .rows
+            .iter()
+            .filter_map(|row| match &row[0] {
+                byoridb_common::Value::Int(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vids, vec![6, 5, 4], "descending vids, top-3");
+    }
 }

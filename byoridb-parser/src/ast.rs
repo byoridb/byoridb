@@ -635,8 +635,19 @@ pub struct MatchStatement {
     pub optional_patterns: Vec<Pattern>,
     pub return_clause: Option<ReturnClause>,
     pub group_by: Option<Vec<Expression>>,
+    /// ORDER BY keys, applied to the projected RETURN rows before OFFSET/LIMIT.
+    /// Empty means no ordering.
+    pub order_by: Vec<OrderByItem>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+}
+
+/// A single `ORDER BY` key: an expression (a RETURN alias or a projected
+/// expression) plus sort direction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrderByItem {
+    pub expr: Expression,
+    pub descending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
