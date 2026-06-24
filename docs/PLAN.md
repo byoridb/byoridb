@@ -339,7 +339,7 @@ GO/FETCH 정규화, `match_executor.rs` id() 정규화, `ddl.rs` DROP EDGE 가�
 sameas 유닛 6(대표선출/out·in-edge rewrite·역인덱스/속성충돌/idempotent·union/self-loop)
 + key 1 + integration 1(end-to-end merge·GO/FETCH 정규화·3종 DELETE 거부). 워크스페이스
 762 lib + 46 integration 통과, fmt·clippy 클린.
-- **프로덕션 스모크 ✅ (2026-06-22)**: AKS(`20.249.128.19`, sha-13d3e70)에서 merge·
+- **프로덕션 스모크 ✅ (2026-06-22)**: AKS(`<AKS-LB-IP>`, sha-13d3e70)에서 merge·
   GO/FETCH 정규화·DELETE 3종 거부 전부 기대대로 통과(HTTP API).
 - **RECOMMEND × sameAs 연계 ✅ (2026-06-22)**: `execute_recommend`가 시드 vid를
   `representative_of`로 정규화(GO/FETCH/MATCH와 일관, D5). merge가 후보(edge/vec)를
@@ -369,7 +369,7 @@ O-0이 정한 **"1단계 full re-materialization → 2단계 B/F, DRed 회피"**
 - **D5. 비용 = O(graph)/delete** (시맨틱 space만). O-0 인정 1단계. B/F(2단계)는 후속.
 - 회귀(inference.rs 5): transitive/symmetric retract, 다른 경로 지원 시 보존,
   domain/range vtype retract, 시맨틱 미선언 no-op. executor lib 187 + integration 46 통과.
-- **프로덕션 스모크 ✅ (2026-06-22)**: AKS(`20.249.128.19`, sha-1994c43)에서 일회용
+- **프로덕션 스모크 ✅ (2026-06-22)**: AKS(`<AKS-LB-IP>`, sha-1994c43)에서 일회용
   space로 검증. `ancestor` TRANSITIVE에 `1->2`,`2->3` INSERT → `GO FROM 1`이 추론 `1->3`
   포함 {2,3} 반환. `DELETE EDGE 2->3` 후 `GO FROM 1`이 {2}만 반환(추론 `1->3` retract 확인,
   insertion-only였다면 잔존). HTTP API로 기대대로 통과.

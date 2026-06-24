@@ -29,8 +29,11 @@ spec:
   # preserves whatever is currently on the cluster — this baked value is
   # used solely when the service is first created. Never rely on editing
   # this file to change the allowlist of a running cluster.
+  # Placeholder (RFC 5737 doc range); set the real operator IP via:
+  #   kubectl patch svc byoridb-public -n byoridb -p \
+  #     '{"spec":{"loadBalancerSourceRanges":["<YOUR_IP>/32"]}}'
   loadBalancerSourceRanges:
-    - 3.37.7.191/32
+    - 203.0.113.0/32
   selector:
     app.kubernetes.io/name: byoridb
     app.kubernetes.io/component: server
