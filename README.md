@@ -13,7 +13,7 @@
   <a href="#기여">기여</a>
 </p>
 
-> **⚠️ 활발히 개발 중** — ByoriDB는 지속적으로 개발되고 있습니다. 릴리스 사이에 API와 동작이 변경될 수 있습니다. 현재 프로덕션 배포는 `v0.2.x` 를 추적합니다.
+> **⚠️ 활발히 개발 중 — 프로덕션 안정성 미보장** — ByoriDB는 아직 초기 단계의 활발히 개발 중인 프로젝트입니다. 기능·API·nGQL 문법·온디스크 포맷·동작이 릴리스 사이에 **예고 없이 바뀔 수 있고**, 검증되지 않은 엣지 케이스가 남아 있을 수 있습니다(특히 비ASCII 데이터·대량 적재·분산 모드). 실데이터 도그푸딩으로 버그를 적극적으로 찾아 고치는 단계이므로 — **중요한 데이터의 단일 저장소로 사용하지 마시고**, 충분히 검증한 뒤 사용하세요. 현재 프로덕션 배포는 `v0.2.x` 를 추적합니다.
 
 ---
 
@@ -179,6 +179,9 @@ FETCH PROP ON person $f.dst;
 
 | 변경 | 내용 |
 |------|------|
+| **쿼리 정확성 수정 (4건)** | ① `WHERE id(n)==X` 바인딩 경로에서 노드 라벨 필터가 무시되던 문제 ② `FETCH PROP ON <tag>` 가 태그 소속을 검증하지 않고 다른 태그 데이터를 반환하던 문제 ③ `GO … OVER *` 에서 `type(edge)`/`dst(edge)`/`src(edge)` 등 edge 함수가 NULL 을 반환하던 문제 ④ 집계 시 암묵 `GROUP BY`(비집계 RETURN 컬럼으로 자동 그룹화) 미동작 — 실데이터 도그푸딩으로 발견·수정 |
+| **대량 쓰기 안정성 (UTF-8 로깅 패닉)** | 긴 비ASCII(한글 등) 쿼리를 로깅할 때 UTF-8 문자 경계가 아닌 고정 바이트 위치에서 잘라 서버가 패닉하던 문제 수정. 대량 INSERT 중 간헐적 connection reset 의 근본 원인이었음 |
+| **nGQL 문자열 escape** | 문자열 리터럴 내 `\"` / `\\` / `\n` 등 escape 시퀀스 처리 — 값에 따옴표·백슬래시가 포함된 데이터 적재 가능 |
 | **역방향 edge 인덱스 (O-1)** | `GO … REVERSELY` 등 incoming 탐색이 전체 엣지 풀스캔 O(E) → `{space}:in-edge:{dst}:…` 인덱스 prefix scan **O(in-degree)** 로. INSERT/DELETE EDGE가 양방향 기록. LDBC Q8 `reply_of REVERSELY` 의 120초 timeout 블로커 해소 |
 | **문자열 리터럴 내 `;` 처리 수정** | `"Alice; Bob"` 같은 리터럴 안의 세미콜론을 compound separator로 오인하던 버그 제거. compound 쿼리는 파서의 정식 `Statement::Compound` 경로로 위임 |
 | **DROP SPACE 완전 정리** | `DROP SPACE` 가 데이터/스키마/인덱스를 모두 purge → 동일 이름 재사용 가능 (반복 벤치 차단 요소 제거) |
@@ -347,7 +350,7 @@ RUST_LOG=info cargo run --release --bin byoridb-server
 | 역방향 edge 인덱스 (incoming O(in-degree) 조회) | ✅ 구현됨 (2026-06) |
 | `SHOW SESSIONS` (라이브 데이터) | ✅ v0.2.15 구현됨 |
 | 다중 노드 샤딩 (파티션의 노드 간 분산) | 진행 중 (현재 단일 노드 배포) |
-| 가변 길이 경로 `*1..n` 실행 | 계획됨 |
+| 가변 길이 경로 `*1..n` 실행 (`MATCH`/`FIND ALL SHORTEST PATHS`) | ✅ 구현됨 (2026-06) |
 | Geography WKB/WKT 디코딩 | 계획됨 |
 | `RETURN *` (전체 변수) | 계획됨 |
 | MVCC / 분산 2PC 트랜잭션 | 미계획 (비용 대비 효과) |
