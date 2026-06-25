@@ -58,6 +58,26 @@ impl MatchExecutor {
             });
         }
 
+        // Indexed GROUP BY + COUNT(*) fast-path: when grouping by a single
+        // indexed property with no WHERE/edges, count via index scan instead of
+        // decoding every vertex blob. ORDER BY/OFFSET/LIMIT still apply here.
+        if let Some((columns, mut rows)) = self.try_indexed_group_count(&plan).await? {
+            if !plan.order_by.is_empty() {
+                sort_rows_by_order(&mut rows, &columns, &plan.order_by);
+            }
+            if let Some(offset) = plan.offset {
+                rows = rows.into_iter().skip(offset).collect();
+            }
+            if let Some(limit) = plan.limit {
+                rows.truncate(limit);
+            }
+            return Ok(ExecutorResult {
+                columns,
+                rows,
+                latency_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
         // Collect rows as binding maps: variable_name → Value::Int(vid)
         let mut binding_rows: Vec<HashMap<String, byoridb_common::Value>> = Vec::new();
         let mut bindings: HashMap<String, byoridb_common::Value> = HashMap::new();
@@ -502,6 +522,111 @@ impl MatchExecutor {
             rows,
             latency_ms: latency,
         })
+    }
+
+    /// Fast-path for `MATCH (v:Tag) RETURN v.Tag.prop AS x, COUNT(*) AS n
+    /// GROUP BY v.Tag.prop` (no WHERE / OPTIONAL / edges) where `prop` has a
+    /// single-field tag index: counts grouped values via an index scan, with no
+    /// vertex-blob decode. Returns `None` when the shape or index doesn't
+    /// qualify — the caller then runs the normal full-scan aggregation.
+    async fn try_indexed_group_count(
+        &self,
+        plan: &crate::plan::MatchPlan,
+    ) -> Result<Option<(Vec<String>, Vec<Vec<byoridb_common::Value>>)>> {
+        // Shape gates: no WHERE / OPTIONAL, single-node pattern, single GROUP BY.
+        if plan.where_clause.is_some() || !plan.optional_patterns.is_empty() {
+            return Ok(None);
+        }
+        let flat = flatten_pattern(&plan.pattern)?;
+        if !flat.edges.is_empty() {
+            return Ok(None);
+        }
+        let group_by = match &plan.group_by {
+            Some(g) if g.len() == 1 => g,
+            _ => return Ok(None),
+        };
+        let return_cols = match &plan.return_clause {
+            Some(c) if c.len() == 2 => c,
+            _ => return Ok(None),
+        };
+        // RETURN must be exactly one aggregate (COUNT) + one non-aggregate that
+        // equals the GROUP BY expression.
+        let agg_count = return_cols
+            .iter()
+            .filter(|c| is_aggregate_expr(&c.expression))
+            .count();
+        if agg_count != 1 {
+            return Ok(None);
+        }
+        let group_expr = &group_by[0];
+        let non_agg: Vec<_> = return_cols
+            .iter()
+            .filter(|c| !is_aggregate_expr(&c.expression))
+            .collect();
+        if non_agg.len() != 1 || &non_agg[0].expression != group_expr {
+            return Ok(None);
+        }
+        // Only COUNT is index-countable here (SUM/AVG/etc. need the value).
+        let agg = return_cols
+            .iter()
+            .find(|c| is_aggregate_expr(&c.expression))
+            .unwrap();
+        if !matches!(&agg.expression, Expression::FunctionCall { name, .. }
+            if name.eq_ignore_ascii_case("COUNT"))
+        {
+            return Ok(None);
+        }
+        // group_expr must be a vertex property `v.Tag.prop` → PropRef.prop.
+        let prop = match group_expr {
+            Expression::PropRef { prop, .. } => prop.clone(),
+            _ => return Ok(None),
+        };
+        let label = match flat.start.labels.first() {
+            Some(l) => l.clone(),
+            None => return Ok(None),
+        };
+        // Find a single-field tag index on (label, prop).
+        let index_manager = match self.ctx.index_manager.as_ref() {
+            Some(im) => im,
+            None => return Ok(None),
+        };
+        let space_id = self.ctx.space_id.unwrap_or(1);
+        let index_def = match index_manager
+            .list_tag_indexes(space_id)
+            .await
+            .into_iter()
+            .find(|i| i.schema_name == label && i.fields.len() == 1 && i.fields[0] == prop)
+        {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        // Count via index scan (part_id 1 — INSERT writes all tag indexes there).
+        let counts = match index_manager.tag_index_group_counts(1, &index_def).await {
+            Ok(c) => c,
+            Err(_) => return Ok(None), // fall back to full scan
+        };
+        let col_names: Vec<String> = return_cols
+            .iter()
+            .map(|c| {
+                c.alias
+                    .clone()
+                    .unwrap_or_else(|| expr_to_col_name(&c.expression))
+            })
+            .collect();
+        let group_is_first = !is_aggregate_expr(&return_cols[0].expression);
+        let rows = counts
+            .into_iter()
+            .map(|(iv, n)| {
+                let gv = index_value_to_value(iv);
+                let cv = byoridb_common::Value::Int(n as i64);
+                if group_is_first {
+                    vec![gv, cv]
+                } else {
+                    vec![cv, gv]
+                }
+            })
+            .collect();
+        Ok(Some((col_names, rows)))
     }
 
     async fn try_execute_simple_count(
@@ -1824,6 +1949,18 @@ fn value_sort_cmp(a: &byoridb_common::Value, b: &byoridb_common::Value) -> std::
         (Null(_), _) => Ordering::Greater,
         (_, Null(_)) => Ordering::Less,
         _ => Ordering::Equal,
+    }
+}
+
+/// Convert a storage-layer IndexValue (from an index key) into a query Value.
+fn index_value_to_value(iv: byoridb_storage::key::IndexValue) -> byoridb_common::Value {
+    use byoridb_storage::key::IndexValue;
+    match iv {
+        IndexValue::Null => byoridb_common::Value::Null(byoridb_common::NullType::Null),
+        IndexValue::Bool(b) => byoridb_common::Value::Bool(b),
+        IndexValue::Int(i) => byoridb_common::Value::Int(i),
+        IndexValue::Float(f) => byoridb_common::Value::Float(f),
+        IndexValue::String(s) => byoridb_common::Value::String(s),
     }
 }
 

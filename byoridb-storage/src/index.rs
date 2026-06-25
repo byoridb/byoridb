@@ -545,6 +545,43 @@ impl IndexManager {
         Ok(())
     }
 
+    /// Count index entries grouped by their (single) indexed value, scanning the
+    /// whole index without decoding any vertex blobs. Accelerates `GROUP BY
+    /// <indexed_prop>` + COUNT(*): O(index entries with tiny keys) instead of
+    /// O(vertices with full blob decode). Single-field indexes only (multi-field
+    /// errors → caller falls back to full scan).
+    pub async fn tag_index_group_counts(
+        &self,
+        part_id: u32,
+        index_def: &IndexDef,
+    ) -> Result<Vec<(IndexValue, u64)>, IndexError> {
+        if index_def.fields.len() != 1 {
+            return Err(IndexError::Storage(
+                "group-count optimization requires a single-field index".to_string(),
+            ));
+        }
+        let prefix = KeyUtils::tag_index_prefix(part_id, index_def.id);
+        let plen = prefix.len();
+        let entries = self
+            .kvstore
+            .scan_prefix(&prefix)
+            .await
+            .map_err(|e| IndexError::Storage(e.to_string()))?;
+        // Group by the encoded value bytes — Float isn't Hash/Eq, and the
+        // encoding is canonical per IndexValue::encode, so it's a valid key.
+        let mut counts: HashMap<Vec<u8>, (IndexValue, u64)> = HashMap::new();
+        for (key, _) in &entries {
+            if key.len() <= plen {
+                continue;
+            }
+            if let Some((value, consumed)) = IndexValue::decode(&key[plen..]) {
+                let vbytes = key[plen..plen + consumed].to_vec();
+                counts.entry(vbytes).or_insert((value, 0)).1 += 1;
+            }
+        }
+        Ok(counts.into_values().collect())
+    }
+
     /// Scan a tag index with given prefix values
     pub async fn scan_tag_index(
         &self,
@@ -849,6 +886,63 @@ mod tests {
         assert_eq!(index.schema_id, 10);
         assert_eq!(index.schema_name, "person");
         assert_eq!(index.fields, vec!["name".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_tag_index_group_counts() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let manager = IndexManager::new(kvstore);
+        manager
+            .create_tag_index(
+                1,
+                "prod_ch_idx".to_string(),
+                10,
+                "product".to_string(),
+                vec!["channel".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        let index_def = manager.get_index(1, "prod_ch_idx").await.unwrap();
+        // channel distribution: a×3, b×1, c×2
+        for (ch, vid) in [("a", 1), ("a", 2), ("a", 3), ("b", 4), ("c", 5), ("c", 6)] {
+            manager
+                .insert_tag_index(1, index_def.id, &[IndexValue::String(ch.to_string())], vid)
+                .await
+                .unwrap();
+        }
+        let counts = manager.tag_index_group_counts(1, &index_def).await.unwrap();
+        let mut m = std::collections::HashMap::new();
+        for (iv, n) in counts {
+            if let IndexValue::String(s) = iv {
+                m.insert(s, n);
+            }
+        }
+        assert_eq!(m.get("a"), Some(&3), "a counted 3");
+        assert_eq!(m.get("b"), Some(&1), "b counted 1");
+        assert_eq!(m.get("c"), Some(&2), "c counted 2");
+        assert_eq!(m.len(), 3, "exactly 3 distinct values");
+    }
+
+    #[tokio::test]
+    async fn test_tag_index_group_counts_rejects_multifield() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let manager = IndexManager::new(kvstore);
+        manager
+            .create_tag_index(
+                1,
+                "multi".to_string(),
+                10,
+                "t".to_string(),
+                vec!["a".to_string(), "b".to_string()],
+                vec![0, 1],
+            )
+            .await
+            .unwrap();
+        let def = manager.get_index(1, "multi").await.unwrap();
+        // multi-field index isn't a single-value group key → error (caller
+        // falls back to full scan).
+        assert!(manager.tag_index_group_counts(1, &def).await.is_err());
     }
 
     #[tokio::test]
