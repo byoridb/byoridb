@@ -211,6 +211,22 @@ impl RedbKVStore {
         }
     }
 
+    /// Force a durable (fsync) checkpoint regardless of the relaxed-durability
+    /// setting. Commits an empty write transaction with `Durability::Immediate`,
+    /// which flushes everything written so far to disk. Call this at the end of
+    /// a relaxed-durability bulk load so the final batches are guaranteed
+    /// persisted before the process exits.
+    pub async fn force_checkpoint(&self) -> Result<()> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let mut wtx = db.begin_write()?;
+            wtx.set_durability(Durability::Immediate)?;
+            wtx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
     /// Durability for the next write commit. `Immediate` (fsync) by default;
     /// under relaxed durability, `None` (no fsync) except every Nth commit which
     /// stays `Immediate` as a checkpoint.
