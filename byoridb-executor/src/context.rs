@@ -53,7 +53,13 @@ impl Default for ExecutionConfig {
             max_memory_mb: 1024, // 1GB
             enable_optimization: true,
             max_traversal_nodes: 100_000,
-            max_scan_limit: 100_000, // 100K rows per scan
+            // 100K rows per scan by default; overridable via BYORIDB_MAX_SCAN_LIMIT
+            // for accurate global aggregation over large datasets (needs enough
+            // memory — this is an OOM guard, so only raise it with headroom).
+            max_scan_limit: std::env::var("BYORIDB_MAX_SCAN_LIMIT")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(100_000),
             max_go_steps: 20,
             max_find_paths: 1024,
             vector_index_min: 1000,

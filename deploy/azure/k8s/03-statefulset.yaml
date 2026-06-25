@@ -54,6 +54,11 @@ spec:
             # Immediate (fsync) durability. Delete the var → defaults to fsync.
             - name: BYORIDB_DURABILITY
               value: "none"
+            # Raise the per-scan row cap (default 100K) so global aggregation /
+            # ORDER BY over the full dataset (product ~7.7M) is accurate, not a
+            # 100K sample. Safe on the 128GB node; it's an OOM guard.
+            - name: BYORIDB_MAX_SCAN_LIMIT
+              value: "10000000"
           ports:
             - { containerPort: 9669,  name: grpc }
             - { containerPort: 19669, name: http }
