@@ -47,13 +47,11 @@ spec:
             # Requires a node large enough to hold it (dbpoolv2 / E16s_v5 128GB).
             - name: BYORIDB_CACHE_SIZE_MB
               value: "65536"
-            # BULK LOAD ONLY — relaxed durability (Durability::None + periodic
-            # checkpoint every 64 commits) for fast ingestion. A crash loses the
-            # last <=64 commits, recovered by re-loading (idempotent VIDs).
-            # REMOVE this once bulk loading is done — steady-state serving needs
-            # Immediate (fsync) durability. Delete the var → defaults to fsync.
-            - name: BYORIDB_DURABILITY
-              value: "none"
+            # NOTE: BYORIDB_DURABILITY was set to "none" (relaxed) for the
+            # 2026-06-26 nexprice bulk load (88M nodes / 151M edges via the
+            # bulkloader Job). Removed afterward — steady-state serving uses the
+            # default Immediate (fsync per commit) durability. Re-add it (value
+            # "none") only for the next large bulk load, then remove again.
             # Raise the per-scan row cap (default 100K) so global aggregation /
             # ORDER BY over the full dataset (product ~7.7M) is accurate, not a
             # 100K sample. Safe on the 128GB node; it's an OOM guard.
