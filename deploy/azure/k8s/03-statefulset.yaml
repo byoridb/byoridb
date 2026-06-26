@@ -60,6 +60,16 @@ spec:
           ports:
             - { containerPort: 9669,  name: grpc }
             - { containerPort: 19669, name: http }
+          # Large datasets make redb open slow at startup: the 88M-vertex /
+          # 151M-edge nexprice load made open take >90s, tripping the liveness
+          # probe before the HTTP port opened → CrashLoopBackOff (2026-06-26
+          # incident). startupProbe gates liveness AND readiness until the
+          # server is actually listening, giving redb open up to ~15min before
+          # any restart. Once it passes once, liveness/readiness take over.
+          startupProbe:
+            httpGet: { path: /health, port: 19669 }
+            periodSeconds: 10
+            failureThreshold: 90
           # /ready flips to 503 the moment a graceful shutdown starts, so the
           # pod leaves Service endpoints while in-flight queries drain. A bare
           # TCP probe stayed "ready" during shutdown (socket still listening).

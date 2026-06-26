@@ -117,6 +117,9 @@ jobs:
             kubectl patch svc byoridb-public -n $K8S_NAMESPACE \
               -p "{\"spec\":{\"loadBalancerSourceRanges\":$LIVE_LB_RANGES}}"
           fi
+          # Timeout must exceed the startupProbe budget (failureThreshold 90 ×
+          # periodSeconds 10 = 900s) so a slow redb open on a large dataset
+          # doesn't trip the rollout before the pod can finish starting.
           kubectl rollout status statefulset/byoridb-server \
             -n $K8S_NAMESPACE \
-            --timeout=300s
+            --timeout=960s
