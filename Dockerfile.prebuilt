@@ -9,6 +9,10 @@ WORKDIR /app
 
 ARG BINARY_PATH=target/release/byoridb-server
 COPY ${BINARY_PATH} /usr/local/bin/byoridb-server
+# Offline bulk loader — invoked by a Job (server scaled to 0) for large imports.
+# Built alongside the server in the deploy workflow; see deploy/azure/jobs/.
+ARG BULKLOADER_PATH=target/release/byoridb-bulkloader
+COPY ${BULKLOADER_PATH} /usr/local/bin/byoridb-bulkloader
 
 RUN mkdir -p /app/data
 

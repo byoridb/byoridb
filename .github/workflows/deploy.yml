@@ -67,8 +67,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-deploy-
 
-      - name: Build release binary
-        run: cargo build --release --bin byoridb-server
+      - name: Build release binaries (server + bulk loader)
+        # `-p` is required: the two bins live in different workspace packages, so
+        # `--bin X --bin Y` alone fails ("no bin target in default-run packages").
+        run: cargo build --release -p byoridb --bin byoridb-server -p byoridb-bulkloader --bin byoridb-bulkloader
 
       - name: Build & push Docker image
         run: |
