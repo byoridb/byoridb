@@ -63,6 +63,26 @@ pub trait KVStore: Send + Sync {
     async fn batch_put(&self, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()>;
     /// Delete many keys in a single transaction (missing keys are ignored).
     async fn batch_delete(&self, keys: Vec<Vec<u8>>) -> Result<()>;
+
+    /// Delete every key under `prefix`, in chunks of up to `chunk` keys per
+    /// commit. Built for `DROP SPACE` on large keyspaces (tens of millions of
+    /// keys): bounds memory and per-transaction work, and never blocks on a
+    /// single giant delete.
+    ///
+    /// The default implementation materializes the full prefix via
+    /// [`Self::scan_prefix`] (which copies values too) before deleting — fine
+    /// for small ranges. Backends override this to read keys only and stream
+    /// the deletes (see `RedbKVStore`). Returns the number of keys removed.
+    async fn delete_prefix_chunked(&self, prefix: &[u8], chunk: usize) -> Result<usize> {
+        let entries = self.scan_prefix(prefix).await?;
+        let n = entries.len();
+        let keys: Vec<Vec<u8>> = entries.into_iter().map(|(k, _)| k).collect();
+        let chunk = chunk.max(1);
+        for c in keys.chunks(chunk) {
+            self.batch_delete(c.to_vec()).await?;
+        }
+        Ok(n)
+    }
     async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
     /// Batch get multiple keys in a single operation
@@ -328,6 +348,53 @@ impl KVStore for RedbKVStore {
             Ok(())
         })
         .await?
+    }
+
+    /// Keys-only chunked prefix delete. Each iteration opens a fresh read
+    /// snapshot, collects up to `chunk` keys under `prefix` **without copying
+    /// values** (DROP only needs keys — `scan_prefix` would copy every vertex
+    /// blob), then deletes them in one write commit. Re-scanning from the start
+    /// of `prefix` each round is O(log N) to reposition, and the just-deleted
+    /// keys are gone from the next snapshot, so progress is monotonic. Memory
+    /// stays bounded by `chunk` regardless of total keyspace size.
+    async fn delete_prefix_chunked(&self, prefix: &[u8], chunk: usize) -> Result<usize> {
+        let chunk = chunk.max(1);
+        let mut total = 0usize;
+        loop {
+            let db = Arc::clone(&self.db);
+            let prefix_v = prefix.to_vec();
+            let keys: Vec<Vec<u8>> =
+                tokio::task::spawn_blocking(move || -> Result<Vec<Vec<u8>>> {
+                    let rtx = db.begin_read()?;
+                    let table = rtx.open_table(KV_TABLE)?;
+                    let mut out = Vec::with_capacity(chunk);
+                    for entry in table.range(prefix_v.as_slice()..)? {
+                        let (k, _) = entry?;
+                        let kb = k.value();
+                        if !kb.starts_with(&prefix_v) {
+                            break;
+                        }
+                        out.push(kb.to_vec());
+                        if out.len() >= chunk {
+                            break;
+                        }
+                    }
+                    Ok(out)
+                })
+                .await??;
+
+            if keys.is_empty() {
+                break;
+            }
+            total += keys.len();
+            self.batch_delete(keys).await?;
+            info!(
+                prefix = %String::from_utf8_lossy(prefix),
+                deleted = total,
+                "delete_prefix_chunked progress"
+            );
+        }
+        Ok(total)
     }
 
     /// Reads keys in input order under a single snapshot. Misses stay `None`.
@@ -1079,5 +1146,41 @@ mod tests {
         let store = RedbKVStore::open(dir.path(), opts).unwrap();
         store.put(b"k", b"v").await.unwrap();
         assert_eq!(store.get(b"k").await.unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_delete_prefix_chunked_removes_only_prefix() {
+        let dir = tempdir().unwrap();
+        let store = RedbKVStore::open(dir.path(), KVStoreOptions::default()).unwrap();
+        // 25 keys under "a:", 5 under "b:" — chunk 10 forces multiple commits
+        // (the large-keyspace path) and a sibling prefix that must survive.
+        for i in 0..25 {
+            store
+                .put(format!("a:{i:02}").as_bytes(), b"val")
+                .await
+                .unwrap();
+        }
+        for i in 0..5 {
+            store
+                .put(format!("b:{i:02}").as_bytes(), b"val")
+                .await
+                .unwrap();
+        }
+        let removed = store.delete_prefix_chunked(b"a:", 10).await.unwrap();
+        assert_eq!(removed, 25);
+        assert!(store.scan_prefix(b"a:").await.unwrap().is_empty());
+        assert_eq!(store.scan_prefix(b"b:").await.unwrap().len(), 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_delete_prefix_chunked_absent_prefix_is_noop() {
+        let dir = tempdir().unwrap();
+        let store = RedbKVStore::open(dir.path(), KVStoreOptions::default()).unwrap();
+        store.put(b"x:1", b"v").await.unwrap();
+        assert_eq!(
+            store.delete_prefix_chunked(b"absent:", 100).await.unwrap(),
+            0
+        );
+        assert_eq!(store.scan_prefix(b"x:").await.unwrap().len(), 1);
     }
 }

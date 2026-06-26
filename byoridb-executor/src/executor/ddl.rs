@@ -198,16 +198,18 @@ impl Executor {
         Ok(ExecutorResult::empty())
     }
 
-    /// Delete every key under `prefix` in chunked batches (one redb commit per
-    /// chunk so a large purge doesn't fsync per key). Returns keys removed.
+    /// Delete every key under `prefix` in chunked, **keys-only** batches (one
+    /// redb commit per chunk). Delegates to `KVStore::delete_prefix_chunked`,
+    /// which reads keys without copying values — critical for `DROP SPACE` on a
+    /// large space, where the old `scan_prefix` path materialized every vertex
+    /// blob in memory and stalled (2026-06-26 dogfooding: cah 8.4M DROP never
+    /// finished). Returns keys removed.
     async fn delete_by_prefix(&self, prefix: &[u8]) -> Result<usize> {
-        let entries = self.ctx.kvstore.scan_prefix(prefix).await?;
-        let n = entries.len();
-        let keys: Vec<Vec<u8>> = entries.into_iter().map(|(k, _)| k).collect();
-        for chunk in keys.chunks(4096) {
-            self.ctx.kvstore.batch_delete(chunk.to_vec()).await?;
-        }
-        Ok(n)
+        Ok(self
+            .ctx
+            .kvstore
+            .delete_prefix_chunked(prefix, 10_000)
+            .await?)
     }
 
     async fn backfill_tag_index(
@@ -793,6 +795,11 @@ impl Executor {
                     .and_then(|v| v.get("id").and_then(|i| i.as_u64()))
                     .map(|i| i as u32);
 
+                // A large space (millions of vertices/edges) can take a while to
+                // purge; log the boundaries so a long DROP is observably in
+                // progress (per-chunk progress comes from delete_prefix_chunked).
+                tracing::info!(space = %name, ?space_id, "DROP SPACE started");
+
                 // 1. Index entries (by index_id prefix, part_id=1) + in-memory
                 //    definitions — so the same space name can be recreated and
                 //    its indexes re-created without "already exists".
@@ -821,6 +828,8 @@ impl Executor {
                     .await?;
                 // 4. The space meta key itself.
                 self.ctx.kvstore.delete(space_key.as_bytes()).await?;
+
+                tracing::info!(space = %name, "DROP SPACE completed");
 
                 Ok(ExecutorResult {
                     columns: vec![],
