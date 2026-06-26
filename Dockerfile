@@ -25,6 +25,7 @@ COPY byoridb-codec/Cargo.toml byoridb-codec/
 COPY byoridb-parser/Cargo.toml byoridb-parser/
 COPY byoridb-executor/Cargo.toml byoridb-executor/
 COPY byoridb-client/Cargo.toml byoridb-client/
+COPY byoridb-bulkloader/Cargo.toml byoridb-bulkloader/
 
 # Create dummy source files to cache dependencies
 RUN mkdir -p src \
@@ -36,10 +37,13 @@ RUN mkdir -p src \
     byoridb-codec/src \
     byoridb-parser/src \
     byoridb-executor/src \
-    byoridb-client/src
-    
+    byoridb-client/src \
+    byoridb-bulkloader/src
+
 RUN echo "fn main() {}" > src/main.rs && \
     echo "fn main() {}" > byoridb-client/src/main.rs && \
+    echo "fn main() {}" > byoridb-bulkloader/src/main.rs && \
+    touch byoridb-bulkloader/src/lib.rs && \
     touch byoridb-common/src/lib.rs && \
     touch byoridb-storage/src/lib.rs && \
     touch byoridb-graph/src/lib.rs && \
@@ -64,8 +68,10 @@ COPY . .
 # Touch main.rs to force rebuild of the binary
 RUN touch src/main.rs
 
-# Build release
-RUN cargo build --release --bin byoridb-server
+# Build release (server + offline bulk loader). `-p` is required: the two bins
+# live in different workspace packages, so `--bin X --bin Y` alone fails to
+# resolve the loader ("no bin target ... in default-run packages").
+RUN cargo build --release -p byoridb --bin byoridb-server -p byoridb-bulkloader --bin byoridb-bulkloader
 
 # Runtime Stage
 FROM debian:bookworm-slim
@@ -78,8 +84,10 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy binary from builder
+# Copy binaries from builder
 COPY --from=builder /usr/src/byoridb/target/release/byoridb-server /usr/local/bin/byoridb-server
+# Offline bulk loader — invoked by a Job (server scaled to 0) for large imports.
+COPY --from=builder /usr/src/byoridb/target/release/byoridb-bulkloader /usr/local/bin/byoridb-bulkloader
 
 # Config is loaded via BYORIDB__* env vars (AppConfig file is optional)
 # Create data directory

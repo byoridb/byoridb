@@ -1,0 +1,88 @@
+# Offline bulk load Job for the nexprice full dataset.
+#
+# NOT under deploy/azure/k8s/ on purpose: deploy.yml applies everything in that
+# directory on every push. This Job is run MANUALLY, only when importing.
+#
+# Prerequisites (see deploy/azure/jobs/README.md for the full runbook):
+#   1. Image must contain /usr/local/bin/byoridb-bulkloader (Dockerfile updated
+#      2026-06-25 — redeploy first so the byoridb-server:<sha> image has it).
+#   2. DDL done via the server: DROP SPACE (old) + CREATE SPACE nexprice
+#      (vid_type = INT64) + CREATE TAG/EDGE for all types below.
+#   3. CSVs uploaded to the data PVC under /app/data/import/.
+#   4. Server scaled to 0 (the data PVC is ReadWriteOnce — one mounter at a time):
+#        kubectl -n byoridb scale statefulset byoridb-server --replicas=0
+#   5. Substitute the image tag below with the CURRENTLY DEPLOYED commit sha
+#      (the deploy workflow tags byoridb-server:<sha>; this Job is applied raw):
+#        kubectl -n byoridb get statefulset byoridb-server \
+#          -o jsonpath='{.spec.template.spec.containers[0].image}'
+#
+# Then: kubectl apply -f deploy/azure/jobs/bulkload-nexprice.yaml
+# Watch: kubectl -n byoridb logs -f job/byoridb-bulkload-nexprice
+# After success: scale the server back to 1, optionally delete /app/data/import.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: byoridb-bulkload-nexprice
+  namespace: byoridb
+  labels:
+    app.kubernetes.io/name: byoridb
+    app.kubernetes.io/component: bulkload
+spec:
+  backoffLimit: 0 # no auto-retry; a partial load is idempotent to re-run manually
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: byoridb
+        app.kubernetes.io/component: bulkload
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 60
+      # Same node pool as the server so the ReadWriteOnce PVC can attach here
+      # (RWO is node-scoped) after the server is scaled to 0.
+      tolerations:
+        - { key: workload, operator: Equal, value: byoridb, effect: NoSchedule }
+      nodeSelector:
+        workload: byoridb
+      containers:
+        - name: bulkloader
+          # REPLACE :PLACEHOLDER_SHA with the currently deployed commit sha
+          # (see header). The server image carries the bulkloader binary.
+          image: byoridbacr23236.azurecr.io/byoridb-server:PLACEHOLDER_SHA
+          imagePullPolicy: IfNotPresent
+          command:
+            - byoridb-bulkloader
+            - --db=/app/data
+            - --space=nexprice
+            # All nodes load first (vid assignment), then all edges resolve
+            # endpoints via the id map. CSV column names assumed: id / src / dst.
+            # Adjust --id-column / --src-column / --dst-column if your headers differ.
+            - --node=sku=/app/data/import/sku.csv
+            - --node=product=/app/data/import/product.csv.gz
+            - --node=brand=/app/data/import/brand.csv
+            - --node=category=/app/data/import/category.csv
+            - --node=channel=/app/data/import/channel.csv
+            - --edge=same_as=/app/data/import/same_as.csv.gz
+            - --edge=sold_on=/app/data/import/sold_on.csv.gz
+            - --edge=in_category=/app/data/import/in_category.csv
+            - --edge=has_brand=/app/data/import/has_brand.csv
+            - --edge=child_of=/app/data/import/child_of.csv
+            - --batch-size=200000
+            - --cache-mb=8192
+            - --durability=relaxed
+          env:
+            - name: RUST_LOG
+              value: "info"
+          resources:
+            # The id map (original-id -> vid) is held in memory for the whole
+            # load: ~89M entries ≈ 6-8GB. Plus an 8GB redb page cache. Headroom
+            # on the 128GB node.
+            requests: { cpu: "2", memory: "16Gi" }
+            limits: { cpu: "8", memory: "32Gi" }
+          volumeMounts:
+            - { name: data, mountPath: /app/data }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            # StatefulSet volumeClaimTemplate `data` + pod `byoridb-server-0`.
+            claimName: data-byoridb-server-0
