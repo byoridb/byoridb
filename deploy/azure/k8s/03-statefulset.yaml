@@ -60,16 +60,20 @@ spec:
           ports:
             - { containerPort: 9669,  name: grpc }
             - { containerPort: 19669, name: http }
-          # Large datasets make redb open slow at startup: the 88M-vertex /
-          # 151M-edge nexprice load made open take >90s, tripping the liveness
-          # probe before the HTTP port opened → CrashLoopBackOff (2026-06-26
-          # incident). startupProbe gates liveness AND readiness until the
-          # server is actually listening, giving redb open up to ~15min before
-          # any restart. Once it passes once, liveness/readiness take over.
+          # redb's open() runs a FULL REPAIR (3 full scans of the file, db.rs:818)
+          # whenever the previous shutdown was unclean (no allocator-state table).
+          # On the 88M-vertex / 151M-edge nexprice dataset that scan takes 20min+.
+          # A SIGKILL mid-repair leaves it unclean again → next open repairs again
+          # → CrashLoopBackOff (2026-06-26 incident). startupProbe must outlast a
+          # full repair so it can complete ONCE: repair finishes → clean state →
+          # subsequent (graceful) restarts open fast. 60min ceiling = repair time
+          # (~20min) + generous headroom; it is NOT per-restart downtime in steady
+          # state. Lower this back toward ~5min once the data shrinks or quick-
+          # repair (redb #829) lands.
           startupProbe:
             httpGet: { path: /health, port: 19669 }
             periodSeconds: 10
-            failureThreshold: 90
+            failureThreshold: 360
           # /ready flips to 503 the moment a graceful shutdown starts, so the
           # pod leaves Service endpoints while in-flight queries drain. A bare
           # TCP probe stayed "ready" during shutdown (socket still listening).
