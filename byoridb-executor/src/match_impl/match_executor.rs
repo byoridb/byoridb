@@ -869,8 +869,23 @@ impl MatchExecutor {
         let entries = self.ctx.kvstore.scan_prefix(&prefix).await?;
         for (_, v) in &entries {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
-                if json.get("semantics").is_some() {
-                    return Ok(true);
+                // CREATE EDGE always serializes a `semantics` object, even when
+                // empty — so check for an actually-set flag, not mere presence.
+                if let Some(sem) = json.get("semantics") {
+                    let active = sem
+                        .get("transitive")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false)
+                        || sem
+                            .get("symmetric")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false)
+                        || ["inverse_of", "subproperty_of", "domain", "range"]
+                            .iter()
+                            .any(|k| sem.get(*k).map(|x| !x.is_null()).unwrap_or(false));
+                    if active {
+                        return Ok(true);
+                    }
                 }
             }
         }
