@@ -19,7 +19,9 @@ use crate::error::{ExecutionError, Result};
 use crate::executor::ExecutorResult;
 use crate::profile::ProfileOp;
 use byoridb_codec::{EdgeData, VertexCodec};
-use byoridb_parser::ast::{BinaryOperator, EdgePattern, Expression, Literal, NodePattern, Pattern};
+use byoridb_parser::ast::{
+    BinaryOperator, EdgeDirection, EdgePattern, Expression, Literal, NodePattern, Pattern,
+};
 use byoridb_storage::index::IndexDef;
 use byoridb_storage::key::IndexValue;
 use std::collections::HashMap;
@@ -62,6 +64,26 @@ impl MatchExecutor {
         // indexed property with no WHERE/edges, count via index scan instead of
         // decoding every vertex blob. ORDER BY/OFFSET/LIMIT still apply here.
         if let Some((columns, mut rows)) = self.try_indexed_group_count(&plan).await? {
+            if !plan.order_by.is_empty() {
+                sort_rows_by_order(&mut rows, &columns, &plan.order_by);
+            }
+            if let Some(offset) = plan.offset {
+                rows = rows.into_iter().skip(offset).collect();
+            }
+            if let Some(limit) = plan.limit {
+                rows.truncate(limit);
+            }
+            return Ok(ExecutorResult {
+                columns,
+                rows,
+                latency_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        // Edge-degree GROUP BY COUNT fast-path: `MATCH (c:Tag)<-[:e]-() RETURN
+        // c.prop, COUNT(*)` — count each group node's edge keys (no EdgeData
+        // decode) instead of traversing+decoding every edge. ORDER BY/LIMIT apply.
+        if let Some((columns, mut rows)) = self.try_edge_degree_group_count(&plan, &space).await? {
             if !plan.order_by.is_empty() {
                 sort_rows_by_order(&mut rows, &columns, &plan.order_by);
             }
@@ -626,6 +648,162 @@ impl MatchExecutor {
                 }
             })
             .collect();
+        Ok(Some((col_names, rows)))
+    }
+
+    /// Fast-path for `MATCH (c:Tag)<-[:etype]-() RETURN c.<prop>, COUNT(*)` and
+    /// the forward `->` form: the per-group count is just how many edge keys
+    /// share the group node's edge prefix
+    /// (`{space}:in-edge:{vid}:{etype}:` / `{space}:edge:{vid}:{etype}:`), so we
+    /// count keys with no `EdgeData` decode and decode only the (few) group-node
+    /// blobs to read `<prop>`. This turns the 33M-edge TOP-category/brand
+    /// aggregation from a multi-minute full traversal into a keys-only count.
+    ///
+    /// Returns `None` (→ normal full traversal) unless the shape qualifies:
+    /// single fixed 1-hop edge, single edge type, directed, **no label/prop on
+    /// the far node** (skipping its decode must be safe), no WHERE/OPTIONAL, and
+    /// RETURN = [start-node PropRef, COUNT(*)] (explicit GROUP BY, if present,
+    /// must equal that PropRef).
+    async fn try_edge_degree_group_count(
+        &self,
+        plan: &crate::plan::MatchPlan,
+        space: &str,
+    ) -> Result<Option<(Vec<String>, Vec<Vec<byoridb_common::Value>>)>> {
+        if plan.where_clause.is_some() || !plan.optional_patterns.is_empty() {
+            return Ok(None);
+        }
+        let flat = flatten_pattern(&plan.pattern)?;
+        if flat.edges.len() != 1 {
+            return Ok(None);
+        }
+        let edge = flat.edges[0];
+        // Fixed single-type edge with no edge-property filter.
+        if edge.range.is_some() || edge.edge_types.len() != 1 || !edge.props.is_empty() {
+            return Ok(None);
+        }
+        let etype = edge.edge_types[0].clone();
+        let reverse = match edge.direction {
+            EdgeDirection::Incoming => true,
+            EdgeDirection::Outgoing => false,
+            // Undirected = out ∪ in; counting both prefixes would double-count.
+            EdgeDirection::Undirected => return Ok(None),
+        };
+        // The far node must carry no filter — we never decode the edge's other
+        // endpoint, so a label/prop there could change the result.
+        let end = flat.nodes[0];
+        if !end.labels.is_empty() || !end.props.is_empty() {
+            return Ok(None);
+        }
+        let start_var = match flat.start.variable.as_deref() {
+            Some(v) => v.to_string(),
+            None => return Ok(None),
+        };
+        let label = match flat.start.labels.first() {
+            Some(l) => l.clone(),
+            None => return Ok(None),
+        };
+        let return_cols = match &plan.return_clause {
+            Some(c) if c.len() == 2 => c,
+            _ => return Ok(None),
+        };
+        if return_cols
+            .iter()
+            .filter(|c| is_aggregate_expr(&c.expression))
+            .count()
+            != 1
+        {
+            return Ok(None);
+        }
+        let non_agg: Vec<_> = return_cols
+            .iter()
+            .filter(|c| !is_aggregate_expr(&c.expression))
+            .collect();
+        if non_agg.len() != 1 {
+            return Ok(None);
+        }
+        let group_expr = non_agg[0].expression.clone();
+        // An explicit GROUP BY must match the grouping column.
+        if let Some(g) = &plan.group_by {
+            if g.len() != 1 || g[0] != group_expr {
+                return Ok(None);
+            }
+        }
+        // Aggregate must be COUNT (SUM/AVG need values we don't read).
+        let agg = return_cols
+            .iter()
+            .find(|c| is_aggregate_expr(&c.expression))
+            .unwrap();
+        if !matches!(&agg.expression, Expression::FunctionCall { name, .. }
+            if name.eq_ignore_ascii_case("COUNT"))
+        {
+            return Ok(None);
+        }
+        // The group expression must reference the start node only (so the blob we
+        // decode per group is the start node, whose vids we enumerate).
+        let refs_start = match &group_expr {
+            Expression::Identifier(v) => v == &start_var,
+            Expression::PropRef { object, .. } => {
+                object == &start_var || object.starts_with(&format!("{}.", start_var))
+            }
+            _ => false,
+        };
+        if !refs_start {
+            return Ok(None);
+        }
+
+        // Enumerate start vids via the tag-vid index ({space}:tagvid:{label}:).
+        let tagvid_prefix = format!("{}:tagvid:{}:", space, label).into_bytes();
+        let tagvid_entries = self.ctx.kvstore.scan_prefix(&tagvid_prefix).await?;
+        if tagvid_entries.is_empty() {
+            // No tag-vid index entries (e.g. legacy data) — fall back so the
+            // full scan can still answer correctly.
+            return Ok(None);
+        }
+
+        let col_names: Vec<String> = return_cols
+            .iter()
+            .map(|c| {
+                c.alias
+                    .clone()
+                    .unwrap_or_else(|| expr_to_col_name(&c.expression))
+            })
+            .collect();
+        let group_is_first = !is_aggregate_expr(&return_cols[0].expression);
+
+        let mut rows: Vec<Vec<byoridb_common::Value>> = Vec::new();
+        for (key, _) in &tagvid_entries {
+            // key = {space}:tagvid:{label}:{vid} — vid is the last segment.
+            let vid = match std::str::from_utf8(key)
+                .ok()
+                .and_then(|s| s.rsplit(':').next())
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                Some(v) => v,
+                None => continue,
+            };
+            let edge_prefix = if reverse {
+                format!("{}:in-edge:{}:{}:", space, vid, etype)
+            } else {
+                format!("{}:edge:{}:{}:", space, vid, etype)
+            };
+            let count = self
+                .ctx
+                .kvstore
+                .count_prefix(edge_prefix.as_bytes())
+                .await?;
+            if count == 0 {
+                continue; // no edges of this type → not interesting for TOP-k
+            }
+            let mut b: HashMap<String, byoridb_common::Value> = HashMap::new();
+            b.insert(start_var.clone(), byoridb_common::Value::Int(vid));
+            let gv = self.eval_return_expr(&group_expr, &b, space).await;
+            let cv = byoridb_common::Value::Int(count as i64);
+            rows.push(if group_is_first {
+                vec![gv, cv]
+            } else {
+                vec![cv, gv]
+            });
+        }
         Ok(Some((col_names, rows)))
     }
 

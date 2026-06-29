@@ -96,6 +96,17 @@ pub trait KVStore: Send + Sync {
         }
         Ok(n)
     }
+
+    /// Count entries under `prefix` **without copying values**. Used by edge
+    /// degree aggregation (`MATCH (c)<-[:e]-() RETURN c, COUNT(*)`), where the
+    /// answer is just how many edge keys share a `{space}:in-edge:{vid}:{etype}:`
+    /// prefix — decoding 33M edge payloads to count them is the whole bottleneck.
+    /// Default streams via `scan_prefix` (copies values); backends override for a
+    /// keys-only range count.
+    async fn count_prefix(&self, prefix: &[u8]) -> Result<u64> {
+        Ok(self.scan_prefix(prefix).await?.len() as u64)
+    }
+
     async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
     /// Batch get multiple keys in a single operation
@@ -407,6 +418,29 @@ impl KVStore for RedbKVStore {
             );
         }
         Ok(total)
+    }
+
+    /// Keys-only prefix count. Iterates `range(prefix..)` over the redb B-tree
+    /// counting keys while they share `prefix`, never touching values. This is
+    /// what makes edge-degree COUNT cheap: ~33M in-edge keys can be counted in
+    /// seconds because no `EdgeData` payload is decoded.
+    async fn count_prefix(&self, prefix: &[u8]) -> Result<u64> {
+        let db = Arc::clone(&self.db);
+        let prefix = prefix.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<u64> {
+            let rtx = db.begin_read()?;
+            let table = rtx.open_table(KV_TABLE)?;
+            let mut n = 0u64;
+            for entry in table.range(prefix.as_slice()..)? {
+                let (k, _) = entry?;
+                if !k.value().starts_with(&prefix) {
+                    break;
+                }
+                n += 1;
+            }
+            Ok(n)
+        })
+        .await?
     }
 
     /// Reads keys in input order under a single snapshot. Misses stay `None`.
@@ -1217,5 +1251,21 @@ mod tests {
             0
         );
         assert_eq!(store.scan_prefix(b"x:").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_count_prefix_counts_only_matching_prefix() {
+        let dir = tempdir().unwrap();
+        let store = RedbKVStore::open(dir.path(), KVStoreOptions::default()).unwrap();
+        for i in 0..7 {
+            store.put(format!("a:{i}").as_bytes(), b"v").await.unwrap();
+        }
+        for i in 0..3 {
+            store.put(format!("b:{i}").as_bytes(), b"v").await.unwrap();
+        }
+        // Counts keys under the prefix without bleeding into a sibling prefix.
+        assert_eq!(store.count_prefix(b"a:").await.unwrap(), 7);
+        assert_eq!(store.count_prefix(b"b:").await.unwrap(), 3);
+        assert_eq!(store.count_prefix(b"absent:").await.unwrap(), 0);
     }
 }
