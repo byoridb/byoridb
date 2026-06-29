@@ -107,6 +107,19 @@ pub trait KVStore: Send + Sync {
         Ok(self.scan_prefix(prefix).await?.len() as u64)
     }
 
+    /// Count many prefixes in **one read transaction**, returning counts in input
+    /// order. Edge-degree aggregation counts thousands of group nodes' prefixes;
+    /// doing each in its own `count_prefix` pays the begin_read + open_table cost
+    /// per node, which dominates. Batching amortizes it to once. Default loops
+    /// `count_prefix`; backends override to share a single snapshot.
+    async fn count_prefixes(&self, prefixes: Vec<Vec<u8>>) -> Result<Vec<u64>> {
+        let mut out = Vec::with_capacity(prefixes.len());
+        for p in &prefixes {
+            out.push(self.count_prefix(p).await?);
+        }
+        Ok(out)
+    }
+
     async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
     /// Batch get multiple keys in a single operation
@@ -439,6 +452,31 @@ impl KVStore for RedbKVStore {
                 n += 1;
             }
             Ok(n)
+        })
+        .await?
+    }
+
+    /// One read snapshot + one table open for the whole batch; each prefix is an
+    /// independent keys-only range count. Amortizes the per-prefix transaction
+    /// overhead that dominates edge-degree aggregation over thousands of nodes.
+    async fn count_prefixes(&self, prefixes: Vec<Vec<u8>>) -> Result<Vec<u64>> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> Result<Vec<u64>> {
+            let rtx = db.begin_read()?;
+            let table = rtx.open_table(KV_TABLE)?;
+            let mut out = Vec::with_capacity(prefixes.len());
+            for prefix in &prefixes {
+                let mut n = 0u64;
+                for entry in table.range(prefix.as_slice()..)? {
+                    let (k, _) = entry?;
+                    if !k.value().starts_with(prefix) {
+                        break;
+                    }
+                    n += 1;
+                }
+                out.push(n);
+            }
+            Ok(out)
         })
         .await?
     }
@@ -1267,5 +1305,23 @@ mod tests {
         assert_eq!(store.count_prefix(b"a:").await.unwrap(), 7);
         assert_eq!(store.count_prefix(b"b:").await.unwrap(), 3);
         assert_eq!(store.count_prefix(b"absent:").await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_count_prefixes_batches_in_one_snapshot() {
+        let dir = tempdir().unwrap();
+        let store = RedbKVStore::open(dir.path(), KVStoreOptions::default()).unwrap();
+        for i in 0..7 {
+            store.put(format!("a:{i}").as_bytes(), b"v").await.unwrap();
+        }
+        for i in 0..3 {
+            store.put(format!("b:{i}").as_bytes(), b"v").await.unwrap();
+        }
+        // Counts returned in input order, matching individual count_prefix.
+        let got = store
+            .count_prefixes(vec![b"a:".to_vec(), b"b:".to_vec(), b"absent:".to_vec()])
+            .await
+            .unwrap();
+        assert_eq!(got, vec![7, 3, 0]);
     }
 }

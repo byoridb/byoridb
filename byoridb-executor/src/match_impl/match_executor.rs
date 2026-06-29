@@ -738,18 +738,16 @@ impl MatchExecutor {
         {
             return Ok(None);
         }
-        // The group expression must reference the start node only (so the blob we
-        // decode per group is the start node, whose vids we enumerate).
-        let refs_start = match &group_expr {
-            Expression::Identifier(v) => v == &start_var,
-            Expression::PropRef { object, .. } => {
-                object == &start_var || object.starts_with(&format!("{}.", start_var))
+        // The group expression must be a property of the start node, so the only
+        // blobs we decode are the (few) group nodes — read in one batch below.
+        let prop_name = match &group_expr {
+            Expression::PropRef { object, prop }
+                if object == &start_var || object.starts_with(&format!("{}.", start_var)) =>
+            {
+                prop.clone()
             }
-            _ => false,
+            _ => return Ok(None),
         };
-        if !refs_start {
-            return Ok(None);
-        }
 
         // Enumerate start vids via the tag-vid index ({space}:tagvid:{label}:).
         let tagvid_prefix = format!("{}:tagvid:{}:", space, label).into_bytes();
@@ -759,6 +757,35 @@ impl MatchExecutor {
             // full scan can still answer correctly.
             return Ok(None);
         }
+        let vids: Vec<i64> = tagvid_entries
+            .iter()
+            .filter_map(|(key, _)| {
+                // key = {space}:tagvid:{label}:{vid} — vid is the last segment.
+                std::str::from_utf8(key)
+                    .ok()
+                    .and_then(|s| s.rsplit(':').next())
+                    .and_then(|s| s.parse::<i64>().ok())
+            })
+            .collect();
+
+        // Two hot reads, each batched into one transaction over all group nodes:
+        // per-node edge counts (keys only) and node blobs (for the group prop).
+        let edge_prefixes: Vec<Vec<u8>> = vids
+            .iter()
+            .map(|&vid| {
+                if reverse {
+                    format!("{}:in-edge:{}:{}:", space, vid, etype).into_bytes()
+                } else {
+                    format!("{}:edge:{}:{}:", space, vid, etype).into_bytes()
+                }
+            })
+            .collect();
+        let counts = self.ctx.kvstore.count_prefixes(edge_prefixes).await?;
+        let vertex_keys: Vec<Vec<u8>> = vids
+            .iter()
+            .map(|&vid| crate::key::SchemaKey::vertex(space, vid))
+            .collect();
+        let blobs = self.ctx.kvstore.batch_get(&vertex_keys).await?;
 
         let col_names: Vec<String> = return_cols
             .iter()
@@ -771,32 +798,14 @@ impl MatchExecutor {
         let group_is_first = !is_aggregate_expr(&return_cols[0].expression);
 
         let mut rows: Vec<Vec<byoridb_common::Value>> = Vec::new();
-        for (key, _) in &tagvid_entries {
-            // key = {space}:tagvid:{label}:{vid} — vid is the last segment.
-            let vid = match std::str::from_utf8(key)
-                .ok()
-                .and_then(|s| s.rsplit(':').next())
-                .and_then(|s| s.parse::<i64>().ok())
-            {
-                Some(v) => v,
-                None => continue,
-            };
-            let edge_prefix = if reverse {
-                format!("{}:in-edge:{}:{}:", space, vid, etype)
-            } else {
-                format!("{}:edge:{}:{}:", space, vid, etype)
-            };
-            let count = self
-                .ctx
-                .kvstore
-                .count_prefix(edge_prefix.as_bytes())
-                .await?;
+        for (i, &count) in counts.iter().enumerate() {
             if count == 0 {
                 continue; // no edges of this type → not interesting for TOP-k
             }
-            let mut b: HashMap<String, byoridb_common::Value> = HashMap::new();
-            b.insert(start_var.clone(), byoridb_common::Value::Int(vid));
-            let gv = self.eval_return_expr(&group_expr, &b, space).await;
+            let gv = match &blobs[i] {
+                Some(blob) => tag_prop_value(blob, &label, &prop_name),
+                None => byoridb_common::Value::Null(byoridb_common::NullType::Null),
+            };
             let cv = byoridb_common::Value::Int(count as i64);
             rows.push(if group_is_first {
                 vec![gv, cv]
@@ -2139,6 +2148,21 @@ fn index_value_to_value(iv: byoridb_storage::key::IndexValue) -> byoridb_common:
         IndexValue::Int(i) => byoridb_common::Value::Int(i),
         IndexValue::Float(f) => byoridb_common::Value::Float(f),
         IndexValue::String(s) => byoridb_common::Value::String(s),
+    }
+}
+
+/// Read one tag's property from a vertex blob (edge-degree fast-path labels each
+/// group by its node's prop). Returns Null if the blob can't decode, the tag is
+/// absent, or the property is unset.
+fn tag_prop_value(blob: &[u8], label: &str, prop: &str) -> byoridb_common::Value {
+    match VertexCodec::decode_vertex(blob) {
+        Ok(v) => v
+            .tags
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(label))
+            .and_then(|t| t.properties.get(prop).cloned())
+            .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null)),
+        Err(_) => byoridb_common::Value::Null(byoridb_common::NullType::Null),
     }
 }
 
