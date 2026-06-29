@@ -51,11 +51,6 @@ pub struct Loader<'a> {
     id_map: HashMap<String, i64>,
     next_vid: i64,
     pending: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Precomputed edge-degree counters accumulated across all edge files:
-    /// (etype, dst) -> in-degree, (etype, src) -> out-degree. Flushed in finish.
-    /// Keyed by (etype, vid) so memory is O(distinct nodes with edges).
-    deg_in: HashMap<(String, i64), i64>,
-    deg_out: HashMap<(String, i64), i64>,
     stats: LoaderStats,
 }
 
@@ -67,8 +62,6 @@ impl<'a> Loader<'a> {
             id_map: HashMap::new(),
             next_vid: 1, // vids start at 1; 0 is the proto/codec default sentinel
             pending: Vec::new(),
-            deg_in: HashMap::new(),
-            deg_out: HashMap::new(),
             stats: LoaderStats::default(),
         }
     }
@@ -285,14 +278,6 @@ impl<'a> Loader<'a> {
                 key::in_edge_data(&self.cfg.space, dst_vid, edge_type, src_vid, ranking),
                 blob,
             );
-            *self
-                .deg_in
-                .entry((edge_type.to_string(), dst_vid))
-                .or_insert(0) += 1;
-            *self
-                .deg_out
-                .entry((edge_type.to_string(), src_vid))
-                .or_insert(0) += 1;
             self.stats.edges += 1;
             self.maybe_flush().await?;
         }
@@ -300,41 +285,16 @@ impl<'a> Loader<'a> {
         Ok(())
     }
 
-    /// Flush accumulated degree counters as i64-LE KV entries. New-load values
-    /// (no prior counter), so a plain set is correct. Called by `finish`.
-    async fn flush_degree_counters(&mut self) -> Result<()> {
-        let space = self.cfg.space.clone();
-        let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for ((etype, dst), n) in &self.deg_in {
-            batch.push((
-                key::indeg_counter(&space, etype, *dst),
-                key::encode_count(*n),
-            ));
-        }
-        for ((etype, src), n) in &self.deg_out {
-            batch.push((
-                key::outdeg_counter(&space, etype, *src),
-                key::encode_count(*n),
-            ));
-        }
-        for chunk in batch.chunks(self.cfg.batch_size.max(1)) {
-            self.store
-                .batch_put(chunk.to_vec())
-                .await
-                .map_err(|e| anyhow!("degree counter batch_put failed: {e}"))?;
-        }
-        Ok(())
-    }
-
-    /// Flush any remaining batch and force a durable (fsync) checkpoint so the
-    /// relaxed-durability commits are guaranteed on disk before exit.
+    /// Flush remaining edges/vertices, then build degree counters by streaming
+    /// the just-loaded edges (memory-O(1), same path as `--backfill-degree`).
+    /// We do NOT accumulate a per-node degree map during the load — at full
+    /// scale that map is hundreds of millions of entries (same_as alone has 33M
+    /// distinct sku dsts) and OOMs. Finally checkpoint so the next open is clean.
     pub async fn finish(mut self) -> Result<LoaderStats> {
         self.flush().await?;
-        self.flush_degree_counters().await?;
-        self.store
-            .checkpoint()
-            .await
-            .map_err(|e| anyhow!("final checkpoint failed: {e}"))?;
+        // backfill_degree_counters streams in-edge/edge (sorted) → counters, and
+        // issues the final durable checkpoint itself.
+        backfill_degree_counters(self.store, &self.cfg.space).await?;
         Ok(self.stats)
     }
 }
