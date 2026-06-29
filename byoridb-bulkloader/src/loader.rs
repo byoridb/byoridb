@@ -13,6 +13,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use byoridb_codec::vertex::{EdgeData, TagData, VertexCodec, VertexData};
 use byoridb_kvstore::{KVStore, RedbKVStore};
 use flate2::read::GzDecoder;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
@@ -50,6 +51,11 @@ pub struct Loader<'a> {
     id_map: HashMap<String, i64>,
     next_vid: i64,
     pending: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Precomputed edge-degree counters accumulated across all edge files:
+    /// (etype, dst) -> in-degree, (etype, src) -> out-degree. Flushed in finish.
+    /// Keyed by (etype, vid) so memory is O(distinct nodes with edges).
+    deg_in: HashMap<(String, i64), i64>,
+    deg_out: HashMap<(String, i64), i64>,
     stats: LoaderStats,
 }
 
@@ -61,6 +67,8 @@ impl<'a> Loader<'a> {
             id_map: HashMap::new(),
             next_vid: 1, // vids start at 1; 0 is the proto/codec default sentinel
             pending: Vec::new(),
+            deg_in: HashMap::new(),
+            deg_out: HashMap::new(),
             stats: LoaderStats::default(),
         }
     }
@@ -277,6 +285,14 @@ impl<'a> Loader<'a> {
                 key::in_edge_data(&self.cfg.space, dst_vid, edge_type, src_vid, ranking),
                 blob,
             );
+            *self
+                .deg_in
+                .entry((edge_type.to_string(), dst_vid))
+                .or_insert(0) += 1;
+            *self
+                .deg_out
+                .entry((edge_type.to_string(), src_vid))
+                .or_insert(0) += 1;
             self.stats.edges += 1;
             self.maybe_flush().await?;
         }
@@ -284,16 +300,110 @@ impl<'a> Loader<'a> {
         Ok(())
     }
 
+    /// Flush accumulated degree counters as i64-LE KV entries. New-load values
+    /// (no prior counter), so a plain set is correct. Called by `finish`.
+    async fn flush_degree_counters(&mut self) -> Result<()> {
+        let space = self.cfg.space.clone();
+        let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for ((etype, dst), n) in &self.deg_in {
+            batch.push((
+                key::indeg_counter(&space, etype, *dst),
+                key::encode_count(*n),
+            ));
+        }
+        for ((etype, src), n) in &self.deg_out {
+            batch.push((
+                key::outdeg_counter(&space, etype, *src),
+                key::encode_count(*n),
+            ));
+        }
+        for chunk in batch.chunks(self.cfg.batch_size.max(1)) {
+            self.store
+                .batch_put(chunk.to_vec())
+                .await
+                .map_err(|e| anyhow!("degree counter batch_put failed: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Flush any remaining batch and force a durable (fsync) checkpoint so the
     /// relaxed-durability commits are guaranteed on disk before exit.
     pub async fn finish(mut self) -> Result<LoaderStats> {
         self.flush().await?;
+        self.flush_degree_counters().await?;
         self.store
             .checkpoint()
             .await
             .map_err(|e| anyhow!("final checkpoint failed: {e}"))?;
         Ok(self.stats)
     }
+}
+
+/// Backfill edge-degree counters for an already-loaded space (loaded before
+/// counters existed). Scans every forward edge key `{space}:edge:{src}:{etype}:
+/// {dst}:{ranking}`, tallies in/out degree per (etype, vid), and writes the
+/// counters. One full edge scan; safe to re-run (set, not increment). Returns
+/// (edges_scanned, counters_written).
+pub async fn backfill_degree_counters(store: &RedbKVStore, space: &str) -> Result<(u64, usize)> {
+    let prefix = key::edge_prefix(space);
+    let prefix_str =
+        String::from_utf8(prefix.clone()).map_err(|e| anyhow!("prefix not utf8: {e}"))?;
+    let mut stream = store
+        .scan_stream(&prefix)
+        .await
+        .map_err(|e| anyhow!("scan_stream: {e}"))?;
+    let mut deg_in: HashMap<(String, i64), i64> = HashMap::new();
+    let mut deg_out: HashMap<(String, i64), i64> = HashMap::new();
+    let mut edges = 0u64;
+    while let Some(item) = stream.next().await {
+        let (k, _) = item.map_err(|e| anyhow!("scan item: {e}"))?;
+        let Ok(s) = std::str::from_utf8(&k) else {
+            continue;
+        };
+        let Some(rest) = s.strip_prefix(&prefix_str) else {
+            continue;
+        };
+        // rest = {src}:{etype}:{dst}:{ranking} (etype is an identifier, no colon)
+        let parts: Vec<&str> = rest.split(':').collect();
+        if parts.len() != 4 {
+            continue;
+        }
+        let (Ok(src), Ok(dst)) = (parts[0].parse::<i64>(), parts[2].parse::<i64>()) else {
+            continue;
+        };
+        let etype = parts[1];
+        *deg_in.entry((etype.to_string(), dst)).or_insert(0) += 1;
+        *deg_out.entry((etype.to_string(), src)).or_insert(0) += 1;
+        edges += 1;
+        if edges % 5_000_000 == 0 {
+            tracing::info!(edges, "backfill: scanning edges");
+        }
+    }
+    let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for ((etype, dst), n) in &deg_in {
+        batch.push((
+            key::indeg_counter(space, etype, *dst),
+            key::encode_count(*n),
+        ));
+    }
+    for ((etype, src), n) in &deg_out {
+        batch.push((
+            key::outdeg_counter(space, etype, *src),
+            key::encode_count(*n),
+        ));
+    }
+    let written = batch.len();
+    for chunk in batch.chunks(100_000) {
+        store
+            .batch_put(chunk.to_vec())
+            .await
+            .map_err(|e| anyhow!("counter batch_put: {e}"))?;
+    }
+    store
+        .checkpoint()
+        .await
+        .map_err(|e| anyhow!("checkpoint: {e}"))?;
+    Ok((edges, written))
 }
 
 /// Open a CSV reader, transparently gunzipping `.gz` files.

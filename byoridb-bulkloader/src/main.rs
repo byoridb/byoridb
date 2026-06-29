@@ -92,6 +92,12 @@ struct Args {
     /// Scans the whole keyspace — use only for small/medium loads.
     #[arg(long)]
     verify: bool,
+
+    /// Backfill edge-degree counters for an already-loaded space, then exit (no
+    /// node/edge loading). One full edge scan → {space}:indeg/outdeg counters.
+    /// For data loaded before counters existed; safe to re-run.
+    #[arg(long)]
+    backfill_degree: bool,
 }
 
 fn parse_assignment(s: &str) -> std::result::Result<(String, PathBuf), String> {
@@ -115,8 +121,8 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    if args.nodes.is_empty() && args.edges.is_empty() {
-        bail!("nothing to load: pass at least one --node or --edge");
+    if !args.backfill_degree && args.nodes.is_empty() && args.edges.is_empty() {
+        bail!("nothing to load: pass at least one --node or --edge (or --backfill-degree)");
     }
 
     let use_fsync = match args.durability.as_str() {
@@ -147,6 +153,14 @@ async fn main() -> Result<()> {
              then stop the server and re-run the loader",
             args.space
         );
+    }
+
+    // Backfill mode: tally existing edges into degree counters and exit.
+    if args.backfill_degree {
+        tracing::info!(space = %args.space, "backfilling edge-degree counters");
+        let (edges, counters) = loader::backfill_degree_counters(&store, &args.space).await?;
+        tracing::info!(edges, counters, "degree backfill complete");
+        return Ok(());
     }
 
     let cfg = LoaderConfig {

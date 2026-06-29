@@ -73,3 +73,19 @@ pub fn edge_prefix(space: &str) -> Vec<u8> {
 pub fn in_edge_prefix(space: &str) -> Vec<u8> {
     format!("{}:in-edge:", space).into_bytes()
 }
+
+/// `{space}:indeg:{etype}:{dst}` — precomputed in-degree counter (i64-LE value).
+/// Must match `byoridb_executor::SchemaKey::indeg_counter` (key-parity tested).
+pub fn indeg_counter(space: &str, etype: &str, dst: i64) -> Vec<u8> {
+    format!("{}:indeg:{}:{}", space, etype, dst).into_bytes()
+}
+
+/// `{space}:outdeg:{etype}:{src}` — precomputed out-degree counter (i64-LE value).
+pub fn outdeg_counter(space: &str, etype: &str, src: i64) -> Vec<u8> {
+    format!("{}:outdeg:{}:{}", space, etype, src).into_bytes()
+}
+
+/// Encode a degree counter value (8-byte little-endian).
+pub fn encode_count(n: i64) -> Vec<u8> {
+    n.to_le_bytes().to_vec()
+}

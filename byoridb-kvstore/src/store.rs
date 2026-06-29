@@ -5,7 +5,7 @@
 use crate::error::Result;
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
-use redb::{Builder, Database, Durability, ReadableDatabase, TableDefinition};
+use redb::{Builder, Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -118,6 +118,29 @@ pub trait KVStore: Send + Sync {
             out.push(self.count_prefix(p).await?);
         }
         Ok(out)
+    }
+
+    /// Atomically add signed deltas to i64-LE counter values in **one write
+    /// transaction** (read-modify-write under a single writer → no lost updates).
+    /// Missing keys start at 0; a resulting count ≤ 0 removes the key (degree
+    /// counters never go negative). Used to maintain edge-degree counters on
+    /// INSERT/DELETE EDGE. Default loops get/put (fine for in-memory backends).
+    async fn add_counters(&self, deltas: Vec<(Vec<u8>, i64)>) -> Result<()> {
+        for (key, delta) in deltas {
+            let cur = self
+                .get(&key)
+                .await?
+                .and_then(|b| b.get(..8).and_then(|s| s.try_into().ok()))
+                .map(i64::from_le_bytes)
+                .unwrap_or(0);
+            let new = cur + delta;
+            if new <= 0 {
+                self.delete(&key).await?;
+            } else {
+                self.put(&key, &new.to_le_bytes()).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
@@ -477,6 +500,37 @@ impl KVStore for RedbKVStore {
                 out.push(n);
             }
             Ok(out)
+        })
+        .await?
+    }
+
+    /// Atomic counter increments in one write transaction: read each key, add the
+    /// delta, and insert (or remove when ≤ 0) — all under redb's single writer, so
+    /// concurrent INSERT/DELETE EDGE can't lose updates.
+    async fn add_counters(&self, deltas: Vec<(Vec<u8>, i64)>) -> Result<()> {
+        let db = Arc::clone(&self.db);
+        let durability = self.next_durability();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut wtx = db.begin_write()?;
+            wtx.set_durability(durability)?;
+            {
+                let mut table = wtx.open_table(KV_TABLE)?;
+                for (key, delta) in &deltas {
+                    let cur = table
+                        .get(key.as_slice())?
+                        .and_then(|g| g.value().get(..8).and_then(|s| s.try_into().ok()))
+                        .map(i64::from_le_bytes)
+                        .unwrap_or(0);
+                    let new = cur + delta;
+                    if new <= 0 {
+                        table.remove(key.as_slice())?;
+                    } else {
+                        table.insert(key.as_slice(), new.to_le_bytes().as_slice())?;
+                    }
+                }
+            }
+            wtx.commit()?;
+            Ok(())
         })
         .await?
     }
@@ -1323,5 +1377,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, vec![7, 3, 0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_counters_increment_decrement_and_remove() {
+        let dir = tempdir().unwrap();
+        let store = RedbKVStore::open(dir.path(), KVStoreOptions::default()).unwrap();
+        let dec = |b: Option<Vec<u8>>| -> i64 {
+            b.and_then(|x| x.get(..8).and_then(|s| s.try_into().ok()))
+                .map(i64::from_le_bytes)
+                .unwrap_or(0)
+        };
+        // Fresh keys start at 0.
+        store
+            .add_counters(vec![(b"a".to_vec(), 5), (b"b".to_vec(), 3)])
+            .await
+            .unwrap();
+        assert_eq!(dec(store.get(b"a").await.unwrap()), 5);
+        assert_eq!(dec(store.get(b"b").await.unwrap()), 3);
+        // Decrement; b hits 0 and is removed (counters never go negative).
+        store
+            .add_counters(vec![(b"a".to_vec(), -2), (b"b".to_vec(), -3)])
+            .await
+            .unwrap();
+        assert_eq!(dec(store.get(b"a").await.unwrap()), 3);
+        assert!(store.get(b"b").await.unwrap().is_none());
     }
 }

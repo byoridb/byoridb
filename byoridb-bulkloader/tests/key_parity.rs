@@ -52,6 +52,21 @@ fn metadata_keys_match_engine() {
 }
 
 #[test]
+fn degree_counter_keys_match_engine() {
+    assert_eq!(
+        key::indeg_counter("nexprice", "in_category", 42),
+        SchemaKey::indeg_counter("nexprice", "in_category", 42)
+    );
+    assert_eq!(
+        key::outdeg_counter("nexprice", "has_brand", 7),
+        SchemaKey::outdeg_counter("nexprice", "has_brand", 7)
+    );
+    // Counter value encoding must match (both i64 little-endian).
+    assert_eq!(key::encode_count(123), SchemaKey::encode_count(123));
+    assert_eq!(SchemaKey::decode_count(&key::encode_count(123)), Some(123));
+}
+
+#[test]
 fn count_prefixes_are_correct_for_negative_vids_too() {
     // Sanity: prefix is a literal cut, so a vertex key always starts with it.
     assert!(key::vertex("s", 7).starts_with(&key::vertex_prefix("s")));

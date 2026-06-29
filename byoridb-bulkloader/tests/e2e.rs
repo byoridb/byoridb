@@ -132,6 +132,35 @@ async fn loads_nodes_edges_with_full_kv_set() {
         (e.src_vid, e.dst_vid, e.edge_type.as_str()),
         (1, 2, "same_as")
     );
+
+    // Degree counters the loader wrote (i64-LE). same_as: 1->2, 2->3 so
+    // in-degree of 2 and 3 is 1 each; out-degree of 1 and 2 is 1 each.
+    let dec = |b: Option<Vec<u8>>| -> i64 {
+        b.and_then(|x| x.get(..8).and_then(|s| s.try_into().ok()))
+            .map(i64::from_le_bytes)
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        dec(store
+            .get(&key::indeg_counter("s", "same_as", 2))
+            .await
+            .unwrap()),
+        1
+    );
+    assert_eq!(
+        dec(store
+            .get(&key::indeg_counter("s", "same_as", 3))
+            .await
+            .unwrap()),
+        1
+    );
+    assert_eq!(
+        dec(store
+            .get(&key::outdeg_counter("s", "same_as", 1))
+            .await
+            .unwrap()),
+        1
+    );
 }
 
 #[tokio::test]

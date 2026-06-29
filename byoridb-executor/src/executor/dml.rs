@@ -153,6 +153,12 @@ impl Executor {
                 let mut inserted = 0i64;
                 // Asserted triples to feed ontology materialization (O-5) after commit.
                 let mut new_triples: Vec<(i64, String, i64)> = Vec::new();
+                // Edge-degree counters (precomputed COUNT): accumulate per
+                // (etype, vid) so multi-row INSERT sums in one increment.
+                let mut deg_in: std::collections::HashMap<(String, i64), i64> =
+                    std::collections::HashMap::new();
+                let mut deg_out: std::collections::HashMap<(String, i64), i64> =
+                    std::collections::HashMap::new();
                 for edge in edges {
                     // Schema validation: verify edge type and its fields exist
                     let edge_type_name = edge.edge_type.clone();
@@ -211,10 +217,31 @@ impl Executor {
                         batch.push((idx_key, Vec::new()));
                     }
                     new_triples.push((edge.src, edge_type_name.clone(), edge.dst));
+                    *deg_in
+                        .entry((edge_type_name.clone(), edge.dst))
+                        .or_insert(0) += 1;
+                    *deg_out
+                        .entry((edge_type_name.clone(), edge.src))
+                        .or_insert(0) += 1;
                     inserted += 1;
                 }
                 if !batch.is_empty() {
                     self.ctx.kvstore.batch_put(batch).await?;
+                }
+                // Maintain edge-degree counters for the asserted edges (used by
+                // the COUNT fast-path). Atomic increment so concurrent inserts
+                // don't lose updates.
+                let counter_deltas: Vec<(Vec<u8>, i64)> = deg_in
+                    .iter()
+                    .map(|((et, dst), d)| {
+                        (SchemaKey::indeg_counter(&effective_space, et, *dst), *d)
+                    })
+                    .chain(deg_out.iter().map(|((et, src), d)| {
+                        (SchemaKey::outdeg_counter(&effective_space, et, *src), *d)
+                    }))
+                    .collect();
+                if !counter_deltas.is_empty() {
+                    self.ctx.kvstore.add_counters(counter_deltas).await?;
                 }
                 // owl:sameAs node-equivalence merge (O-8): collapse equivalence
                 // classes onto a canonical representative *before* O-5 so
@@ -524,6 +551,11 @@ impl Executor {
         }
 
         let mut deleted = 0i64;
+        // Edge-degree counter decrements for edges that actually existed.
+        let mut deg_in: std::collections::HashMap<(String, i64), i64> =
+            std::collections::HashMap::new();
+        let mut deg_out: std::collections::HashMap<(String, i64), i64> =
+            std::collections::HashMap::new();
         for (src, dst, ranking) in &plan.edge_refs {
             // Key format: {space}:edge:{src}:{edge_type}:{dst}:{ranking}
             let key = format!(
@@ -541,8 +573,22 @@ impl Executor {
                     *ranking,
                 );
                 self.ctx.kvstore.delete(&in_edge_key).await?;
+                *deg_in.entry((plan.edge_name.clone(), *dst)).or_insert(0) -= 1;
+                *deg_out.entry((plan.edge_name.clone(), *src)).or_insert(0) -= 1;
                 deleted += 1;
             }
+        }
+        // Apply the degree-counter decrements (atomic; ≤0 removes the key).
+        let counter_deltas: Vec<(Vec<u8>, i64)> =
+            deg_in
+                .iter()
+                .map(|((et, dst), d)| (SchemaKey::indeg_counter(&effective_space, et, *dst), *d))
+                .chain(deg_out.iter().map(|((et, src), d)| {
+                    (SchemaKey::outdeg_counter(&effective_space, et, *src), *d)
+                }))
+                .collect();
+        if !counter_deltas.is_empty() {
+            self.ctx.kvstore.add_counters(counter_deltas).await?;
         }
 
         // O-9 retraction: re-materialize the ontology closure so entailments

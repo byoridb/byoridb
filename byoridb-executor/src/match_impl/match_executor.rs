@@ -768,19 +768,62 @@ impl MatchExecutor {
             })
             .collect();
 
-        // Two hot reads, each batched into one transaction over all group nodes:
-        // per-node edge counts (keys only) and node blobs (for the group prop).
-        let edge_prefixes: Vec<Vec<u8>> = vids
-            .iter()
-            .map(|&vid| {
-                if reverse {
-                    format!("{}:in-edge:{}:{}:", space, vid, etype).into_bytes()
+        // Counts per group node. Prefer precomputed degree counters — a single
+        // batch_get instead of scanning 33M edge keys. Only trust them when the
+        // space declares no semantics (counters track asserted edges only, so an
+        // inferred-edge space would undercount) and they're actually present
+        // (a not-yet-backfilled space has none → prefix-count). Otherwise fall
+        // back to the keys-only prefix count (correct, slower).
+        let counts: Vec<u64> = {
+            let counter_usable = !self.space_has_semantics(space).await?;
+            let from_counter = if counter_usable {
+                let counter_keys: Vec<Vec<u8>> = vids
+                    .iter()
+                    .map(|&vid| {
+                        if reverse {
+                            crate::key::SchemaKey::indeg_counter(space, &etype, vid)
+                        } else {
+                            crate::key::SchemaKey::outdeg_counter(space, &etype, vid)
+                        }
+                    })
+                    .collect();
+                let cblobs = self.ctx.kvstore.batch_get(&counter_keys).await?;
+                if cblobs.iter().any(|b| b.is_some()) {
+                    Some(
+                        cblobs
+                            .iter()
+                            .map(|b| {
+                                b.as_ref()
+                                    .and_then(|x| crate::key::SchemaKey::decode_count(x))
+                                    .filter(|&c| c > 0)
+                                    .map(|c| c as u64)
+                                    .unwrap_or(0)
+                            })
+                            .collect(),
+                    )
                 } else {
-                    format!("{}:edge:{}:{}:", space, vid, etype).into_bytes()
+                    None
                 }
-            })
-            .collect();
-        let counts = self.ctx.kvstore.count_prefixes(edge_prefixes).await?;
+            } else {
+                None
+            };
+            match from_counter {
+                Some(c) => c,
+                None => {
+                    let edge_prefixes: Vec<Vec<u8>> = vids
+                        .iter()
+                        .map(|&vid| {
+                            if reverse {
+                                format!("{}:in-edge:{}:{}:", space, vid, etype).into_bytes()
+                            } else {
+                                format!("{}:edge:{}:{}:", space, vid, etype).into_bytes()
+                            }
+                        })
+                        .collect();
+                    self.ctx.kvstore.count_prefixes(edge_prefixes).await?
+                }
+            }
+        };
         let vertex_keys: Vec<Vec<u8>> = vids
             .iter()
             .map(|&vid| crate::key::SchemaKey::vertex(space, vid))
@@ -814,6 +857,24 @@ impl MatchExecutor {
             });
         }
         Ok(Some((col_names, rows)))
+    }
+
+    /// True if any edge type in the space declares semantic flags (transitive /
+    /// inverseOf / subPropertyOf / domain / range). Degree counters track only
+    /// asserted edges, so the counter fast-path must defer to the prefix-count
+    /// path where inference would add edges. Cheap — edge schemas number in the
+    /// dozens.
+    async fn space_has_semantics(&self, space: &str) -> Result<bool> {
+        let prefix = format!("space:{}:edge:", space).into_bytes();
+        let entries = self.ctx.kvstore.scan_prefix(&prefix).await?;
+        for (_, v) in &entries {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
+                if json.get("semantics").is_some() {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     async fn try_execute_simple_count(

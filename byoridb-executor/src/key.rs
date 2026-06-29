@@ -242,6 +242,32 @@ impl SchemaKey {
     pub fn next_space_id_key() -> Vec<u8> {
         b"__meta:next_space_id".to_vec()
     }
+
+    // ===== Edge degree counters (precomputed GROUP BY COUNT) =====
+
+    /// In-degree counter: `{space}:indeg:{etype}:{dst}` → i64-LE count of edges
+    /// of `etype` pointing into `dst`. Maintained by INSERT/DELETE EDGE and the
+    /// bulk loader so `MATCH (d)<-[:etype]-() RETURN d, COUNT(*)` reads counters
+    /// instead of scanning every edge.
+    pub fn indeg_counter(space: &str, etype: &str, dst: i64) -> Vec<u8> {
+        format!("{}:indeg:{}:{}", space, etype, dst).into_bytes()
+    }
+
+    /// Out-degree counter: `{space}:outdeg:{etype}:{src}` → i64-LE count.
+    pub fn outdeg_counter(space: &str, etype: &str, src: i64) -> Vec<u8> {
+        format!("{}:outdeg:{}:{}", space, etype, src).into_bytes()
+    }
+
+    /// Encode a degree counter value (8-byte little-endian, matching the
+    /// `encode_repr` convention).
+    pub fn encode_count(n: i64) -> Vec<u8> {
+        n.to_le_bytes().to_vec()
+    }
+
+    /// Decode a degree counter value written by [`encode_count`].
+    pub fn decode_count(bytes: &[u8]) -> Option<i64> {
+        bytes.try_into().ok().map(i64::from_le_bytes)
+    }
 }
 
 #[cfg(test)]
