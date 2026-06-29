@@ -340,21 +340,50 @@ impl<'a> Loader<'a> {
 }
 
 /// Backfill edge-degree counters for an already-loaded space (loaded before
-/// counters existed). Scans every forward edge key `{space}:edge:{src}:{etype}:
-/// {dst}:{ranking}`, tallies in/out degree per (etype, vid), and writes the
-/// counters. One full edge scan; safe to re-run (set, not increment). Returns
+/// counters existed). **Memory-O(1) streaming**: the in-edge keyspace is sorted
+/// by dst and the edge keyspace by src, so each `(vid, etype)` group is a
+/// contiguous run — we tally a run and emit its counter as the next run starts,
+/// never materializing a per-node map (the HashMap approach OOMed on same_as's
+/// 33M distinct sku dsts). Indeg from `{space}:in-edge:`, outdeg from
+/// `{space}:edge:`. Safe to re-run (set, not increment). Returns
 /// (edges_scanned, counters_written).
 pub async fn backfill_degree_counters(store: &RedbKVStore, space: &str) -> Result<(u64, usize)> {
-    let prefix = key::edge_prefix(space);
+    // in-edge key: {space}:in-edge:{dst}:{etype}:{src}:{ranking} → group by dst.
+    let (in_edges, indeg) =
+        stream_degree_counters(store, &key::in_edge_prefix(space), space, true).await?;
+    // edge key: {space}:edge:{src}:{etype}:{dst}:{ranking} → group by src.
+    let (_out_edges, outdeg) =
+        stream_degree_counters(store, &key::edge_prefix(space), space, false).await?;
+    store
+        .checkpoint()
+        .await
+        .map_err(|e| anyhow!("checkpoint: {e}"))?;
+    Ok((in_edges, indeg + outdeg))
+}
+
+/// Scan a sorted edge keyspace and write one degree counter per contiguous
+/// `(vid, etype)` run. `is_in` selects in-edge (group by dst → indeg) vs edge
+/// (group by src → outdeg); in both, the grouping vid is the first path segment.
+/// Returns (edges_scanned, counters_written).
+async fn stream_degree_counters(
+    store: &RedbKVStore,
+    prefix: &[u8],
+    space: &str,
+    is_in: bool,
+) -> Result<(u64, usize)> {
     let prefix_str =
-        String::from_utf8(prefix.clone()).map_err(|e| anyhow!("prefix not utf8: {e}"))?;
+        String::from_utf8(prefix.to_vec()).map_err(|e| anyhow!("prefix not utf8: {e}"))?;
     let mut stream = store
-        .scan_stream(&prefix)
+        .scan_stream(prefix)
         .await
         .map_err(|e| anyhow!("scan_stream: {e}"))?;
-    let mut deg_in: HashMap<(String, i64), i64> = HashMap::new();
-    let mut deg_out: HashMap<(String, i64), i64> = HashMap::new();
     let mut edges = 0u64;
+    let mut written = 0usize;
+    let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    // Current run: (etype, vid) and its running count.
+    let mut cur: Option<(String, i64)> = None;
+    let mut count = 0i64;
+
     while let Some(item) = stream.next().await {
         let (k, _) = item.map_err(|e| anyhow!("scan item: {e}"))?;
         let Ok(s) = std::str::from_utf8(&k) else {
@@ -363,46 +392,61 @@ pub async fn backfill_degree_counters(store: &RedbKVStore, space: &str) -> Resul
         let Some(rest) = s.strip_prefix(&prefix_str) else {
             continue;
         };
-        // rest = {src}:{etype}:{dst}:{ranking} (etype is an identifier, no colon)
+        // in-edge rest: {dst}:{etype}:{src}:{ranking}; edge rest: {src}:{etype}:{dst}:{ranking}
         let parts: Vec<&str> = rest.split(':').collect();
         if parts.len() != 4 {
             continue;
         }
-        let (Ok(src), Ok(dst)) = (parts[0].parse::<i64>(), parts[2].parse::<i64>()) else {
+        let Ok(vid) = parts[0].parse::<i64>() else {
             continue;
         };
         let etype = parts[1];
-        *deg_in.entry((etype.to_string(), dst)).or_insert(0) += 1;
-        *deg_out.entry((etype.to_string(), src)).or_insert(0) += 1;
         edges += 1;
-        if edges % 5_000_000 == 0 {
-            tracing::info!(edges, "backfill: scanning edges");
+        match &cur {
+            Some((et, v)) if et == etype && *v == vid => count += 1,
+            _ => {
+                if let Some((et, v)) = cur.take() {
+                    let ckey = if is_in {
+                        key::indeg_counter(space, &et, v)
+                    } else {
+                        key::outdeg_counter(space, &et, v)
+                    };
+                    batch.push((ckey, key::encode_count(count)));
+                    if batch.len() >= 100_000 {
+                        written += batch.len();
+                        store
+                            .batch_put(std::mem::take(&mut batch))
+                            .await
+                            .map_err(|e| anyhow!("counter batch_put: {e}"))?;
+                    }
+                }
+                cur = Some((etype.to_string(), vid));
+                count = 1;
+            }
+        }
+        if edges.is_multiple_of(10_000_000) {
+            tracing::info!(
+                edges,
+                kind = if is_in { "indeg" } else { "outdeg" },
+                "backfill scanning"
+            );
         }
     }
-    let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for ((etype, dst), n) in &deg_in {
-        batch.push((
-            key::indeg_counter(space, etype, *dst),
-            key::encode_count(*n),
-        ));
+    if let Some((et, v)) = cur.take() {
+        let ckey = if is_in {
+            key::indeg_counter(space, &et, v)
+        } else {
+            key::outdeg_counter(space, &et, v)
+        };
+        batch.push((ckey, key::encode_count(count)));
     }
-    for ((etype, src), n) in &deg_out {
-        batch.push((
-            key::outdeg_counter(space, etype, *src),
-            key::encode_count(*n),
-        ));
-    }
-    let written = batch.len();
-    for chunk in batch.chunks(100_000) {
+    if !batch.is_empty() {
+        written += batch.len();
         store
-            .batch_put(chunk.to_vec())
+            .batch_put(batch)
             .await
             .map_err(|e| anyhow!("counter batch_put: {e}"))?;
     }
-    store
-        .checkpoint()
-        .await
-        .map_err(|e| anyhow!("checkpoint: {e}"))?;
     Ok((edges, written))
 }
 

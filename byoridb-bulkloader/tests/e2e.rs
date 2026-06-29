@@ -221,3 +221,85 @@ async fn strict_mode_aborts_on_duplicate_id() {
         .unwrap_err();
     assert!(err.to_string().contains("duplicate"));
 }
+
+#[tokio::test]
+async fn backfill_degree_streaming_recomputes_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(dir.path());
+    write_meta(&store).await;
+
+    let node_csv = dir.path().join("sku.csv");
+    std::fs::write(&node_csv, "id,price\nS1,1\nS2,2\nS3,3\n").unwrap();
+    let edge_csv = dir.path().join("same_as.csv");
+    // 1->2, 2->3, 1->3 : S3 in-degree 2 (a contiguous group of 2), S2 in 1;
+    // S1 out 2, S2 out 1.
+    std::fs::write(&edge_csv, "src,dst\nS1,S2\nS2,S3\nS1,S3\n").unwrap();
+
+    let mut ldr = Loader::new(&store, cfg());
+    ldr.load_node_file("sku", &node_csv, &ColumnTypes::new())
+        .await
+        .unwrap();
+    ldr.load_edge_file("same_as", &edge_csv, &ColumnTypes::new())
+        .await
+        .unwrap();
+    ldr.finish().await.unwrap();
+
+    let dec = |b: Option<Vec<u8>>| -> i64 {
+        b.and_then(|x| x.get(..8).and_then(|s| s.try_into().ok()))
+            .map(i64::from_le_bytes)
+            .unwrap_or(0)
+    };
+
+    // Wipe the counters the loader wrote, then rebuild them via the streaming
+    // backfill and confirm it recomputes the same values (esp. S3 indeg = 2).
+    for k in [
+        key::indeg_counter("s", "same_as", 2),
+        key::indeg_counter("s", "same_as", 3),
+        key::outdeg_counter("s", "same_as", 1),
+        key::outdeg_counter("s", "same_as", 2),
+    ] {
+        store.delete(&k).await.unwrap();
+    }
+    assert_eq!(
+        dec(store
+            .get(&key::indeg_counter("s", "same_as", 3))
+            .await
+            .unwrap()),
+        0
+    );
+
+    let (in_edges, written) = byoridb_bulkloader::loader::backfill_degree_counters(&store, "s")
+        .await
+        .unwrap();
+    assert_eq!(in_edges, 3, "scanned 3 in-edges in the indeg pass");
+    // indeg{2,3} (2 counters) + outdeg{1,2} (2 counters) = 4.
+    assert_eq!(written, 4, "indeg(2,3) + outdeg(1,2) counters written");
+    assert_eq!(
+        dec(store
+            .get(&key::indeg_counter("s", "same_as", 3))
+            .await
+            .unwrap()),
+        2
+    );
+    assert_eq!(
+        dec(store
+            .get(&key::indeg_counter("s", "same_as", 2))
+            .await
+            .unwrap()),
+        1
+    );
+    assert_eq!(
+        dec(store
+            .get(&key::outdeg_counter("s", "same_as", 1))
+            .await
+            .unwrap()),
+        2
+    );
+    assert_eq!(
+        dec(store
+            .get(&key::outdeg_counter("s", "same_as", 2))
+            .await
+            .unwrap()),
+        1
+    );
+}
