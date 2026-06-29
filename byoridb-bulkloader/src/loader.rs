@@ -289,7 +289,7 @@ impl<'a> Loader<'a> {
     pub async fn finish(mut self) -> Result<LoaderStats> {
         self.flush().await?;
         self.store
-            .force_checkpoint()
+            .checkpoint()
             .await
             .map_err(|e| anyhow!("final checkpoint failed: {e}"))?;
         Ok(self.stats)

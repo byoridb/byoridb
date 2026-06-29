@@ -8,7 +8,7 @@ use super::env::{StorageEnv, StorageEnvConfig};
 use super::error::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{error, info};
 
 /// Storage server status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +55,19 @@ impl StorageServer {
         info!("Stopping storage server");
 
         *self.status.write().await = ServerStatus::Stopped;
+
+        // Cleanly checkpoint redb BEFORE dropping the env, so the next open()
+        // finds a clean shutdown and skips the multi-minute full repair. Relying
+        // on Drop is not enough: the KVStore is shared via Arc, so `env = None`
+        // may not actually drop the Database, and even then Drop does not
+        // guarantee the 2-phase allocator-state commit redb needs to mark clean.
+        if let Some(env) = &self.env {
+            if let Err(e) = env.kvstore.checkpoint().await {
+                error!("redb checkpoint on shutdown failed: {e}");
+            } else {
+                info!("redb checkpointed (clean shutdown — next open skips repair)");
+            }
+        }
         self.env = None;
 
         info!("Storage server stopped");

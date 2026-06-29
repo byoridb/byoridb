@@ -240,7 +240,9 @@ async fn main() -> anyhow::Result<()> {
         warn!("HTTP Service shutdown timed out");
     }
 
-    // Stop storage server (this syncs WAL)
+    // Stop storage server. This checkpoints redb (2-phase Immediate commit) so
+    // the next startup finds a clean shutdown and skips the full-repair scan,
+    // which on a large dataset takes many minutes (2026-06-26 incident).
     info!("Stopping Storage Server...");
     if let Err(e) = storage_server.stop().await {
         error!("Error stopping storage server: {}", e);

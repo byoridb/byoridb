@@ -64,6 +64,19 @@ pub trait KVStore: Send + Sync {
     /// Delete many keys in a single transaction (missing keys are ignored).
     async fn batch_delete(&self, keys: Vec<Vec<u8>>) -> Result<()>;
 
+    /// Force a durable (fsync, 2-phase) checkpoint so the next `open()` finds a
+    /// clean shutdown and skips the expensive full-repair scan.
+    ///
+    /// redb's `open()` runs a full repair (3 scans of the file) whenever the
+    /// last transaction wasn't a 2-phase commit that updated the allocator-state
+    /// table. On a large dataset that repair takes many minutes, so a server
+    /// MUST call this on graceful shutdown (and a bulk loader at the end of a
+    /// relaxed-durability load) to leave the store clean. Default is a no-op for
+    /// backends that are always durable (e.g. in-memory).
+    async fn checkpoint(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Delete every key under `prefix`, in chunks of up to `chunk` keys per
     /// commit. Built for `DROP SPACE` on large keyspaces (tens of millions of
     /// keys): bounds memory and per-transaction work, and never blocks on a
@@ -231,22 +244,6 @@ impl RedbKVStore {
         }
     }
 
-    /// Force a durable (fsync) checkpoint regardless of the relaxed-durability
-    /// setting. Commits an empty write transaction with `Durability::Immediate`,
-    /// which flushes everything written so far to disk. Call this at the end of
-    /// a relaxed-durability bulk load so the final batches are guaranteed
-    /// persisted before the process exits.
-    pub async fn force_checkpoint(&self) -> Result<()> {
-        let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || {
-            let mut wtx = db.begin_write()?;
-            wtx.set_durability(Durability::Immediate)?;
-            wtx.commit()?;
-            Ok(())
-        })
-        .await?
-    }
-
     /// Durability for the next write commit. `Immediate` (fsync) by default;
     /// under relaxed durability, `None` (no fsync) except every Nth commit which
     /// stays `Immediate` as a checkpoint.
@@ -344,6 +341,21 @@ impl KVStore for RedbKVStore {
                     table.remove(key.as_slice())?;
                 }
             }
+            wtx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Commit an empty 2-phase (`Durability::Immediate`) transaction. This
+    /// updates the allocator-state table and fsyncs, marking the store cleanly
+    /// shut down so the next `open()` loads the allocator state directly instead
+    /// of running a full repair (3 file scans). Cheap regardless of dataset size.
+    async fn checkpoint(&self) -> Result<()> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let mut wtx = db.begin_write()?;
+            wtx.set_durability(Durability::Immediate)?;
             wtx.commit()?;
             Ok(())
         })
@@ -1170,6 +1182,29 @@ mod tests {
         assert_eq!(removed, 25);
         assert!(store.scan_prefix(b"a:").await.unwrap().is_empty());
         assert_eq!(store.scan_prefix(b"b:").await.unwrap().len(), 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_succeeds_under_relaxed_and_preserves_data() {
+        // Under relaxed durability (the bulk-load / risky path), checkpoint must
+        // commit cleanly and leave data intact. This is what graceful shutdown
+        // and the loader call to avoid the next open()'s full repair.
+        let dir = tempdir().unwrap();
+        let store = RedbKVStore::open(
+            dir.path(),
+            KVStoreOptions {
+                use_fsync: false,
+                ..KVStoreOptions::default()
+            },
+        )
+        .unwrap();
+        store.put(b"k", b"v").await.unwrap();
+        store.checkpoint().await.unwrap();
+        assert_eq!(store.get(b"k").await.unwrap(), Some(b"v".to_vec()));
+        // Reopening after a checkpoint must still see the data.
+        drop(store);
+        let reopened = RedbKVStore::open(dir.path(), KVStoreOptions::default()).unwrap();
+        assert_eq!(reopened.get(b"k").await.unwrap(), Some(b"v".to_vec()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
