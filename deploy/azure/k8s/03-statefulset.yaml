@@ -20,7 +20,12 @@ spec:
         app.kubernetes.io/component: server
     spec:
       enableServiceLinks: false
-      terminationGracePeriodSeconds: 60
+      # Graceful shutdown must finish the redb checkpoint, or the next open runs
+      # a multi-hour full repair on a large store (2026-06-29 incident: 100GB
+      # redb). The shutdown sequence (drain ~25s + service stop ~30s + redb
+      # checkpoint) overran the old 60s window → SIGKILL → unclean → repair on
+      # every deploy. 300s leaves ample room for the checkpoint to complete.
+      terminationGracePeriodSeconds: 300
       tolerations:
         - key: workload
           operator: Equal
