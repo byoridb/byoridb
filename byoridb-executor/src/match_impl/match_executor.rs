@@ -181,6 +181,11 @@ impl MatchExecutor {
             .await?;
         }
 
+        // OOM guard after the first pattern (its fan-out is bounded by
+        // max_scan_limit, but a high-degree traversal can still accumulate).
+        self.ctx
+            .check_result_budget(binding_rows.len().saturating_mul(BINDING_ROW_EST_BYTES))?;
+
         // Comma-separated multi-patterns: INNER join each additional pattern
         // onto the rows produced by the first pattern. Unlike OPTIONAL MATCH
         // (left join, keeps unmatched rows with NULLs), a required pattern that
@@ -234,6 +239,10 @@ impl MatchExecutor {
                     }
                 }
                 binding_rows = next_rows;
+                // OOM guard: an INNER join can multiply rows — bound the product.
+                self.ctx.check_result_budget(
+                    binding_rows.len().saturating_mul(BINDING_ROW_EST_BYTES),
+                )?;
             }
             if join_profiling {
                 self.ctx.record_profile(
@@ -339,6 +348,10 @@ impl MatchExecutor {
         } else {
             binding_rows
         };
+
+        // OOM guard after OPTIONAL expansion (left join can also grow rows).
+        self.ctx
+            .check_result_budget(binding_rows.len().saturating_mul(BINDING_ROW_EST_BYTES))?;
 
         // Apply WHERE clause against actual vertex properties
         let filtered = if let Some(ref where_expr) = plan.where_clause {
@@ -470,6 +483,10 @@ impl MatchExecutor {
                 )
             } else {
                 let mut projected = Vec::new();
+                // Track the real footprint of projected rows (which can hold
+                // full vertices/edges, unlike the small binding rows) and fail
+                // before the node OOMs. Checked every 16K rows + once at the end.
+                let mut proj_bytes = 0usize;
                 for row_bindings in filtered {
                     let mut row = Vec::new();
                     for col in return_cols {
@@ -478,8 +495,13 @@ impl MatchExecutor {
                             .await;
                         row.push(val);
                     }
+                    proj_bytes += estimate_row_bytes(&row);
                     projected.push(row);
+                    if projected.len().is_multiple_of(16384) {
+                        self.ctx.check_result_budget(proj_bytes)?;
+                    }
                 }
+                self.ctx.check_result_budget(proj_bytes)?;
                 (col_names, projected)
             }
         } else {
@@ -2005,6 +2027,12 @@ impl MatchExecutor {
         Box::pin(async move {
             if edge_idx >= edges.len() {
                 rows.push(bindings.clone());
+                // OOM guard: bound accumulated rows against max_memory_mb.
+                // Checked every 64K rows to keep the per-row cost negligible.
+                if rows.len().is_multiple_of(65536) {
+                    self.ctx
+                        .check_result_budget(rows.len().saturating_mul(BINDING_ROW_EST_BYTES))?;
+                }
                 return Ok(());
             }
 
@@ -2509,4 +2537,36 @@ pub(super) fn json_value_equals(
         (serde_json::Value::String(s), byoridb_common::Value::String(b)) => s == b,
         _ => false,
     }
+}
+
+// ===== Result-memory estimation (max_memory_mb OOM guard) =====
+
+/// Conservative per-binding-row footprint estimate (a `HashMap` plus a few
+/// small values). Binding rows hold variable→vid maps, so this is dominated by
+/// container overhead. Used to bound binding-row accumulation against the
+/// `max_memory_mb` budget before it can OOM the node.
+const BINDING_ROW_EST_BYTES: usize = 256;
+
+/// Cheap, conservative estimate of a projected [`Value`]'s footprint in bytes.
+/// Strings count their length; composite values (vertex/edge/map/list/path/set)
+/// use a flat estimate rather than walking their internals — this is a safety
+/// guard, not exact accounting, so a slight under/overestimate is fine.
+fn estimate_value_bytes(v: &byoridb_common::Value) -> usize {
+    use byoridb_common::Value;
+    match v {
+        Value::String(s) => 24 + s.len(),
+        Value::Edge(_) => 256,
+        Value::Vertex(_)
+        | Value::Path(_)
+        | Value::Map(_)
+        | Value::Set(_)
+        | Value::List(_)
+        | Value::DataSet(_) => 512,
+        _ => 16,
+    }
+}
+
+/// Estimated footprint of one projected output row.
+fn estimate_row_bytes(row: &[byoridb_common::Value]) -> usize {
+    24 + row.iter().map(estimate_value_bytes).sum::<usize>()
 }
