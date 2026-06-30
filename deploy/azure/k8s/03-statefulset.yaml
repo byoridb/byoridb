@@ -66,6 +66,14 @@ spec:
             # 100K sample. Safe on the 128GB node; it's an OOM guard.
             - name: BYORIDB_MAX_SCAN_LIMIT
               value: "10000000"
+            # Per-query result-memory cap. A query that would materialize more
+            # than this (e.g. RETURN n over tens of millions of rows) fails with
+            # ResourceExhausted instead of OOM-killing the node (which forces a
+            # ~60min redb repair). 8GB is generous for legitimate aggregation
+            # (product ~7.7M rows) yet far below the 100Gi limit + 32GB cache,
+            # so a runaway query is rejected with large headroom to spare.
+            - name: BYORIDB_MAX_MEMORY_MB
+              value: "8192"
           ports:
             - { containerPort: 9669,  name: grpc }
             - { containerPort: 19669, name: http }

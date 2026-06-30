@@ -38,6 +38,9 @@ pub enum ExecutionError {
     #[error("Invalid operation: {0}")]
     InvalidOperation(String),
 
+    #[error("Resource exhausted: {0}")]
+    ResourceExhausted(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

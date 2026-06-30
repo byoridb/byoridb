@@ -23,6 +23,12 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct ExecutionConfig {
     pub timeout_ms: u64,
+    /// Soft cap on the estimated memory a single query may accumulate while
+    /// materializing results (binding rows + projected output). When exceeded,
+    /// the query fails with [`crate::error::ExecutionError::ResourceExhausted`]
+    /// instead of letting the process OOM (which on a single node forces a
+    /// ~60min redb repair). `0` disables the cap. Overridable via
+    /// `BYORIDB_MAX_MEMORY_MB`.
     pub max_memory_mb: usize,
     pub enable_optimization: bool,
     /// Hard cap on the number of vertices BFS/Dijkstra will process before
@@ -49,8 +55,14 @@ pub struct ExecutionConfig {
 impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
-            timeout_ms: 30000,   // 30 seconds
-            max_memory_mb: 1024, // 1GB
+            timeout_ms: 30000, // 30 seconds
+            // Per-query result-memory cap (OOM guard). Default 1GB; raise via
+            // BYORIDB_MAX_MEMORY_MB on nodes with headroom so legitimate large
+            // aggregations aren't rejected while runaway materializations still are.
+            max_memory_mb: std::env::var("BYORIDB_MAX_MEMORY_MB")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1024),
             enable_optimization: true,
             max_traversal_nodes: 100_000,
             // 100K rows per scan by default; overridable via BYORIDB_MAX_SCAN_LIMIT
@@ -191,6 +203,22 @@ impl ExecutionContext {
     /// Whether any full scan has occurred during this context's lifetime.
     pub fn took_full_scan(&self) -> bool {
         self.full_scan.load(Ordering::Relaxed)
+    }
+
+    /// Fail the query if `estimated_bytes` of accumulated result memory exceeds
+    /// the `max_memory_mb` budget. Executors call this as they materialize rows,
+    /// so a runaway query returns [`crate::error::ExecutionError::ResourceExhausted`]
+    /// instead of OOM-killing the process. `max_memory_mb == 0` disables the cap.
+    pub fn check_result_budget(&self, estimated_bytes: usize) -> crate::error::Result<()> {
+        let cap = self.config.max_memory_mb.saturating_mul(1024 * 1024);
+        if cap > 0 && estimated_bytes > cap {
+            return Err(crate::error::ExecutionError::ResourceExhausted(format!(
+                "query exceeded the {} MB result-memory cap (max_memory_mb) while \
+                 materializing rows — add a LIMIT or narrow the query",
+                self.config.max_memory_mb
+            )));
+        }
+        Ok(())
     }
 
     /// Set the roles of the authenticated caller for RBAC checks.

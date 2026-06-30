@@ -1153,6 +1153,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn match_projection_respects_max_memory_mb() {
+        // A 1MB result-memory cap: projecting a wide column over enough rows
+        // must fail with ResourceExhausted instead of OOMing (the systematic
+        // OOM guard — PLAN.md G-11 max_memory_mb).
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let ctx = Arc::new(
+            ExecutionContext::new(kvstore)
+                .with_space("default".to_string())
+                .with_config(ExecutionConfig {
+                    max_memory_mb: 1, // 1 MB
+                    ..ExecutionConfig::default()
+                }),
+        );
+        let executor = Executor::new(ctx);
+        let run = |q: String| {
+            let stmt = byoridb_parser::parse(&q).expect("parse");
+            ExecutionPlanBuilder::build(stmt).expect("plan")
+        };
+
+        executor
+            .execute(run("CREATE TAG t(big string)".to_string()))
+            .await
+            .unwrap();
+        // ~30KB string × 60 rows ⟹ projecting n.big ≈ 1.8MB > the 1MB cap.
+        let big = "x".repeat(30_000);
+        for i in 1..=60 {
+            executor
+                .execute(run(format!("INSERT VERTEX t(big) VALUES {i}:(\"{big}\")")))
+                .await
+                .unwrap();
+        }
+
+        let err = executor
+            .execute(run("MATCH (n:t) RETURN n.big".to_string()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::ResourceExhausted(_)),
+            "expected ResourceExhausted, got {err:?}"
+        );
+
+        // A small projection under the cap still succeeds.
+        let ok = executor
+            .execute(run("MATCH (n:t) RETURN id(n) LIMIT 5".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(ok.rows.len(), 5);
+    }
+
+    #[tokio::test]
     async fn test_match_count_uses_unlimited_count_path() {
         let kvstore = Arc::new(MemoryKVStore::new());
         let ctx = Arc::new(

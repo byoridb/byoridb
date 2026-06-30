@@ -895,10 +895,15 @@ Azure AKS에 실제로 배포해보며 발견된 마찰 포인트.
   1→10`·`failureThreshold 1→3`(slow /ready로 LB 이탈 방지), `BYORIDB_CACHE_SIZE_MB 65536→32768`
   (working set 11~20GB 충분 + OOM 헤드룸 — 무거운 쿼리가 노드를 못 죽이게). COUNT OOM 트리거 자체는
   C 섹션(스트리밍, PR#14)으로 별도 해소.
-  **미해결(후속)**: ① `max_memory_mb` 강제(현재 선언만, S-13) — 임의 쿼리(대형 MATCH 결과
-  materialize 등)가 노드를 못 죽이게 하는 근본 방어 ② 단일노드 SPOF·~60분 repair 다운타임 →
-  HA(G-2 분산 선결) 또는 redb quick-repair(redb #829) 대기. 이번 사건이 우선순위 3(운영)의
-  실증 근거.
+  **① `max_memory_mb` 강제 ✅ (2026-06-30, 미배포)**: 결과 누적 메모리를 `max_memory_mb`로
+  bound → 초과 시 OOM 대신 `ExecutionError::ResourceExhausted`. MATCH의 binding-row 누적(phase
+  경계 + match_edges 내부 64K마다)과 projection(실제 바이트, 16K마다)에 가드. `ctx.check_result_budget`
+  + Value 바이트 추정기. `BYORIDB_MAX_MEMORY_MB` env 노출(prod 8192=8GB — 정당 집계 7.7M행 허용,
+  100Gi 한도 대비 큰 헤드룸). 회귀: 1MB cap + 30KB×60행 projection이 ResourceExhausted, 작은 쿼리
+  통과. executor 211/211.
+  **미해결(후속)**: ② GO/LOOKUP/FETCH 누적 경로에도 동일 가드(현재 MATCH만; LOOKUP은 max_scan_limit
+  부분 방어) ③ 단일노드 SPOF·~60분 repair 다운타임 → HA(G-2 분산 선결) 또는 redb quick-repair(redb
+  #829) 대기. 이번 사건이 우선순위 3(운영)의 실증 근거.
 
 ---
 
