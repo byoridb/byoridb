@@ -33,6 +33,7 @@
 //! retracted (O-0 phase 1; incremental B/F is a later optimization). Cost is
 //! O(graph) per delete in a semantic space.
 
+use super::provenance::{Fact, Justification, RuleKind};
 use super::Executor;
 use crate::algo;
 use crate::error::Result;
@@ -145,6 +146,10 @@ impl Executor {
             self.ctx.kvstore.delete(&key).await?;
         }
 
+        // Drop all provenance: it is rebuilt by the run below from the surviving
+        // asserted edges, so a deleted fact's stale justifications disappear.
+        self.clear_provenance(space).await?;
+
         // Re-derive the full closure from the surviving asserted edges.
         self.run_materialization(space, asserted, &meta).await
     }
@@ -213,42 +218,114 @@ impl Executor {
 
         let mut written = 0usize;
         while let Some((s, p, d)) = worklist.pop_front() {
-            let mut derived: Vec<Triple> = Vec::new();
+            // The edge whose consequences we derive this iteration is the
+            // premise of every justification recorded below.
+            let premise = Fact::Edge { s, p: p.clone(), d };
+            // Each entry pairs a derived triple with how it was entailed.
+            let mut derived: Vec<(Triple, Justification)> = Vec::new();
 
             if meta.symmetric.contains(&p) {
-                derived.push((d, p.clone(), s));
+                derived.push((
+                    (d, p.clone(), s),
+                    Justification {
+                        rule: RuleKind::Symmetric,
+                        premises: vec![premise.clone()],
+                    },
+                ));
             }
             if let Some(invs) = meta.inverse.get(&p) {
                 for q in invs {
-                    derived.push((d, q.clone(), s));
+                    derived.push((
+                        (d, q.clone(), s),
+                        Justification {
+                            rule: RuleKind::InverseOf,
+                            premises: vec![premise.clone()],
+                        },
+                    ));
                 }
             }
             if let Some(sups) = meta.superprops.get(&p) {
                 for q in sups {
-                    derived.push((s, q.clone(), d));
+                    derived.push((
+                        (s, q.clone(), d),
+                        Justification {
+                            rule: RuleKind::SubPropertyOf,
+                            premises: vec![premise.clone()],
+                        },
+                    ));
                 }
             }
             if meta.transitive.contains(&p) {
                 let etype = [p.clone()];
                 // (s,p,d) ∧ (d,p,x) ⟹ (s,p,x)
                 for n in algo::get_neighbors(&self.ctx, space, d, &etype).await? {
-                    derived.push((s, p.clone(), n.dst));
+                    derived.push((
+                        (s, p.clone(), n.dst),
+                        Justification {
+                            rule: RuleKind::Transitive,
+                            premises: vec![
+                                premise.clone(),
+                                Fact::Edge {
+                                    s: d,
+                                    p: p.clone(),
+                                    d: n.dst,
+                                },
+                            ],
+                        },
+                    ));
                 }
                 // (y,p,s) ∧ (s,p,d) ⟹ (y,p,d)  (n.dst is the source vertex y)
                 for n in algo::get_incoming_neighbors(&self.ctx, space, s, &etype).await? {
-                    derived.push((n.dst, p.clone(), d));
+                    derived.push((
+                        (n.dst, p.clone(), d),
+                        Justification {
+                            rule: RuleKind::Transitive,
+                            premises: vec![
+                                Fact::Edge {
+                                    s: n.dst,
+                                    p: p.clone(),
+                                    d: s,
+                                },
+                                premise.clone(),
+                            ],
+                        },
+                    ));
                 }
             }
 
             // domain/range ⟹ vertex type inference (subject is-a domain,
             // object is-a range). Types do not entail further edges, so they
-            // are written but not enqueued.
+            // are written (with provenance) but not enqueued.
             if let Some(class) = meta.domain.get(&p) {
+                self.record_provenance(
+                    space,
+                    &Fact::Vtype {
+                        vid: s,
+                        class: class.clone(),
+                    },
+                    Justification {
+                        rule: RuleKind::Domain,
+                        premises: vec![premise.clone()],
+                    },
+                )
+                .await?;
                 if self.assert_vertex_type(space, s, class).await? {
                     written += 1;
                 }
             }
             if let Some(class) = meta.range.get(&p) {
+                self.record_provenance(
+                    space,
+                    &Fact::Vtype {
+                        vid: d,
+                        class: class.clone(),
+                    },
+                    Justification {
+                        rule: RuleKind::Range,
+                        premises: vec![premise.clone()],
+                    },
+                )
+                .await?;
                 if self.assert_vertex_type(space, d, class).await? {
                     written += 1;
                 }
@@ -261,17 +338,32 @@ impl Executor {
                 return Ok(());
             }
 
-            for triple in derived {
+            for (triple, justification) in derived {
+                let (s2, p2, d2) = (triple.0, triple.1.clone(), triple.2);
+                // Record provenance for *every* derivation — even of an edge
+                // already in the graph — so the justification set is complete
+                // for retraction. record_provenance dedups identical entries.
+                self.record_provenance(
+                    space,
+                    &Fact::Edge {
+                        s: s2,
+                        p: p2.clone(),
+                        d: d2,
+                    },
+                    justification,
+                )
+                .await?;
+
                 if !seen.insert(triple.clone()) {
                     continue; // already queued/processed this run
                 }
-                let (s2, p2, d2) = &triple;
                 // Already in the graph (asserted, or inferred at an earlier
-                // insert): its own consequences are already materialized — skip.
-                if self.triple_exists(space, *s2, p2, *d2).await? {
+                // insert): its own consequences are already materialized — skip
+                // writing/enqueueing (its provenance above is still recorded).
+                if self.triple_exists(space, s2, &p2, d2).await? {
                     continue;
                 }
-                self.write_inferred_edge(space, *s2, p2, *d2).await?;
+                self.write_inferred_edge(space, s2, &p2, d2).await?;
                 written += 1;
                 if written >= cap {
                     tracing::warn!(
@@ -620,5 +712,187 @@ mod tests {
             run(&e, "CREATE EDGE foo() INVERSE OF foo").await.is_err(),
             "self INVERSE OF must error"
         );
+    }
+
+    // ---- Provenance (Phase 1): justification capture ----
+
+    #[tokio::test]
+    async fn transitive_records_provenance() {
+        // 1->2, 2->3 over a TRANSITIVE edge infers 1->3; its provenance must
+        // record the Transitive rule with both premise edges.
+        let e = create_executor();
+        ok(&e, "CREATE EDGE ancestor() TRANSITIVE").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 2->3:()").await;
+        assert!(has(&e, 1, "ancestor", 3).await, "1->3 inferred");
+
+        let justs = e
+            .provenance_of(
+                "default",
+                &Fact::Edge {
+                    s: 1,
+                    p: "ancestor".to_string(),
+                    d: 3,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            justs.iter().any(|j| j.rule == RuleKind::Transitive
+                && j.premises
+                    == vec![
+                        Fact::Edge {
+                            s: 1,
+                            p: "ancestor".to_string(),
+                            d: 2
+                        },
+                        Fact::Edge {
+                            s: 2,
+                            p: "ancestor".to_string(),
+                            d: 3
+                        },
+                    ]),
+            "transitive justification with both premises recorded, got {justs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn symmetric_records_provenance() {
+        let e = create_executor();
+        ok(&e, "CREATE EDGE knows() SYMMETRIC").await;
+        ok(&e, "INSERT EDGE knows() VALUES 1->2:()").await;
+        let justs = e
+            .provenance_of(
+                "default",
+                &Fact::Edge {
+                    s: 2,
+                    p: "knows".to_string(),
+                    d: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            justs.len(),
+            1,
+            "one justification for the symmetric reverse"
+        );
+        assert_eq!(justs[0].rule, RuleKind::Symmetric);
+        assert_eq!(
+            justs[0].premises,
+            vec![Fact::Edge {
+                s: 1,
+                p: "knows".to_string(),
+                d: 2
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_clears_inferred_fact_provenance() {
+        // Deleting 2->3 retracts the inferred 1->3 (full re-materialization),
+        // and its provenance must be cleared with it (not left stale).
+        let e = create_executor();
+        ok(&e, "CREATE EDGE ancestor() TRANSITIVE").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 2->3:()").await;
+        let fact = Fact::Edge {
+            s: 1,
+            p: "ancestor".to_string(),
+            d: 3,
+        };
+        assert!(
+            !e.provenance_of("default", &fact).await.unwrap().is_empty(),
+            "provenance present before delete"
+        );
+        ok(&e, "DELETE EDGE ancestor 2->3").await;
+        assert!(!has(&e, 1, "ancestor", 3).await, "inferred 1->3 retracted");
+        assert!(
+            e.provenance_of("default", &fact).await.unwrap().is_empty(),
+            "provenance cleared after retraction"
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_range_records_vtype_provenance() {
+        let e = create_executor();
+        ok(&e, "CREATE CLASS person()").await;
+        ok(&e, "CREATE CLASS city()").await;
+        ok(&e, "CREATE TAG place()").await;
+        ok(&e, "CREATE EDGE bornIn() DOMAIN person RANGE city").await;
+        ok(&e, "INSERT VERTEX place() VALUES 2:()").await;
+        ok(&e, "INSERT EDGE bornIn() VALUES 1->2:()").await;
+        // RANGE city ⟹ vertex 2 is-a city, justified by the bornIn edge.
+        let justs = e
+            .provenance_of(
+                "default",
+                &Fact::Vtype {
+                    vid: 2,
+                    class: "city".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            justs.iter().any(|j| j.rule == RuleKind::Range
+                && j.premises
+                    == vec![Fact::Edge {
+                        s: 1,
+                        p: "bornIn".to_string(),
+                        d: 2
+                    }]),
+            "range justification recorded for inferred vtype, got {justs:?}"
+        );
+    }
+
+    // ---- Phase 2: WHY explanation surface ----
+
+    #[tokio::test]
+    async fn why_explains_transitive_inference() {
+        // `WHY 1 -> 3 OVER ancestor` should show 1->3 as inferred via transitive
+        // from the two asserted edges, which appear as asserted leaves.
+        let e = create_executor();
+        ok(&e, "CREATE EDGE ancestor() TRANSITIVE").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 2->3:()").await;
+
+        let r = run(&e, "WHY 1 -> 3 OVER ancestor").await.unwrap();
+        assert_eq!(
+            r.columns,
+            vec!["depth", "fact", "status", "rule", "premises"]
+        );
+        // Root row: inferred via transitive, premises = both asserted edges.
+        let root = &r.rows[0];
+        assert_eq!(root[1], Value::String("1 -ancestor-> 3".to_string()));
+        assert_eq!(root[2], Value::String("inferred".to_string()));
+        assert_eq!(root[3], Value::String("transitive".to_string()));
+        assert_eq!(
+            root[4],
+            Value::String("1 -ancestor-> 2, 2 -ancestor-> 3".to_string())
+        );
+        // Both premises appear as asserted leaves somewhere in the tree.
+        let has_asserted = |f: &str| {
+            r.rows.iter().any(|row| {
+                row[1] == Value::String(f.to_string())
+                    && row[2] == Value::String("asserted".to_string())
+            })
+        };
+        assert!(
+            has_asserted("1 -ancestor-> 2"),
+            "premise 1->2 asserted leaf"
+        );
+        assert!(
+            has_asserted("2 -ancestor-> 3"),
+            "premise 2->3 asserted leaf"
+        );
+    }
+
+    #[tokio::test]
+    async fn why_unknown_edge_reports_not_found() {
+        let e = create_executor();
+        ok(&e, "CREATE EDGE ancestor() TRANSITIVE").await;
+        let r = run(&e, "WHY 9 -> 99 OVER ancestor").await.unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][2], Value::String("not found".to_string()));
     }
 }

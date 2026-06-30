@@ -27,6 +27,14 @@ pub enum Statement {
     Recommend(RecommendStatement),
     /// `CHECK CONSISTENCY` — report ontology consistency violations (O-6).
     CheckConsistency,
+    /// `WHY <src> -> <dst> OVER <edge_type>` — explain how an inferred edge was
+    /// entailed by walking its provenance/justification tree (O-provenance
+    /// Phase 2). Returns the derivation as a flattened tree.
+    ExplainInference {
+        src: i64,
+        dst: i64,
+        edge_type: String,
+    },
     Grant(GrantStatement),
     Revoke(RevokeStatement),
     Balance(BalanceStatement),

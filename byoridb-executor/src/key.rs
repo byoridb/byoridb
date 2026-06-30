@@ -148,6 +148,30 @@ impl SchemaKey {
         s.rsplit(':').next().map(|c| c.to_string())
     }
 
+    // ===== Inference provenance (PLAN.md O-provenance) =====
+
+    /// Provenance for an inferred edge fact: `{space}:prov:e:{s}:{p}:{d}` →
+    /// serde_json(`Vec<Justification>`). Written by O-5 materialization to record
+    /// *every* way the edge `(s)-p->(d)` was entailed (rule + premise facts).
+    /// `p` is an nGQL identifier (no `:`); `s`/`d` are i64, so segments are
+    /// unambiguous. Consumed by explanation and incremental retraction.
+    pub fn prov_edge(space: &str, s: i64, p: &str, d: i64) -> Vec<u8> {
+        format!("{}:prov:e:{}:{}:{}", space, s, p, d).into_bytes()
+    }
+
+    /// Provenance for an inferred vertex type: `{space}:prov:v:{vid}:{class}` →
+    /// serde_json(`Vec<Justification>`). The domain/range counterpart of
+    /// [`prov_edge`]; `class` is an nGQL identifier (no `:`).
+    pub fn prov_vtype(space: &str, vid: i64, class: &str) -> Vec<u8> {
+        format!("{}:prov:v:{}:{}", space, vid, class).into_bytes()
+    }
+
+    /// Prefix covering every provenance entry in a space: `{space}:prov:`.
+    /// Used to drop all provenance on full re-materialization.
+    pub fn prov_prefix(space: &str) -> Vec<u8> {
+        format!("{}:prov:", space).into_bytes()
+    }
+
     // ===== Tag-vid secondary index (label-only MATCH acceleration) =====
 
     /// Tag-vid index entry: `{space}:tagvid:{tag}:{vid}` → empty. Written by

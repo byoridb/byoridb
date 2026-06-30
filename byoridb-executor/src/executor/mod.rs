@@ -72,6 +72,11 @@ impl Executor {
             ExecutionPlan::Lookup(lookup_plan) => self.execute_lookup(lookup_plan).await?,
             ExecutionPlan::Recommend(rec_plan) => self.execute_recommend(rec_plan).await?,
             ExecutionPlan::CheckConsistency => self.execute_check_consistency().await?,
+            ExecutionPlan::ExplainInference {
+                src,
+                dst,
+                edge_type,
+            } => self.explain_inference(src, &edge_type, dst).await?,
             ExecutionPlan::Match(match_plan) => {
                 use crate::match_impl::MatchExecutor;
                 let match_executor = MatchExecutor::new(self.ctx.clone());
@@ -192,6 +197,7 @@ mod dml;
 mod dogfood_regression;
 mod dql;
 mod inference;
+mod provenance;
 mod recommend;
 mod sameas;
 mod show;

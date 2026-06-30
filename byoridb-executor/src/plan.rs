@@ -71,6 +71,14 @@ pub enum ExecutionPlan {
     /// CHECK CONSISTENCY — report ontology consistency violations (O-6).
     CheckConsistency,
 
+    /// WHY <src> -> <dst> OVER <edge_type> — explain an inferred edge by
+    /// walking its provenance tree (O-provenance Phase 2).
+    ExplainInference {
+        src: i64,
+        dst: i64,
+        edge_type: String,
+    },
+
     /// Compound query — a sequence of clauses where each may bind its
     /// `ExecutorResult` to a variable consumed by subsequent clauses.
     /// The final non-assignment clause's result is the query output.
@@ -946,6 +954,15 @@ impl ExecutionPlanBuilder {
                 limit: rec.limit,
             })),
             Statement::CheckConsistency => Ok(ExecutionPlan::CheckConsistency),
+            Statement::ExplainInference {
+                src,
+                dst,
+                edge_type,
+            } => Ok(ExecutionPlan::ExplainInference {
+                src,
+                dst,
+                edge_type,
+            }),
             Statement::Find(find_stmt) => Ok(ExecutionPlan::Find(FindPlan {
                 find_type: match find_stmt.find_type {
                     byoridb_parser::ast::FindType::Path => FindType::Path,

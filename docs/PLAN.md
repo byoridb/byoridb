@@ -1,9 +1,14 @@
 # ByoriDB 플랜
 
-마지막 업데이트: 2026-06-22 (온톨로지 핵심 O-1~O-9 + 유사도 추천 R-1~R-3b 구현 완료.
-O-8 owl:sameAs(write-time canonical merge)·O-9 삭제 retraction(full re-materialization)
-구현·검증 완료. O-8·O-9 모두 AKS 배포 완료(sha-1994c43) + 프로덕션 스모크 통과.
-상세는 O/R 섹션. 남은 건 retraction B/F 최적화·분산 materialization·운영.)
+마지막 업데이트: 2026-06-30 (방향성 재정의 — **core vs Studio 책임 경계** 확정.
+ByoriDB core = 추론 능력을 가진 semantic graph DB core(Palantir clone 아님),
+Studio = Ontology Workbench + Operational Modeling UX. core 로드맵은 Studio가
+요구하는 primitive(provenance·explanation·incremental retraction·change-feed·
+constraint hooks·shape validation)로 역산. datasource mapping/action/writeback은
+선 위(Studio)로 이관. 상세는 "프로젝트 방향 > core vs Studio 책임 경계" 섹션.
+또한 첫 primitive 착수 — **O-10 provenance + explanation(`WHY`) Phase 1+2 완료**(미배포).
+compound `USE` space 버그도 PR#11(d9d7a6f) 배포. 상세는 O-10 섹션.
+이전: 온톨로지 핵심 O-1~O-9 + 유사도 추천 R-1~R-3b 구현·배포 완료(sha-1994c43).)
 
 이전의 `ROADMAP.md` / `docs/NEXT_STEPS.md` / `docs/MOCK_REMEDIATION_PLAN.md` /
 `docs/GRAPH_ALGORITHM_OPTIMIZATION_PLAN.md` 4개 문서를 통합한 **단일 진실원**.
@@ -33,6 +38,41 @@ O-8 owl:sameAs(write-time canonical merge)·O-9 삭제 retraction(full re-materi
 트랙으로 유사도 추천(R-1~R-3b: 구조/임베딩 flat·HNSW/하이브리드)도 완료. 남은
 온톨로지 작업은 고급 추론(`sameAs` 동치, 삭제 retraction=B/F, 분산 materialization)
 뿐 — 각각 난이도·리스크 최상이라 별도 결정 필요. 상세·미착수는 **O/R 섹션** 참조.
+
+### core vs Studio 책임 경계 (2026-06-30 확정 — 방향성 재정의)
+
+**"온톨로지"는 두 가지 다른 것을 가리킨다.** ① 논리적/지식 온톨로지(W3C·OWL·추론
+엔진 전통) ② 운영 온톨로지(Palantir Foundry — Object/Link/**Action**/Function +
+데이터 통합 + write-back 의사결정 플랫폼). ByoriDB는 ①을 깊게 파는 DB이고,
+Palantir는 ②를 파는 앱 플랫폼이다 — 같은 단어, 다른 제품 카테고리.
+
+**포지셔닝: ByoriDB는 Palantir clone이 아니라, Palantir식 운영 온톨로지를 올릴 수
+있는 "추론 능력을 가진 semantic graph DB core"다.** Studio는 그 위의 Ontology
+Workbench + Operational Modeling UX를 소유한다. 세 가지 원칙을 못으로 박는다:
+
+1. **core는 semantic graph primitive만 소유한다.** 클래스 계층·시맨틱 관계·추론·
+   provenance·explanation·제약 평가까지. 그 이상은 안 된다.
+2. **Studio는 Ontology Workbench + Operational Modeling UX를 소유한다.**
+3. **datasource mapping, object/action/function abstraction, workflow/writeback/
+   audit은 core로 흘러들어오면 안 된다.** 이게 들어오는 순간 core는 반쪽짜리
+   Palantir clone이 되어 1번 선언과 모순된다.
+
+**기능 분류 — 신규 항목은 반드시 이 선을 먼저 긋는다:**
+
+| 🟦 선 아래 — core(ByoriDB) 책임 | 🟥 선 위 — Studio/운영 레이어 책임 |
+|---|---|
+| OWL 2 RL 규칙 (property chain, functional/inverse-functional, equivalentClass/Property) | external datasource mapping layer (ETL/통합) |
+| provenance (어느 규칙·전제로 유도됐나) | object/action/function abstraction |
+| explanation API ("왜 이 fact가?") | action-level validation / writeback / audit |
+| incremental retraction (provenance 기반, O-9 비용 해소) | workflow / 시뮬레이션 / branching |
+| change-feed / subscription (live object 동적성의 토대) | 오브젝트 단위 권한·lineage UX |
+| constraint hooks + shape validation | — |
+
+**규율: core 로드맵은 "Studio가 요구하는 primitive"로 역산한다.** 순수 OWL 2 RL
+규칙 나열이 아니라 — provenance / explanation API / incremental retraction /
+change-feed / constraint hooks / shape validation 이 운영 레이어를 떠받치는
+인터페이스이므로 우선순위가 올라간다. (object abstraction은 CLASS+vertex+properties로
+이미 ~80% 충족 — 진짜 빠진 건 Action/Function이고 그건 선 위다.)
 
 ---
 
@@ -374,6 +414,34 @@ O-0이 정한 **"1단계 full re-materialization → 2단계 B/F, DRed 회피"**
   포함 {2,3} 반환. `DELETE EDGE 2->3` 후 `GO FROM 1`이 {2}만 반환(추론 `1->3` retract 확인,
   insertion-only였다면 잔존). HTTP API로 기대대로 통과.
 - **후속**: B/F 증분(O-0 2단계, deep-research 선행), DELETE VERTEX edge cascade(별개 이슈).
+
+**O-10 [P1] 추론 provenance + explanation (Studio-요구 primitive)** 🟡 Phase 1+2 완료 (2026-06-30, 미배포)
+
+"core 로드맵은 Studio가 요구하는 primitive로 역산"(경계 섹션 참조)의 첫 항목. 추론
+사실의 **justification**(어느 규칙·어느 전제)을 저장해 ① explanation ② incremental
+retraction ③ audit 토대를 동시에 마련.
+
+- **Phase 1 — provenance 저장 ✅**: 신규 `executor/provenance.rs`. O-5 materialization이
+  도출 시점에 각 inferred edge/vtype의 (rule, premises)를 `{space}:prov:` 사이드 키스페이스에
+  기록(`record_provenance`, dedup append). transitive는 전제 2개, 나머지 1개. `triple_exists`
+  스킵 전에 기록해 **완전한 justification 집합** 보장(재귀 retraction의 선결). `rematerialize_space`
+  (삭제 경로)가 `clear_provenance`로 비우고 재구축 → stale 방지. 값은 serde_json(컴팩트화는 후속).
+  회귀 4건(transitive/symmetric/domain-range 캡처 + 삭제 시 클리어).
+- **Phase 2 — explanation 표면 ✅**: 신규 statement **`WHY <src> -> <dst> OVER <edge_type>`**.
+  prov 트리를 pre-order DFS walk → `depth|fact|status|rule|premises` 반환. asserted는 leaf,
+  cycle/공유 지원은 1회만 표시, 미존재 edge는 "not found". lexer `WHY` 토큰 + AST/plan/RBAC(Read).
+  회귀: parser 1 + executor 2.
+- **미착수**: vtype explanation 표면(현재 edge만; executor 로직은 `Fact::Vtype` 이미 처리),
+  provenance 값 컴팩트화(serde_json→bincode), reverse 인덱스(`prov-rev`, Phase 3용).
+- **Phase 3 — incremental retraction**: ⏸️ **설계 결정 대기.** O-0이 정한 B/F(bookkeeping-free)
+  vs provenance 기반 truth-maintenance. transitive 등 재귀 규칙의 well-founded support
+  (cycle 상호정당화) 문제로 단순 cascade는 overdelete. O-9의 O(graph)/delete 비용 해소가 목표.
+
+**버그 수정 (2026-06-30, PR#11 d9d7a6f 배포):** compound `USE X; <stmt>` 가 같은 요청 후속
+문장의 space에 미적용 → nexprice(95GB) "비어 보임" 인시던트. `execute_use`가 ctx.space를 못 바꾸고
+실제 전환은 graph 레이어 session(다음 요청부터)이라, compound는 stale space로 실행됐음. 수정:
+`ExecutionContext.vars`를 `Arc<Mutex>`로 + `derive_with_space`, `execute_compound`가 USE 절에서
+컨텍스트 파생해 후속 절에 적용. 회귀 2건. 진단 플레이북은 메모리 참조.
 
 ### R. 유사도 / 추천 (P1 — 차별화 기능, 2026-06-15 신설)
 
