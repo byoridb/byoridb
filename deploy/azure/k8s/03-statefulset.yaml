@@ -47,11 +47,15 @@ spec:
             - secretRef:
                 name: byoridb-root
           env:
-            # redb page cache, sized near the working set (data ~11-20GB) so
-            # reads stay in memory and bulk loads don't hit the disk-IOPS wall.
-            # Requires a node large enough to hold it (dbpoolv2 / E16s_v5 128GB).
+            # redb page cache, sized above the working set (data ~11-20GB) so
+            # reads stay in memory. Cut 65536→32768 after the 2026-06-30 OOM:
+            # 32GB amply covers the working set while leaving large headroom
+            # under the 100Gi pod limit, so a heavy query can't push the node
+            # into OOMKill (which forces a ~60min redb repair). Raise it back
+            # toward 65536 only for a large bulk load (paired with a bigger node),
+            # then restore.
             - name: BYORIDB_CACHE_SIZE_MB
-              value: "65536"
+              value: "32768"
             # NOTE: BYORIDB_DURABILITY was set to "none" (relaxed) for the
             # 2026-06-26 nexprice bulk load (88M nodes / 151M edges via the
             # bulkloader Job). Removed afterward — steady-state serving uses the
@@ -86,12 +90,22 @@ spec:
             httpGet: { path: /ready, port: 19669 }
             initialDelaySeconds: 5
             periodSeconds: 3
-            failureThreshold: 1
+            # timeoutSeconds defaulted to 1s; a single slow /ready under load
+            # then flapped the pod out of Service endpoints. 10s timeout + 3
+            # failures tolerates transient slowness without dropping traffic.
+            timeoutSeconds: 10
+            failureThreshold: 3
+          # 2026-06-30 incident: after a ~60min repair the server became ready
+          # but /health (implicit 1s timeout) was slow during post-startup load
+          # (cache warm), so liveness failed 4×15s=60s → SIGKILL *before* a clean
+          # checkpoint → unclean → another 60min repair → loop. A 10s timeout and
+          # 6 failures (90s) let the server stabilize and checkpoint.
           livenessProbe:
             httpGet: { path: /health, port: 19669 }
             initialDelaySeconds: 30
             periodSeconds: 15
-            failureThreshold: 4
+            timeoutSeconds: 10
+            failureThreshold: 6
           resources:
             requests: { cpu: "2", memory: "8Gi" }
             limits:   { cpu: "14", memory: "100Gi" }

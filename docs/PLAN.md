@@ -887,6 +887,18 @@ Azure AKS에 실제로 배포해보며 발견된 마찰 포인트.
   2. 코드 측: `Environment::prefix_separator("__")`로 single-underscore env(`BYORIDB_PUBLIC_*`, `BYORIDB_ROOT_PASSWORD` 등)는 config crate가 더 이상 잡지 않음. 단위 테스트로 회귀 차단.
 - **G-9 빌드 1회 비용이 크니 사전 점검 비용도 큼** (관찰)
   배포 1회 시도에서 5번 빌드/재배포 사이클 소요: Rust 1.80→1.86→1.90, `COPY config` 부재, env Vec 파싱. 각 사이클 ~20분 → 누적 비용 매우 큼. G-3(빌드 캐싱) + 사전 CI 통합 우선순위 ↑.
+- **G-11 프로브 관대화 + 캐시 헤드룸 (repair-loop 방어)** ✅ 수정 (2026-06-30, 미배포)
+  2026-06-30 인시던트: 무거운 COUNT 반복 → OOMKill → ~60분 redb full repair → 서버 ready
+  직후 liveness `/health`(암묵 timeout 1초)가 부하로 느려져 4×15s=60s 실패 → **checkpoint 전
+  SIGKILL → unclean → 또 60분 repair → 루프**. 매니페스트 수정(03-statefulset.yaml):
+  liveness `timeoutSeconds 1→10`·`failureThreshold 4→6`(90초 여유), readiness `timeoutSeconds
+  1→10`·`failureThreshold 1→3`(slow /ready로 LB 이탈 방지), `BYORIDB_CACHE_SIZE_MB 65536→32768`
+  (working set 11~20GB 충분 + OOM 헤드룸 — 무거운 쿼리가 노드를 못 죽이게). COUNT OOM 트리거 자체는
+  C 섹션(스트리밍, PR#14)으로 별도 해소.
+  **미해결(후속)**: ① `max_memory_mb` 강제(현재 선언만, S-13) — 임의 쿼리(대형 MATCH 결과
+  materialize 등)가 노드를 못 죽이게 하는 근본 방어 ② 단일노드 SPOF·~60분 repair 다운타임 →
+  HA(G-2 분산 선결) 또는 redb quick-repair(redb #829) 대기. 이번 사건이 우선순위 3(운영)의
+  실증 근거.
 
 ---
 
