@@ -244,6 +244,10 @@ pub struct SemanticFlags {
     pub domain: Option<String>,
     /// `RANGE D`: `(a)-p->(b) ⟹ b is-a D` (object vertex type inference).
     pub range: Option<String>,
+    /// `CHAIN p1, p2` (owl:propertyChainAxiom): `(a)-p1->(x) ∧ (x)-p2->(b) ⟹
+    /// (a)-p->(b)`. Generalizes `transitive` (which is the chain `[p, p]`).
+    /// Currently exactly two links (longer chains are a follow-up).
+    pub property_chain: Option<Vec<String>>,
 }
 
 impl SemanticFlags {
@@ -255,6 +259,7 @@ impl SemanticFlags {
             && self.subproperty_of.is_none()
             && self.domain.is_none()
             && self.range.is_none()
+            && self.property_chain.is_none()
     }
 }
 

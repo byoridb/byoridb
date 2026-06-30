@@ -6,8 +6,10 @@ Studio = Ontology Workbench + Operational Modeling UX. core 로드맵은 Studio�
 요구하는 primitive(provenance·explanation·incremental retraction·change-feed·
 constraint hooks·shape validation)로 역산. datasource mapping/action/writeback은
 선 위(Studio)로 이관. 상세는 "프로젝트 방향 > core vs Studio 책임 경계" 섹션.
-또한 첫 primitive 착수 — **O-10 provenance + explanation(`WHY`) Phase 1+2 완료**(미배포).
-compound `USE` space 버그도 PR#11(d9d7a6f) 배포. 상세는 O-10 섹션.
+또한 Studio-요구 primitive 착수 — **O-10 provenance + explanation(`WHY`) + DRed
+incremental retraction 배포·스모크 완료**(PR#12 sha-413d401). **O-11 property chain
+(prp-spo2) 2-link 구현 완료**(미배포). compound `USE` space 버그도 PR#11(d9d7a6f) 배포.
+상세는 O-10/O-11 섹션.
 이전: 온톨로지 핵심 O-1~O-9 + 유사도 추천 R-1~R-3b 구현·배포 완료(sha-1994c43).)
 
 이전의 `ROADMAP.md` / `docs/NEXT_STEPS.md` / `docs/MOCK_REMEDIATION_PLAN.md` /
@@ -415,7 +417,7 @@ O-0이 정한 **"1단계 full re-materialization → 2단계 B/F, DRed 회피"**
   insertion-only였다면 잔존). HTTP API로 기대대로 통과.
 - **후속**: B/F 증분(O-0 2단계, deep-research 선행), DELETE VERTEX edge cascade(별개 이슈).
 
-**O-10 [P1] 추론 provenance + explanation + incremental retraction (Studio-요구 primitive)** ✅ Phase 1+2+3 완료 (2026-06-30, 미배포)
+**O-10 [P1] 추론 provenance + explanation + incremental retraction (Studio-요구 primitive)** ✅ Phase 1+2+3 구현·**배포·프로덕션 스모크 완료** (2026-06-30, PR#12 sha-413d401)
 
 "core 로드맵은 Studio가 요구하는 primitive로 역산"(경계 섹션 참조)의 첫 항목. 추론
 사실의 **justification**(어느 규칙·어느 전제)을 저장해 ① explanation ② incremental
@@ -433,7 +435,7 @@ retraction ③ audit 토대를 동시에 마련.
   회귀: parser 1 + executor 2.
 - **미착수**: vtype explanation 표면(현재 edge만; executor 로직은 `Fact::Vtype` 이미 처리),
   provenance 값 컴팩트화(serde_json→bincode), reverse 인덱스(`prov-rev`, Phase 3용).
-- **Phase 3 — incremental retraction (DRed) ✅** (2026-06-30, 미배포): 사용자 결정 =
+- **Phase 3 — incremental retraction (DRed) ✅** (2026-06-30, 배포 완료): 사용자 결정 =
   **provenance 기반 DRed**(O-0의 B/F 대신 — Phase 1에서 bookkeeping=provenance를 이미
   만들었으므로 O-0이 DRed를 피한 이유가 사라짐). reverse provenance 인덱스(`prov-rev`:
   premise edge → 의존 fact, `record_provenance`가 함께 기록). DELETE EDGE가
@@ -451,6 +453,21 @@ retraction ③ audit 토대를 동시에 마련.
 실제 전환은 graph 레이어 session(다음 요청부터)이라, compound는 stale space로 실행됐음. 수정:
 `ExecutionContext.vars`를 `Arc<Mutex>`로 + `derive_with_space`, `execute_compound`가 USE 절에서
 컨텍스트 파생해 후속 절에 적용. 회귀 2건. 진단 플레이북은 메모리 참조.
+
+**O-11 [P1] property chain (owl:propertyChainAxiom, prp-spo2)** ✅ 2-link 구현 완료 (2026-06-30, 미배포)
+
+OWL 2 RL의 핵심 규칙이자 transitive의 일반화. `CREATE EDGE <q>() CHAIN <p1>, <p2>` →
+`(a)-p1->(x) ∧ (x)-p2->(b) ⟹ (a)-q->(b)` (예: `grandparent ← parent ∘ parent`,
+`colleagueOrg ← knows ∘ worksAt`). 경쟁 LPG(Neo4j/Nebula)에 없는 차별점.
+
+- 신규 lexer 토큰 `CHAIN` + `SemanticFlags.property_chain: Option<Vec<String>>` + parser
+  (콤마 구분 edge 리스트). DDL 검증: 정확히 2-link + 각 link 존재(executor/ddl.rs).
+- `RelMeta`에 `chain_first`(p1→[(q,p2)])·`chain_second`(p2→[(q,p1)]) 인덱스. materialization
+  worklist에 forward(link1)+backward(link2) 규칙 → 어느 link가 마지막에 삽입돼도 폐포.
+  transitive(`[p,p]`)와 공존. `RuleKind::PropertyChain`으로 provenance·WHY·DRed 자동 연계.
+- 회귀: 파서 1 + 실행기 5(동일타입/이종타입/WHY/DRed retraction/검증). executor 210/210.
+- **미착수**: 3-link 이상 체인(현재 정확히 2개만, 초과 시 명시 에러). n-link는 path-walk +
+  provenance 다중경로 처리 필요 — 후속.
 
 ### R. 유사도 / 추천 (P1 — 차별화 기능, 2026-06-15 신설)
 
