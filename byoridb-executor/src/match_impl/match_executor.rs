@@ -24,6 +24,7 @@ use byoridb_parser::ast::{
 };
 use byoridb_storage::index::IndexDef;
 use byoridb_storage::key::IndexValue;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -955,26 +956,36 @@ impl MatchExecutor {
         matcher: &PatternMatcher,
     ) -> Result<usize> {
         let profiling = self.ctx.profiling();
+        // Count by STREAMING the scan — never materialize the matched set. A
+        // `COUNT` only needs the tally, so collecting every entry into a `Vec`
+        // (as the old code did via `scan_prefix_limited(.., None)`) was an
+        // unbounded allocation that OOM-killed the node on large tags (88M
+        // vertices ≈ GBs per query). `scan_stream` uses a bounded channel, so
+        // memory stays O(1) regardless of tag size.
         if node.props.is_empty() {
             if let Some(label) = node.labels.first() {
                 let prefix = format!("{}:tagvid:{}:", space, label);
                 let t = std::time::Instant::now();
-                let results = self
-                    .ctx
-                    .kvstore
-                    .scan_prefix_limited(prefix.as_bytes(), None)
-                    .await?;
-                if !results.is_empty() {
+                let mut stream = self.ctx.kvstore.scan_stream(prefix.as_bytes()).await?;
+                let mut count = 0u64;
+                while let Some(item) = stream.next().await {
+                    item?;
+                    count += 1;
+                }
+                // A populated tag-vid index answers the count; an empty result
+                // means the index is absent (pre-index data) — fall through to
+                // the full scan below, preserving the original behavior.
+                if count > 0 {
                     if profiling {
                         self.ctx.record_profile(
                             ProfileOp::TagVidScan,
                             format!("label={} (count)", label),
-                            results.len() as u64,
+                            count,
                             t.elapsed().as_micros() as u64,
                             false,
                         );
                     }
-                    return Ok(results.len());
+                    return Ok(count as usize);
                 }
             }
         }
@@ -982,14 +993,12 @@ impl MatchExecutor {
         self.ctx.mark_full_scan();
         let prefix = format!("{}:vertex:", space);
         let t = std::time::Instant::now();
-        let results = self
-            .ctx
-            .kvstore
-            .scan_prefix_limited(prefix.as_bytes(), None)
-            .await?;
-        let scanned = results.len();
-        let mut count = 0;
-        for (_, value) in results {
+        let mut stream = self.ctx.kvstore.scan_stream(prefix.as_bytes()).await?;
+        let mut count = 0u64;
+        let mut scanned = 0u64;
+        while let Some(item) = stream.next().await {
+            let (_, value) = item?;
+            scanned += 1;
             if matcher.matches_node(&value, node)? {
                 count += 1;
             }
@@ -998,12 +1007,12 @@ impl MatchExecutor {
             self.ctx.record_profile(
                 ProfileOp::FullScan,
                 format!("scanned {} vertices (count)", scanned),
-                count as u64,
+                count,
                 t.elapsed().as_micros() as u64,
                 true,
             );
         }
-        Ok(count)
+        Ok(count as usize)
     }
 
     /// Evaluate a return expression against bound variables, fetching vertex

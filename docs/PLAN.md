@@ -752,6 +752,13 @@ HTTP API에 쿼리 크기 제한 없음 (gRPC는 64MB 제한 있음).
 
 ### C. 그래프 알고리즘 후속 (P2~P3, 워크로드 의존)
 
+- **label-only COUNT 스트리밍화** ✅ 수정 (2026-06-30): `MATCH (n:tag) RETURN COUNT(n)`이
+  `count_node_matches_unlimited`에서 `scan_prefix_limited(.., None)`로 태그 전 항목(88M)을 `Vec`에
+  적재 후 `.len()` → 쿼리당 수 GB, 반복 시 **프로덕션 OOMKill**(2026-06-30 인시던트). `scan_stream`
+  (bounded channel)로 스트리밍 카운트 → 메모리 O(1). 정확성 불변(tagvid/full-scan 폴백 동일).
+  **후속**: ① tag별 vertex-count 사전계산 카운터(`{space}:tag_count:{tag}`, INSERT/DELETE VERTEX·
+  sameAs 유지 + 기존 88M 백필)로 O(1) 조회 — 현재는 여전히 O(N) 시간(~6s). ② `max_memory_mb`
+  강제(현재 선언만, 미사용 — S-13)로 무거운 쿼리가 노드를 못 죽이게(단일노드 SPOF 방어).
 - **MATCH pattern execution reorder** — 가장 selective한 노드부터. semantic risk 큼.
 - **LOOKUP range 술어 인덱스 미사용** ([#1](https://github.com/byoridb/byoridb/issues/1)) — `LOOKUP ... WHERE age > 30` 이 인덱스가 있어도 풀스캔으로 폴백. 실행기/플래너 모두 동등(Eq) 조건만 인덱스 경로로 라우팅(`execute_lookup`/`extract_eq_condition`, `explain::lookup_access`/`eq_field`). 근본: `IndexManager::lookup_tag` point-equality만 지원, range index scan 미구현. EXPLAIN/PROFILE 풀스캔 경고(dc5be3b)가 발견.
 - **label-only MATCH reverse index** ✅ 완료 (2026-05-29) — `{space}:tagvid:{tag}:{vid}` 보조 인덱스 도입. INSERT VERTEX 에서 자동 기록, MATCH 에서 label-only 패턴 시 자동 사용.
