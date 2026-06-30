@@ -551,6 +551,8 @@ impl Executor {
         }
 
         let mut deleted = 0i64;
+        // Asserted edges actually removed — seed set for incremental retraction.
+        let mut deleted_edges: Vec<(i64, String, i64)> = Vec::new();
         // Edge-degree counter decrements for edges that actually existed.
         let mut deg_in: std::collections::HashMap<(String, i64), i64> =
             std::collections::HashMap::new();
@@ -576,6 +578,7 @@ impl Executor {
                 *deg_in.entry((plan.edge_name.clone(), *dst)).or_insert(0) -= 1;
                 *deg_out.entry((plan.edge_name.clone(), *src)).or_insert(0) -= 1;
                 deleted += 1;
+                deleted_edges.push((*src, plan.edge_name.clone(), *dst));
             }
         }
         // Apply the degree-counter decrements (atomic; ≤0 removes the key).
@@ -591,10 +594,12 @@ impl Executor {
             self.ctx.kvstore.add_counters(counter_deltas).await?;
         }
 
-        // O-9 retraction: re-materialize the ontology closure so entailments
-        // that depended on the deleted edge(s) are retracted. No-op for spaces
-        // without semantic relations.
-        self.rematerialize_space(&effective_space).await?;
+        // O-10 Phase 3 retraction: incremental DRed over provenance — overdelete
+        // the deleted edges' dependent closure, then rederive from surviving
+        // neighbors. Touches only the affected region (vs O-9 full re-mat).
+        // No-op for spaces without semantic relations.
+        self.retract_edges_incremental(&effective_space, deleted_edges)
+            .await?;
 
         Ok(ExecutorResult {
             columns: vec!["Deleted".to_string()],

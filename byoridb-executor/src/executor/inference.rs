@@ -27,12 +27,20 @@
 //! closure over the current graph. A write cap (`max_traversal_nodes`) guards
 //! pathological closures and logs if hit.
 //!
-//! **Deletes: full re-materialization (O-9).** DELETE EDGE/VERTEX calls
-//! [`Executor::rematerialize_space`], which drops all inferred facts and
-//! re-derives them from the surviving asserted edges — so stale entailments are
-//! retracted (O-0 phase 1; incremental B/F is a later optimization). Cost is
-//! O(graph) per delete in a semantic space.
+//! **Deletes — two strategies.**
+//! - DELETE EDGE uses **incremental DRed** (O-10 Phase 3,
+//!   [`Executor::retract_edges_incremental`]): overdelete the deleted edges'
+//!   dependent closure via reverse provenance, then rederive from surviving
+//!   neighbors. Touches only the affected region.
+//! - DELETE VERTEX still uses **full re-materialization** (O-9,
+//!   [`Executor::rematerialize_space`]): drops all inferred facts + provenance
+//!   and re-derives from the surviving asserted edges. O(graph) per delete; an
+//!   incremental DELETE VERTEX path is a follow-up.
+//!
+//! Both retract stale entailments while keeping facts still supported by another
+//! derivation.
 
+use super::provenance::{Fact, Justification, RuleKind};
 use super::Executor;
 use crate::algo;
 use crate::error::Result;
@@ -145,6 +153,10 @@ impl Executor {
             self.ctx.kvstore.delete(&key).await?;
         }
 
+        // Drop all provenance: it is rebuilt by the run below from the surviving
+        // asserted edges, so a deleted fact's stale justifications disappear.
+        self.clear_provenance(space).await?;
+
         // Re-derive the full closure from the surviving asserted edges.
         self.run_materialization(space, asserted, &meta).await
     }
@@ -213,42 +225,114 @@ impl Executor {
 
         let mut written = 0usize;
         while let Some((s, p, d)) = worklist.pop_front() {
-            let mut derived: Vec<Triple> = Vec::new();
+            // The edge whose consequences we derive this iteration is the
+            // premise of every justification recorded below.
+            let premise = Fact::Edge { s, p: p.clone(), d };
+            // Each entry pairs a derived triple with how it was entailed.
+            let mut derived: Vec<(Triple, Justification)> = Vec::new();
 
             if meta.symmetric.contains(&p) {
-                derived.push((d, p.clone(), s));
+                derived.push((
+                    (d, p.clone(), s),
+                    Justification {
+                        rule: RuleKind::Symmetric,
+                        premises: vec![premise.clone()],
+                    },
+                ));
             }
             if let Some(invs) = meta.inverse.get(&p) {
                 for q in invs {
-                    derived.push((d, q.clone(), s));
+                    derived.push((
+                        (d, q.clone(), s),
+                        Justification {
+                            rule: RuleKind::InverseOf,
+                            premises: vec![premise.clone()],
+                        },
+                    ));
                 }
             }
             if let Some(sups) = meta.superprops.get(&p) {
                 for q in sups {
-                    derived.push((s, q.clone(), d));
+                    derived.push((
+                        (s, q.clone(), d),
+                        Justification {
+                            rule: RuleKind::SubPropertyOf,
+                            premises: vec![premise.clone()],
+                        },
+                    ));
                 }
             }
             if meta.transitive.contains(&p) {
                 let etype = [p.clone()];
                 // (s,p,d) ∧ (d,p,x) ⟹ (s,p,x)
                 for n in algo::get_neighbors(&self.ctx, space, d, &etype).await? {
-                    derived.push((s, p.clone(), n.dst));
+                    derived.push((
+                        (s, p.clone(), n.dst),
+                        Justification {
+                            rule: RuleKind::Transitive,
+                            premises: vec![
+                                premise.clone(),
+                                Fact::Edge {
+                                    s: d,
+                                    p: p.clone(),
+                                    d: n.dst,
+                                },
+                            ],
+                        },
+                    ));
                 }
                 // (y,p,s) ∧ (s,p,d) ⟹ (y,p,d)  (n.dst is the source vertex y)
                 for n in algo::get_incoming_neighbors(&self.ctx, space, s, &etype).await? {
-                    derived.push((n.dst, p.clone(), d));
+                    derived.push((
+                        (n.dst, p.clone(), d),
+                        Justification {
+                            rule: RuleKind::Transitive,
+                            premises: vec![
+                                Fact::Edge {
+                                    s: n.dst,
+                                    p: p.clone(),
+                                    d: s,
+                                },
+                                premise.clone(),
+                            ],
+                        },
+                    ));
                 }
             }
 
             // domain/range ⟹ vertex type inference (subject is-a domain,
             // object is-a range). Types do not entail further edges, so they
-            // are written but not enqueued.
+            // are written (with provenance) but not enqueued.
             if let Some(class) = meta.domain.get(&p) {
+                self.record_provenance(
+                    space,
+                    &Fact::Vtype {
+                        vid: s,
+                        class: class.clone(),
+                    },
+                    Justification {
+                        rule: RuleKind::Domain,
+                        premises: vec![premise.clone()],
+                    },
+                )
+                .await?;
                 if self.assert_vertex_type(space, s, class).await? {
                     written += 1;
                 }
             }
             if let Some(class) = meta.range.get(&p) {
+                self.record_provenance(
+                    space,
+                    &Fact::Vtype {
+                        vid: d,
+                        class: class.clone(),
+                    },
+                    Justification {
+                        rule: RuleKind::Range,
+                        premises: vec![premise.clone()],
+                    },
+                )
+                .await?;
                 if self.assert_vertex_type(space, d, class).await? {
                     written += 1;
                 }
@@ -261,17 +345,32 @@ impl Executor {
                 return Ok(());
             }
 
-            for triple in derived {
+            for (triple, justification) in derived {
+                let (s2, p2, d2) = (triple.0, triple.1.clone(), triple.2);
+                // Record provenance for *every* derivation — even of an edge
+                // already in the graph — so the justification set is complete
+                // for retraction. record_provenance dedups identical entries.
+                self.record_provenance(
+                    space,
+                    &Fact::Edge {
+                        s: s2,
+                        p: p2.clone(),
+                        d: d2,
+                    },
+                    justification,
+                )
+                .await?;
+
                 if !seen.insert(triple.clone()) {
                     continue; // already queued/processed this run
                 }
-                let (s2, p2, d2) = &triple;
                 // Already in the graph (asserted, or inferred at an earlier
-                // insert): its own consequences are already materialized — skip.
-                if self.triple_exists(space, *s2, p2, *d2).await? {
+                // insert): its own consequences are already materialized — skip
+                // writing/enqueueing (its provenance above is still recorded).
+                if self.triple_exists(space, s2, &p2, d2).await? {
                     continue;
                 }
-                self.write_inferred_edge(space, *s2, p2, *d2).await?;
+                self.write_inferred_edge(space, s2, &p2, d2).await?;
                 written += 1;
                 if written >= cap {
                     tracing::warn!(
@@ -331,6 +430,151 @@ impl Executor {
         }
         self.ctx.kvstore.put(&key, &[]).await?;
         Ok(true)
+    }
+
+    /// Incremental retraction via provenance-based **DRed** (PLAN.md O-10
+    /// Phase 3), replacing the O(graph) full re-materialization for DELETE EDGE.
+    ///
+    /// `deleted` are the asserted edges just removed by the caller. Two phases:
+    ///
+    /// 1. **Overdelete** — transitive closure over the reverse-provenance index
+    ///    (`dependents_of`) from each deleted edge: every inferred fact that
+    ///    named a removed fact as a premise is tentatively deleted (edge keys +
+    ///    its provenance), recursing through inferred edges. An edge that *also*
+    ///    exists as asserted survives and is not recursed through (it still
+    ///    supports its dependents). vtypes never entail, so they are leaves.
+    /// 2. **Rederive** — re-run materialization seeded with the surviving
+    ///    asserted edges incident to the affected vertices. Rules are local
+    ///    (1-edge for symmetric/inverse/subprop/domain/range; adjacent-edge for
+    ///    transitive, whose neighbor lookups read the live graph), so this
+    ///    neighborhood seed re-derives exactly the facts still supported — the
+    ///    DRed rederive pass that gives correct retraction under recursion
+    ///    (transitive cycles) without DRed's classic over-deletion surviving.
+    ///
+    /// No-op for spaces without semantic relations (nothing was inferred).
+    pub(super) async fn retract_edges_incremental(
+        &self,
+        space: &str,
+        deleted: Vec<Triple>,
+    ) -> Result<()> {
+        let meta = self.load_rel_meta(space).await?;
+        if meta.is_empty() {
+            return Ok(());
+        }
+
+        let mut affected: HashSet<i64> = HashSet::new();
+        let mut visited: HashSet<Fact> = HashSet::new();
+        let mut processed: HashSet<Triple> = HashSet::new();
+        let mut frontier: VecDeque<Triple> = VecDeque::new();
+        for (s, p, d) in deleted {
+            affected.insert(s);
+            affected.insert(d);
+            frontier.push_back((s, p, d));
+        }
+
+        // ---- Overdelete ----
+        while let Some((s, p, d)) = frontier.pop_front() {
+            if !processed.insert((s, p.clone(), d)) {
+                continue;
+            }
+            for g in self.dependents_of(space, s, &p, d).await? {
+                if !visited.insert(g.clone()) {
+                    continue;
+                }
+                match &g {
+                    Fact::Edge {
+                        s: gs,
+                        p: gp,
+                        d: gd,
+                    } => {
+                        // An asserted copy survives → it still supports its own
+                        // dependents; don't delete or recurse through it.
+                        if self.edge_has_asserted(space, *gs, gp, *gd).await? {
+                            continue;
+                        }
+                        affected.insert(*gs);
+                        affected.insert(*gd);
+                        // Inferred edges are written at ranking 0 (write_inferred_edge).
+                        self.ctx
+                            .kvstore
+                            .delete(&SchemaKey::edge_data(space, *gs, gp, *gd, 0))
+                            .await?;
+                        self.ctx
+                            .kvstore
+                            .delete(&SchemaKey::in_edge_data(space, *gd, gp, *gs, 0))
+                            .await?;
+                        self.purge_fact_provenance(space, &g).await?;
+                        frontier.push_back((*gs, gp.clone(), *gd));
+                    }
+                    Fact::Vtype { vid, class } => {
+                        affected.insert(*vid);
+                        self.ctx
+                            .kvstore
+                            .delete(&SchemaKey::vtype(space, *vid, class))
+                            .await?;
+                        self.purge_fact_provenance(space, &g).await?;
+                    }
+                }
+            }
+            // Dependents are now traversed, so the removed edge's reverse-prov
+            // entry can go (it supports nothing). Done *after* reading dependents
+            // above — deleting it earlier would lose the traversal links.
+            self.delete_prov_rev_edge(space, s, &p, d).await?;
+        }
+
+        // ---- Rederive from surviving asserted edges incident to affected vertices ----
+        let mut seeds: Vec<Triple> = Vec::new();
+        let mut seen: HashSet<Triple> = HashSet::new();
+        for v in &affected {
+            for t in self.surviving_asserted_incident(space, *v).await? {
+                if seen.insert(t.clone()) {
+                    seeds.push(t);
+                }
+            }
+        }
+        self.run_materialization(space, seeds, &meta).await
+    }
+
+    /// True if an **asserted** (non-`__inferred__`) edge `(s)-p->(d)` exists at
+    /// any ranking. Distinguishes a fact that survives a delete (asserted) from
+    /// one that is purely materialized (retractable).
+    async fn edge_has_asserted(&self, space: &str, s: i64, p: &str, d: i64) -> Result<bool> {
+        let prefix = format!("{}:edge:{}:{}:{}:", space, s, p, d);
+        for (_k, v) in self.ctx.kvstore.scan_prefix(prefix.as_bytes()).await? {
+            if let Ok(edge) = VertexCodec::decode_edge(&v) {
+                if !edge.properties.contains_key(INFERRED_MARKER) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Surviving **asserted** edges incident to vertex `v` (both out- and
+    /// in-edges), as `(src, type, dst)` triples — the rederive seed set. Inferred
+    /// edges are excluded (they are re-derived, not seeds).
+    async fn surviving_asserted_incident(&self, space: &str, v: i64) -> Result<Vec<Triple>> {
+        let mut out = Vec::new();
+        let push_asserted = |edge: byoridb_codec::EdgeData, acc: &mut Vec<Triple>| {
+            if !edge.properties.contains_key(INFERRED_MARKER) {
+                acc.push((edge.src_vid, edge.edge_type, edge.dst_vid));
+            }
+        };
+        // Out-edges: {space}:edge:{v}:
+        let out_prefix = SchemaKey::edge_data_src_prefix(space, v);
+        for (_k, val) in self.ctx.kvstore.scan_prefix(&out_prefix).await? {
+            if let Ok(edge) = VertexCodec::decode_edge(&val) {
+                push_asserted(edge, &mut out);
+            }
+        }
+        // In-edges: {space}:in-edge:{v}: (value is the denormalized edge payload)
+        let in_prefix = SchemaKey::in_edge_data_dst_prefix(space, v);
+        for (_k, val) in self.ctx.kvstore.scan_prefix(&in_prefix).await? {
+            if let Ok(edge) = VertexCodec::decode_edge(&val) {
+                push_asserted(edge, &mut out);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -619,6 +863,261 @@ mod tests {
         assert!(
             run(&e, "CREATE EDGE foo() INVERSE OF foo").await.is_err(),
             "self INVERSE OF must error"
+        );
+    }
+
+    // ---- Provenance (Phase 1): justification capture ----
+
+    #[tokio::test]
+    async fn transitive_records_provenance() {
+        // 1->2, 2->3 over a TRANSITIVE edge infers 1->3; its provenance must
+        // record the Transitive rule with both premise edges.
+        let e = create_executor();
+        ok(&e, "CREATE EDGE ancestor() TRANSITIVE").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 2->3:()").await;
+        assert!(has(&e, 1, "ancestor", 3).await, "1->3 inferred");
+
+        let justs = e
+            .provenance_of(
+                "default",
+                &Fact::Edge {
+                    s: 1,
+                    p: "ancestor".to_string(),
+                    d: 3,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            justs.iter().any(|j| j.rule == RuleKind::Transitive
+                && j.premises
+                    == vec![
+                        Fact::Edge {
+                            s: 1,
+                            p: "ancestor".to_string(),
+                            d: 2
+                        },
+                        Fact::Edge {
+                            s: 2,
+                            p: "ancestor".to_string(),
+                            d: 3
+                        },
+                    ]),
+            "transitive justification with both premises recorded, got {justs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn symmetric_records_provenance() {
+        let e = create_executor();
+        ok(&e, "CREATE EDGE knows() SYMMETRIC").await;
+        ok(&e, "INSERT EDGE knows() VALUES 1->2:()").await;
+        let justs = e
+            .provenance_of(
+                "default",
+                &Fact::Edge {
+                    s: 2,
+                    p: "knows".to_string(),
+                    d: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            justs.len(),
+            1,
+            "one justification for the symmetric reverse"
+        );
+        assert_eq!(justs[0].rule, RuleKind::Symmetric);
+        assert_eq!(
+            justs[0].premises,
+            vec![Fact::Edge {
+                s: 1,
+                p: "knows".to_string(),
+                d: 2
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_clears_inferred_fact_provenance() {
+        // Deleting 2->3 retracts the inferred 1->3 (full re-materialization),
+        // and its provenance must be cleared with it (not left stale).
+        let e = create_executor();
+        ok(&e, "CREATE EDGE ancestor() TRANSITIVE").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 2->3:()").await;
+        let fact = Fact::Edge {
+            s: 1,
+            p: "ancestor".to_string(),
+            d: 3,
+        };
+        assert!(
+            !e.provenance_of("default", &fact).await.unwrap().is_empty(),
+            "provenance present before delete"
+        );
+        ok(&e, "DELETE EDGE ancestor 2->3").await;
+        assert!(!has(&e, 1, "ancestor", 3).await, "inferred 1->3 retracted");
+        assert!(
+            e.provenance_of("default", &fact).await.unwrap().is_empty(),
+            "provenance cleared after retraction"
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_range_records_vtype_provenance() {
+        let e = create_executor();
+        ok(&e, "CREATE CLASS person()").await;
+        ok(&e, "CREATE CLASS city()").await;
+        ok(&e, "CREATE TAG place()").await;
+        ok(&e, "CREATE EDGE bornIn() DOMAIN person RANGE city").await;
+        ok(&e, "INSERT VERTEX place() VALUES 2:()").await;
+        ok(&e, "INSERT EDGE bornIn() VALUES 1->2:()").await;
+        // RANGE city ⟹ vertex 2 is-a city, justified by the bornIn edge.
+        let justs = e
+            .provenance_of(
+                "default",
+                &Fact::Vtype {
+                    vid: 2,
+                    class: "city".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            justs.iter().any(|j| j.rule == RuleKind::Range
+                && j.premises
+                    == vec![Fact::Edge {
+                        s: 1,
+                        p: "bornIn".to_string(),
+                        d: 2
+                    }]),
+            "range justification recorded for inferred vtype, got {justs:?}"
+        );
+    }
+
+    // ---- Phase 2: WHY explanation surface ----
+
+    #[tokio::test]
+    async fn why_explains_transitive_inference() {
+        // `WHY 1 -> 3 OVER ancestor` should show 1->3 as inferred via transitive
+        // from the two asserted edges, which appear as asserted leaves.
+        let e = create_executor();
+        ok(&e, "CREATE EDGE ancestor() TRANSITIVE").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 2->3:()").await;
+
+        let r = run(&e, "WHY 1 -> 3 OVER ancestor").await.unwrap();
+        assert_eq!(
+            r.columns,
+            vec!["depth", "fact", "status", "rule", "premises"]
+        );
+        // Root row: inferred via transitive, premises = both asserted edges.
+        let root = &r.rows[0];
+        assert_eq!(root[1], Value::String("1 -ancestor-> 3".to_string()));
+        assert_eq!(root[2], Value::String("inferred".to_string()));
+        assert_eq!(root[3], Value::String("transitive".to_string()));
+        assert_eq!(
+            root[4],
+            Value::String("1 -ancestor-> 2, 2 -ancestor-> 3".to_string())
+        );
+        // Both premises appear as asserted leaves somewhere in the tree.
+        let has_asserted = |f: &str| {
+            r.rows.iter().any(|row| {
+                row[1] == Value::String(f.to_string())
+                    && row[2] == Value::String("asserted".to_string())
+            })
+        };
+        assert!(
+            has_asserted("1 -ancestor-> 2"),
+            "premise 1->2 asserted leaf"
+        );
+        assert!(
+            has_asserted("2 -ancestor-> 3"),
+            "premise 2->3 asserted leaf"
+        );
+    }
+
+    #[tokio::test]
+    async fn why_unknown_edge_reports_not_found() {
+        let e = create_executor();
+        ok(&e, "CREATE EDGE ancestor() TRANSITIVE").await;
+        let r = run(&e, "WHY 9 -> 99 OVER ancestor").await.unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][2], Value::String("not found".to_string()));
+    }
+
+    // ---- Phase 3: incremental DRed retraction — the hard cases ----
+
+    #[tokio::test]
+    async fn dred_retracts_cycle_well_founded() {
+        // A transitive 3-cycle 1->2->3->1 closes to ALL 9 pairs (incl. self-loops
+        // 1->1,2->2,3->3 and back-edges 2->1,3->2). Deleting asserted 3->1 must
+        // collapse the closure to exactly {1->2, 2->3, 1->3}: every fact whose
+        // derivation passed through 3->1 — including 1->3's *cyclic* alternative
+        // justification via 1->1 — is overdeleted, then 1->3 is REDERIVED from
+        // the surviving 1->2,2->3. This is the well-founded-support case where a
+        // naive cascade (no rederive) would wrongly drop 1->3 or keep cycle facts.
+        let e = create_executor();
+        ok(&e, "CREATE EDGE ancestor() TRANSITIVE").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 2->3:()").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 3->1:()").await;
+        // Sanity: the cycle fully closed.
+        assert!(
+            has(&e, 1, "ancestor", 1).await,
+            "self-loop inferred in cycle"
+        );
+        assert!(
+            has(&e, 2, "ancestor", 1).await,
+            "back-edge inferred in cycle"
+        );
+
+        ok(&e, "DELETE EDGE ancestor 3->1").await;
+
+        // Survivors + the one still-supported inference.
+        assert!(has(&e, 1, "ancestor", 2).await, "asserted 1->2 kept");
+        assert!(has(&e, 2, "ancestor", 3).await, "asserted 2->3 kept");
+        assert!(
+            has(&e, 1, "ancestor", 3).await,
+            "1->3 rederived from 1->2,2->3"
+        );
+        // Everything that depended on 3->1 is gone.
+        assert!(!has(&e, 3, "ancestor", 1).await, "deleted 3->1 gone");
+        assert!(!has(&e, 2, "ancestor", 1).await, "back-edge 2->1 retracted");
+        assert!(!has(&e, 3, "ancestor", 2).await, "back-edge 3->2 retracted");
+        assert!(!has(&e, 1, "ancestor", 1).await, "self-loop 1->1 retracted");
+        assert!(!has(&e, 2, "ancestor", 2).await, "self-loop 2->2 retracted");
+        assert!(!has(&e, 3, "ancestor", 3).await, "self-loop 3->3 retracted");
+    }
+
+    #[tokio::test]
+    async fn dred_keeps_fact_with_surviving_second_justification() {
+        // related has TWO subproperties; knows 1->2 and likes 1->2 each entail
+        // related 1->2 (two justifications). Deleting knows 1->2 must overdelete
+        // the inferred related 1->2 then REDERIVE it from the surviving likes 1->2.
+        let e = create_executor();
+        ok(&e, "CREATE EDGE related()").await;
+        ok(&e, "CREATE EDGE knows() SUBPROPERTY OF related").await;
+        ok(&e, "CREATE EDGE likes() SUBPROPERTY OF related").await;
+        ok(&e, "INSERT EDGE knows() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE likes() VALUES 1->2:()").await;
+        assert!(has(&e, 1, "related", 2).await, "related inferred (both)");
+
+        ok(&e, "DELETE EDGE knows 1->2").await;
+        assert!(!has(&e, 1, "knows", 2).await, "knows deleted");
+        assert!(has(&e, 1, "likes", 2).await, "likes survives");
+        assert!(
+            has(&e, 1, "related", 2).await,
+            "related kept — still supported by likes"
+        );
+
+        // Deleting the second support too now fully retracts related.
+        ok(&e, "DELETE EDGE likes 1->2").await;
+        assert!(
+            !has(&e, 1, "related", 2).await,
+            "related retracted once all support gone"
         );
     }
 }

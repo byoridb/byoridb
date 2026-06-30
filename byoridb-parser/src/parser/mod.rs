@@ -173,6 +173,20 @@ impl Parser {
                 self.consume_token(Token::Consistency)?;
                 Ok(Statement::CheckConsistency)
             }
+            // WHY <src> -> <dst> OVER <edge_type> (provenance explanation)
+            Token::Why => {
+                self.advance();
+                let src = self.consume_integer()?;
+                self.consume_token(Token::Arrow)?;
+                let dst = self.consume_integer()?;
+                self.consume_token(Token::Over)?;
+                let edge_type = self.consume_identifier()?;
+                Ok(Statement::ExplainInference {
+                    src,
+                    dst,
+                    edge_type,
+                })
+            }
             // EXPLAIN / PROFILE
             tok @ (Token::Explain | Token::Profile) => {
                 let profile = matches!(tok, Token::Profile);
@@ -308,6 +322,7 @@ impl Parser {
             Token::Disjoint => "disjoint",
             Token::With => "with",
             Token::Consistency => "consistency",
+            Token::Why => "why",
             // Role keywords (used as identifiers in GRANT/REVOKE)
             Token::Admin => "ADMIN",
             Token::God => "GOD",

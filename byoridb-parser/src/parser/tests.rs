@@ -1270,6 +1270,22 @@ fn test_parse_check_consistency() {
 }
 
 #[test]
+fn test_parse_why_inference() {
+    match parse("WHY 1 -> 3 OVER ancestor").unwrap() {
+        Statement::ExplainInference {
+            src,
+            dst,
+            edge_type,
+        } => {
+            assert_eq!(src, 1);
+            assert_eq!(dst, 3);
+            assert_eq!(edge_type, "ancestor");
+        }
+        other => panic!("expected ExplainInference, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_parse_create_edge_semantics() {
     match parse("CREATE EDGE ancestor() TRANSITIVE").unwrap() {
         Statement::Create(CreateStatement::Edge(e)) => {

@@ -87,6 +87,8 @@ pub enum Token {
     Check,
     #[token("CONSISTENCY", ignore(case))]
     Consistency,
+    #[token("WHY", ignore(case))]
+    Why,
     #[token("MATCH", ignore(case))]
     Match,
     #[token("GO", ignore(case))]
