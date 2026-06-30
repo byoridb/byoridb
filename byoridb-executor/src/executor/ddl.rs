@@ -472,6 +472,32 @@ impl Executor {
             }
         }
 
+        // CHAIN p1, p2 (owl:propertyChainAxiom): exactly two links for now, each
+        // an already-declared edge type so materialization (O-5) resolves them.
+        if let Some(chain) = &semantics.property_chain {
+            if chain.len() != 2 {
+                return Err(ExecutionError::InvalidOperation(format!(
+                    "CHAIN must have exactly 2 edge types (got {}); longer chains \
+                     are not yet supported",
+                    chain.len()
+                )));
+            }
+            for target in chain {
+                if self
+                    .ctx
+                    .kvstore
+                    .get(&SchemaKey::edge(&space, target))
+                    .await?
+                    .is_none()
+                {
+                    return Err(ExecutionError::InvalidOperation(format!(
+                        "CHAIN target edge type '{}' does not exist",
+                        target
+                    )));
+                }
+            }
+        }
+
         // DOMAIN / RANGE reference a *class* (vertex type) — validate it exists
         // as a tag or class so type inference (O-5) resolves it.
         for (clause, target) in [("DOMAIN", &semantics.domain), ("RANGE", &semantics.range)] {

@@ -317,6 +317,7 @@ impl Parser {
             Token::Symmetric => "symmetric",
             Token::Inverse => "inverse",
             Token::Subproperty => "subproperty",
+            Token::Chain => "chain",
             Token::Domain => "domain",
             Token::Range => "range",
             Token::Disjoint => "disjoint",

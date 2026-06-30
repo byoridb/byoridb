@@ -45,6 +45,7 @@ pub(super) enum RuleKind {
     InverseOf,
     SubPropertyOf,
     Transitive,
+    PropertyChain,
     Domain,
     Range,
 }
@@ -385,6 +386,7 @@ fn rule_to_string(rule: &RuleKind) -> &'static str {
         RuleKind::InverseOf => "inverseOf",
         RuleKind::SubPropertyOf => "subPropertyOf",
         RuleKind::Transitive => "transitive",
+        RuleKind::PropertyChain => "propertyChain",
         RuleKind::Domain => "domain",
         RuleKind::Range => "range",
     }

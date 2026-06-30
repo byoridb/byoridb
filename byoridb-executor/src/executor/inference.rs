@@ -70,6 +70,15 @@ pub(super) struct RelMeta {
     domain: HashMap<String, String>,
     /// edge type → range class (object vertex type).
     range: HashMap<String, String>,
+    /// First chain link `p1` → list of `(q, p2)`: for an edge `(s)-p1->(d)`,
+    /// each `p2`-neighbor `b` of `d` entails `(s)-q->(b)` (owl:propertyChainAxiom
+    /// `q ← p1 ∘ p2`).
+    chain_first: HashMap<String, Vec<(String, String)>>,
+    /// Second chain link `p2` → list of `(q, p1)`: for an edge `(x)-p2->(b)`,
+    /// each `p1`-predecessor `a` of `x` entails `(a)-q->(b)`. The backward
+    /// counterpart of `chain_first`, so a chain closes regardless of which link
+    /// is inserted last.
+    chain_second: HashMap<String, Vec<(String, String)>>,
 }
 
 impl RelMeta {
@@ -80,6 +89,8 @@ impl RelMeta {
             && self.superprops.is_empty()
             && self.domain.is_empty()
             && self.range.is_empty()
+            && self.chain_first.is_empty()
+            && self.chain_second.is_empty()
     }
 }
 
@@ -203,6 +214,21 @@ impl Executor {
             if let Some(c) = sem.range {
                 meta.range.insert(name.clone(), c);
             }
+            // CHAIN [p1, p2]: index by both links so the chain closes whichever
+            // edge is inserted last. Ignore malformed chains (len != 2) — the
+            // DDL validator already rejects them; this is defensive.
+            if let Some(chain) = sem.property_chain {
+                if let [p1, p2] = chain.as_slice() {
+                    meta.chain_first
+                        .entry(p1.clone())
+                        .or_default()
+                        .push((name.clone(), p2.clone()));
+                    meta.chain_second
+                        .entry(p2.clone())
+                        .or_default()
+                        .push((name.clone(), p1.clone()));
+                }
+            }
         }
         Ok(meta)
     }
@@ -297,6 +323,53 @@ impl Executor {
                             ],
                         },
                     ));
+                }
+            }
+
+            // property chain (owl:propertyChainAxiom) q ← p1 ∘ p2.
+            // Link 1: (s)-p->(d) is p1 ⟹ for each p2-neighbor b of d, (s)-q->(b).
+            if let Some(axioms) = meta.chain_first.get(&p) {
+                for (q, p2) in axioms {
+                    let et = [p2.clone()];
+                    for n in algo::get_neighbors(&self.ctx, space, d, &et).await? {
+                        derived.push((
+                            (s, q.clone(), n.dst),
+                            Justification {
+                                rule: RuleKind::PropertyChain,
+                                premises: vec![
+                                    premise.clone(),
+                                    Fact::Edge {
+                                        s: d,
+                                        p: p2.clone(),
+                                        d: n.dst,
+                                    },
+                                ],
+                            },
+                        ));
+                    }
+                }
+            }
+            // Link 2: (s)-p->(d) is p2 ⟹ for each p1-predecessor a of s, (a)-q->(d).
+            // (get_incoming_neighbors yields edges into s; n.dst is the source a.)
+            if let Some(axioms) = meta.chain_second.get(&p) {
+                for (q, p1) in axioms {
+                    let et = [p1.clone()];
+                    for n in algo::get_incoming_neighbors(&self.ctx, space, s, &et).await? {
+                        derived.push((
+                            (n.dst, q.clone(), d),
+                            Justification {
+                                rule: RuleKind::PropertyChain,
+                                premises: vec![
+                                    Fact::Edge {
+                                        s: n.dst,
+                                        p: p1.clone(),
+                                        d: s,
+                                    },
+                                    premise.clone(),
+                                ],
+                            },
+                        ));
+                    }
                 }
             }
 
@@ -1118,6 +1191,104 @@ mod tests {
         assert!(
             !has(&e, 1, "related", 2).await,
             "related retracted once all support gone"
+        );
+    }
+
+    // ---- Property chain (owl:propertyChainAxiom, prp-spo2) ----
+
+    #[tokio::test]
+    async fn property_chain_two_step_derives() {
+        // grandparent ← parent ∘ parent (same-type chain — the transitive-like case).
+        let e = create_executor();
+        ok(&e, "CREATE EDGE parent()").await;
+        ok(&e, "CREATE EDGE grandparent() CHAIN parent, parent").await;
+        ok(&e, "INSERT EDGE parent() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE parent() VALUES 2->3:()").await;
+        assert!(
+            has(&e, 1, "grandparent", 3).await,
+            "1-parent->2-parent->3 ⟹ 1-grandparent->3"
+        );
+        assert!(
+            !has(&e, 1, "grandparent", 2).await,
+            "single hop is not grandparent"
+        );
+        // parent itself is not transitive, so no inferred parent 1->3.
+        assert!(
+            !has(&e, 1, "parent", 3).await,
+            "parent stays non-transitive"
+        );
+    }
+
+    #[tokio::test]
+    async fn property_chain_distinct_link_types() {
+        // q ← p1 ∘ p2 with p1 ≠ p2; closes via the *second* link inserted last
+        // (exercises the backward chain rule).
+        let e = create_executor();
+        ok(&e, "CREATE EDGE knows()").await;
+        ok(&e, "CREATE EDGE worksAt()").await;
+        ok(&e, "CREATE EDGE colleagueOrg() CHAIN knows, worksAt").await;
+        ok(&e, "INSERT EDGE knows() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE worksAt() VALUES 2->100:()").await;
+        assert!(
+            has(&e, 1, "colleagueOrg", 100).await,
+            "1-knows->2-worksAt->100 ⟹ 1-colleagueOrg->100"
+        );
+        assert!(!has(&e, 2, "colleagueOrg", 100).await, "no spurious chain");
+    }
+
+    #[tokio::test]
+    async fn why_explains_property_chain() {
+        let e = create_executor();
+        ok(&e, "CREATE EDGE parent()").await;
+        ok(&e, "CREATE EDGE grandparent() CHAIN parent, parent").await;
+        ok(&e, "INSERT EDGE parent() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE parent() VALUES 2->3:()").await;
+        let r = run(&e, "WHY 1 -> 3 OVER grandparent").await.unwrap();
+        let root = &r.rows[0];
+        assert_eq!(root[2], Value::String("inferred".to_string()));
+        assert_eq!(root[3], Value::String("propertyChain".to_string()));
+        assert_eq!(
+            root[4],
+            Value::String("1 -parent-> 2, 2 -parent-> 3".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn property_chain_retracts_on_delete() {
+        // DRed retraction works for chain-derived edges too.
+        let e = create_executor();
+        ok(&e, "CREATE EDGE parent()").await;
+        ok(&e, "CREATE EDGE grandparent() CHAIN parent, parent").await;
+        ok(&e, "INSERT EDGE parent() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE parent() VALUES 2->3:()").await;
+        assert!(has(&e, 1, "grandparent", 3).await, "grandparent inferred");
+        ok(&e, "DELETE EDGE parent 2->3").await;
+        assert!(
+            !has(&e, 1, "grandparent", 3).await,
+            "grandparent retracted when a chain link is deleted"
+        );
+        assert!(has(&e, 1, "parent", 2).await, "surviving link kept");
+    }
+
+    #[tokio::test]
+    async fn create_edge_rejects_bad_chain() {
+        let e = create_executor();
+        ok(&e, "CREATE EDGE parent()").await;
+        assert!(
+            run(&e, "CREATE EDGE gp() CHAIN parent").await.is_err(),
+            "1-link chain must be rejected (exactly 2 required)"
+        );
+        assert!(
+            run(&e, "CREATE EDGE gp() CHAIN parent, parent, parent")
+                .await
+                .is_err(),
+            "3-link chain must be rejected"
+        );
+        assert!(
+            run(&e, "CREATE EDGE gp() CHAIN parent, nope")
+                .await
+                .is_err(),
+            "unknown chain target must be rejected"
         );
     }
 }

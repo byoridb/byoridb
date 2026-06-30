@@ -1308,6 +1308,15 @@ fn test_parse_create_edge_semantics() {
         }
         other => panic!("Expected Create Edge, got {:?}", other),
     }
+    match parse("CREATE EDGE grandparent() CHAIN parent, parent").unwrap() {
+        Statement::Create(CreateStatement::Edge(e)) => {
+            assert_eq!(
+                e.semantics.property_chain.as_deref(),
+                Some(["parent".to_string(), "parent".to_string()].as_slice())
+            );
+        }
+        other => panic!("Expected Create Edge, got {:?}", other),
+    }
     // No semantic clause → all default off.
     match parse("CREATE EDGE plain()").unwrap() {
         Statement::Create(CreateStatement::Edge(e)) => assert!(e.semantics.is_empty()),

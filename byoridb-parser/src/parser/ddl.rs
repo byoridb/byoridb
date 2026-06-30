@@ -467,6 +467,15 @@ impl Parser {
                     self.consume_token(Token::Of)?;
                     semantics.subproperty_of = Some(self.consume_identifier()?);
                 }
+                Token::Chain => {
+                    // CHAIN p1, p2[, ...] — comma-separated edge-type list.
+                    self.advance();
+                    let mut chain = vec![self.consume_identifier()?];
+                    while self.match_token(Token::Comma) {
+                        chain.push(self.consume_identifier()?);
+                    }
+                    semantics.property_chain = Some(chain);
+                }
                 Token::Domain => {
                     self.advance();
                     semantics.domain = Some(self.consume_identifier()?);
