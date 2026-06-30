@@ -94,8 +94,10 @@ pub struct ExecutionContext {
     /// the duration of a query, and compound execution needs to insert
     /// each clause's `ExecutorResult` for subsequent clauses to read.
     /// Access is synchronous and short — the lock is never held across an
-    /// `.await` boundary.
-    pub vars: Mutex<HashMap<String, ExecutorResult>>,
+    /// `.await` boundary. Wrapped in `Arc` so a `USE`-derived sibling context
+    /// (see [`Self::derive_with_space`]) shares the *same* bindings: a compound
+    /// like `$a = GO ...; USE other; ... $a ...` must still resolve `$a`.
+    pub vars: Arc<Mutex<HashMap<String, ExecutorResult>>>,
 
     /// Active profile collector. `Some` only while a `PROFILE <query>` is
     /// executing; instrumentation sites push [`ProfileRecord`]s through it.
@@ -127,7 +129,7 @@ impl ExecutionContext {
             distributed_mode: false,
             partition_num: None,
             caller_roles: vec![],
-            vars: Mutex::new(HashMap::new()),
+            vars: Arc::new(Mutex::new(HashMap::new())),
             profile: Mutex::new(None),
             full_scan: Arc::new(AtomicBool::new(false)),
         }
@@ -216,6 +218,37 @@ impl ExecutionContext {
     pub fn with_space(mut self, space: String) -> Self {
         self.space = Some(space);
         self
+    }
+
+    /// Derive a sibling context bound to a different `space`, sharing the same
+    /// kvstore, index manager, variable bindings (`Arc<Mutex>`), profile
+    /// collector, full-scan flag, caller roles, and config. Used by compound
+    /// execution so a `USE` clause switches the space seen by *subsequent*
+    /// clauses in the same request — `execute_use` cannot mutate `space` in
+    /// place because the context is shared behind an `Arc`.
+    ///
+    /// `space_id` is reset to `None` to match the normal per-request path (the
+    /// Graph service builds the context with `with_space` only); distributed
+    /// reads resolve it on demand from the space name.
+    pub fn derive_with_space(&self, space: String) -> Self {
+        Self {
+            space: Some(space),
+            space_id: None,
+            config: self.config.clone(),
+            kvstore: self.kvstore.clone(),
+            index_manager: self.index_manager.clone(),
+            #[cfg(feature = "distributed")]
+            meta_client: self.meta_client.clone(),
+            #[cfg(feature = "distributed")]
+            storage_client: self.storage_client.clone(),
+            #[cfg(feature = "distributed")]
+            distributed_mode: self.distributed_mode,
+            partition_num: self.partition_num,
+            caller_roles: self.caller_roles.clone(),
+            vars: self.vars.clone(),
+            profile: Mutex::new(self.profile.lock().clone()),
+            full_scan: self.full_scan.clone(),
+        }
     }
 
     pub fn with_space_id(mut self, space_id: u32) -> Self {

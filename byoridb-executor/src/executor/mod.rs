@@ -111,10 +111,33 @@ impl Executor {
     {
         Box::pin(async move {
             let mut last_result = ExecutorResult::empty();
+            // Working context for the clauses. A `USE` clause swaps it for a
+            // sibling context on the new space so *subsequent* clauses see the
+            // switch. `execute_use` alone cannot: `ctx.space` is set once per
+            // request from the session and a session-level switch only takes
+            // effect on the *next* request — so `USE nexprice; MATCH ...` would
+            // otherwise run the MATCH on the stale/unset space (the cause of a
+            // "data looks empty" incident). `$var` bindings are preserved
+            // because `vars` is shared via `Arc` across derived contexts.
+            let mut ctx = self.ctx.clone();
             for clause in clauses {
-                let result = self.execute(*clause.plan).await?;
+                if let ExecutionPlan::Use(use_plan) = clause.plan.as_ref() {
+                    // Validate the target exists (mirrors `execute_use`) so a
+                    // typo errors instead of silently misrouting later clauses.
+                    let space_key = crate::key::SchemaKey::space(&use_plan.space);
+                    if ctx.kvstore.get(&space_key).await?.is_none() {
+                        return Err(crate::error::ExecutionError::SpaceNotFound(
+                            use_plan.space.clone(),
+                        ));
+                    }
+                    ctx = Arc::new(ctx.derive_with_space(use_plan.space.clone()));
+                    last_result = ExecutorResult::empty();
+                    continue;
+                }
+                let exec = Executor::new(ctx.clone());
+                let result = exec.execute(*clause.plan).await?;
                 if let Some(var) = clause.var {
-                    self.ctx.bind_var(var, result.clone());
+                    ctx.bind_var(var, result.clone());
                 } else {
                     last_result = result;
                 }
@@ -868,6 +891,63 @@ mod tests {
                 byoridb_common::Value::Int(2),
                 byoridb_common::Value::Int(3)
             ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compound_use_switches_space_for_subsequent_clauses() {
+        // Regression (production incident): `USE other; <stmt>` in ONE request
+        // must route <stmt> to `other`, not the session's prior/unset space.
+        // A fully-populated space looked empty because the MATCH after `USE`
+        // ran on the stale space. The executor's default space here is "default".
+        let executor = create_executor();
+
+        // Create `other` so USE existence-validation passes. The default space
+        // ("default") need not exist — the negative assertion below only checks
+        // that nothing was written under it.
+        let stmt = byoridb_parser::parse("CREATE SPACE other").unwrap();
+        let plan = ExecutionPlanBuilder::build(stmt).unwrap();
+        executor.execute(plan).await.unwrap();
+
+        // One compound: switch to `other`, then create a tag. With the fix the
+        // tag is created in `other`; without it, in the stale "default".
+        let stmt = byoridb_parser::parse("USE other; CREATE TAG person()").unwrap();
+        let plan = ExecutionPlanBuilder::build(stmt).unwrap();
+        executor.execute(plan).await.unwrap();
+
+        let in_other = executor
+            .ctx
+            .kvstore
+            .get(&SchemaKey::tag("other", "person"))
+            .await
+            .unwrap();
+        let in_default = executor
+            .ctx
+            .kvstore
+            .get(&SchemaKey::tag("default", "person"))
+            .await
+            .unwrap();
+        assert!(
+            in_other.is_some(),
+            "USE other must route the subsequent CREATE TAG to `other`"
+        );
+        assert!(
+            in_default.is_none(),
+            "CREATE TAG must NOT land in the default space after USE other"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compound_use_unknown_space_errors() {
+        // A `USE` of a non-existent space inside a compound must error (not
+        // silently misroute the following clauses).
+        let executor = create_executor();
+        let stmt = byoridb_parser::parse("USE nonexistent; CREATE TAG t()").unwrap();
+        let plan = ExecutionPlanBuilder::build(stmt).unwrap();
+        let err = executor.execute(plan).await.unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::SpaceNotFound(_)),
+            "expected SpaceNotFound, got {err:?}"
         );
     }
 
