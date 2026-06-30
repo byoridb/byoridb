@@ -27,11 +27,18 @@
 //! closure over the current graph. A write cap (`max_traversal_nodes`) guards
 //! pathological closures and logs if hit.
 //!
-//! **Deletes: full re-materialization (O-9).** DELETE EDGE/VERTEX calls
-//! [`Executor::rematerialize_space`], which drops all inferred facts and
-//! re-derives them from the surviving asserted edges — so stale entailments are
-//! retracted (O-0 phase 1; incremental B/F is a later optimization). Cost is
-//! O(graph) per delete in a semantic space.
+//! **Deletes — two strategies.**
+//! - DELETE EDGE uses **incremental DRed** (O-10 Phase 3,
+//!   [`Executor::retract_edges_incremental`]): overdelete the deleted edges'
+//!   dependent closure via reverse provenance, then rederive from surviving
+//!   neighbors. Touches only the affected region.
+//! - DELETE VERTEX still uses **full re-materialization** (O-9,
+//!   [`Executor::rematerialize_space`]): drops all inferred facts + provenance
+//!   and re-derives from the surviving asserted edges. O(graph) per delete; an
+//!   incremental DELETE VERTEX path is a follow-up.
+//!
+//! Both retract stale entailments while keeping facts still supported by another
+//! derivation.
 
 use super::provenance::{Fact, Justification, RuleKind};
 use super::Executor;
@@ -423,6 +430,151 @@ impl Executor {
         }
         self.ctx.kvstore.put(&key, &[]).await?;
         Ok(true)
+    }
+
+    /// Incremental retraction via provenance-based **DRed** (PLAN.md O-10
+    /// Phase 3), replacing the O(graph) full re-materialization for DELETE EDGE.
+    ///
+    /// `deleted` are the asserted edges just removed by the caller. Two phases:
+    ///
+    /// 1. **Overdelete** — transitive closure over the reverse-provenance index
+    ///    (`dependents_of`) from each deleted edge: every inferred fact that
+    ///    named a removed fact as a premise is tentatively deleted (edge keys +
+    ///    its provenance), recursing through inferred edges. An edge that *also*
+    ///    exists as asserted survives and is not recursed through (it still
+    ///    supports its dependents). vtypes never entail, so they are leaves.
+    /// 2. **Rederive** — re-run materialization seeded with the surviving
+    ///    asserted edges incident to the affected vertices. Rules are local
+    ///    (1-edge for symmetric/inverse/subprop/domain/range; adjacent-edge for
+    ///    transitive, whose neighbor lookups read the live graph), so this
+    ///    neighborhood seed re-derives exactly the facts still supported — the
+    ///    DRed rederive pass that gives correct retraction under recursion
+    ///    (transitive cycles) without DRed's classic over-deletion surviving.
+    ///
+    /// No-op for spaces without semantic relations (nothing was inferred).
+    pub(super) async fn retract_edges_incremental(
+        &self,
+        space: &str,
+        deleted: Vec<Triple>,
+    ) -> Result<()> {
+        let meta = self.load_rel_meta(space).await?;
+        if meta.is_empty() {
+            return Ok(());
+        }
+
+        let mut affected: HashSet<i64> = HashSet::new();
+        let mut visited: HashSet<Fact> = HashSet::new();
+        let mut processed: HashSet<Triple> = HashSet::new();
+        let mut frontier: VecDeque<Triple> = VecDeque::new();
+        for (s, p, d) in deleted {
+            affected.insert(s);
+            affected.insert(d);
+            frontier.push_back((s, p, d));
+        }
+
+        // ---- Overdelete ----
+        while let Some((s, p, d)) = frontier.pop_front() {
+            if !processed.insert((s, p.clone(), d)) {
+                continue;
+            }
+            for g in self.dependents_of(space, s, &p, d).await? {
+                if !visited.insert(g.clone()) {
+                    continue;
+                }
+                match &g {
+                    Fact::Edge {
+                        s: gs,
+                        p: gp,
+                        d: gd,
+                    } => {
+                        // An asserted copy survives → it still supports its own
+                        // dependents; don't delete or recurse through it.
+                        if self.edge_has_asserted(space, *gs, gp, *gd).await? {
+                            continue;
+                        }
+                        affected.insert(*gs);
+                        affected.insert(*gd);
+                        // Inferred edges are written at ranking 0 (write_inferred_edge).
+                        self.ctx
+                            .kvstore
+                            .delete(&SchemaKey::edge_data(space, *gs, gp, *gd, 0))
+                            .await?;
+                        self.ctx
+                            .kvstore
+                            .delete(&SchemaKey::in_edge_data(space, *gd, gp, *gs, 0))
+                            .await?;
+                        self.purge_fact_provenance(space, &g).await?;
+                        frontier.push_back((*gs, gp.clone(), *gd));
+                    }
+                    Fact::Vtype { vid, class } => {
+                        affected.insert(*vid);
+                        self.ctx
+                            .kvstore
+                            .delete(&SchemaKey::vtype(space, *vid, class))
+                            .await?;
+                        self.purge_fact_provenance(space, &g).await?;
+                    }
+                }
+            }
+            // Dependents are now traversed, so the removed edge's reverse-prov
+            // entry can go (it supports nothing). Done *after* reading dependents
+            // above — deleting it earlier would lose the traversal links.
+            self.delete_prov_rev_edge(space, s, &p, d).await?;
+        }
+
+        // ---- Rederive from surviving asserted edges incident to affected vertices ----
+        let mut seeds: Vec<Triple> = Vec::new();
+        let mut seen: HashSet<Triple> = HashSet::new();
+        for v in &affected {
+            for t in self.surviving_asserted_incident(space, *v).await? {
+                if seen.insert(t.clone()) {
+                    seeds.push(t);
+                }
+            }
+        }
+        self.run_materialization(space, seeds, &meta).await
+    }
+
+    /// True if an **asserted** (non-`__inferred__`) edge `(s)-p->(d)` exists at
+    /// any ranking. Distinguishes a fact that survives a delete (asserted) from
+    /// one that is purely materialized (retractable).
+    async fn edge_has_asserted(&self, space: &str, s: i64, p: &str, d: i64) -> Result<bool> {
+        let prefix = format!("{}:edge:{}:{}:{}:", space, s, p, d);
+        for (_k, v) in self.ctx.kvstore.scan_prefix(prefix.as_bytes()).await? {
+            if let Ok(edge) = VertexCodec::decode_edge(&v) {
+                if !edge.properties.contains_key(INFERRED_MARKER) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Surviving **asserted** edges incident to vertex `v` (both out- and
+    /// in-edges), as `(src, type, dst)` triples — the rederive seed set. Inferred
+    /// edges are excluded (they are re-derived, not seeds).
+    async fn surviving_asserted_incident(&self, space: &str, v: i64) -> Result<Vec<Triple>> {
+        let mut out = Vec::new();
+        let push_asserted = |edge: byoridb_codec::EdgeData, acc: &mut Vec<Triple>| {
+            if !edge.properties.contains_key(INFERRED_MARKER) {
+                acc.push((edge.src_vid, edge.edge_type, edge.dst_vid));
+            }
+        };
+        // Out-edges: {space}:edge:{v}:
+        let out_prefix = SchemaKey::edge_data_src_prefix(space, v);
+        for (_k, val) in self.ctx.kvstore.scan_prefix(&out_prefix).await? {
+            if let Ok(edge) = VertexCodec::decode_edge(&val) {
+                push_asserted(edge, &mut out);
+            }
+        }
+        // In-edges: {space}:in-edge:{v}: (value is the denormalized edge payload)
+        let in_prefix = SchemaKey::in_edge_data_dst_prefix(space, v);
+        for (_k, val) in self.ctx.kvstore.scan_prefix(&in_prefix).await? {
+            if let Ok(edge) = VertexCodec::decode_edge(&val) {
+                push_asserted(edge, &mut out);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -894,5 +1046,78 @@ mod tests {
         let r = run(&e, "WHY 9 -> 99 OVER ancestor").await.unwrap();
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0][2], Value::String("not found".to_string()));
+    }
+
+    // ---- Phase 3: incremental DRed retraction — the hard cases ----
+
+    #[tokio::test]
+    async fn dred_retracts_cycle_well_founded() {
+        // A transitive 3-cycle 1->2->3->1 closes to ALL 9 pairs (incl. self-loops
+        // 1->1,2->2,3->3 and back-edges 2->1,3->2). Deleting asserted 3->1 must
+        // collapse the closure to exactly {1->2, 2->3, 1->3}: every fact whose
+        // derivation passed through 3->1 — including 1->3's *cyclic* alternative
+        // justification via 1->1 — is overdeleted, then 1->3 is REDERIVED from
+        // the surviving 1->2,2->3. This is the well-founded-support case where a
+        // naive cascade (no rederive) would wrongly drop 1->3 or keep cycle facts.
+        let e = create_executor();
+        ok(&e, "CREATE EDGE ancestor() TRANSITIVE").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 2->3:()").await;
+        ok(&e, "INSERT EDGE ancestor() VALUES 3->1:()").await;
+        // Sanity: the cycle fully closed.
+        assert!(
+            has(&e, 1, "ancestor", 1).await,
+            "self-loop inferred in cycle"
+        );
+        assert!(
+            has(&e, 2, "ancestor", 1).await,
+            "back-edge inferred in cycle"
+        );
+
+        ok(&e, "DELETE EDGE ancestor 3->1").await;
+
+        // Survivors + the one still-supported inference.
+        assert!(has(&e, 1, "ancestor", 2).await, "asserted 1->2 kept");
+        assert!(has(&e, 2, "ancestor", 3).await, "asserted 2->3 kept");
+        assert!(
+            has(&e, 1, "ancestor", 3).await,
+            "1->3 rederived from 1->2,2->3"
+        );
+        // Everything that depended on 3->1 is gone.
+        assert!(!has(&e, 3, "ancestor", 1).await, "deleted 3->1 gone");
+        assert!(!has(&e, 2, "ancestor", 1).await, "back-edge 2->1 retracted");
+        assert!(!has(&e, 3, "ancestor", 2).await, "back-edge 3->2 retracted");
+        assert!(!has(&e, 1, "ancestor", 1).await, "self-loop 1->1 retracted");
+        assert!(!has(&e, 2, "ancestor", 2).await, "self-loop 2->2 retracted");
+        assert!(!has(&e, 3, "ancestor", 3).await, "self-loop 3->3 retracted");
+    }
+
+    #[tokio::test]
+    async fn dred_keeps_fact_with_surviving_second_justification() {
+        // related has TWO subproperties; knows 1->2 and likes 1->2 each entail
+        // related 1->2 (two justifications). Deleting knows 1->2 must overdelete
+        // the inferred related 1->2 then REDERIVE it from the surviving likes 1->2.
+        let e = create_executor();
+        ok(&e, "CREATE EDGE related()").await;
+        ok(&e, "CREATE EDGE knows() SUBPROPERTY OF related").await;
+        ok(&e, "CREATE EDGE likes() SUBPROPERTY OF related").await;
+        ok(&e, "INSERT EDGE knows() VALUES 1->2:()").await;
+        ok(&e, "INSERT EDGE likes() VALUES 1->2:()").await;
+        assert!(has(&e, 1, "related", 2).await, "related inferred (both)");
+
+        ok(&e, "DELETE EDGE knows 1->2").await;
+        assert!(!has(&e, 1, "knows", 2).await, "knows deleted");
+        assert!(has(&e, 1, "likes", 2).await, "likes survives");
+        assert!(
+            has(&e, 1, "related", 2).await,
+            "related kept — still supported by likes"
+        );
+
+        // Deleting the second support too now fully retracts related.
+        ok(&e, "DELETE EDGE likes 1->2").await;
+        assert!(
+            !has(&e, 1, "related", 2).await,
+            "related retracted once all support gone"
+        );
     }
 }

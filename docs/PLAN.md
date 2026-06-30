@@ -415,7 +415,7 @@ O-0이 정한 **"1단계 full re-materialization → 2단계 B/F, DRed 회피"**
   insertion-only였다면 잔존). HTTP API로 기대대로 통과.
 - **후속**: B/F 증분(O-0 2단계, deep-research 선행), DELETE VERTEX edge cascade(별개 이슈).
 
-**O-10 [P1] 추론 provenance + explanation (Studio-요구 primitive)** 🟡 Phase 1+2 완료 (2026-06-30, 미배포)
+**O-10 [P1] 추론 provenance + explanation + incremental retraction (Studio-요구 primitive)** ✅ Phase 1+2+3 완료 (2026-06-30, 미배포)
 
 "core 로드맵은 Studio가 요구하는 primitive로 역산"(경계 섹션 참조)의 첫 항목. 추론
 사실의 **justification**(어느 규칙·어느 전제)을 저장해 ① explanation ② incremental
@@ -433,9 +433,18 @@ retraction ③ audit 토대를 동시에 마련.
   회귀: parser 1 + executor 2.
 - **미착수**: vtype explanation 표면(현재 edge만; executor 로직은 `Fact::Vtype` 이미 처리),
   provenance 값 컴팩트화(serde_json→bincode), reverse 인덱스(`prov-rev`, Phase 3용).
-- **Phase 3 — incremental retraction**: ⏸️ **설계 결정 대기.** O-0이 정한 B/F(bookkeeping-free)
-  vs provenance 기반 truth-maintenance. transitive 등 재귀 규칙의 well-founded support
-  (cycle 상호정당화) 문제로 단순 cascade는 overdelete. O-9의 O(graph)/delete 비용 해소가 목표.
+- **Phase 3 — incremental retraction (DRed) ✅** (2026-06-30, 미배포): 사용자 결정 =
+  **provenance 기반 DRed**(O-0의 B/F 대신 — Phase 1에서 bookkeeping=provenance를 이미
+  만들었으므로 O-0이 DRed를 피한 이유가 사라짐). reverse provenance 인덱스(`prov-rev`:
+  premise edge → 의존 fact, `record_provenance`가 함께 기록). DELETE EDGE가
+  `retract_edges_incremental` 호출: ① **overdelete** = 삭제 edge에서 `prov-rev` 따라 의존
+  closure를 BFS로 tentative 삭제(asserted 사본 있는 edge는 생존·미재귀, vtype은 leaf)
+  ② **rederive** = affected 정점에 인접한 생존 asserted edge를 seed로 materialization
+  재실행 → 다른 경로로 지원되는 것만 복구. **재귀(transitive cycle)의 well-founded support를
+  rederive 패스가 정확히 처리**. DELETE VERTEX는 여전히 full re-mat(O-9, 증분 path는 후속).
+  핵심 구현 함정: overdelete 시 edge의 `prov-rev`(의존자 목록)를 **의존자 traverse 후에** 삭제
+  (먼저 지우면 traversal 링크 유실). 회귀: 사이클 well-founded + 다중 justification 생존 +
+  기존 O-9 6건 전부 DRed 경로로 통과. executor 205/205.
 
 **버그 수정 (2026-06-30, PR#11 d9d7a6f 배포):** compound `USE X; <stmt>` 가 같은 요청 후속
 문장의 space에 미적용 → nexprice(95GB) "비어 보임" 인시던트. `execute_use`가 ctx.space를 못 바꾸고

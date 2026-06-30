@@ -166,10 +166,27 @@ impl SchemaKey {
         format!("{}:prov:v:{}:{}", space, vid, class).into_bytes()
     }
 
-    /// Prefix covering every provenance entry in a space: `{space}:prov:`.
-    /// Used to drop all provenance on full re-materialization.
+    /// Prefix covering every forward provenance entry in a space: `{space}:prov:`.
+    /// Disjoint from `prov-rev:` (the char after `prov` is `:` vs `-`). Used to
+    /// drop all forward provenance on full re-materialization.
     pub fn prov_prefix(space: &str) -> Vec<u8> {
         format!("{}:prov:", space).into_bytes()
+    }
+
+    /// Reverse provenance for a premise edge `(s)-p->(d)`:
+    /// `{space}:prov-rev:e:{s}:{p}:{d}` → serde_json(`Vec<Fact>`) of the
+    /// dependent facts that fact supports. Every rule premise is an edge
+    /// (vtypes never entail further facts), so the reverse index is keyed by
+    /// edge only. The `prov-rev:` infix keeps it disjoint from `prov:`. Used by
+    /// incremental retraction (DRed) to find a deleted edge's dependents.
+    pub fn prov_rev_edge(space: &str, s: i64, p: &str, d: i64) -> Vec<u8> {
+        format!("{}:prov-rev:e:{}:{}:{}", space, s, p, d).into_bytes()
+    }
+
+    /// Prefix covering every reverse-provenance entry in a space:
+    /// `{space}:prov-rev:`.
+    pub fn prov_rev_prefix(space: &str) -> Vec<u8> {
+        format!("{}:prov-rev:", space).into_bytes()
     }
 
     // ===== Tag-vid secondary index (label-only MATCH acceleration) =====
