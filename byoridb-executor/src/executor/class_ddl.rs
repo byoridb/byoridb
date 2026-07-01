@@ -26,6 +26,11 @@ pub(super) struct ClassDef {
     /// Disjoint classes (O-6). `#[serde(default)]` keeps pre-O-6 records loadable.
     #[serde(default)]
     pub disjoint: Vec<String>,
+    /// Equivalent classes (owl:equivalentClass) — bidirectional subClassOf.
+    /// Registered on both classes at CREATE time so ancestor walks are
+    /// symmetric. `#[serde(default)]` keeps pre-equivalence records loadable.
+    #[serde(default)]
+    pub equivalent_classes: Vec<String>,
 }
 
 impl Executor {
@@ -36,6 +41,7 @@ impl Executor {
         props: Vec<crate::plan::PropertyDef>,
         superclasses: Vec<String>,
         disjoint: Vec<String>,
+        equivalent_classes: Vec<String>,
     ) -> Result<ExecutorResult> {
         let space = self.require_space()?.to_string();
 
@@ -125,6 +131,32 @@ impl Executor {
             }
         }
 
+        // Dedup equivalent targets; each must be an existing class and not self.
+        let mut equivalent: Vec<String> = Vec::new();
+        for target in equivalent_classes {
+            if target == name {
+                return Err(ExecutionError::InvalidOperation(format!(
+                    "Class {} cannot be EQUIVALENT TO itself",
+                    name
+                )));
+            }
+            if self
+                .ctx
+                .kvstore
+                .get(&SchemaKey::class(&space, &target))
+                .await?
+                .is_none()
+            {
+                return Err(ExecutionError::InvalidOperation(format!(
+                    "EQUIVALENT TO {} does not exist as a class",
+                    target
+                )));
+            }
+            if !equivalent.contains(&target) {
+                equivalent.push(target);
+            }
+        }
+
         let tag_data = serde_json::json!({
             "name": name,
             "properties": props,
@@ -133,18 +165,28 @@ impl Executor {
             name: name.clone(),
             superclasses: parents,
             disjoint: disjoint_classes,
+            equivalent_classes: equivalent.clone(),
         };
 
         // One transaction: the tag schema and the class record must not be
         // observable separately (a tag without its hierarchy record would
         // pass DDL re-runs as a "plain tag" and block re-creation).
-        self.ctx
-            .kvstore
-            .batch_put(vec![
-                (tag_key, serde_json::to_vec(&tag_data)?),
-                (class_key, serde_json::to_vec(&class_def)?),
-            ])
-            .await?;
+        let mut batch = vec![
+            (tag_key, serde_json::to_vec(&tag_data)?),
+            (class_key, serde_json::to_vec(&class_def)?),
+        ];
+        // owl:equivalentClass is symmetric — register this class on each target
+        // too, so ancestor walks from either side are symmetric without a full
+        // class scan at query time.
+        for target in &equivalent {
+            if let Some(mut tdef) = self.load_class(&space, target).await? {
+                if !tdef.equivalent_classes.contains(&name) {
+                    tdef.equivalent_classes.push(name.clone());
+                    batch.push((SchemaKey::class(&space, target), serde_json::to_vec(&tdef)?));
+                }
+            }
+        }
+        self.ctx.kvstore.batch_put(batch).await?;
 
         Ok(ExecutorResult::empty())
     }
@@ -491,6 +533,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.rows, vec![vec![byoridb_common::Value::Int(7)]]);
+    }
+
+    #[tokio::test]
+    async fn equivalent_class_membership_is_symmetric() {
+        // owl:equivalentClass — an instance of either class satisfies is_a for
+        // the other. The reverse direction (human instance is_a person) works
+        // only because CREATE registers the equivalence on *both* classes.
+        let exec = executor();
+        run(&exec, "CREATE CLASS human(name STRING)").await.unwrap();
+        run(
+            &exec,
+            "CREATE CLASS person(name STRING) EQUIVALENT TO human",
+        )
+        .await
+        .unwrap();
+        run(&exec, "INSERT VERTEX person(name) VALUES 1:(\"a\")")
+            .await
+            .unwrap();
+        run(&exec, "INSERT VERTEX human(name) VALUES 2:(\"b\")")
+            .await
+            .unwrap();
+
+        // person instance (1) is_a human (forward: person.equivalent = [human]).
+        let r1 = run(
+            &exec,
+            "MATCH (x:person) WHERE is_a(x, \"human\") RETURN id(x) AS vid",
+        )
+        .await
+        .unwrap();
+        assert_eq!(r1.rows, vec![vec![byoridb_common::Value::Int(1)]]);
+
+        // human instance (2) is_a person (reverse: human.equivalent = [person]
+        // was registered when person was created).
+        let r2 = run(
+            &exec,
+            "MATCH (x:human) WHERE is_a(x, \"person\") RETURN id(x) AS vid",
+        )
+        .await
+        .unwrap();
+        assert_eq!(r2.rows, vec![vec![byoridb_common::Value::Int(2)]]);
+    }
+
+    #[tokio::test]
+    async fn equivalent_class_validation() {
+        let exec = executor();
+        // Target must exist as a class.
+        assert!(
+            run(&exec, "CREATE CLASS a() EQUIVALENT TO nope")
+                .await
+                .is_err(),
+            "EQUIVALENT TO unknown class must error"
+        );
+        // Self-reference rejected.
+        assert!(
+            run(&exec, "CREATE CLASS a() EQUIVALENT TO a")
+                .await
+                .is_err(),
+            "self EQUIVALENT TO must error"
+        );
     }
 
     #[tokio::test]

@@ -227,6 +227,9 @@ pub struct CreateClassStatement {
     /// Classes this class is disjoint with (O-6): no vertex may belong to both.
     /// Symmetric — registered both ways at consistency-check time.
     pub disjoint: Vec<String>,
+    /// Classes equivalent to this one (owl:equivalentClass): bidirectional
+    /// subClassOf. Instances of either class are instances of the other.
+    pub equivalent_classes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -292,6 +295,9 @@ pub struct SemanticFlags {
     /// (a)-p->(b)`. Generalizes `transitive` (which is the chain `[p, p]`).
     /// Currently exactly two links (longer chains are a follow-up).
     pub property_chain: Option<Vec<String>>,
+    /// `EQUIVALENT TO q` (owl:equivalentProperty): `(a)-p->(b) ⟺ (a)-q->(b)`.
+    /// Bidirectional subPropertyOf — registered both ways at materialization.
+    pub equivalent_property: Option<String>,
 }
 
 impl SemanticFlags {
@@ -304,6 +310,7 @@ impl SemanticFlags {
             && self.domain.is_none()
             && self.range.is_none()
             && self.property_chain.is_none()
+            && self.equivalent_property.is_none()
     }
 }
 

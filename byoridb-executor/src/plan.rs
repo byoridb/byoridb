@@ -191,6 +191,7 @@ pub enum CreatePlan {
         props: Vec<PropertyDef>,
         superclasses: Vec<String>,
         disjoint: Vec<String>,
+        equivalent_classes: Vec<String>,
     },
     /// SHACL-style shape: property constraints validated against instances of
     /// the target class. Reuses the parser's `ShapeConstraint` (it carries an
@@ -525,6 +526,7 @@ impl ExecutionPlanBuilder {
                         .collect(),
                     superclasses: class.superclasses,
                     disjoint: class.disjoint,
+                    equivalent_classes: class.equivalent_classes,
                 },
                 byoridb_parser::ast::CreateStatement::Shape(shape) => CreatePlan::Shape {
                     name: shape.name,

@@ -415,6 +415,16 @@ impl Parser {
             }
         }
 
+        // Optional `EQUIVALENT TO c1[, c2 ...]` (owl:equivalentClass).
+        let mut equivalent_classes = Vec::new();
+        if self.match_token(Token::Equivalent) {
+            self.consume_token(Token::To)?;
+            equivalent_classes.push(self.consume_identifier()?);
+            while self.match_token(Token::Comma) {
+                equivalent_classes.push(self.consume_identifier()?);
+            }
+        }
+
         // Optional `DISJOINT WITH c1[, c2 ...]` (O-6).
         let mut disjoint = Vec::new();
         if self.match_token(Token::Disjoint) {
@@ -432,6 +442,7 @@ impl Parser {
                 props,
                 superclasses,
                 disjoint,
+                equivalent_classes,
             },
         )))
     }
@@ -541,6 +552,11 @@ impl Parser {
                     self.advance();
                     self.consume_token(Token::Of)?;
                     semantics.subproperty_of = Some(self.consume_identifier()?);
+                }
+                Token::Equivalent => {
+                    self.advance();
+                    self.consume_token(Token::To)?;
+                    semantics.equivalent_property = Some(self.consume_identifier()?);
                 }
                 Token::Chain => {
                     // CHAIN p1, p2[, ...] — comma-separated edge-type list.

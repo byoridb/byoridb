@@ -85,11 +85,15 @@ pub(crate) async fn members_of(ctx: &ExecutionContext, space: &str, rep: i64) ->
 #[derive(Deserialize)]
 struct ClassDef {
     superclasses: Vec<String>,
+    /// owl:equivalentClass targets — walked like superclasses so ancestor sets
+    /// are symmetric (A ≡ B ⟹ each is in the other's ancestor closure).
+    #[serde(default)]
+    equivalent_classes: Vec<String>,
 }
 
-/// All transitive superclasses of class `name` (BFS, deduped, excludes `name`).
-/// A plain tag with no class metadata yields an empty list. Errors if the
-/// hierarchy exceeds [`MAX_CLASS_DEPTH`].
+/// All transitive superclasses of class `name` (BFS, deduped, excludes `name`),
+/// including owl:equivalentClass closure. A plain tag with no class metadata
+/// yields an empty list. Errors if the hierarchy exceeds [`MAX_CLASS_DEPTH`].
 pub(crate) async fn class_ancestors_of(
     ctx: &ExecutionContext,
     space: &str,
@@ -114,7 +118,7 @@ pub(crate) async fn class_ancestors_of(
                     current, e
                 ))
             })?;
-            for parent in def.superclasses {
+            for parent in def.superclasses.into_iter().chain(def.equivalent_classes) {
                 if seen.insert(parent.clone()) {
                     ancestors.push(parent.clone());
                     next.push(parent);
