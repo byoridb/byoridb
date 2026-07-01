@@ -71,6 +71,9 @@ pub enum ExecutionPlan {
     /// CHECK CONSISTENCY — report ontology consistency violations (O-6).
     CheckConsistency,
 
+    /// CHECK SHAPE — report vertices violating a declared shape's constraints.
+    CheckShape,
+
     /// WHY <src> -> <dst> OVER <edge_type> — explain an inferred edge by
     /// walking its provenance tree (O-provenance Phase 2).
     ExplainInference {
@@ -189,6 +192,15 @@ pub enum CreatePlan {
         superclasses: Vec<String>,
         disjoint: Vec<String>,
     },
+    /// SHACL-style shape: property constraints validated against instances of
+    /// the target class. Reuses the parser's `ShapeConstraint` (it carries an
+    /// `Expression` for value predicates, which the plan stores verbatim).
+    Shape {
+        name: String,
+        if_not_exists: bool,
+        target_class: String,
+        constraints: Vec<byoridb_parser::ast::ShapeConstraint>,
+    },
 }
 
 pub enum DropPlan {
@@ -199,6 +211,7 @@ pub enum DropPlan {
     EdgeIndex { name: String, if_exists: bool },
     User { name: String, if_exists: bool },
     Class { name: String, if_exists: bool },
+    Shape { name: String, if_exists: bool },
 }
 
 pub enum AlterPlan {
@@ -513,6 +526,12 @@ impl ExecutionPlanBuilder {
                     superclasses: class.superclasses,
                     disjoint: class.disjoint,
                 },
+                byoridb_parser::ast::CreateStatement::Shape(shape) => CreatePlan::Shape {
+                    name: shape.name,
+                    if_not_exists: shape.if_not_exists,
+                    target_class: shape.target_class,
+                    constraints: shape.constraints,
+                },
                 byoridb_parser::ast::CreateStatement::User(user) => CreatePlan::User {
                     name: user.username,
                     if_not_exists: user.if_not_exists,
@@ -542,6 +561,10 @@ impl ExecutionPlanBuilder {
                 byoridb_parser::ast::DropStatement::Class(class) => DropPlan::Class {
                     name: class.name,
                     if_exists: class.if_exists,
+                },
+                byoridb_parser::ast::DropStatement::Shape(shape) => DropPlan::Shape {
+                    name: shape.name,
+                    if_exists: shape.if_exists,
                 },
                 byoridb_parser::ast::DropStatement::Edge(edge) => DropPlan::Edge {
                     name: edge.name,
@@ -954,6 +977,7 @@ impl ExecutionPlanBuilder {
                 limit: rec.limit,
             })),
             Statement::CheckConsistency => Ok(ExecutionPlan::CheckConsistency),
+            Statement::CheckShape => Ok(ExecutionPlan::CheckShape),
             Statement::ExplainInference {
                 src,
                 dst,

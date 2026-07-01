@@ -71,6 +71,21 @@ impl SchemaKey {
         format!("space:{}:class:", space).into_bytes()
     }
 
+    // ===== Shape keys (SHACL-style validation) =====
+
+    /// Create a shape metadata key: `space:{space}:shape:{name}` → JSON
+    /// (`{"name", "target_class", "constraints": [...]}`). Lives under the same
+    /// `space:{space}:` schema range that DROP SPACE deletes, so shapes die with
+    /// their space (like classes).
+    pub fn shape(space: &str, name: &str) -> Vec<u8> {
+        format!("space:{}:shape:{}", space, name).into_bytes()
+    }
+
+    /// Prefix for scanning all shapes in a space: `space:{space}:shape:`
+    pub fn shape_prefix(space: &str) -> Vec<u8> {
+        format!("space:{}:shape:", space).into_bytes()
+    }
+
     // ===== Edge keys =====
 
     /// Create an edge type key: `space:{space}:edge:{name}`

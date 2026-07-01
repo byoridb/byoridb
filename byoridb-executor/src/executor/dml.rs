@@ -51,6 +51,24 @@ impl Executor {
                         self.validate_tag_props(&effective_space, &tag.name, &tag.props)
                             .await?;
                     }
+                    // Write-time shape validation (SHACL-style constraints):
+                    // reject a vertex violating any in-scope shape. The flattened
+                    // property map mirrors the RECOMMEND filter convention (bare +
+                    // `{tag}.{prop}`). No-op when no shapes are declared.
+                    {
+                        let mut tag_names = Vec::with_capacity(vertex.tags.len());
+                        let mut sprops: std::collections::HashMap<String, byoridb_common::Value> =
+                            std::collections::HashMap::new();
+                        for tag in &vertex.tags {
+                            tag_names.push(tag.name.clone());
+                            for (k, v) in &tag.props {
+                                sprops.insert(format!("{}.{}", tag.name, k), v.clone());
+                                sprops.insert(k.clone(), v.clone());
+                            }
+                        }
+                        self.validate_write_shapes(&effective_space, &tag_names, &sprops)
+                            .await?;
+                    }
                     let key = format!("{}:vertex:{}", effective_space, vertex.vid);
                     // Convert plan TagData to codec TagData and use Proto encoding
                     let codec_vertex = CodecVertexData {
@@ -404,6 +422,24 @@ impl Executor {
                     tag.properties.insert(k.clone(), v.clone());
                 }
             }
+        }
+
+        // Write-time shape validation over the *post-update* vertex state, so a
+        // partial UPDATE that would leave the vertex non-conformant is rejected
+        // before it is persisted. No-op when no shapes are declared.
+        {
+            let mut tag_names = Vec::with_capacity(vertex_data.tags.len());
+            let mut sprops: std::collections::HashMap<String, byoridb_common::Value> =
+                std::collections::HashMap::new();
+            for tag in &vertex_data.tags {
+                tag_names.push(tag.name.clone());
+                for (k, v) in &tag.properties {
+                    sprops.insert(format!("{}.{}", tag.name, k), v.clone());
+                    sprops.insert(k.clone(), v.clone());
+                }
+            }
+            self.validate_write_shapes(&effective_space, &tag_names, &sprops)
+                .await?;
         }
 
         // Re-encode using Proto format

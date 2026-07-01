@@ -89,6 +89,11 @@ pub enum Token {
     Check,
     #[token("CONSISTENCY", ignore(case))]
     Consistency,
+    // Shape validation (SHACL-style constraints)
+    #[token("SHAPE", ignore(case))]
+    Shape,
+    #[token("REQUIRED", ignore(case))]
+    Required,
     #[token("WHY", ignore(case))]
     Why,
     #[token("MATCH", ignore(case))]

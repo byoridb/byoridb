@@ -3,7 +3,7 @@ name = "byoridb"
 version = "0.2.4"
 edition = "2021"
 authors = ["ByoriDB Contributors"]
-description = "A fast, durable distributed graph database built in Rust"
+description = "A fast, durable ontology graph database built in Rust (nGQL-compatible, RDFS-Plus reasoning; distribution on the roadmap)"
 license = "Apache-2.0"
 repository = "https://github.com/byoridb/byoridb"
 

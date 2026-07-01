@@ -167,11 +167,23 @@ impl Parser {
             Token::Go => self.parse_go(),
             Token::Lookup => self.parse_lookup(),
             Token::Recommend => self.parse_recommend(),
-            // CHECK CONSISTENCY (O-6 ontology validation)
+            // CHECK CONSISTENCY (O-6 disjointness) / CHECK SHAPE (shape validation)
             Token::Check => {
                 self.advance();
-                self.consume_token(Token::Consistency)?;
-                Ok(Statement::CheckConsistency)
+                match self.peek_token()? {
+                    Token::Consistency => {
+                        self.advance();
+                        Ok(Statement::CheckConsistency)
+                    }
+                    Token::Shape => {
+                        self.advance();
+                        Ok(Statement::CheckShape)
+                    }
+                    other => Err(ParseError::UnexpectedToken(format!(
+                        "Expected CONSISTENCY or SHAPE after CHECK, got {:?}",
+                        other
+                    ))),
+                }
             }
             // WHY <src> -> <dst> OVER <edge_type> (provenance explanation)
             Token::Why => {
@@ -324,6 +336,10 @@ impl Parser {
             Token::With => "with",
             Token::Consistency => "consistency",
             Token::Why => "why",
+            // Shape keywords — both are plausible property names, so keep them
+            // usable as identifiers outside a CREATE SHAPE clause.
+            Token::Shape => "shape",
+            Token::Required => "required",
             // Role keywords (used as identifiers in GRANT/REVOKE)
             Token::Admin => "ADMIN",
             Token::God => "GOD",

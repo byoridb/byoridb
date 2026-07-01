@@ -189,6 +189,7 @@ impl Parser {
         match token {
             Token::Space => self.parse_create_space(),
             Token::Class => self.parse_create_class(),
+            Token::Shape => self.parse_create_shape(),
             Token::Tag => {
                 // `CREATE TAG INDEX …` vs `CREATE TAG name(…)`
                 let next = self
@@ -433,6 +434,80 @@ impl Parser {
                 disjoint,
             },
         )))
+    }
+
+    /// Parse `CREATE SHAPE [IF NOT EXISTS] name ON class (constraint, ...)`.
+    ///
+    /// Each constraint is one of:
+    ///   `<prop> <datatype> [REQUIRED]` — datatype (optionally also required)
+    ///   `<prop> REQUIRED`              — presence-only
+    ///   `<prop> CHECK <expr>`          — boolean value predicate
+    fn parse_create_shape(&mut self) -> ParseResult {
+        self.consume_token(Token::Shape)?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let name = self.consume_identifier()?;
+        self.consume_token(Token::On)?;
+        let target_class = self.consume_identifier()?;
+
+        self.consume_token(Token::LParen)?;
+        let mut constraints = Vec::new();
+        loop {
+            let property = self.consume_identifier()?;
+            match self.peek_token()? {
+                Token::Check => {
+                    self.advance();
+                    let expr = self.parse_expression()?;
+                    constraints.push(ShapeConstraint {
+                        property,
+                        kind: ShapeConstraintKind::Predicate(expr),
+                    });
+                }
+                Token::Required => {
+                    self.advance();
+                    constraints.push(ShapeConstraint {
+                        property,
+                        kind: ShapeConstraintKind::Required,
+                    });
+                }
+                // Otherwise a datatype constraint, optionally REQUIRED too.
+                _ => {
+                    let data_type = self.parse_data_type()?;
+                    constraints.push(ShapeConstraint {
+                        property: property.clone(),
+                        kind: ShapeConstraintKind::DataType(data_type),
+                    });
+                    if self.match_token(Token::Required) {
+                        constraints.push(ShapeConstraint {
+                            property,
+                            kind: ShapeConstraintKind::Required,
+                        });
+                    }
+                }
+            }
+            if !self.match_token(Token::Comma) {
+                break;
+            }
+        }
+        self.consume_token(Token::RParen)?;
+
+        Ok(Statement::Create(CreateStatement::Shape(
+            CreateShapeStatement {
+                if_not_exists,
+                name,
+                target_class,
+                constraints,
+            },
+        )))
+    }
+
+    fn parse_drop_shape(&mut self) -> ParseResult {
+        self.consume_token(Token::Shape)?;
+        let if_exists = self.parse_if_exists()?;
+        let name = self.consume_identifier()?;
+        Ok(Statement::Drop(DropStatement::Shape(DropShapeStatement {
+            if_exists,
+            name,
+        })))
     }
 
     fn parse_create_edge(&mut self) -> ParseResult {
@@ -779,6 +854,7 @@ impl Parser {
         match token {
             Token::Space => self.parse_drop_space(),
             Token::Class => self.parse_drop_class(),
+            Token::Shape => self.parse_drop_shape(),
             Token::Tag => self.parse_drop_tag(),
             Token::Edge => self.parse_drop_edge(),
             Token::Index => self.parse_drop_index(),

@@ -1,6 +1,11 @@
 # ByoriDB 플랜
 
-마지막 업데이트: 2026-06-30 (방향성 재정의 — **core vs Studio 책임 경계** 확정.
+마지막 업데이트: 2026-07-01 (**O-12 shape validation(constraint hooks, SHACL식) 구현 완료**
+— 미배포. required/datatype/value-predicate 제약을 CREATE SHAPE로 선언, write-time 거부 +
+CHECK SHAPE 탐지 양경로. 경계 섹션 🟦 "constraint hooks + shape validation" primitive 충족.
+상세는 O-12 섹션. 참고: PR#13~#17(O-11 property chain, COUNT 스트리밍, G-11 ①② max_memory_mb)은
+main 머지 완료 → 자동배포 대상이나 배포 SHA 미확인 — 배포 상태는 별도 확인 필요.
+이전: 방향성 재정의 — **core vs Studio 책임 경계** 확정.
 ByoriDB core = 추론 능력을 가진 semantic graph DB core(Palantir clone 아님),
 Studio = Ontology Workbench + Operational Modeling UX. core 로드맵은 Studio가
 요구하는 primitive(provenance·explanation·incremental retraction·change-feed·
@@ -468,6 +473,38 @@ OWL 2 RL의 핵심 규칙이자 transitive의 일반화. `CREATE EDGE <q>() CHAI
 - 회귀: 파서 1 + 실행기 5(동일타입/이종타입/WHY/DRed retraction/검증). executor 210/210.
 - **미착수**: 3-link 이상 체인(현재 정확히 2개만, 초과 시 명시 에러). n-link는 path-walk +
   provenance 다중경로 처리 필요 — 후속.
+
+**O-12 [P1] shape validation (constraint hooks, SHACL식) ✅ 구현 완료 (2026-07-01, 미배포)**
+
+경계 섹션 🟦 core 책임의 **"constraint hooks + shape validation"** 항목 (Studio-요구 primitive).
+O-6 disjoint 일관성 검사의 확장 — property 제약(required / datatype / value predicate)을
+**CHECK와 write-time 양쪽**에서 검증. property graph는 property가 single-valued라 SHACL
+`minCount≥1` = required, `maxCount`는 구조적 보장, cardinality(관계 수)는 edge 대상이라 별도
+트랙으로 제외(설계 결정).
+
+- **문법**: `CREATE SHAPE [IF NOT EXISTS] <name> ON <class> (<prop> <datatype> [REQUIRED]
+  | <prop> REQUIRED | <prop> CHECK <expr>, ...)` + `DROP SHAPE` + `CHECK SHAPE`. 신규 lexer
+  토큰 **SHAPE/REQUIRED만**(TYPE는 속성명으로 흔해 회피 — `<prop> <datatype>` 형태로 property
+  spec 파서 `parse_data_type` 재사용). SHAPE/REQUIRED는 `keyword_to_string` 등록해 속성명으로도
+  사용 가능(무회귀).
+- **저장**: `space:{space}:shape:{name}` JSON(name/target_class/constraints). class 패턴과
+  동일하게 DROP SPACE의 `space:{space}:` prefix 삭제에 자동 포함.
+- **targetClass**: 정점의 full class set(태그 ∪ O-5 추론타입 ∪ O-3 ancestor, `vertex_class_set`)에
+  target이 있으면 매칭 → **subclass 인스턴스도 검증**(SHACL targetClass 의미론).
+- **검증 2경로 공유(`shape_violations`)**: ① write-time — INSERT VERTEX(정점 tags+props) /
+  UPDATE VERTEX(**갱신 후 전체 상태**)가 위반 시 `InvalidOperation` 거부. shape 미선언 space는
+  prefix 스캔 empty로 조기 no-op(O-6/O-9 패턴, 무회귀). ② `CHECK SHAPE` — 전체 정점 스캔 위반
+  리포트(`vid/shape/property/constraint`, 추론 타입 경유 위반도 탐지).
+- **datatype 호환**: Value variant ↔ DataType 매핑(Int은 Float/Double 허용, null/absent는
+  *present일 때만* 검사 = 부재는 required가 별도 담당). predicate는 `Evaluator::evaluate_condition`
+  재활용(EvalContext current=평탄화 props).
+- 신규 `executor/shape.rs`. RBAC: CREATE/DROP SHAPE는 `Statement::Create/Drop` catch-all 자동
+  매핑, `CheckShape`만 `Permission::Read` + `QueryType::Show` 추가. 회귀: 파서 3 + 실행기 9
+  (required/datatype/predicate write-time 거부 · CHECK 리포트 · subclass 상속 · UPDATE 전이 거부
+  · no-op 무회귀 · DDL lifecycle · DROP SPACE cleanup). 워크스페이스 lib 전부 통과, fmt·clippy(변경
+  크레이트) 클린.
+- **미착수(후속)**: edge cardinality(관계 수 min/max — 순회 비용), closed-world(선언 외 property
+  금지 / SHACL sh:closed), 배포·프로덕션 스모크, 분산 meta 연동(G-2 이후).
 
 ### R. 유사도 / 추천 (P1 — 차별화 기능, 2026-06-15 신설)
 

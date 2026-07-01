@@ -72,6 +72,7 @@ impl Executor {
             ExecutionPlan::Lookup(lookup_plan) => self.execute_lookup(lookup_plan).await?,
             ExecutionPlan::Recommend(rec_plan) => self.execute_recommend(rec_plan).await?,
             ExecutionPlan::CheckConsistency => self.execute_check_consistency().await?,
+            ExecutionPlan::CheckShape => self.execute_check_shape().await?,
             ExecutionPlan::ExplainInference {
                 src,
                 dst,
@@ -200,6 +201,7 @@ mod inference;
 mod provenance;
 mod recommend;
 mod sameas;
+mod shape;
 mod show;
 mod vector_index;
 
