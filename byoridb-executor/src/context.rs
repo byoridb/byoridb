@@ -375,3 +375,30 @@ impl ExecutionContext {
         self.partition_num
     }
 }
+
+// ===== Result-memory estimation (shared by all executors for the OOM guard) =====
+
+/// Cheap, conservative estimate of a materialized [`Value`]'s footprint in
+/// bytes. Strings count their length; composite values (vertex/edge/map/list/
+/// path/set) use a flat estimate rather than walking their internals — this
+/// feeds [`ExecutionContext::check_result_budget`], a safety guard, so a slight
+/// under/overestimate is fine.
+pub(crate) fn estimate_value_bytes(v: &byoridb_common::Value) -> usize {
+    use byoridb_common::Value;
+    match v {
+        Value::String(s) => 24 + s.len(),
+        Value::Edge(_) => 256,
+        Value::Vertex(_)
+        | Value::Path(_)
+        | Value::Map(_)
+        | Value::Set(_)
+        | Value::List(_)
+        | Value::DataSet(_) => 512,
+        _ => 16,
+    }
+}
+
+/// Estimated footprint of one output row.
+pub(crate) fn estimate_row_bytes(row: &[byoridb_common::Value]) -> usize {
+    24 + row.iter().map(estimate_value_bytes).sum::<usize>()
+}

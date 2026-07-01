@@ -110,6 +110,7 @@ impl Executor {
 
         // Convert VertexData to rows
         let mut rows = Vec::new();
+        let mut result_bytes = 0usize; // OOM guard: bound accumulated result memory
         for vertex in vertices {
             // Tag membership: only emit vertices carrying a requested tag, and
             // only the requested tags' data (mirrors execute_fetch_local).
@@ -140,8 +141,13 @@ impl Executor {
                 row.push(byoridb_common::Value::String(tag_json.to_string()));
             }
 
+            result_bytes += crate::context::estimate_row_bytes(&row);
             rows.push(row);
+            if rows.len().is_multiple_of(16384) {
+                self.ctx.check_result_budget(result_bytes)?;
+            }
         }
+        self.ctx.check_result_budget(result_bytes)?;
 
         let mut columns = vec!["VertexID".to_string()];
         columns.extend(plan.tags.clone());
@@ -208,6 +214,7 @@ impl Executor {
         let results = self.ctx.kvstore.batch_get(&keys).await?;
 
         let mut rows = Vec::new();
+        let mut result_bytes = 0usize; // OOM guard: bound accumulated result memory
         for (vid, data_opt) in resolved_vids.iter().zip(results.iter()) {
             if let Some(data) = data_opt {
                 if let Ok(vertex_data) = VertexCodec::decode_vertex(data) {
@@ -242,10 +249,15 @@ impl Executor {
                         }
                     }
 
+                    result_bytes += crate::context::estimate_row_bytes(&row);
                     rows.push(row);
+                    if rows.len().is_multiple_of(16384) {
+                        self.ctx.check_result_budget(result_bytes)?;
+                    }
                 }
             }
         }
+        self.ctx.check_result_budget(result_bytes)?;
 
         if profiling {
             self.ctx.record_profile(
@@ -275,6 +287,7 @@ impl Executor {
     ) -> Result<ExecutorResult> {
         let edge_type = plan.tags.first().map(|s| s.as_str()).unwrap_or("*");
         let mut rows = Vec::new();
+        let mut result_bytes = 0usize; // OOM guard: bound accumulated result memory
         let profiling = self.ctx.profiling();
         let fetch_start = std::time::Instant::now();
 
@@ -292,16 +305,22 @@ impl Executor {
                 match VertexCodec::decode_edge(&value) {
                     Ok(edge) if edge.dst_vid == *dst => {
                         let edge_json = VertexCodec::edge_to_json(&edge);
-                        rows.push(vec![
+                        let row = vec![
                             byoridb_common::Value::Int(edge.src_vid),
                             byoridb_common::Value::Int(edge.dst_vid),
                             byoridb_common::Value::String(edge_json.to_string()),
-                        ]);
+                        ];
+                        result_bytes += crate::context::estimate_row_bytes(&row);
+                        rows.push(row);
+                        if rows.len().is_multiple_of(16384) {
+                            self.ctx.check_result_budget(result_bytes)?;
+                        }
                     }
                     _ => continue,
                 }
             }
         }
+        self.ctx.check_result_budget(result_bytes)?;
 
         if profiling {
             self.ctx.record_profile(
@@ -665,6 +684,7 @@ impl Executor {
             .collect();
 
         let mut rows = Vec::with_capacity(traversal.len());
+        let mut result_bytes = 0usize; // OOM guard: bound accumulated result memory
         for (src_vid, dst_vid, last_edge) in traversal {
             let mut row = Vec::with_capacity(plan.yield_clause.columns.len());
             for col in &plan.yield_clause.columns {
@@ -679,8 +699,13 @@ impl Executor {
                     .await;
                 row.push(val);
             }
+            result_bytes += crate::context::estimate_row_bytes(&row);
             rows.push(row);
+            if rows.len().is_multiple_of(16384) {
+                self.ctx.check_result_budget(result_bytes)?;
+            }
         }
+        self.ctx.check_result_budget(result_bytes)?;
 
         if profiling {
             self.ctx.record_profile(
@@ -1163,6 +1188,7 @@ impl Executor {
         }
 
         let mut rows = Vec::new();
+        let mut result_bytes = 0usize; // OOM guard: bound accumulated result memory
         for (key, value) in results {
             let (vid, tag_str) = if VertexCodec::is_proto_format(&value) {
                 // Proto-encoded: vid is stored inside the data
@@ -1196,8 +1222,13 @@ impl Executor {
             if !tag_str.is_empty() {
                 row.push(byoridb_common::Value::String(tag_str));
             }
+            result_bytes += crate::context::estimate_row_bytes(&row);
             rows.push(row);
+            if rows.len().is_multiple_of(16384) {
+                self.ctx.check_result_budget(result_bytes)?;
+            }
         }
+        self.ctx.check_result_budget(result_bytes)?;
 
         if let Some(offset) = plan.offset {
             rows = rows.into_iter().skip(offset).collect();
