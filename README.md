@@ -13,7 +13,7 @@
   <a href="#기여">기여</a>
 </p>
 
-> **⚠️ 활발히 개발 중 — 프로덕션 안정성 미보장** — ByoriDB는 아직 초기 단계의 활발히 개발 중인 프로젝트입니다. 기능·API·nGQL 문법·온디스크 포맷·동작이 릴리스 사이에 **예고 없이 바뀔 수 있고**, 검증되지 않은 엣지 케이스가 남아 있을 수 있습니다(특히 비ASCII 데이터·대량 적재·분산 모드). 실데이터 도그푸딩으로 버그를 적극적으로 찾아 고치는 단계이므로 — **중요한 데이터의 단일 저장소로 사용하지 마시고**, 충분히 검증한 뒤 사용하세요. 현재 프로덕션 배포는 `v0.2.x` 를 추적합니다.
+> **⚠️ 활발히 개발 중 — 프로덕션 안정성 미보장** — ByoriDB는 아직 초기 단계의 활발히 개발 중인 프로젝트입니다. 기능·API·nGQL 문법·온디스크 포맷·동작이 릴리스 사이에 **예고 없이 바뀔 수 있고**, 검증되지 않은 엣지 케이스가 남아 있을 수 있습니다(특히 비ASCII 데이터·대량 적재·분산 모드). 실데이터 도그푸딩으로 버그를 적극적으로 찾아 고치는 단계이므로 — **중요한 데이터의 단일 저장소로 사용하지 마시고**, 충분히 검증한 뒤 사용하세요. 프로덕션은 고정 semver 릴리스가 아니라 `main` HEAD 를 커밋 SHA 태그(`sha-<short>`)로 **연속 배포(CD)** 합니다 (현재 Cargo 버전 `0.2.4`, 최신 git 태그 `v0.2.1`).
 
 ---
 
@@ -102,7 +102,7 @@ SHOW TAG INDEXES;
 | **shape 검증** | `CREATE SHAPE <name> ON <class> (<prop> <type> [REQUIRED] \| <prop> CHECK <expr>)`, `DROP SHAPE`, `CHECK SHAPE` — required / datatype / value-predicate 제약을 write-time 거부 + 스캔 리포트 |
 | **추천** | `RECOMMEND SIMILAR TO <vid> ( OVER <edges> \| BY EMBEDDING <prop> \| BLEND … ) [WHERE …] [LIMIT k]`, `CREATE VECTOR INDEX` |
 
-### Cypher 스타일 MATCH (v0.2.x 이후)
+### Cypher 스타일 MATCH
 
 ```sql
 -- 전체 태그 데이터를 담은 vertex 객체
@@ -375,7 +375,7 @@ cargo bench -p byoridb-executor --bench graph_traversal
 cargo bench -p byoridb-kvstore  --bench wal_overhead
 ```
 
-## HTTP API (v0.2.x)
+## HTTP API
 
 ```
 POST   /api/v1/session            → 세션 생성 (session_id 반환)
@@ -425,7 +425,7 @@ RUST_LOG=info cargo run --release --bin byoridb-server
 | 항목 | 상태 |
 |------|--------|
 | 역방향 edge 인덱스 (incoming O(in-degree) 조회) | ✅ 구현됨 (2026-06) |
-| `SHOW SESSIONS` (라이브 데이터) | ✅ v0.2.15 구현됨 |
+| `SHOW SESSIONS` (라이브 데이터) | ✅ 구현됨 |
 | 다중 노드 샤딩 (파티션의 노드 간 분산) | 진행 중 (현재 단일 노드 배포) |
 | 가변 길이 경로 `*1..n` 실행 (`MATCH`/`FIND ALL SHORTEST PATHS`) | ✅ 구현됨 (2026-06) |
 | shape 검증 (SHACL식 required/datatype/값 술어 제약) | ✅ 구현됨 (2026-07) |
