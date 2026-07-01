@@ -1,10 +1,13 @@
 # ByoriDB 플랜
 
-마지막 업데이트: 2026-07-01 (**O-12 shape validation(constraint hooks, SHACL식) 구현 완료**
-— 미배포. required/datatype/value-predicate 제약을 CREATE SHAPE로 선언, write-time 거부 +
-CHECK SHAPE 탐지 양경로. 경계 섹션 🟦 "constraint hooks + shape validation" primitive 충족.
-상세는 O-12 섹션. 참고: PR#13~#17(O-11 property chain, COUNT 스트리밍, G-11 ①② max_memory_mb)은
-main 머지 완료 → 자동배포 대상이나 배포 SHA 미확인 — 배포 상태는 별도 확인 필요.
+마지막 업데이트: 2026-07-01 (**O-12 shape validation(constraint hooks, SHACL식) 구현·배포 완료**
+— PR#18 main 머지 → AKS 자동배포 **sha-58093ca**. required/datatype/value-predicate 제약을
+CREATE SHAPE로 선언, write-time 거부 + CHECK SHAPE 탐지 양경로. 경계 섹션 🟦 "constraint hooks +
+shape validation" primitive 충족. 상세는 O-12 섹션. 함께 배포: README/book/Cargo.toml 의 "분산
+그래프 DB" 단정 표현 정정(다중 노드 배포는 로드맵) + 버전 표기 정정(프로덕션은 semver 릴리스가
+아니라 커밋 SHA 태그 `sha-<short>` 로 연속 배포 — Cargo 0.2.4 / 최신 태그 v0.2.1). 프로덕션 스모크
+미착수. 참고: PR#13~#17(O-11 property chain, COUNT 스트리밍, G-11 ①② max_memory_mb)도 각 main 머지
+시 자동배포됨.
 이전: 방향성 재정의 — **core vs Studio 책임 경계** 확정.
 ByoriDB core = 추론 능력을 가진 semantic graph DB core(Palantir clone 아님),
 Studio = Ontology Workbench + Operational Modeling UX. core 로드맵은 Studio가
@@ -474,7 +477,7 @@ OWL 2 RL의 핵심 규칙이자 transitive의 일반화. `CREATE EDGE <q>() CHAI
 - **미착수**: 3-link 이상 체인(현재 정확히 2개만, 초과 시 명시 에러). n-link는 path-walk +
   provenance 다중경로 처리 필요 — 후속.
 
-**O-12 [P1] shape validation (constraint hooks, SHACL식) ✅ 구현 완료 (2026-07-01, 미배포)**
+**O-12 [P1] shape validation (constraint hooks, SHACL식) ✅ 구현·배포 완료 (2026-07-01, PR#18 sha-58093ca)**
 
 경계 섹션 🟦 core 책임의 **"constraint hooks + shape validation"** 항목 (Studio-요구 primitive).
 O-6 disjoint 일관성 검사의 확장 — property 제약(required / datatype / value predicate)을
@@ -504,7 +507,7 @@ O-6 disjoint 일관성 검사의 확장 — property 제약(required / datatype 
   · no-op 무회귀 · DDL lifecycle · DROP SPACE cleanup). 워크스페이스 lib 전부 통과, fmt·clippy(변경
   크레이트) 클린.
 - **미착수(후속)**: edge cardinality(관계 수 min/max — 순회 비용), closed-world(선언 외 property
-  금지 / SHACL sh:closed), 배포·프로덕션 스모크, 분산 meta 연동(G-2 이후).
+  금지 / SHACL sh:closed), 프로덕션 스모크(AKS HTTP), 분산 meta 연동(G-2 이후).
 
 ### R. 유사도 / 추천 (P1 — 차별화 기능, 2026-06-15 신설)
 
