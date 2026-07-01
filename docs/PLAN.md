@@ -901,9 +901,13 @@ Azure AKS에 실제로 배포해보며 발견된 마찰 포인트.
   + Value 바이트 추정기. `BYORIDB_MAX_MEMORY_MB` env 노출(prod 8192=8GB — 정당 집계 7.7M행 허용,
   100Gi 한도 대비 큰 헤드룸). 회귀: 1MB cap + 30KB×60행 projection이 ResourceExhausted, 작은 쿼리
   통과. executor 211/211.
-  **미해결(후속)**: ② GO/LOOKUP/FETCH 누적 경로에도 동일 가드(현재 MATCH만; LOOKUP은 max_scan_limit
-  부분 방어) ③ 단일노드 SPOF·~60분 repair 다운타임 → HA(G-2 분산 선결) 또는 redb quick-repair(redb
-  #829) 대기. 이번 사건이 우선순위 3(운영)의 실증 근거.
+  **② GO/LOOKUP/FETCH 가드 확장 ✅ (2026-06-30, 미배포)**: `estimate_row_bytes`/`estimate_value_bytes`를
+  `context.rs` 공용으로 이동, `check_result_budget`를 GO_local·LOOKUP 풀스캔·FETCH(local/distributed/
+  edges) 누적 루프에 적용(16K행마다 + 최종). 분산 전용 경로(GO_distributed, 분산 LOOKUP fetch)는
+  standalone prod 미실행이라 후순위. LOOKUP `results` 스캔 자체의 materialize(max_scan_limit로 바운드)를
+  COUNT처럼 완전 스트리밍화하는 건 추가 후속.
+  **미해결(후속)**: ③ 단일노드 SPOF·~60분 repair 다운타임 → HA(G-2 분산 선결) 또는 redb quick-repair
+  (redb #829) 대기. 이번 사건이 우선순위 3(운영)의 실증 근거.
 
 ---
 

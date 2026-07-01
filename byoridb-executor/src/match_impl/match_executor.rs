@@ -495,7 +495,7 @@ impl MatchExecutor {
                             .await;
                         row.push(val);
                     }
-                    proj_bytes += estimate_row_bytes(&row);
+                    proj_bytes += crate::context::estimate_row_bytes(&row);
                     projected.push(row);
                     if projected.len().is_multiple_of(16384) {
                         self.ctx.check_result_budget(proj_bytes)?;
@@ -2544,29 +2544,7 @@ pub(super) fn json_value_equals(
 /// Conservative per-binding-row footprint estimate (a `HashMap` plus a few
 /// small values). Binding rows hold variable→vid maps, so this is dominated by
 /// container overhead. Used to bound binding-row accumulation against the
-/// `max_memory_mb` budget before it can OOM the node.
+/// `max_memory_mb` budget before it can OOM the node. (Projected-row byte
+/// estimation lives in `crate::context::estimate_row_bytes`, shared with the
+/// GO/LOOKUP/FETCH executors.)
 const BINDING_ROW_EST_BYTES: usize = 256;
-
-/// Cheap, conservative estimate of a projected [`Value`]'s footprint in bytes.
-/// Strings count their length; composite values (vertex/edge/map/list/path/set)
-/// use a flat estimate rather than walking their internals — this is a safety
-/// guard, not exact accounting, so a slight under/overestimate is fine.
-fn estimate_value_bytes(v: &byoridb_common::Value) -> usize {
-    use byoridb_common::Value;
-    match v {
-        Value::String(s) => 24 + s.len(),
-        Value::Edge(_) => 256,
-        Value::Vertex(_)
-        | Value::Path(_)
-        | Value::Map(_)
-        | Value::Set(_)
-        | Value::List(_)
-        | Value::DataSet(_) => 512,
-        _ => 16,
-    }
-}
-
-/// Estimated footprint of one projected output row.
-fn estimate_row_bytes(row: &[byoridb_common::Value]) -> usize {
-    24 + row.iter().map(estimate_value_bytes).sum::<usize>()
-}
