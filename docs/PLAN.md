@@ -1100,3 +1100,10 @@ Phase 0–7 모두 ✅, 커밋 `1d90124`. 핵심 임팩트:
 - pre-commit 훅이 `cargo fmt` 검사 — 커밋 전 `cargo fmt --all` 선실행.
 - 커밋 메시지: `<type>(<scope>): <subject>`. type은 feat/fix/refactor/chore/docs.
 - `.claude/`는 로컬 전용. 절대 커밋 금지.
+- `deploy.yml`에 `paths-ignore: ['docs/**', '*.md']` — **문서/`.md`만 바뀐 커밋은 배포 스킵**(이미지 무변경). 코드 파일(`*.rs`, `Cargo.toml` 등)이 하나라도 바뀌면 배포 트리거. 문서-only 정정이면 재배포 부담 0.
+
+**버전 / 릴리스 정책 (2026-07-01 확정 — 방안 A)**
+
+- **배포·버전의 유일한 진실 = 커밋 SHA.** `deploy.yml`이 `sha-$(git rev-parse --short HEAD)`(+`latest`)로 `main` HEAD를 연속 배포(CD). PLAN.md의 각 항목이 인용하는 `sha-<short>`가 배포 지표다.
+- **semver 릴리스는 운영하지 않는다.** `Cargo.toml`의 `version`(현 `0.2.4`)과 기존 git 태그 `v0.x`(v0.1.0/v0.2.0/v0.2.1)는 **릴리스 라인이 아니라 초기 스냅샷/개발값**이다. 셋을 동기화하지 않으며, 프로덕션이 "특정 semver를 추적"하지 않는다.
+- **규칙: 문서(README/book/PLAN 등)에 새 semver 숫자를 박지 말 것.** 기능 상태는 이 PLAN.md와 README 기능표·로드맵으로 표현한다(과거 README 본문의 `v0.2.15` 같은 실체 없는 버전이 이렇게 생겼다). 외부 소비자용 안정 릴리스가 생기면 그때 방안 B(마일스톤 태그 + Cargo bump + CHANGELOG)로 승격.
