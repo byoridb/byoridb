@@ -27,6 +27,10 @@ pub enum Statement {
     Recommend(RecommendStatement),
     /// `CHECK CONSISTENCY` — report ontology consistency violations (O-6).
     CheckConsistency,
+    /// `CHECK SHAPE` — report vertices that violate a declared shape's
+    /// property constraints (required / datatype / value predicate). Shape
+    /// validation is the SHACL-style complement to O-6 disjointness checking.
+    CheckShape,
     /// `WHY <src> -> <dst> OVER <edge_type>` — explain how an inferred edge was
     /// entailed by walking its provenance/justification tree (O-provenance
     /// Phase 2). Returns the derivation as a flattened tree.
@@ -172,6 +176,46 @@ pub enum CreateStatement {
     /// class is a tag (instances are vertices carrying it) plus hierarchy
     /// metadata (O-3 TBox).
     Class(CreateClassStatement),
+    /// `CREATE SHAPE name ON class (constraints...)` — a SHACL-style set of
+    /// property constraints validated against every vertex bearing the target
+    /// class (or one of its subclasses).
+    Shape(CreateShapeStatement),
+}
+
+/// `CREATE SHAPE [IF NOT EXISTS] <name> ON <class> (<constraint>, ...)`.
+///
+/// The shape targets `target_class`: a vertex is in scope when `target_class`
+/// is in its full ontology class set (declared tags ∪ inferred types ∪ their
+/// ancestors), so subclass instances are validated too (SHACL `targetClass`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateShapeStatement {
+    pub if_not_exists: bool,
+    pub name: String,
+    pub target_class: String,
+    pub constraints: Vec<ShapeConstraint>,
+}
+
+/// One property constraint inside a [`CreateShapeStatement`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShapeConstraint {
+    /// The vertex property this constraint applies to.
+    pub property: String,
+    pub kind: ShapeConstraintKind,
+}
+
+/// The kind of a [`ShapeConstraint`]. In a property graph a vertex property is
+/// single-valued, so SHACL `minCount≥1` collapses to `Required` and `maxCount`
+/// is structurally guaranteed; cardinality over *relations* (edges) is a
+/// separate, higher-cost track.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ShapeConstraintKind {
+    /// The property must be present and non-null (`<prop> REQUIRED`).
+    Required,
+    /// The property value must match the declared type (`<prop> <datatype>`).
+    DataType(DataType),
+    /// The property must satisfy a boolean value predicate
+    /// (`<prop> CHECK <expr>`), e.g. `age CHECK age >= 0`.
+    Predicate(Expression),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -400,6 +444,14 @@ pub enum DropStatement {
     /// `DROP CLASS [IF EXISTS] name` — removes the class metadata and its
     /// tag definition. Rejected while subclasses exist (RESTRICT).
     Class(DropClassStatement),
+    /// `DROP SHAPE [IF EXISTS] name` — removes a shape's constraint definition.
+    Shape(DropShapeStatement),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DropShapeStatement {
+    pub if_exists: bool,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -79,6 +79,15 @@ impl Executor {
                 self.handle_create_class(name, if_not_exists, props, superclasses, disjoint)
                     .await
             }
+            crate::plan::CreatePlan::Shape {
+                name,
+                if_not_exists,
+                target_class,
+                constraints,
+            } => {
+                self.handle_create_shape(name, if_not_exists, target_class, constraints)
+                    .await
+            }
             crate::plan::CreatePlan::User {
                 name,
                 if_not_exists,
@@ -909,6 +918,9 @@ impl Executor {
             }
             crate::plan::DropPlan::Class { name, if_exists } => {
                 self.handle_drop_class(name, if_exists).await
+            }
+            crate::plan::DropPlan::Shape { name, if_exists } => {
+                self.handle_drop_shape(name, if_exists).await
             }
             crate::plan::DropPlan::Edge { name, if_exists } => {
                 // O-8 D7: the sameAs reserved type underpins irreversible merges;

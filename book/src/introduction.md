@@ -1,6 +1,6 @@
 # ByoriDB
 
-nGQL 호환 쿼리 언어를 갖춘, Rust로 작성된 분산 그래프 데이터베이스입니다.
+nGQL 호환 쿼리 언어와 온톨로지 추론(RDFS-Plus) 레이어를 갖춘, Rust로 작성된 그래프 데이터베이스입니다. 분산은 설계에 반영되어 있으나 다중 노드 배포는 아직 로드맵 단계이며, 현재 프로덕션은 단일 노드입니다.
 
 ## 개요
 
@@ -48,11 +48,21 @@ ByoriDB는 다음과 같은 특징을 갖춘 독립적인 그래프 데이터베
 - `FIND PATH` - 최단 경로 쿼리
 - `RECOMMEND` - 유사 버텍스 추천 (구조적 / 임베딩 코사인 + WHERE 필터)
 
-### 분산 시스템
+**온톨로지 / 시맨틱**
+- `CREATE CLASS … SUBCLASS OF … [DISJOINT WITH …]` - 클래스 계층 (TBox)
+- `CREATE EDGE … TRANSITIVE/SYMMETRIC/INVERSE OF/SUBPROPERTY OF/DOMAIN/RANGE/CHAIN` - 시맨틱 관계
+- RDFS-Plus forward-chaining materialization + `owl:sameAs` 동치 + `WHY` 설명
+- `CREATE SHAPE … ON <class> (…)` / `CHECK SHAPE` - SHACL식 shape 검증 (required/datatype/값 술어)
+- `CHECK CONSISTENCY` / `is_a(v, "class")` - 일관성 검사 / 계층 인지 쿼리
+
+### 분산 (설계 — 다중 노드 배포는 진행 중)
+
+> ⚠️ 아래는 라이브러리 레이어의 분산 메커니즘이며, 실행 바이너리는 현재 단일 노드만 노출합니다. 진짜 다중 노드 배포는 launcher 통합(로드맵) 후 가능합니다.
+
 - **Raft 합의**: 리더 선출, 로그 복제, 스냅샷
 - **Meta 서비스**: 스키마 관리를 위한 gRPC/HTTP 서버
 - **파티셔닝**: VID 기반 consistent hashing
-- **복제 팩터(Replica Factor)**: 다중 노드 복제
+- **복제 팩터(Replica Factor)**: 다중 노드 복제 (설계)
 
 ### 성능 최적화
 - **Bloom filter**: 약 1%의 거짓 양성률(false positive rate)

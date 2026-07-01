@@ -1,7 +1,7 @@
 [book]
 title = "ByoriDB Documentation"
 authors = ["ByoriDB Team"]
-description = "A distributed graph database written in Rust"
+description = "An ontology graph database written in Rust (nGQL-compatible, RDFS-Plus reasoning; distribution on the roadmap)"
 language = "en"
 multilingual = false
 src = "src"

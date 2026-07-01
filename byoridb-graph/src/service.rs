@@ -415,7 +415,8 @@ impl GraphService {
             | Statement::Find(_)
             | Statement::Recommend(_)
             | Statement::ExplainInference { .. }
-            | Statement::CheckConsistency => Permission::Read,
+            | Statement::CheckConsistency
+            | Statement::CheckShape => Permission::Read,
             // Write
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => Permission::Write,
             // Create / schema
@@ -453,6 +454,7 @@ impl GraphService {
             Statement::Find(_) => QueryType::Find,
             Statement::Recommend(_) => QueryType::Recommend,
             Statement::CheckConsistency => QueryType::Show,
+            Statement::CheckShape => QueryType::Show,
             Statement::ExplainInference { .. } => QueryType::Show,
             Statement::Grant(_) => QueryType::Create, // User management uses Create metrics
             Statement::Revoke(_) => QueryType::Create,

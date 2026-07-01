@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">ByoriDB</h1>
-  <p align="center">Rust로 작성된 분산 그래프 데이터베이스 — nGQL 호환 + 온톨로지 추론(RDFS-Plus) 레이어</p>
+  <p align="center">Rust로 작성된 온톨로지 그래프 데이터베이스 — nGQL 호환 + 온톨로지 추론(RDFS-Plus) 레이어 <em>(분산은 설계에 반영, 다중 노드 배포는 로드맵)</em></p>
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
 ## 왜 ByoriDB 인가?
 
 - **안전성 & 속도** — Rust의 메모리 안전성과 zero-cost abstraction 기반의 C++ 급 성능
-- **분산 설계** — Raft 합의, consistent hashing, 수평 확장을 처음부터 염두에 둔 설계
+- **분산 지향 설계** — Raft 합의·consistent hashing·수평 확장을 처음부터 염두에 둔 설계 *(다중 노드 배포는 아직 진행 중 — 현재 프로덕션은 단일 노드)*
 - **모던 스택** — Tokio 비동기 런타임 + redb(순수 Rust 임베디드 KV). JVM 튜닝이나 GC 정지 없음
 - **nGQL 호환** — 친숙한 그래프 쿼리 언어 + 확장되는 Cypher 스타일 지원
 - **온톨로지 추론** — property graph 코어 위에 얹은 시맨틱 레이어: 클래스 계층, 시맨틱 관계 타입(transitive/symmetric/inverse/…), RDFS-Plus forward-chaining materialization, `owl:sameAs` 동치 — 단순 그래프DB를 넘어 온톨로지 DB 를 지향
@@ -98,7 +98,8 @@ SHOW TAG INDEXES;
 | **MATCH** | 패턴 매칭, `WHERE` (AND/OR/NOT/CONTAINS/STARTS WITH/ENDS WITH/=~), `RETURN v/e` 객체, `OPTIONAL MATCH`, `GROUP BY`, `ORDER BY … ASC/DESC`, `LIMIT/OFFSET` |
 | **함수** | `id(v)`, `properties(v/e)`, `tags(v)` / `labels(v)`, `COUNT/SUM/AVG/MAX/MIN`, `LOWER/UPPER/LENGTH/CONTAINS/STARTS_WITH/ENDS_WITH` |
 | **관리** | `SHOW SPACES/TAGS/EDGES/INDEXES/STATS/SESSIONS/CREATE TAG`, `EXPLAIN/PROFILE`, `REBUILD INDEX`, `BALANCE`, `GRANT/REVOKE` |
-| **온톨로지** | `CREATE CLASS … SUBCLASS OF … [DISJOINT WITH …]`, `SHOW/DESCRIBE CLASS`, `CREATE EDGE … TRANSITIVE/SYMMETRIC/INVERSE OF/SUBPROPERTY OF/DOMAIN/RANGE`, `INSERT EDGE sameAs()`, `CHECK CONSISTENCY`, `is_a(v, "class")` |
+| **온톨로지** | `CREATE CLASS … SUBCLASS OF … [DISJOINT WITH …]`, `SHOW/DESCRIBE CLASS`, `CREATE EDGE … TRANSITIVE/SYMMETRIC/INVERSE OF/SUBPROPERTY OF/DOMAIN/RANGE/CHAIN`, `INSERT EDGE sameAs()`, `CHECK CONSISTENCY`, `is_a(v, "class")`, `WHY … OVER …` |
+| **shape 검증** | `CREATE SHAPE <name> ON <class> (<prop> <type> [REQUIRED] \| <prop> CHECK <expr>)`, `DROP SHAPE`, `CHECK SHAPE` — required / datatype / value-predicate 제약을 write-time 거부 + 스캔 리포트 |
 | **추천** | `RECOMMEND SIMILAR TO <vid> ( OVER <edges> \| BY EMBEDDING <prop> \| BLEND … ) [WHERE …] [LIMIT k]`, `CREATE VECTOR INDEX` |
 
 ### Cypher 스타일 MATCH (v0.2.x 이후)
@@ -164,7 +165,24 @@ CHECK CONSISTENCY;                              -- disjoint 위반 탐지
 MATCH (n:dog) WHERE is_a(n, "animal") RETURN n; -- subclass 까지 매칭
 ```
 
-지원 규칙(RDFS-Plus): `subClassOf`/`subPropertyOf` 전이, `owl:TransitiveProperty`, `owl:inverseOf`, `owl:SymmetricProperty`, `domain`/`range` vertex 타입 추론, `owl:sameAs` 동치. 삭제 시에는 더 이상 도출되지 않는 추론을 re-materialization 으로 제거합니다(retraction).
+지원 규칙(RDFS-Plus): `subClassOf`/`subPropertyOf` 전이, `owl:TransitiveProperty`, `owl:inverseOf`, `owl:SymmetricProperty`, `owl:propertyChainAxiom`(2-link), `domain`/`range` vertex 타입 추론, `owl:sameAs` 동치. 삭제 시에는 더 이상 도출되지 않는 추론을 제거합니다(retraction — provenance 기반 증분 DRed). `WHY <src> -> <dst> OVER <edge>` 로 추론 사실의 유도 과정을 설명할 수 있습니다.
+
+### shape 검증 (constraint hooks)
+
+클래스 인스턴스가 만족해야 할 property 제약을 SHACL 스타일로 선언합니다. write-time에 위반을 거부하고, `CHECK SHAPE` 로 기존 데이터의 위반을 리포트합니다.
+
+```sql
+CREATE SHAPE personShape ON person (
+    email STRING REQUIRED,   -- 필수 + 타입
+    age   INT,               -- 타입
+    age   CHECK age >= 0      -- 값 술어
+);
+
+INSERT VERTEX person(age) VALUES 1:(-1);  -- 거부: email 누락 + age < 0
+CHECK SHAPE;                              -- 위반 리포트 (vid/shape/property/constraint)
+```
+
+targetClass 의미론으로 **subclass 인스턴스도 검증**됩니다. property graph 특성상 property는 single-valued이므로 `REQUIRED`(= SHACL `minCount≥1`)·datatype·값 술어를 다루고, 관계(edge) 카디널리티는 별도 트랙입니다.
 
 ### 유사도 / 추천
 
@@ -180,15 +198,20 @@ RECOMMEND SIMILAR TO 1 BLEND EMBEDDING vec 0.7 OVER follows 0.3
   WHERE is_a("product") LIMIT 10;
 ```
 
-### 분산 시스템
+### 분산 (설계 — 다중 노드 배포는 진행 중)
 
-- **Raft 합의** — 리더 선출, 로그 복제, 스냅샷
+> ⚠️ **아직 단일 노드입니다.** 아래는 라이브러리 레이어에 구현된 분산 *메커니즘*이지만,
+> 실행 바이너리(`byoridb-server`)는 현재 단일 노드 실행만 노출하며 peer/cluster 설정
+> 인터페이스가 없습니다. `docker-compose.yml` 의 3 컨테이너도 Raft peer 설정이 없어
+> **독립된 단일 노드 3개**로 동작합니다. 진짜 다중 노드 배포는 launcher 통합(로드맵) 후 가능합니다.
+
+- **Raft 합의** — 리더 선출, 로그 복제, 스냅샷 (라이브러리 구현)
 - **Consistent Hashing** — VID 기반 파티셔닝으로 데이터 이동 최소화 (~1/N)
 - **Meta 서비스** — gRPC/HTTP를 통한 중앙집중 스키마 관리
 - **복제** — 설정 가능한 replica factor + 자동 파티션 할당
 - **온라인 스키마 변경** — 무중단 `ALTER TAG/EDGE ADD` (지연 마이그레이션)
 
-> 참고: 진정한 다중 노드 샤딩(파티션의 노드 간 분산)은 아직 진행 중입니다. 현재 프로덕션 배포는 단일 노드입니다([로드맵](#알려진-제약--로드맵) 참조).
+자세한 내용은 [로드맵](#알려진-제약--로드맵) 및 [프로젝트 플랜](docs/PLAN.md) 의 G-2 항목을 참고하세요.
 
 ### 스토리지 엔진
 
@@ -227,6 +250,9 @@ RECOMMEND SIMILAR TO 1 BLEND EMBEDDING vec 0.7 OVER follows 0.3
 
 | 변경 | 내용 |
 |------|------|
+| **온톨로지: shape 검증 (constraint hooks)** | `CREATE SHAPE … ON <class>` 로 required / datatype / 값 술어(`CHECK`) 제약 선언 — INSERT/UPDATE VERTEX write-time 거부 + `CHECK SHAPE` 스캔 리포트. targetClass 의미론으로 subclass 인스턴스도 검증 |
+| **온톨로지: property chain + provenance/설명/증분 retraction (O-10~O-12)** | `owl:propertyChainAxiom`(2-link) 규칙, 추론 사실의 provenance 저장 + `WHY … OVER …` 설명, 삭제 시 provenance 기반 증분 DRed retraction |
+| **대량 집계 OOM 방어** | 라벨 전용 `COUNT` 스트리밍화(88M 태그 풀스캔 시 GB급 메모리 → O(1)), `max_memory_mb` 로 쿼리 결과 누적 메모리 상한 강제(초과 시 OOM 대신 오류) |
 | **쿼리 정확성 수정 (4건)** | ① `WHERE id(n)==X` 바인딩 경로에서 노드 라벨 필터가 무시되던 문제 ② `FETCH PROP ON <tag>` 가 태그 소속을 검증하지 않고 다른 태그 데이터를 반환하던 문제 ③ `GO … OVER *` 에서 `type(edge)`/`dst(edge)`/`src(edge)` 등 edge 함수가 NULL 을 반환하던 문제 ④ 집계 시 암묵 `GROUP BY`(비집계 RETURN 컬럼으로 자동 그룹화) 미동작 — 실데이터 도그푸딩으로 발견·수정 |
 | **대량 쓰기 안정성 (UTF-8 로깅 패닉)** | 긴 비ASCII(한글 등) 쿼리를 로깅할 때 UTF-8 문자 경계가 아닌 고정 바이트 위치에서 잘라 서버가 패닉하던 문제 수정. 대량 INSERT 중 간헐적 connection reset 의 근본 원인이었음 |
 | **nGQL 문자열 escape** | 문자열 리터럴 내 `\"` / `\\` / `\n` 등 escape 시퀀스 처리 — 값에 따옴표·백슬래시가 포함된 데이터 적재 가능 |
@@ -402,6 +428,8 @@ RUST_LOG=info cargo run --release --bin byoridb-server
 | `SHOW SESSIONS` (라이브 데이터) | ✅ v0.2.15 구현됨 |
 | 다중 노드 샤딩 (파티션의 노드 간 분산) | 진행 중 (현재 단일 노드 배포) |
 | 가변 길이 경로 `*1..n` 실행 (`MATCH`/`FIND ALL SHORTEST PATHS`) | ✅ 구현됨 (2026-06) |
+| shape 검증 (SHACL식 required/datatype/값 술어 제약) | ✅ 구현됨 (2026-07) |
+| 관계(edge) 카디널리티 제약 | 계획됨 |
 | Geography WKB/WKT 디코딩 | 계획됨 |
 | `RETURN *` (전체 변수) | 계획됨 |
 | MVCC / 분산 2PC 트랜잭션 | 미계획 (비용 대비 효과) |

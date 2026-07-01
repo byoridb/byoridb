@@ -616,6 +616,61 @@ fn test_parse_create_class_without_hierarchy() {
     }
 }
 
+// ===== SHAPE statements (shape validation) =====
+
+#[test]
+fn test_parse_create_shape_mixed_constraints() {
+    use crate::ast::ShapeConstraintKind;
+    let result = parse(
+        "CREATE SHAPE personShape ON person (email STRING REQUIRED, age INT, age CHECK age >= 0)",
+    );
+    assert!(result.is_ok(), "parse failed: {:?}", result);
+    match result.unwrap() {
+        Statement::Create(CreateStatement::Shape(stmt)) => {
+            assert_eq!(stmt.name, "personShape");
+            assert_eq!(stmt.target_class, "person");
+            // `email STRING REQUIRED` expands to two constraints (datatype +
+            // required), then `age INT`, then `age CHECK ...` → 4 total.
+            assert_eq!(stmt.constraints.len(), 4);
+            assert_eq!(stmt.constraints[0].property, "email");
+            assert!(matches!(
+                stmt.constraints[0].kind,
+                ShapeConstraintKind::DataType(_)
+            ));
+            assert!(matches!(
+                stmt.constraints[1].kind,
+                ShapeConstraintKind::Required
+            ));
+            assert!(matches!(
+                stmt.constraints[3].kind,
+                ShapeConstraintKind::Predicate(_)
+            ));
+        }
+        s => panic!("Expected CreateShape, got {:?}", s),
+    }
+}
+
+#[test]
+fn test_parse_check_shape_and_drop_shape() {
+    assert!(matches!(
+        parse("CHECK SHAPE").unwrap(),
+        Statement::CheckShape
+    ));
+    match parse("DROP SHAPE IF EXISTS s").unwrap() {
+        Statement::Drop(DropStatement::Shape(stmt)) => {
+            assert_eq!(stmt.name, "s");
+            assert!(stmt.if_exists);
+        }
+        s => panic!("Expected DropShape, got {:?}", s),
+    }
+}
+
+#[test]
+fn test_shape_and_required_usable_as_identifiers() {
+    // `shape` / `required` must still work as property names outside CREATE SHAPE.
+    assert!(parse("CREATE TAG t(shape STRING, required INT)").is_ok());
+}
+
 #[test]
 fn test_parse_drop_class() {
     match parse("DROP CLASS IF EXISTS dog").unwrap() {
