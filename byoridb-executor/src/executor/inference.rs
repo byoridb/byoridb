@@ -66,6 +66,9 @@ pub(super) struct RelMeta {
     inverse: HashMap<String, Vec<String>>,
     /// edge type → its direct superproperties.
     superprops: HashMap<String, Vec<String>>,
+    /// edge type → equivalent edge types (bidirectional closure of
+    /// `owl:equivalentProperty`). Like `superprops` but symmetric.
+    equivalent_props: HashMap<String, Vec<String>>,
     /// edge type → domain class (subject vertex type).
     domain: HashMap<String, String>,
     /// edge type → range class (object vertex type).
@@ -87,6 +90,7 @@ impl RelMeta {
             && self.symmetric.is_empty()
             && self.inverse.is_empty()
             && self.superprops.is_empty()
+            && self.equivalent_props.is_empty()
             && self.domain.is_empty()
             && self.range.is_empty()
             && self.chain_first.is_empty()
@@ -208,6 +212,17 @@ impl Executor {
             if let Some(q) = sem.subproperty_of {
                 meta.superprops.entry(name.clone()).or_default().push(q);
             }
+            if let Some(q) = sem.equivalent_property {
+                // owl:equivalentProperty is symmetric — register both directions.
+                meta.equivalent_props
+                    .entry(name.clone())
+                    .or_default()
+                    .push(q.clone());
+                meta.equivalent_props
+                    .entry(q)
+                    .or_default()
+                    .push(name.clone());
+            }
             if let Some(c) = sem.domain {
                 meta.domain.insert(name.clone(), c);
             }
@@ -283,6 +298,20 @@ impl Executor {
                         (s, q.clone(), d),
                         Justification {
                             rule: RuleKind::SubPropertyOf,
+                            premises: vec![premise.clone()],
+                        },
+                    ));
+                }
+            }
+            // owl:equivalentProperty: (a)-p->(b) ∧ p ≡ q ⟹ (a)-q->(b). The
+            // `equivalent_props` index is symmetric, so the reverse (q ⟹ p) is
+            // derived when the q-edge is processed.
+            if let Some(eqs) = meta.equivalent_props.get(&p) {
+                for q in eqs {
+                    derived.push((
+                        (s, q.clone(), d),
+                        Justification {
+                            rule: RuleKind::EquivalentProperty,
                             premises: vec![premise.clone()],
                         },
                     ));
@@ -715,6 +744,39 @@ mod tests {
         assert!(
             has(&e, 1, "related", 2).await,
             "superproperty edge inferred"
+        );
+    }
+
+    #[tokio::test]
+    async fn equivalent_property_materializes_both_directions() {
+        let e = create_executor();
+        ok(&e, "CREATE EDGE likes()").await;
+        ok(&e, "CREATE EDGE enjoys() EQUIVALENT TO likes").await;
+        // likes 1->2 ⟹ enjoys 1->2
+        ok(&e, "INSERT EDGE likes() VALUES 1->2:()").await;
+        assert!(
+            has(&e, 1, "enjoys", 2).await,
+            "equivalent enjoys inferred from likes"
+        );
+        // owl:equivalentProperty is symmetric: enjoys 3->4 ⟹ likes 3->4
+        ok(&e, "INSERT EDGE enjoys() VALUES 3->4:()").await;
+        assert!(
+            has(&e, 3, "likes", 4).await,
+            "equivalent likes inferred (bidirectional)"
+        );
+    }
+
+    #[tokio::test]
+    async fn equivalent_property_retracts_on_delete() {
+        let e = create_executor();
+        ok(&e, "CREATE EDGE likes()").await;
+        ok(&e, "CREATE EDGE enjoys() EQUIVALENT TO likes").await;
+        ok(&e, "INSERT EDGE likes() VALUES 1->2:()").await;
+        assert!(has(&e, 1, "enjoys", 2).await, "equivalent enjoys inferred");
+        ok(&e, "DELETE EDGE likes 1->2").await;
+        assert!(
+            !has(&e, 1, "enjoys", 2).await,
+            "inferred enjoys retracted (DRed)"
         );
     }
 

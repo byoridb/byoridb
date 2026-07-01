@@ -98,7 +98,7 @@ SHOW TAG INDEXES;
 | **MATCH** | 패턴 매칭, `WHERE` (AND/OR/NOT/CONTAINS/STARTS WITH/ENDS WITH/=~), `RETURN v/e` 객체, `OPTIONAL MATCH`, `GROUP BY`, `ORDER BY … ASC/DESC`, `LIMIT/OFFSET` |
 | **함수** | `id(v)`, `properties(v/e)`, `tags(v)` / `labels(v)`, `COUNT/SUM/AVG/MAX/MIN`, `LOWER/UPPER/LENGTH/CONTAINS/STARTS_WITH/ENDS_WITH` |
 | **관리** | `SHOW SPACES/TAGS/EDGES/INDEXES/STATS/SESSIONS/CREATE TAG`, `EXPLAIN/PROFILE`, `REBUILD INDEX`, `BALANCE`, `GRANT/REVOKE` |
-| **온톨로지** | `CREATE CLASS … SUBCLASS OF … [DISJOINT WITH …]`, `SHOW/DESCRIBE CLASS`, `CREATE EDGE … TRANSITIVE/SYMMETRIC/INVERSE OF/SUBPROPERTY OF/DOMAIN/RANGE/CHAIN`, `INSERT EDGE sameAs()`, `CHECK CONSISTENCY`, `is_a(v, "class")`, `WHY … OVER …` |
+| **온톨로지** | `CREATE CLASS … SUBCLASS OF … [EQUIVALENT TO …] [DISJOINT WITH …]`, `SHOW/DESCRIBE CLASS`, `CREATE EDGE … TRANSITIVE/SYMMETRIC/INVERSE OF/SUBPROPERTY OF/EQUIVALENT TO/DOMAIN/RANGE/CHAIN`, `INSERT EDGE sameAs()`, `CHECK CONSISTENCY`, `is_a(v, "class")`, `WHY … OVER …` |
 | **shape 검증** | `CREATE SHAPE <name> ON <class> (<prop> <type> [REQUIRED] \| <prop> CHECK <expr>)`, `DROP SHAPE`, `CHECK SHAPE` — required / datatype / value-predicate 제약을 write-time 거부 + 스캔 리포트 |
 | **추천** | `RECOMMEND SIMILAR TO <vid> ( OVER <edges> \| BY EMBEDDING <prop> \| BLEND … ) [WHERE …] [LIMIT k]`, `CREATE VECTOR INDEX` |
 
@@ -165,7 +165,7 @@ CHECK CONSISTENCY;                              -- disjoint 위반 탐지
 MATCH (n:dog) WHERE is_a(n, "animal") RETURN n; -- subclass 까지 매칭
 ```
 
-지원 규칙(RDFS-Plus): `subClassOf`/`subPropertyOf` 전이, `owl:TransitiveProperty`, `owl:inverseOf`, `owl:SymmetricProperty`, `owl:propertyChainAxiom`(2-link), `domain`/`range` vertex 타입 추론, `owl:sameAs` 동치. 삭제 시에는 더 이상 도출되지 않는 추론을 제거합니다(retraction — provenance 기반 증분 DRed). `WHY <src> -> <dst> OVER <edge>` 로 추론 사실의 유도 과정을 설명할 수 있습니다.
+지원 규칙(RDFS-Plus + OWL 2 RL): `subClassOf`/`subPropertyOf` 전이, `owl:equivalentClass`/`owl:equivalentProperty`, `owl:TransitiveProperty`, `owl:inverseOf`, `owl:SymmetricProperty`, `owl:propertyChainAxiom`(2-link), `domain`/`range` vertex 타입 추론, `owl:sameAs` 동치. 삭제 시에는 더 이상 도출되지 않는 추론을 제거합니다(retraction — provenance 기반 증분 DRed). `WHY <src> -> <dst> OVER <edge>` 로 추론 사실의 유도 과정을 설명할 수 있습니다.
 
 ### shape 검증 (constraint hooks)
 

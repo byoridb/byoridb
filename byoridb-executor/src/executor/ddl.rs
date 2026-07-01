@@ -75,9 +75,17 @@ impl Executor {
                 props,
                 superclasses,
                 disjoint,
+                equivalent_classes,
             } => {
-                self.handle_create_class(name, if_not_exists, props, superclasses, disjoint)
-                    .await
+                self.handle_create_class(
+                    name,
+                    if_not_exists,
+                    props,
+                    superclasses,
+                    disjoint,
+                    equivalent_classes,
+                )
+                .await
             }
             crate::plan::CreatePlan::Shape {
                 name,
@@ -458,6 +466,7 @@ impl Executor {
         for (clause, target) in [
             ("INVERSE OF", &semantics.inverse_of),
             ("SUBPROPERTY OF", &semantics.subproperty_of),
+            ("EQUIVALENT TO", &semantics.equivalent_property),
         ] {
             if let Some(target) = target {
                 if target == &name {

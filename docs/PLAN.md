@@ -509,6 +509,28 @@ O-6 disjoint 일관성 검사의 확장 — property 제약(required / datatype 
 - **미착수(후속)**: edge cardinality(관계 수 min/max — 순회 비용), closed-world(선언 외 property
   금지 / SHACL sh:closed), 프로덕션 스모크(AKS HTTP), 분산 meta 연동(G-2 이후).
 
+**O-13 [P1] OWL 2 RL: equivalentClass + equivalentProperty ✅ 구현 완료 (2026-07-01, 미배포)**
+
+O-11 property chain에 이은 OWL 2 RL 규칙 확장. 4규칙 중 **self-contained 2개**(기존 subClassOf/
+subPropertyOf 양방향)만 이번 MVP. functional/inverse-functional(sameAs 유도)은 Phase 2로 분리.
+
+- **equivalentClass** (`CREATE CLASS c(...) [SUBCLASS OF ...] EQUIVALENT TO d1[, d2] [DISJOINT WITH ...]`):
+  양방향 subClassOf. `ClassDef.equivalent_classes` 저장 + CREATE 시 **대상 ClassDef에도 역등록**(양쪽
+  walk 대칭 → 쿼리타임 전체 스캔 회피). `ontology::class_ancestors_of`가 superclasses ∪ equivalent_classes를
+  walk → `is_a` 대칭(a≡b면 a인스턴스 `is_a b`, b인스턴스 `is_a a`). 존재/자기참조 검증.
+- **equivalentProperty** (`CREATE EDGE e() EQUIVALENT TO f`): 양방향 subPropertyOf. O-4 `SemanticFlags.
+  equivalent_property`, `load_rel_meta`가 `RelMeta.equivalent_props`에 **양방향 등록**, O-5 materialization에
+  `(a)-p->b ∧ p≡q ⟹ (a)-q->b` 규칙(대칭이라 역방향 자동). `RuleKind::EquivalentProperty`로 provenance/WHY/
+  DRed 자동 연계. `handle_create_edge` 검증 loop에 대상 존재/자기참조.
+- **함정(수정)**: `RelMeta::is_empty()`에 `equivalent_props` 누락 → 시맨틱이 equivalentProperty뿐인 space에서
+  `materialize_inserted_edges`가 조기 no-op으로 스킵돼 추론 안 됨. is_empty()에 추가해 해소(디버깅으로 발견).
+- 신규 lexer 토큰 `EQUIVALENT`(`TO` 재사용). CREATE CLASS 절 순서: SUBCLASS OF → EQUIVALENT TO → DISJOINT
+  WITH. 회귀: 파서 2 + 실행기 4(equivalentClass is_a 대칭·검증, equivalentProperty materialization 양방향·
+  DRed retraction). executor 224 + parser 117 통과, fmt·clippy 클린.
+- **미착수(Phase 2)**: functional / inverse-functional property — materialization 도중 sameAs를 유도해 O-8
+  canonical merge를 재진입 호출해야 함(D10 "merge 먼저→materialize" 순서와 얽힘). entity resolution 자동화
+  (IFP email→동일 상품 병합)라 가치 크나 복잡. 배포·프로덕션 스모크도 후속.
+
 ### R. 유사도 / 추천 (P1 — 차별화 기능, 2026-06-15 신설)
 
 "어떤 노드와 가장 유사한 노드 top-k 추천" — 채널 간 동일 상품 후보 발견

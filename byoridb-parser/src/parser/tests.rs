@@ -672,6 +672,32 @@ fn test_shape_and_required_usable_as_identifiers() {
 }
 
 #[test]
+fn test_parse_create_class_equivalent_to() {
+    let result = parse("CREATE CLASS person(name STRING) EQUIVALENT TO human, individual");
+    assert!(result.is_ok(), "parse failed: {:?}", result);
+    match result.unwrap() {
+        Statement::Create(CreateStatement::Class(stmt)) => {
+            assert_eq!(stmt.name, "person");
+            assert_eq!(stmt.equivalent_classes, vec!["human", "individual"]);
+        }
+        s => panic!("Expected CreateClass, got {:?}", s),
+    }
+}
+
+#[test]
+fn test_parse_create_edge_equivalent_property() {
+    let result = parse("CREATE EDGE enjoys() EQUIVALENT TO likes");
+    assert!(result.is_ok(), "parse failed: {:?}", result);
+    match result.unwrap() {
+        Statement::Create(CreateStatement::Edge(stmt)) => {
+            assert_eq!(stmt.name, "enjoys");
+            assert_eq!(stmt.semantics.equivalent_property.as_deref(), Some("likes"));
+        }
+        s => panic!("Expected CreateEdge, got {:?}", s),
+    }
+}
+
+#[test]
 fn test_parse_drop_class() {
     match parse("DROP CLASS IF EXISTS dog").unwrap() {
         Statement::Drop(DropStatement::Class(stmt)) => {

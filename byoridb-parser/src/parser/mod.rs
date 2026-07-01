@@ -329,6 +329,7 @@ impl Parser {
             Token::Symmetric => "symmetric",
             Token::Inverse => "inverse",
             Token::Subproperty => "subproperty",
+            Token::Equivalent => "equivalent",
             Token::Chain => "chain",
             Token::Domain => "domain",
             Token::Range => "range",
