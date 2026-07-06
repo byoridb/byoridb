@@ -14,6 +14,11 @@
 //! - The server must be **stopped** (redb is single-writer per process).
 //! - The space, tags, and edge types must already exist — run
 //!   `CREATE SPACE / TAG / EDGE` via the server first, then stop it.
+//! - Because this writes KV rows directly, it does **not** trigger executor DML
+//!   hooks. For searchable product names, run
+//!   `REBUILD TEXT INDEX ON product(prod_name)` after the load and before
+//!   serving search traffic, or extend the direct-KV writer to maintain the
+//!   text-index manifest/stats/posting keys itself.
 //!
 //! ## Example
 //! ```text

@@ -60,6 +60,8 @@ pub enum Token {
     Find,
     #[token("LOOKUP", ignore(case))]
     Lookup,
+    #[token("SEARCH", ignore(case))]
+    Search,
     #[token("RECOMMEND", ignore(case))]
     Recommend,
     #[token("SIMILAR", ignore(case))]
@@ -156,6 +158,8 @@ pub enum Token {
     Return,
     #[token("WITH", ignore(case))]
     With,
+    #[token("FOR", ignore(case))]
+    For,
     #[token("INDEXES", ignore(case))]
     Indexes,
     #[token("CONTAINS", ignore(case))]

@@ -91,12 +91,33 @@ kubectl -n byoridb scale statefulset byoridb-server --replicas=1
 kubectl -n byoridb rollout status statefulset byoridb-server --timeout=180s
 ```
 
-### 6. Verify with real queries
+### 6. Rebuild text indexes after direct-KV loads
+
+The bulk loader and any future direct-KV import/update tool bypass the executor
+DML hooks that maintain text-search indexes on `INSERT` / `UPDATE` / `DELETE`.
+After loading or directly mutating searchable vertices, either:
+
+- run the matching rebuild before serving search traffic, or
+- implement the same text-index maintenance contract as the executor
+  (`manifest`, `stats`, `doc`, and `post` keys).
+
+For the nexprice product-name search index:
+
+```sql
+USE nexprice;
+REBUILD TEXT INDEX ON product(prod_name);
+```
+
+Once this rebuild has run, normal nGQL DML keeps the index current
+incrementally. Direct-KV writers must continue to maintain or rebuild it.
+
+### 7. Verify with real queries
 
 ```sql
 USE nexprice;
 MATCH (n:sku) RETURN count(n);
 MATCH (n:product) RETURN count(n);
+SEARCH product.prod_name FOR 'NS84S03B_PAP' LIMIT 20;
 GO FROM <some_product_vid> OVER same_as YIELD dst(edge);
 GO FROM <some_sku_vid> OVER same_as REVERSELY YIELD dst(edge);   -- reverse index
 ```
@@ -113,3 +134,6 @@ GO FROM <some_sku_vid> OVER same_as REVERSELY YIELD dst(edge);   -- reverse inde
   after loading so serving uses Immediate (fsync) durability.
 - **`--verify`** is intentionally omitted from the Job: it scans the whole
   keyspace. Trust the loader's tallies; spot-check with the queries above.
+- **Text search:** direct-KV loads do not update text-search postings. Rebuild
+  `product(prod_name)` after each load, or add explicit text-index maintenance
+  to the loader/tool before relying on `SEARCH`.

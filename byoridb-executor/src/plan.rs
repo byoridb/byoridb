@@ -65,6 +65,12 @@ pub enum ExecutionPlan {
     /// LOOKUP query
     Lookup(LookupPlan),
 
+    /// SEARCH text index query
+    Search(SearchPlan),
+
+    /// REBUILD TEXT INDEX ON tag(prop)
+    RebuildTextIndex(TextIndexPlan),
+
     /// RECOMMEND — top-k similar vertices by shared-neighbor overlap.
     Recommend(RecommendPlan),
 
@@ -128,6 +134,18 @@ pub enum DescribePlan {
     TagIndex(String),
     EdgeIndex(String),
     Class(String),
+}
+
+pub struct SearchPlan {
+    pub tag_name: String,
+    pub prop: String,
+    pub query: String,
+    pub limit: usize,
+}
+
+pub struct TextIndexPlan {
+    pub tag_name: String,
+    pub prop: String,
 }
 
 /// Balance plan for partition management
@@ -972,6 +990,18 @@ impl ExecutionPlanBuilder {
                 limit: lookup.limit,
                 offset: lookup.offset,
             })),
+            Statement::Search(search) => Ok(ExecutionPlan::Search(SearchPlan {
+                tag_name: search.tag_name,
+                prop: search.prop,
+                query: search.query,
+                limit: search.limit,
+            })),
+            Statement::RebuildTextIndex(index) => {
+                Ok(ExecutionPlan::RebuildTextIndex(TextIndexPlan {
+                    tag_name: index.tag_name,
+                    prop: index.prop,
+                }))
+            }
             Statement::Recommend(rec) => Ok(ExecutionPlan::Recommend(RecommendPlan {
                 src_vid: rec.src_vid,
                 by: rec.by,

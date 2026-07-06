@@ -95,12 +95,21 @@ SHOW TAG INDEXES;
 | **DDL** | `CREATE/DROP/ALTER SPACE/TAG/EDGE`, `CREATE/DROP TAG INDEX`, `IF NOT EXISTS / IF EXISTS` |
 | **DML** | `INSERT VERTEX/EDGE`, `UPDATE VERTEX` (upsert), `DELETE VERTEX/EDGE` |
 | **DQL** | `FETCH PROP ON`, `GO … OVER … [REVERSELY] YIELD`, `MATCH`, `LOOKUP`, `FIND SHORTEST PATH` |
+| **텍스트 검색** | `REBUILD TEXT INDEX ON <tag>(<prop>)`, `SEARCH <tag>.<prop> FOR '<query>' [LIMIT k]`; nGQL DML은 증분 갱신, bulk/direct-KV 도구는 직접 유지하거나 rebuild 필수 |
 | **MATCH** | 패턴 매칭, `WHERE` (AND/OR/NOT/CONTAINS/STARTS WITH/ENDS WITH/=~), `RETURN v/e` 객체, `OPTIONAL MATCH`, `GROUP BY`, `ORDER BY … ASC/DESC`, `LIMIT/OFFSET` |
 | **함수** | `id(v)`, `properties(v/e)`, `tags(v)` / `labels(v)`, `COUNT/SUM/AVG/MAX/MIN`, `LOWER/UPPER/LENGTH/CONTAINS/STARTS_WITH/ENDS_WITH` |
 | **관리** | `SHOW SPACES/TAGS/EDGES/INDEXES/STATS/SESSIONS/CREATE TAG`, `EXPLAIN/PROFILE`, `REBUILD INDEX`, `BALANCE`, `GRANT/REVOKE` |
 | **온톨로지** | `CREATE CLASS … SUBCLASS OF … [EQUIVALENT TO …] [DISJOINT WITH …]`, `SHOW/DESCRIBE CLASS`, `CREATE EDGE … TRANSITIVE/SYMMETRIC/INVERSE OF/SUBPROPERTY OF/EQUIVALENT TO/DOMAIN/RANGE/CHAIN`, `INSERT EDGE sameAs()`, `CHECK CONSISTENCY`, `is_a(v, "class")`, `WHY … OVER …` |
 | **shape 검증** | `CREATE SHAPE <name> ON <class> (<prop> <type> [REQUIRED] \| <prop> CHECK <expr>)`, `DROP SHAPE`, `CHECK SHAPE` — required / datatype / value-predicate 제약을 write-time 거부 + 스캔 리포트 |
 | **추천** | `RECOMMEND SIMILAR TO <vid> ( OVER <edges> \| BY EMBEDDING <prop> \| BLEND … ) [WHERE …] [LIMIT k]`, `CREATE VECTOR INDEX` |
+
+### 텍스트 검색 색인 운영 규칙
+
+`REBUILD TEXT INDEX ON product(prod_name)`처럼 한 번 색인을 만든 뒤에는
+일반 nGQL `INSERT` / `UPDATE` / `DELETE`가 해당 색인을 증분 갱신합니다.
+단, `byoridb-bulkloader`나 별도 직접-KV 도구는 executor DML hook을 우회하므로
+검색 대상 vertex를 변경한 뒤 `REBUILD TEXT INDEX ...`를 실행하거나, 도구 안에서
+동일한 text-index manifest/stats/doc/posting key를 유지해야 합니다.
 
 ### Cypher 스타일 MATCH
 

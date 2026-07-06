@@ -70,6 +70,10 @@ impl Executor {
             ExecutionPlan::Fetch(fetch_plan) => self.execute_fetch(fetch_plan).await?,
             ExecutionPlan::Go(go_plan) => self.execute_go(go_plan).await?,
             ExecutionPlan::Lookup(lookup_plan) => self.execute_lookup(lookup_plan).await?,
+            ExecutionPlan::Search(search_plan) => self.execute_search(search_plan).await?,
+            ExecutionPlan::RebuildTextIndex(index_plan) => {
+                self.execute_rebuild_text_index(index_plan).await?
+            }
             ExecutionPlan::Recommend(rec_plan) => self.execute_recommend(rec_plan).await?,
             ExecutionPlan::CheckConsistency => self.execute_check_consistency().await?,
             ExecutionPlan::CheckShape => self.execute_check_shape().await?,
@@ -203,6 +207,7 @@ mod recommend;
 mod sameas;
 mod shape;
 mod show;
+mod text_search;
 mod vector_index;
 
 #[cfg(test)]

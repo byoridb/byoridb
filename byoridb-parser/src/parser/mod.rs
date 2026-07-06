@@ -127,9 +127,27 @@ impl Parser {
             Token::Revoke => self.parse_revoke(),
             // Admin commands
             Token::Balance => self.parse_balance(),
+            // REBUILD TEXT INDEX ON <tag>(<prop>)
             // REBUILD TAG/EDGE INDEX <name>
             Token::Rebuild => {
                 self.advance();
+                let next = self.peek_token()?;
+                let next_word = match &next {
+                    Token::Identifier(s) => Some(s.clone()),
+                    _ => self.keyword_to_string(&next),
+                };
+                if next_word.is_some_and(|s| s.eq_ignore_ascii_case("text")) {
+                    self.advance();
+                    self.consume_token(Token::Index)?;
+                    self.consume_token(Token::On)?;
+                    let tag_name = self.consume_identifier()?;
+                    self.consume_token(Token::LParen)?;
+                    let prop = self.consume_identifier()?;
+                    self.consume_token(Token::RParen)?;
+                    return Ok(Statement::RebuildTextIndex(
+                        crate::ast::TextIndexStatement { tag_name, prop },
+                    ));
+                }
                 let kind = self.peek_token()?;
                 let is_tag = match kind {
                     Token::Tag => {
@@ -166,6 +184,7 @@ impl Parser {
             Token::Match => self.parse_match(),
             Token::Go => self.parse_go(),
             Token::Lookup => self.parse_lookup(),
+            Token::Search => self.parse_search(),
             Token::Recommend => self.parse_recommend(),
             // CHECK CONSISTENCY (O-6 disjointness) / CHECK SHAPE (shape validation)
             Token::Check => {
@@ -310,7 +329,9 @@ impl Parser {
             Token::Values => "values",
             Token::Set => "set",
             Token::All => "all",
+            Token::Search => "search",
             Token::From => "from",
+            Token::For => "for",
             Token::To => "to",
             Token::On => "on",
             Token::As => "as",
@@ -355,7 +376,7 @@ impl Parser {
     pub(crate) fn consume_string_literal(&mut self) -> Result<String> {
         let token = self.peek_token()?;
         match token {
-            Token::StringLiteral(s) => {
+            Token::StringLiteral(s) | Token::SingleQuotedString(s) => {
                 self.advance();
                 Ok(unquote(&s))
             }

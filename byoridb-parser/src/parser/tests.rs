@@ -183,6 +183,35 @@ fn test_parse_lookup() {
 }
 
 #[test]
+fn test_parse_search_product_name() {
+    let result =
+        parse("SEARCH product.prod_name FOR '[노스페이스] 세미 레인부츠 NS84S03B_PAP' LIMIT 20");
+    assert!(result.is_ok(), "parse failed: {:?}", result);
+    match result.unwrap() {
+        Statement::Search(stmt) => {
+            assert_eq!(stmt.tag_name, "product");
+            assert_eq!(stmt.prop, "prod_name");
+            assert_eq!(stmt.query, "[노스페이스] 세미 레인부츠 NS84S03B_PAP");
+            assert_eq!(stmt.limit, 20);
+        }
+        other => panic!("Expected Search statement, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_rebuild_text_index() {
+    let result = parse("REBUILD TEXT INDEX ON product(prod_name)");
+    assert!(result.is_ok(), "parse failed: {:?}", result);
+    match result.unwrap() {
+        Statement::RebuildTextIndex(stmt) => {
+            assert_eq!(stmt.tag_name, "product");
+            assert_eq!(stmt.prop, "prod_name");
+        }
+        other => panic!("Expected RebuildTextIndex statement, got {:?}", other),
+    }
+}
+
+#[test]
 fn test_parse_match() {
     let result = parse("MATCH (n:person) RETURN n");
     assert!(result.is_ok());
