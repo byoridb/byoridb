@@ -16,9 +16,11 @@ use byoridb_common::Value;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tracing::info;
 
 const DEFAULT_BATCH: usize = 4096;
 const MAX_TOKEN_LEN: usize = 96;
+const REBUILD_PROGRESS_INTERVAL: u64 = 100_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TextDoc {
@@ -68,12 +70,31 @@ impl Executor {
             .kvstore
             .scan_stream(&crate::key::SchemaKey::vertex_prefix(&space))
             .await?;
-        let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(DEFAULT_BATCH);
-        let mut docs = 0u64;
-        let mut total_len = 0u64;
-        let mut postings = 0u64;
+        let mut candidates: Vec<(i64, String)> = Vec::new();
+        let mut scanned = 0u64;
+        let mut candidate_docs = 0u64;
+
+        info!(
+            space = %space,
+            tag = %plan.tag_name,
+            prop = %plan.prop,
+            deleted,
+            "text index rebuild scan started"
+        );
 
         while let Some(item) = stream.next().await {
+            scanned += 1;
+            if scanned.is_multiple_of(REBUILD_PROGRESS_INTERVAL) {
+                info!(
+                    space = %space,
+                    tag = %plan.tag_name,
+                    prop = %plan.prop,
+                    scanned,
+                    candidate_docs,
+                    "text index rebuild scan progress"
+                );
+            }
+
             let (_key, value) = item?;
             let Ok(vertex) = VertexCodec::decode_vertex(&value) else {
                 continue;
@@ -84,26 +105,44 @@ impl Executor {
             let Some(Value::String(text)) = tag.properties.get(&plan.prop) else {
                 continue;
             };
-            let terms = weighted_terms(text);
-            if terms.is_empty() {
+            if text.trim().is_empty() {
                 continue;
             }
+            candidate_docs += 1;
+            candidates.push((vertex.vid, text.clone()));
+        }
+        drop(stream);
 
-            let doc_len: u32 = terms.values().map(|v| *v as u32).sum();
+        info!(
+            space = %space,
+            tag = %plan.tag_name,
+            prop = %plan.prop,
+            scanned,
+            candidate_docs,
+            "text index rebuild scan complete"
+        );
+
+        let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(DEFAULT_BATCH);
+        let mut docs = 0u64;
+        let mut total_len = 0u64;
+        let mut postings = 0u64;
+
+        for (vid, text) in candidates {
+            let Some((doc, terms)) = indexed_doc(&text) else {
+                continue;
+            };
+
             docs += 1;
-            total_len += u64::from(doc_len);
+            total_len += u64::from(doc.len);
             batch.push((
-                text_doc_key(&space, &plan.tag_name, &plan.prop, vertex.vid),
-                serde_json::to_vec(&TextDoc {
-                    len: doc_len,
-                    text: text.clone(),
-                })?,
+                text_doc_key(&space, &plan.tag_name, &plan.prop, vid),
+                serde_json::to_vec(&doc)?,
             ));
 
             for (term, freq) in terms {
                 postings += 1;
                 batch.push((
-                    text_posting_key(&space, &plan.tag_name, &plan.prop, &term, vertex.vid),
+                    text_posting_key(&space, &plan.tag_name, &plan.prop, &term, vid),
                     freq.to_le_bytes().to_vec(),
                 ));
                 if batch.len() >= DEFAULT_BATCH {
@@ -112,6 +151,17 @@ impl Executor {
                         .batch_put(std::mem::take(&mut batch))
                         .await?;
                 }
+            }
+
+            if docs.is_multiple_of(REBUILD_PROGRESS_INTERVAL) {
+                info!(
+                    space = %space,
+                    tag = %plan.tag_name,
+                    prop = %plan.prop,
+                    docs,
+                    postings,
+                    "text index rebuild write progress"
+                );
             }
         }
 
