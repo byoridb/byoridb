@@ -67,10 +67,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-deploy-
 
-      - name: Build release binaries (server + bulk loader)
-        # `-p` is required: the two bins live in different workspace packages, so
+      - name: Build release binaries (server + bulk loader + CLI)
+        # `-p` is required: the bins live in different workspace packages, so
         # `--bin X --bin Y` alone fails ("no bin target in default-run packages").
-        run: cargo build --release -p byoridb --bin byoridb-server -p byoridb-bulkloader --bin byoridb-bulkloader
+        run: cargo build --release -p byoridb --bin byoridb-server -p byoridb-bulkloader --bin byoridb-bulkloader -p byoridb-client --bin byoridb-cli
 
       - name: Build & push Docker image
         run: |
@@ -78,6 +78,7 @@ jobs:
           IMAGE="$ACR_REGISTRY/$IMAGE_NAME"
           docker build \
             --build-arg BINARY_PATH=target/release/byoridb-server \
+            --build-arg CLI_PATH=target/release/byoridb-cli \
             -f Dockerfile.prebuilt \
             -t "$IMAGE:$TAG" \
             -t "$IMAGE:latest" \

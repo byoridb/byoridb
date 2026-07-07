@@ -13,10 +13,12 @@ COPY ${BINARY_PATH} /usr/local/bin/byoridb-server
 # Built alongside the server in the deploy workflow; see deploy/azure/jobs/.
 ARG BULKLOADER_PATH=target/release/byoridb-bulkloader
 COPY ${BULKLOADER_PATH} /usr/local/bin/byoridb-bulkloader
+# Online admin/query CLI — used by maintenance Jobs such as text index rebuilds.
+ARG CLI_PATH=target/release/byoridb-cli
+COPY ${CLI_PATH} /usr/local/bin/byoridb-cli
 
 RUN mkdir -p /app/data
 
 EXPOSE 9669 19669
 
 CMD ["byoridb-server"]
-

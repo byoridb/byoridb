@@ -68,10 +68,13 @@ COPY . .
 # Touch main.rs to force rebuild of the binary
 RUN touch src/main.rs
 
-# Build release (server + offline bulk loader). `-p` is required: the two bins
-# live in different workspace packages, so `--bin X --bin Y` alone fails to
-# resolve the loader ("no bin target ... in default-run packages").
-RUN cargo build --release -p byoridb --bin byoridb-server -p byoridb-bulkloader --bin byoridb-bulkloader
+# Build release (server + offline bulk loader + online CLI). `-p` is required:
+# the bins live in different workspace packages, so `--bin X --bin Y` alone
+# fails to resolve cross-package binaries ("no bin target ...").
+RUN cargo build --release \
+    -p byoridb --bin byoridb-server \
+    -p byoridb-bulkloader --bin byoridb-bulkloader \
+    -p byoridb-client --bin byoridb-cli
 
 # Runtime Stage
 FROM debian:bookworm-slim
@@ -88,6 +91,8 @@ WORKDIR /app
 COPY --from=builder /usr/src/byoridb/target/release/byoridb-server /usr/local/bin/byoridb-server
 # Offline bulk loader — invoked by a Job (server scaled to 0) for large imports.
 COPY --from=builder /usr/src/byoridb/target/release/byoridb-bulkloader /usr/local/bin/byoridb-bulkloader
+# Online admin/query CLI — used by maintenance Jobs such as text index rebuilds.
+COPY --from=builder /usr/src/byoridb/target/release/byoridb-cli /usr/local/bin/byoridb-cli
 
 # Config is loaded via BYORIDB__* env vars (AppConfig file is optional)
 # Create data directory
