@@ -1,6 +1,7 @@
 target/
 !target/release/byoridb-server
 !target/release/byoridb-bulkloader
+!target/release/byoridb-cli
 **/*.rs.bk
 .git/
 .env
