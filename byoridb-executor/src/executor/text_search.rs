@@ -15,12 +15,13 @@ use byoridb_codec::{VertexCodec, VertexData};
 use byoridb_common::Value;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::info;
 
 const DEFAULT_BATCH: usize = 4096;
 const MAX_TOKEN_LEN: usize = 96;
 const REBUILD_PROGRESS_INTERVAL: u64 = 100_000;
+const RESUME_DOC_PROGRESS_INTERVAL: usize = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TextDoc {
@@ -59,11 +60,29 @@ impl Executor {
     ) -> Result<ExecutorResult> {
         let space = self.require_space()?.to_string();
         let prefix = text_index_prefix(&space, &plan.tag_name, &plan.prop);
-        let deleted = self
-            .ctx
-            .kvstore
-            .delete_prefix_chunked(&prefix, 10_000)
-            .await?;
+        let stats_key = text_stats_key(&space, &plan.tag_name, &plan.prop);
+        let existing_docs = if self.ctx.kvstore.get(&stats_key).await?.is_none() {
+            self.load_partial_text_doc_ids(&space, &plan.tag_name, &plan.prop)
+                .await?
+        } else {
+            HashSet::new()
+        };
+        let resume_existing_docs = existing_docs.len();
+        let deleted = if resume_existing_docs == 0 {
+            self.ctx
+                .kvstore
+                .delete_prefix_chunked(&prefix, 10_000)
+                .await?
+        } else {
+            info!(
+                space = %space,
+                tag = %plan.tag_name,
+                prop = %plan.prop,
+                resume_existing_docs,
+                "text index rebuild resume detected"
+            );
+            0
+        };
 
         let mut stream = self
             .ctx
@@ -79,6 +98,7 @@ impl Executor {
             tag = %plan.tag_name,
             prop = %plan.prop,
             deleted,
+            resume_existing_docs,
             "text index rebuild scan started"
         );
 
@@ -126,6 +146,8 @@ impl Executor {
         let mut docs = 0u64;
         let mut total_len = 0u64;
         let mut postings = 0u64;
+        let mut resumed_docs = 0u64;
+        let mut written_docs = 0u64;
 
         for (vid, text) in candidates {
             let Some((doc, terms)) = indexed_doc(&text) else {
@@ -134,13 +156,32 @@ impl Executor {
 
             docs += 1;
             total_len += u64::from(doc.len);
+            postings += terms.len() as u64;
+
+            if existing_docs.contains(&vid) {
+                resumed_docs += 1;
+                if docs.is_multiple_of(REBUILD_PROGRESS_INTERVAL) {
+                    info!(
+                        space = %space,
+                        tag = %plan.tag_name,
+                        prop = %plan.prop,
+                        docs,
+                        postings,
+                        resumed_docs,
+                        written_docs,
+                        "text index rebuild write progress"
+                    );
+                }
+                continue;
+            }
+
+            written_docs += 1;
             batch.push((
                 text_doc_key(&space, &plan.tag_name, &plan.prop, vid),
                 serde_json::to_vec(&doc)?,
             ));
 
             for (term, freq) in terms {
-                postings += 1;
                 batch.push((
                     text_posting_key(&space, &plan.tag_name, &plan.prop, &term, vid),
                     freq.to_le_bytes().to_vec(),
@@ -160,6 +201,8 @@ impl Executor {
                     prop = %plan.prop,
                     docs,
                     postings,
+                    resumed_docs,
+                    written_docs,
                     "text index rebuild write progress"
                 );
             }
@@ -291,6 +334,39 @@ impl Executor {
         };
         let manifest: TextIndexManifest = serde_json::from_slice(&bytes)?;
         Ok(manifest.indexes)
+    }
+
+    async fn load_partial_text_doc_ids(
+        &self,
+        space: &str,
+        tag: &str,
+        prop: &str,
+    ) -> Result<HashSet<i64>> {
+        let mut stream = self
+            .ctx
+            .kvstore
+            .scan_stream(&text_doc_prefix(space, tag, prop))
+            .await?;
+        let mut docs = HashSet::new();
+
+        while let Some(item) = stream.next().await {
+            let (key, _value) = item?;
+            let Some(vid) = vid_from_doc_key(&key) else {
+                continue;
+            };
+            docs.insert(vid);
+            if docs.len().is_multiple_of(RESUME_DOC_PROGRESS_INTERVAL) {
+                info!(
+                    space = %space,
+                    tag = %tag,
+                    prop = %prop,
+                    existing_docs = docs.len(),
+                    "text index rebuild resume scan progress"
+                );
+            }
+        }
+
+        Ok(docs)
     }
 
     pub(super) async fn sync_text_indexes_for_vertex(
@@ -558,6 +634,10 @@ fn text_doc_key(space: &str, tag: &str, prop: &str, vid: i64) -> Vec<u8> {
     format!("{space}:textidx:{tag}:{prop}:doc:{vid}").into_bytes()
 }
 
+fn text_doc_prefix(space: &str, tag: &str, prop: &str) -> Vec<u8> {
+    format!("{space}:textidx:{tag}:{prop}:doc:").into_bytes()
+}
+
 fn text_posting_prefix(space: &str, tag: &str, prop: &str, term: &str) -> Vec<u8> {
     format!("{space}:textidx:{tag}:{prop}:post:{term}:").into_bytes()
 }
@@ -567,6 +647,11 @@ fn text_posting_key(space: &str, tag: &str, prop: &str, term: &str, vid: i64) ->
 }
 
 fn vid_from_posting_key(key: &[u8]) -> Option<i64> {
+    let s = std::str::from_utf8(key).ok()?;
+    s.rsplit(':').next()?.parse().ok()
+}
+
+fn vid_from_doc_key(key: &[u8]) -> Option<i64> {
     let s = std::str::from_utf8(key).ok()?;
     s.rsplit(':').next()?.parse().ok()
 }
@@ -636,6 +721,54 @@ mod tests {
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][0], Value::Int(1));
         assert_eq!(result.rows[1][0], Value::Int(2));
+    }
+
+    #[tokio::test]
+    async fn rebuild_resumes_partial_text_index() {
+        let e = executor();
+        run(&e, "CREATE TAG product(prod_name STRING)")
+            .await
+            .unwrap();
+        run(
+            &e,
+            "INSERT VERTEX product(prod_name) VALUES \
+             1:(\"노스페이스 세미 레인부츠 NS84S03B_PAP\"), \
+             2:(\"노스페이스 세미 레인부츠 NS84S03B_RED\")",
+        )
+        .await
+        .unwrap();
+
+        let text = "노스페이스 세미 레인부츠 NS84S03B_PAP";
+        let (doc, terms) = indexed_doc(text).unwrap();
+        let mut pairs = vec![(
+            text_doc_key("default", "product", "prod_name", 1),
+            serde_json::to_vec(&doc).unwrap(),
+        )];
+        for (term, freq) in terms {
+            pairs.push((
+                text_posting_key("default", "product", "prod_name", &term, 1),
+                freq.to_le_bytes().to_vec(),
+            ));
+        }
+        e.ctx.kvstore.batch_put(pairs).await.unwrap();
+
+        let rebuilt = run(&e, "REBUILD TEXT INDEX ON product(prod_name)")
+            .await
+            .unwrap();
+        assert_eq!(rebuilt.rows[0][0], Value::Int(2));
+        assert_eq!(rebuilt.rows[0][2], Value::Int(0));
+
+        let existing = run(&e, "SEARCH product.prod_name FOR 'NS84S03B_PAP' LIMIT 1")
+            .await
+            .unwrap();
+        assert_eq!(existing.rows.len(), 1);
+        assert_eq!(existing.rows[0][0], Value::Int(1));
+
+        let written = run(&e, "SEARCH product.prod_name FOR 'NS84S03B_RED' LIMIT 1")
+            .await
+            .unwrap();
+        assert_eq!(written.rows.len(), 1);
+        assert_eq!(written.rows[0][0], Value::Int(2));
     }
 
     #[tokio::test]
