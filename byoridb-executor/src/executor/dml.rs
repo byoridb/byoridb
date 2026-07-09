@@ -39,10 +39,6 @@ impl Executor {
                     Some(im) => im.list_tag_indexes(space_id).await,
                     None => Vec::new(),
                 };
-                let text_indexes = self.list_text_indexes(&effective_space).await?;
-                let maintain_text_indexes = !text_indexes.is_empty();
-                let mut text_index_updates: Vec<(Option<CodecVertexData>, CodecVertexData)> =
-                    Vec::new();
                 let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                 let mut inserted = 0i64;
                 // Properties whose dense vectors changed → their persisted HNSW
@@ -74,15 +70,6 @@ impl Executor {
                             .await?;
                     }
                     let key = format!("{}:vertex:{}", effective_space, vertex.vid);
-                    let old_text_vertex = if maintain_text_indexes {
-                        self.ctx
-                            .kvstore
-                            .get(key.as_bytes())
-                            .await?
-                            .and_then(|data| VertexCodec::decode_vertex(&data).ok())
-                    } else {
-                        None
-                    };
                     // Convert plan TagData to codec TagData and use Proto encoding
                     let codec_vertex = CodecVertexData {
                         vid: vertex.vid,
@@ -95,9 +82,6 @@ impl Executor {
                             })
                             .collect(),
                     };
-                    if maintain_text_indexes {
-                        text_index_updates.push((old_text_vertex, codec_vertex.clone()));
-                    }
                     let data = VertexCodec::encode_vertex(&codec_vertex)
                         .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
                     batch.push((key.into_bytes(), data));
@@ -151,15 +135,6 @@ impl Executor {
                 }
                 if !batch.is_empty() {
                     self.ctx.kvstore.batch_put(batch).await?;
-                }
-                for (old_vertex, new_vertex) in &text_index_updates {
-                    self.sync_text_indexes_for_vertex(
-                        &effective_space,
-                        old_vertex.as_ref(),
-                        Some(new_vertex),
-                        &text_indexes,
-                    )
-                    .await?;
                 }
                 // Invalidate persisted vector indexes (R-2b) for embedding props
                 // touched by this INSERT — rebuilt lazily on next BY EMBEDDING query.
@@ -420,25 +395,18 @@ impl Executor {
         let existing_data = self.ctx.kvstore.get(key.as_bytes()).await?;
 
         // Upsert: create vertex if it does not exist yet
-        let old_vertex_data = if let Some(data) = existing_data {
-            Some(
-                VertexCodec::decode_vertex(&data)
-                    .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?,
-            )
+        let mut vertex_data = if let Some(data) = existing_data {
+            VertexCodec::decode_vertex(&data)
+                .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?
         } else {
-            None
+            byoridb_codec::VertexData {
+                vid,
+                tags: vec![byoridb_codec::TagData {
+                    name: tag_name.clone(),
+                    properties: std::collections::HashMap::new(),
+                }],
+            }
         };
-        let mut vertex_data =
-            old_vertex_data
-                .clone()
-                .unwrap_or_else(|| byoridb_codec::VertexData {
-                    vid,
-                    tags: vec![byoridb_codec::TagData {
-                        name: tag_name.clone(),
-                        properties: std::collections::HashMap::new(),
-                    }],
-                });
-        let text_indexes = self.list_text_indexes(&effective_space).await?;
 
         // Update props in the matching tag; add the tag if absent
         let tag_exists = vertex_data.tags.iter().any(|t| t.name == *tag_name);
@@ -495,15 +463,6 @@ impl Executor {
                 }
                 None => self.ctx.kvstore.delete(&vkey).await?,
             }
-        }
-        if !text_indexes.is_empty() {
-            self.sync_text_indexes_for_vertex(
-                &effective_space,
-                old_vertex_data.as_ref(),
-                Some(&vertex_data),
-                &text_indexes,
-            )
-            .await?;
         }
 
         Ok(ExecutorResult {
@@ -571,7 +530,6 @@ impl Executor {
         let mut deleted = 0;
         let mut dirty_vec_props: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        let text_indexes = self.list_text_indexes(&effective_space).await?;
         for (vid, (key, exists)) in plan.vids.iter().zip(keys.iter().zip(results.iter())) {
             let Some(data) = exists else { continue };
             self.ctx.kvstore.delete(key).await?;
@@ -586,15 +544,6 @@ impl Executor {
                             dirty_vec_props.insert(prop.clone());
                         }
                     }
-                }
-                if !text_indexes.is_empty() {
-                    self.sync_text_indexes_for_vertex(
-                        &effective_space,
-                        Some(&vertex),
-                        None,
-                        &text_indexes,
-                    )
-                    .await?;
                 }
             }
         }

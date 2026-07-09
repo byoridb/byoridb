@@ -110,12 +110,6 @@ pub async fn build_plan_tree(ctx: &ExecutionContext, plan: &ExecutionPlan) -> Pl
     match plan {
         ExecutionPlan::Go(p) => build_go(p),
         ExecutionPlan::Lookup(p) => build_lookup(ctx, p).await,
-        ExecutionPlan::Search(p) => build_search(p),
-        ExecutionPlan::RebuildTextIndex(p) => PlanNode::new(
-            "TextIndexRebuild",
-            format!("{}.{}", p.tag_name, p.prop),
-            AccessPath::Index(format!("text:{}({})", p.tag_name, p.prop)),
-        ),
         ExecutionPlan::Match(p) => build_match(ctx, p).await,
         ExecutionPlan::Find(p) => build_find(p),
         ExecutionPlan::Fetch(p) => build_fetch(p),
@@ -754,14 +748,6 @@ fn binop_str(op: &BinaryOperator) -> &'static str {
     }
 }
 
-fn build_search(p: &crate::plan::SearchPlan) -> PlanNode {
-    PlanNode::new(
-        "TextSearch",
-        format!("{}.{} FOR {:?}", p.tag_name, p.prop, p.query),
-        AccessPath::Index(format!("text:{}({})", p.tag_name, p.prop)),
-    )
-}
-
 /// Short label for a plan variant used by the single-node fallback.
 fn plan_kind(plan: &ExecutionPlan) -> &'static str {
     match plan {
@@ -783,8 +769,6 @@ fn plan_kind(plan: &ExecutionPlan) -> &'static str {
         ExecutionPlan::Match(_) => "Match",
         ExecutionPlan::Go(_) => "Go",
         ExecutionPlan::Lookup(_) => "Lookup",
-        ExecutionPlan::Search(_) => "Search",
-        ExecutionPlan::RebuildTextIndex(_) => "RebuildTextIndex",
         ExecutionPlan::Recommend(_) => "Recommend",
         ExecutionPlan::CheckConsistency => "CheckConsistency",
         ExecutionPlan::CheckShape => "CheckShape",

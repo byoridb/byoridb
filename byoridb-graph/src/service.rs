@@ -412,7 +412,6 @@ impl GraphService {
             | Statement::Go(_)
             | Statement::Match(_)
             | Statement::Lookup(_)
-            | Statement::Search(_)
             | Statement::Find(_)
             | Statement::Recommend(_)
             | Statement::ExplainInference { .. }
@@ -421,10 +420,9 @@ impl GraphService {
             // Write
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => Permission::Write,
             // Create / schema
-            Statement::Create(_)
-            | Statement::Alter(_)
-            | Statement::RebuildTextIndex(_)
-            | Statement::Balance(_) => Permission::Create,
+            Statement::Create(_) | Statement::Alter(_) | Statement::Balance(_) => {
+                Permission::Create
+            }
             // Drop
             Statement::Drop(_) => Permission::Drop,
             // User management — requires GOD/ADMIN (Create covers it; GOD has all)
@@ -453,7 +451,6 @@ impl GraphService {
             Statement::Go(_) => QueryType::Go,
             Statement::Match(_) => QueryType::Match,
             Statement::Lookup(_) => QueryType::Lookup,
-            Statement::Search(_) => QueryType::Lookup,
             Statement::Find(_) => QueryType::Find,
             Statement::Recommend(_) => QueryType::Recommend,
             Statement::CheckConsistency => QueryType::Show,
@@ -461,7 +458,6 @@ impl GraphService {
             Statement::ExplainInference { .. } => QueryType::Show,
             Statement::Grant(_) => QueryType::Create, // User management uses Create metrics
             Statement::Revoke(_) => QueryType::Create,
-            Statement::RebuildTextIndex(_) => QueryType::Create,
             Statement::Balance(_) => QueryType::Show, // Admin commands use Show metrics
             // Compound queries are categorized by their dominant trailing
             // clause for metrics; default to Go since `$var = ...` chains

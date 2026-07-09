@@ -24,8 +24,6 @@ pub enum Statement {
     Match(MatchStatement),
     Go(GoStatement),
     Lookup(LookupStatement),
-    Search(SearchStatement),
-    RebuildTextIndex(TextIndexStatement),
     Recommend(RecommendStatement),
     /// `CHECK CONSISTENCY` — report ontology consistency violations (O-6).
     CheckConsistency,
@@ -56,25 +54,6 @@ pub enum Statement {
         profile: bool,
         statement: Box<Statement>,
     },
-}
-
-/// `SEARCH <tag>.<prop> FOR "<text>" [LIMIT k]` — tokenized text search over a
-/// rebuilt text index. Intended for product-name candidate retrieval before
-/// graph expansion (`same_as`, `sold_on`, etc.).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SearchStatement {
-    pub tag_name: String,
-    pub prop: String,
-    pub query: String,
-    pub limit: usize,
-}
-
-/// `REBUILD TEXT INDEX ON <tag>(<prop>)` — rebuild the tokenized text index for
-/// one string property from the current vertex store.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TextIndexStatement {
-    pub tag_name: String,
-    pub prop: String,
 }
 
 /// `RECOMMEND SIMILAR TO <vid> ... [LIMIT k]` — top-k similar-vertex

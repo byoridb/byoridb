@@ -874,39 +874,4 @@ impl Parser {
             offset,
         }))
     }
-
-    // ===== SEARCH statement =====
-
-    /// Parse: SEARCH tag.property FOR "query text" [LIMIT n]
-    pub(crate) fn parse_search(&mut self) -> ParseResult {
-        self.consume_token(Token::Search)?;
-        let tag_name = self.consume_identifier()?;
-        self.consume_token(Token::Dot)?;
-        let prop = self.consume_identifier()?;
-        self.consume_token(Token::For)?;
-        let query = self.consume_string_literal()?;
-        let limit = if self.match_token(Token::Limit) {
-            match self.peek_token()? {
-                Token::Integer(n) if n > 0 => {
-                    self.advance();
-                    n as usize
-                }
-                other => {
-                    return Err(ParseError::InvalidSyntax(format!(
-                        "SEARCH LIMIT must be a positive integer, got {:?}",
-                        other
-                    )))
-                }
-            }
-        } else {
-            20
-        };
-
-        Ok(Statement::Search(SearchStatement {
-            tag_name,
-            prop,
-            query,
-            limit,
-        }))
-    }
 }
