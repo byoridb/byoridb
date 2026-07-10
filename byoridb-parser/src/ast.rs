@@ -662,6 +662,8 @@ pub struct FetchStatement {
     pub yield_clause: Option<YieldClause>,
     /// `$var.col` variable reference as VID source (compound statement support)
     pub src_var: Option<String>,
+    /// `AS OF <ts>` (T-트랙): resolve state as-of this transaction time (epoch millis).
+    pub as_of: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

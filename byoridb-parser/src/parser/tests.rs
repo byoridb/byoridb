@@ -18,6 +18,28 @@ fn test_parse_show_spaces() {
 }
 
 #[test]
+fn test_parse_fetch_as_of() {
+    // T-트랙: FETCH ... AS OF <ts> 시점 질의 파싱.
+    let result = parse("FETCH PROP ON person 1 AS OF 100");
+    assert!(result.is_ok(), "AS OF should parse: {:?}", result);
+    match result.unwrap() {
+        Statement::Fetch(f) => {
+            assert_eq!(f.as_of, Some(100));
+            assert_eq!(f.tags, vec!["person".to_string()]);
+        }
+        _ => panic!("Expected Fetch"),
+    }
+}
+
+#[test]
+fn test_parse_fetch_without_as_of() {
+    match parse("FETCH PROP ON person 1").unwrap() {
+        Statement::Fetch(f) => assert_eq!(f.as_of, None),
+        _ => panic!("Expected Fetch"),
+    }
+}
+
+#[test]
 fn test_parse_use_space() {
     let result = parse("USE my_space");
     assert!(result.is_ok());

@@ -12,4 +12,6 @@ pub use backup::{
 pub use error::{KVStoreError, Result};
 // Pure-Rust KV store: the trait, the redb-backed and in-memory backends, and
 // the scan filter types.
-pub use store::{FilterFn, KVStore, KVStoreOptions, MemoryKVStore, RedbKVStore};
+pub use store::{
+    FilterFn, KVStore, KVStoreOptions, MemoryKVStore, RedbKVStore, VersionRecord, VALID_OPEN,
+};
