@@ -315,6 +315,8 @@ pub struct FetchPlan {
     pub is_edge_fetch: bool,
     /// `$var.col` variable reference — resolved at runtime from ctx.vars
     pub src_var: Option<String>,
+    /// `AS OF <ts>` (T-트랙): resolve as-of this transaction time (epoch millis).
+    pub as_of: Option<i64>,
 }
 
 pub struct FindPlan {
@@ -901,6 +903,7 @@ impl ExecutionPlanBuilder {
                     edge_refs,
                     is_edge_fetch,
                     src_var: fetch.src_var,
+                    as_of: fetch.as_of,
                 }))
             }
             Statement::Go(go_stmt) => {

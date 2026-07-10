@@ -203,6 +203,7 @@ mod recommend;
 mod sameas;
 mod shape;
 mod show;
+mod temporal;
 mod vector_index;
 
 #[cfg(test)]
@@ -232,6 +233,104 @@ mod tests {
         let kvstore = Arc::new(MemoryKVStore::new());
         let ctx = Arc::new(ExecutionContext::new(kvstore).with_space("default".to_string()));
         Executor::new(ctx)
+    }
+
+    // ---- T-4: T-트랙 읽기 표면(FETCH ... AS OF) end-to-end ----
+
+    fn person_blob(name: &str) -> Vec<u8> {
+        let v = byoridb_codec::VertexData {
+            vid: 1,
+            tags: vec![byoridb_codec::TagData {
+                name: "person".to_string(),
+                properties: HashMap::from([(
+                    "name".to_string(),
+                    byoridb_common::Value::String(name.to_string()),
+                )]),
+            }],
+        };
+        byoridb_codec::VertexCodec::encode_vertex(&v).unwrap()
+    }
+
+    fn fetch_as_of_plan(vid: i64, as_of: Option<i64>) -> ExecutionPlan {
+        ExecutionPlan::Fetch(FetchPlan {
+            space: "default".to_string(),
+            vids: vec![vid],
+            tags: vec!["person".to_string()],
+            yield_clause: None,
+            edge_refs: vec![],
+            is_edge_fetch: false,
+            src_var: None,
+            as_of,
+        })
+    }
+
+    #[tokio::test]
+    async fn fetch_as_of_resolves_history() {
+        let kv = Arc::new(MemoryKVStore::new());
+        let key = b"default:vertex:1".to_vec();
+        // 이력: [100,∞)@100="A", [200,∞)@200="B" (v1: valid==tx, open interval)
+        kv.put_version(&key, 100, i64::MAX, 100, &person_blob("A"))
+            .await
+            .unwrap();
+        kv.put_version(&key, 200, i64::MAX, 200, &person_blob("B"))
+            .await
+            .unwrap();
+        kv.put(&key, &person_blob("B")).await.unwrap(); // 현재뷰=최신
+
+        let ctx = Arc::new(ExecutionContext::new(kv).with_space("default".to_string()));
+        let exec = Executor::new(ctx);
+
+        // 존재 전 시점 → 0행
+        let r = exec.execute(fetch_as_of_plan(1, Some(50))).await.unwrap();
+        assert_eq!(r.rows.len(), 0, "존재 전 시점");
+        // A 시점(150) → name=A
+        let ra = exec.execute(fetch_as_of_plan(1, Some(150))).await.unwrap();
+        assert_eq!(ra.rows.len(), 1);
+        let ra_dbg = format!("{:?}", ra.rows);
+        assert!(ra_dbg.contains('A') && !ra_dbg.contains('B'), "150→A");
+        // B 시점(250) → name=B
+        let rb = exec.execute(fetch_as_of_plan(1, Some(250))).await.unwrap();
+        assert_eq!(rb.rows.len(), 1);
+        assert!(format!("{:?}", rb.rows).contains('B'), "250→B");
+        // 현재뷰(AS OF 없음) → 1행 (무회귀)
+        assert_eq!(
+            exec.execute(fetch_as_of_plan(1, None))
+                .await
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_as_of_tombstone_absent() {
+        let kv = Arc::new(MemoryKVStore::new());
+        let key = b"default:vertex:2".to_vec();
+        kv.put_version(&key, 100, i64::MAX, 100, &person_blob("A"))
+            .await
+            .unwrap();
+        kv.put_version(&key, 300, i64::MAX, 300, &[]).await.unwrap(); // tombstone
+        let ctx = Arc::new(ExecutionContext::new(kv).with_space("default".to_string()));
+        let exec = Executor::new(ctx);
+        // 삭제 전(150) → 1행, 삭제 후(400) → 0행
+        assert_eq!(
+            exec.execute(fetch_as_of_plan(2, Some(150)))
+                .await
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        assert_eq!(
+            exec.execute(fetch_as_of_plan(2, Some(400)))
+                .await
+                .unwrap()
+                .rows
+                .len(),
+            0,
+            "tombstone 이후"
+        );
     }
 
     async fn insert_test_edge(
@@ -615,6 +714,7 @@ mod tests {
             edge_refs: vec![],
             is_edge_fetch: false,
             src_var: None,
+            as_of: None,
         };
 
         let result = executor.execute_fetch(plan).await.unwrap();
@@ -650,6 +750,7 @@ mod tests {
             edge_refs: vec![],
             is_edge_fetch: false,
             src_var: None,
+            as_of: None,
         };
 
         let result = executor.execute_fetch(plan).await.unwrap();
@@ -669,6 +770,7 @@ mod tests {
             edge_refs: vec![],
             is_edge_fetch: false,
             src_var: None,
+            as_of: None,
         };
 
         let result = executor.execute_fetch(plan).await.unwrap();
@@ -1616,6 +1718,7 @@ mod tests {
                 edge_refs: vec![(1, 2)],
                 is_edge_fetch: true,
                 src_var: None,
+                as_of: None,
             }))
             .await
             .unwrap();

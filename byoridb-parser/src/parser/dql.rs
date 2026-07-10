@@ -140,6 +140,7 @@ impl Parser {
             } else {
                 None
             };
+            let as_of = self.parse_opt_as_of()?;
             return Ok(Statement::Fetch(FetchStatement {
                 fetch_type: FetchType::Vertex,
                 space: None,
@@ -147,6 +148,7 @@ impl Parser {
                 tags,
                 yield_clause,
                 src_var: Some(qualified),
+                as_of,
             }));
         }
 
@@ -177,6 +179,7 @@ impl Parser {
         } else {
             None
         };
+        let as_of = self.parse_opt_as_of()?;
 
         Ok(Statement::Fetch(FetchStatement {
             fetch_type,
@@ -185,7 +188,19 @@ impl Parser {
             tags,
             yield_clause,
             src_var: None,
+            as_of,
         }))
+    }
+
+    /// Parse an optional `AS OF <int>` suffix (T-트랙 시점 질의). Returns the
+    /// transaction-time (epoch millis) to resolve state as-of, or `None`.
+    fn parse_opt_as_of(&mut self) -> Result<Option<i64>> {
+        if self.match_token(Token::As) {
+            self.consume_token(Token::Of)?;
+            Ok(Some(self.consume_integer()?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Return true when the upcoming tokens look like `<int> ->` (edge ref).

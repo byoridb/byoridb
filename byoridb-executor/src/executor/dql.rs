@@ -211,7 +211,18 @@ impl Executor {
             .map(|vid| format!("{}:vertex:{}", effective_space, vid).into_bytes())
             .collect();
 
-        let results = self.ctx.kvstore.batch_get(&keys).await?;
+        // T-트랙: `AS OF <ts>` 면 이력에서 resolution(빈 payload=tombstone→없음),
+        // 아니면 기존 현재뷰 batch_get(무회귀).
+        let results: Vec<Option<Vec<u8>>> = if let Some(ts) = plan.as_of {
+            let mut out = Vec::with_capacity(keys.len());
+            for key in &keys {
+                let v = self.ctx.kvstore.get_as_of(key, ts, ts).await?;
+                out.push(v.filter(|b| !b.is_empty()));
+            }
+            out
+        } else {
+            self.ctx.kvstore.batch_get(&keys).await?
+        };
 
         let mut rows = Vec::new();
         let mut result_bytes = 0usize; // OOM guard: bound accumulated result memory

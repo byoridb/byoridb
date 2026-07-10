@@ -159,6 +159,13 @@ pub trait KVStore: Send + Sync {
     /// All stored versions of `entity_key`, newest-first (valid_from desc, tx desc).
     async fn scan_history(&self, entity_key: &[u8]) -> Result<Vec<VersionRecord>>;
 
+    /// Append many versions in one transaction (bulk write path). Each tuple is
+    /// `(entity_key, valid_from, valid_to, tx, value)`. Append-only.
+    async fn batch_put_version(
+        &self,
+        versions: Vec<(Vec<u8>, i64, i64, i64, Vec<u8>)>,
+    ) -> Result<()>;
+
     /// Resolve the value of `entity_key` as-of real-world `valid_at`, according to
     /// knowledge recorded up to transaction time `tx_at`: among versions with
     /// `tx <= tx_at` whose `[valid_from, valid_to)` covers `valid_at`, pick the one
@@ -853,6 +860,32 @@ impl KVStore for RedbKVStore {
         })
         .await?
     }
+
+    async fn batch_put_version(
+        &self,
+        versions: Vec<(Vec<u8>, i64, i64, i64, Vec<u8>)>,
+    ) -> Result<()> {
+        if versions.is_empty() {
+            return Ok(());
+        }
+        let db = Arc::clone(&self.db);
+        let durability = self.next_durability();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut wtx = db.begin_write()?;
+            wtx.set_durability(durability)?;
+            {
+                let mut table = wtx.open_table(HISTORY_TABLE)?;
+                for (ek, vf, vt, tx, val) in &versions {
+                    let key = history_key(ek, *vf, *tx);
+                    let v = encode_history_value(*vt, val);
+                    table.insert(key.as_slice(), v.as_slice())?;
+                }
+            }
+            wtx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
 }
 
 /// In-memory KVStore for testing
@@ -904,6 +937,17 @@ impl KVStore for MemoryKVStore {
             history_key(entity_key, valid_from, tx),
             encode_history_value(valid_to, value),
         );
+        Ok(())
+    }
+
+    async fn batch_put_version(
+        &self,
+        versions: Vec<(Vec<u8>, i64, i64, i64, Vec<u8>)>,
+    ) -> Result<()> {
+        let mut h = self.history.write().await;
+        for (ek, vf, vt, tx, val) in &versions {
+            h.insert(history_key(ek, *vf, *tx), encode_history_value(*vt, val));
+        }
         Ok(())
     }
 
