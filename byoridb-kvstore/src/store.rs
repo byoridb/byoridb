@@ -15,6 +15,11 @@ use tracing::info;
 /// Single KV table. The store presents one flat byte keyspace, so all rows
 /// live in one redb table; prefix scans are range queries over it.
 const KV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
+/// Separate table for bitemporal version history (T-트랙). Physically isolated
+/// from `KV_TABLE` so current-view full scans don't share B-tree pages / page
+/// cache with bulk history — the prototype (`examples/temporal_readbench.rs`)
+/// showed co-residence in one table regressed current-view prefix-scan ~2x.
+const HISTORY_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("history");
 
 /// Item yielded by [`KVStore::scan_stream`]. Each `(key, value)` is owned so
 /// the stream can outlive the underlying iterator.
@@ -55,6 +60,78 @@ pub type FilterFn = Box<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync>;
 /// Return true to continue scanning, false to stop early.
 pub type ScanVisitorFn = Box<dyn FnMut(&[u8], &[u8]) -> bool + Send>;
 
+/// Sentinel for an open (still-valid / "Now"/∞) interval end. See T-트랙 design.
+pub const VALID_OPEN: i64 = i64::MAX;
+
+/// One stored bitemporal version of an entity (T-트랙, asserted-facts-only).
+/// `valid_from`/`valid_to` = real-world validity as a half-open `[from, to)`
+/// interval (`to == VALID_OPEN` means still valid). `tx` = transaction time
+/// (when the system recorded it). `value` = the entity payload at that version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionRecord {
+    pub valid_from: i64,
+    pub valid_to: i64,
+    pub tx: i64,
+    pub value: Vec<u8>,
+}
+
+// Order-preserving DESCENDING 8-byte encoding of an i64, so that within an
+// entity's history prefix, larger valid_from / tx sort first (newest-first).
+fn desc_i64(v: i64) -> [u8; 8] {
+    (!((v as u64) ^ (1u64 << 63))).to_be_bytes()
+}
+
+fn undesc_i64(b: &[u8]) -> i64 {
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(b);
+    ((!u64::from_be_bytes(arr)) ^ (1u64 << 63)) as i64
+}
+
+/// History key = `entity_key || 0x00 || desc(valid_from) || desc(tx)`.
+/// Entity keys are ASCII (`sp:vertex:…`) so the 0x00 separator can't collide.
+fn history_key(entity_key: &[u8], valid_from: i64, tx: i64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(entity_key.len() + 1 + 16);
+    k.extend_from_slice(entity_key);
+    k.push(0x00);
+    k.extend_from_slice(&desc_i64(valid_from));
+    k.extend_from_slice(&desc_i64(tx));
+    k
+}
+
+fn history_prefix(entity_key: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(entity_key.len() + 1);
+    k.extend_from_slice(entity_key);
+    k.push(0x00);
+    k
+}
+
+/// Recover `(valid_from, tx)` from the trailing 16 bytes of a [`history_key`].
+fn parse_history_key_times(key: &[u8]) -> Option<(i64, i64)> {
+    if key.len() < 16 {
+        return None;
+    }
+    let vf = undesc_i64(&key[key.len() - 16..key.len() - 8]);
+    let tx = undesc_i64(&key[key.len() - 8..]);
+    Some((vf, tx))
+}
+
+/// History value = `valid_to (8B BE) || payload`.
+fn encode_history_value(valid_to: i64, payload: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + payload.len());
+    v.extend_from_slice(&valid_to.to_be_bytes());
+    v.extend_from_slice(payload);
+    v
+}
+
+fn decode_history_value(v: &[u8]) -> Option<(i64, Vec<u8>)> {
+    if v.len() < 8 {
+        return None;
+    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(&v[..8]);
+    Some((i64::from_be_bytes(arr), v[8..].to_vec()))
+}
+
 #[async_trait]
 pub trait KVStore: Send + Sync {
     async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
@@ -63,6 +140,48 @@ pub trait KVStore: Send + Sync {
     async fn batch_put(&self, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()>;
     /// Delete many keys in a single transaction (missing keys are ignored).
     async fn batch_delete(&self, keys: Vec<Vec<u8>>) -> Result<()>;
+
+    // ---- Bitemporal version history (T-트랙, asserted-facts-only) ----
+
+    /// Append one immutable version of `entity_key` to the history keyspace.
+    /// Never mutates existing rows (append-only). `valid_to == VALID_OPEN` marks
+    /// a still-open interval. Physically separate from the current-view keyspace,
+    /// so it never affects current-view reads.
+    async fn put_version(
+        &self,
+        entity_key: &[u8],
+        valid_from: i64,
+        valid_to: i64,
+        tx: i64,
+        value: &[u8],
+    ) -> Result<()>;
+
+    /// All stored versions of `entity_key`, newest-first (valid_from desc, tx desc).
+    async fn scan_history(&self, entity_key: &[u8]) -> Result<Vec<VersionRecord>>;
+
+    /// Resolve the value of `entity_key` as-of real-world `valid_at`, according to
+    /// knowledge recorded up to transaction time `tx_at`: among versions with
+    /// `tx <= tx_at` whose `[valid_from, valid_to)` covers `valid_at`, pick the one
+    /// with the greatest `(valid_from, tx)`. Backend-agnostic default over
+    /// [`KVStore::scan_history`].
+    async fn get_as_of(
+        &self,
+        entity_key: &[u8],
+        valid_at: i64,
+        tx_at: i64,
+    ) -> Result<Option<Vec<u8>>> {
+        let versions = self.scan_history(entity_key).await?;
+        let mut best: Option<&VersionRecord> = None;
+        for v in &versions {
+            if v.tx <= tx_at && v.valid_from <= valid_at && valid_at < v.valid_to {
+                match best {
+                    Some(b) if (b.valid_from, b.tx) >= (v.valid_from, v.tx) => {}
+                    _ => best = Some(v),
+                }
+            }
+        }
+        Ok(best.map(|v| v.value.clone()))
+    }
 
     /// Force a durable (fsync, 2-phase) checkpoint so the next `open()` finds a
     /// clean shutdown and skips the expensive full-repair scan.
@@ -267,6 +386,7 @@ impl RedbKVStore {
         let wtx = db.begin_write()?;
         {
             wtx.open_table(KV_TABLE)?;
+            wtx.open_table(HISTORY_TABLE)?;
         }
         wtx.commit()?;
 
@@ -678,17 +798,76 @@ impl KVStore for RedbKVStore {
         });
         Ok(ReceiverStream::new(rx).boxed())
     }
+
+    async fn put_version(
+        &self,
+        entity_key: &[u8],
+        valid_from: i64,
+        valid_to: i64,
+        tx: i64,
+        value: &[u8],
+    ) -> Result<()> {
+        let db = Arc::clone(&self.db);
+        let durability = self.next_durability();
+        let key = history_key(entity_key, valid_from, tx);
+        let val = encode_history_value(valid_to, value);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut wtx = db.begin_write()?;
+            wtx.set_durability(durability)?;
+            {
+                let mut table = wtx.open_table(HISTORY_TABLE)?;
+                table.insert(key.as_slice(), val.as_slice())?;
+            }
+            wtx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn scan_history(&self, entity_key: &[u8]) -> Result<Vec<VersionRecord>> {
+        let db = Arc::clone(&self.db);
+        let prefix = history_prefix(entity_key);
+        tokio::task::spawn_blocking(move || -> Result<Vec<VersionRecord>> {
+            let rtx = db.begin_read()?;
+            let table = rtx.open_table(HISTORY_TABLE)?;
+            let mut out = Vec::new();
+            for entry in table.range(prefix.as_slice()..)? {
+                let (k, v) = entry?;
+                let kb = k.value();
+                if !kb.starts_with(&prefix) {
+                    break;
+                }
+                let (Some((valid_from, tx)), Some((valid_to, value))) =
+                    (parse_history_key_times(kb), decode_history_value(v.value()))
+                else {
+                    continue;
+                };
+                out.push(VersionRecord {
+                    valid_from,
+                    valid_to,
+                    tx,
+                    value,
+                });
+            }
+            Ok(out)
+        })
+        .await?
+    }
 }
 
 /// In-memory KVStore for testing
 pub struct MemoryKVStore {
     data: Arc<tokio::sync::RwLock<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>>,
+    /// Separate ordered map for version history — mirrors RedbKVStore's
+    /// `HISTORY_TABLE` physical isolation from the current-view keyspace.
+    history: Arc<tokio::sync::RwLock<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>>,
 }
 
 impl MemoryKVStore {
     pub fn new() -> Self {
         MemoryKVStore {
             data: Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
+            history: Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
         }
     }
 }
@@ -710,6 +889,45 @@ impl KVStore for MemoryKVStore {
         let mut data = self.data.write().await;
         data.insert(key.to_vec(), value.to_vec());
         Ok(())
+    }
+
+    async fn put_version(
+        &self,
+        entity_key: &[u8],
+        valid_from: i64,
+        valid_to: i64,
+        tx: i64,
+        value: &[u8],
+    ) -> Result<()> {
+        let mut h = self.history.write().await;
+        h.insert(
+            history_key(entity_key, valid_from, tx),
+            encode_history_value(valid_to, value),
+        );
+        Ok(())
+    }
+
+    async fn scan_history(&self, entity_key: &[u8]) -> Result<Vec<VersionRecord>> {
+        let prefix = history_prefix(entity_key);
+        let h = self.history.read().await;
+        let mut out = Vec::new();
+        for (k, v) in h.range(prefix.clone()..) {
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            let (Some((valid_from, tx)), Some((valid_to, value))) =
+                (parse_history_key_times(k), decode_history_value(v))
+            else {
+                continue;
+            };
+            out.push(VersionRecord {
+                valid_from,
+                valid_to,
+                tx,
+                value,
+            });
+        }
+        Ok(out)
     }
 
     async fn delete(&self, key: &[u8]) -> Result<()> {
