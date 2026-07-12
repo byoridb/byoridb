@@ -1140,6 +1140,56 @@ async fn test_update_delete_respect_conditions() {
     service.sign_out(session_id, session_id).await;
 }
 
+/// Regression: INSERT must reject a value whose type does not match the declared
+/// column type. Before the fix, schema validation checked only property *names*,
+/// so a string dropped into an INT64 column was silently stored.
+#[tokio::test]
+async fn test_insert_rejects_type_mismatch() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE type_test").await;
+    execute(&service, session_id, "USE type_test").await;
+    execute(
+        &service,
+        session_id,
+        "CREATE TAG t(age INT64, name STRING)",
+    )
+    .await;
+
+    // A string into an INT64 column must be rejected (was silently accepted).
+    let bad = service
+        .execute(
+            session_id,
+            r#"INSERT VERTEX t(age) VALUES 1:("oops")"#.to_string(),
+        )
+        .await;
+    assert!(
+        bad.is_err(),
+        "string into INT64 column must be rejected, got: {:?}",
+        bad
+    );
+
+    // Correctly-typed values still succeed.
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX t(age, name) VALUES 2:(30, "ok")"#,
+    )
+    .await;
+    let fetched = execute(&service, session_id, "FETCH PROP ON t 2").await;
+    assert_eq!(
+        fetched.row_count(),
+        1,
+        "correctly-typed INSERT should persist"
+    );
+
+    service.sign_out(session_id, session_id).await;
+}
+
 /// Graceful shutdown: once readiness is flipped off, new queries must be
 /// rejected with a clear error (k8s stops routing via /ready; this guards the
 /// window where a connection is already open).

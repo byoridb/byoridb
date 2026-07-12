@@ -302,6 +302,31 @@ impl Executor {
 
     /// Validate that a tag exists in the space and that all provided property
     /// names are declared in the tag schema.
+    /// Whether a value is assignable to a declared column type (serde variant
+    /// name of `ast::DataType`, e.g. "Int64"/"String"). `None` (a non-unit type
+    /// such as `FixedString(n)`) is treated leniently. Null is allowed here
+    /// (nullability is a separate concern); Int coerces to float/temporal types;
+    /// composite values (lists/maps, e.g. embeddings) are not strictly typed.
+    fn value_assignable(value: &byoridb_common::Value, type_name: Option<&str>) -> bool {
+        use byoridb_common::Value as V;
+        let Some(t) = type_name else { return true };
+        match value {
+            V::Null(_) => true,
+            V::Bool(_) => t == "Bool",
+            V::Int(_) => matches!(
+                t,
+                "Int8" | "Int16" | "Int32" | "Int64" | "Float" | "Double" | "Timestamp" | "Date"
+                    | "Time" | "DateTime"
+            ),
+            V::Float(_) => matches!(t, "Float" | "Double"),
+            V::String(_) => matches!(
+                t,
+                "String" | "Geography" | "Date" | "Time" | "DateTime" | "Timestamp"
+            ),
+            _ => true,
+        }
+    }
+
     pub(super) async fn validate_tag_props(
         &self,
         space: &str,
@@ -319,20 +344,25 @@ impl Executor {
         let schema: serde_json::Value = serde_json::from_slice(&schema_bytes)
             .map_err(|e| ExecutionError::InvalidOperation(format!("Corrupt tag schema: {}", e)))?;
 
-        let defined: std::collections::HashSet<String> = schema["properties"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|p| p["name"].as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        for field in props.keys() {
-            if !defined.contains(field) {
+        let empty = vec![];
+        let props_arr = schema["properties"].as_array().unwrap_or(&empty);
+        for (field, value) in props {
+            let Some(pdef) = props_arr
+                .iter()
+                .find(|p| p["name"].as_str() == Some(field.as_str()))
+            else {
                 return Err(ExecutionError::InvalidOperation(format!(
                     "Tag '{}' has no field '{}'",
                     tag_name, field
+                )));
+            };
+            if !Self::value_assignable(value, pdef["data_type"].as_str()) {
+                return Err(ExecutionError::TypeMismatch(format!(
+                    "field '{}' of tag '{}' expects type {}, got {:?}",
+                    field,
+                    tag_name,
+                    pdef["data_type"],
+                    value
                 )));
             }
         }
@@ -358,20 +388,25 @@ impl Executor {
         let schema: serde_json::Value = serde_json::from_slice(&schema_bytes)
             .map_err(|e| ExecutionError::InvalidOperation(format!("Corrupt edge schema: {}", e)))?;
 
-        let defined: std::collections::HashSet<String> = schema["properties"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|p| p["name"].as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        for field in props.keys() {
-            if !defined.contains(field) {
+        let empty = vec![];
+        let props_arr = schema["properties"].as_array().unwrap_or(&empty);
+        for (field, value) in props {
+            let Some(pdef) = props_arr
+                .iter()
+                .find(|p| p["name"].as_str() == Some(field.as_str()))
+            else {
                 return Err(ExecutionError::InvalidOperation(format!(
                     "Edge type '{}' has no field '{}'",
                     edge_type, field
+                )));
+            };
+            if !Self::value_assignable(value, pdef["data_type"].as_str()) {
+                return Err(ExecutionError::TypeMismatch(format!(
+                    "field '{}' of edge '{}' expects type {}, got {:?}",
+                    field,
+                    edge_type,
+                    pdef["data_type"],
+                    value
                 )));
             }
         }
