@@ -233,7 +233,7 @@ impl Executor {
         // Fallback: use index_manager when meta_client is unavailable
         if !self.ctx.has_meta_client() {
             if let Some(index_manager) = &self.ctx.index_manager {
-                let space_id = self.ctx.space_id.unwrap_or(1); // H-series: align with DDL/DML fallback (was 0, hiding persisted defs)
+                let space_id = self.ctx.resolve_space_id().await; // resolved from space name (fixes cross-space index collapse)
                 let indexes = index_manager.list_tag_indexes(space_id).await;
                 let rows = indexes
                     .iter()
@@ -329,7 +329,7 @@ impl Executor {
         // Fallback: use index_manager when meta_client is unavailable
         if !self.ctx.has_meta_client() {
             if let Some(index_manager) = &self.ctx.index_manager {
-                let space_id = self.ctx.space_id.unwrap_or(1); // H-series: align with DDL/DML fallback (was 0, hiding persisted defs)
+                let space_id = self.ctx.resolve_space_id().await; // resolved from space name (fixes cross-space index collapse)
                 let indexes = index_manager.list_edge_indexes(space_id).await;
                 let rows = indexes
                     .iter()
@@ -769,7 +769,7 @@ impl Executor {
             .space
             .as_ref()
             .ok_or_else(|| ExecutionError::InvalidOperation("No space selected".to_string()))?;
-        let space_id = self.ctx.space_id.unwrap_or(1); // H-series: align with DDL/DML fallback (was 0, hiding persisted defs)
+        let space_id = self.ctx.resolve_space_id().await; // resolved from space name (fixes cross-space index collapse)
         let index_manager = self.ctx.index_manager.as_ref().ok_or_else(|| {
             ExecutionError::InvalidOperation("No index manager available".to_string())
         })?;
@@ -1115,7 +1115,7 @@ impl Executor {
             .space
             .as_ref()
             .ok_or_else(|| ExecutionError::InvalidOperation("No space selected".to_string()))?;
-        let space_id = self.ctx.space_id.unwrap_or(1); // H-series: align with DDL/DML fallback (was 0, hiding persisted defs)
+        let space_id = self.ctx.resolve_space_id().await; // resolved from space name (fixes cross-space index collapse)
         let index_manager = match self.ctx.index_manager.as_ref() {
             Some(m) => m,
             None => {

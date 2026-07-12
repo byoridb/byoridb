@@ -150,7 +150,7 @@ impl Executor {
         let index_manager = self.ctx.index_manager.as_ref().ok_or_else(|| {
             ExecutionError::InvalidOperation("CREATE TAG INDEX requires IndexManager".to_string())
         })?;
-        let space_id = self.ctx.space_id.unwrap_or(1);
+        let space_id = self.ctx.resolve_space_id().await;
         let field_indices: Vec<usize> = (0..props.len()).collect();
         let index_id = index_manager
             .create_tag_index(
@@ -196,7 +196,7 @@ impl Executor {
         let index_manager = self.ctx.index_manager.as_ref().ok_or_else(|| {
             ExecutionError::InvalidOperation("CREATE EDGE INDEX requires IndexManager".to_string())
         })?;
-        let space_id = self.ctx.space_id.unwrap_or(1);
+        let space_id = self.ctx.resolve_space_id().await;
         let field_indices: Vec<usize> = (0..props.len()).collect();
         let index_id = index_manager
             .create_edge_index(
@@ -1025,7 +1025,7 @@ impl Executor {
             };
         };
         match index_manager
-            .drop_index(self.ctx.space_id.unwrap_or(1), &name)
+            .drop_index(self.ctx.resolve_space_id().await, &name)
             .await
         {
             Ok(()) => Ok(ExecutorResult::empty()),
@@ -1081,7 +1081,7 @@ impl Executor {
             };
         };
         match index_manager
-            .drop_index(self.ctx.space_id.unwrap_or(1), &name)
+            .drop_index(self.ctx.resolve_space_id().await, &name)
             .await
         {
             Ok(()) => Ok(ExecutorResult::empty()),

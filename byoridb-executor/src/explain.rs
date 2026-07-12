@@ -438,7 +438,7 @@ async fn lookup_access(ctx: &ExecutionContext, p: &LookupPlan) -> AccessPath {
     if let LookupType::Tag(_) = p.lookup_type {
         if let (Some(im), Some(expr)) = (ctx.index_manager.as_ref(), p.where_clause.as_ref()) {
             if let Some(field) = eq_field(expr) {
-                let space_id = ctx.space_id.unwrap_or(1);
+                let space_id = ctx.resolve_space_id().await;
                 let indexes = im.list_tag_indexes(space_id).await;
                 if let Some(idx) = indexes
                     .iter()
@@ -464,7 +464,7 @@ async fn match_start_access(ctx: &ExecutionContext, node: &NodePattern) -> Acces
 
     if !props.is_empty() {
         if let (Some(im), Some(label)) = (ctx.index_manager.as_ref(), label) {
-            let space_id = ctx.space_id.unwrap_or(1);
+            let space_id = ctx.resolve_space_id().await;
             let indexes = im.list_tag_indexes(space_id).await;
             let label_idx: Vec<&IndexDef> = indexes
                 .iter()

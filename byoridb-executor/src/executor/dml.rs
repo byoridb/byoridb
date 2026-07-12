@@ -34,7 +34,7 @@ impl Executor {
                 // commits in one redb transaction (one fsync) instead of one per
                 // put. This is the dominant cost for bulk loads. The batch is
                 // also atomic — a multi-row INSERT now applies all-or-nothing.
-                let space_id = self.ctx.space_id.unwrap_or(1);
+                let space_id = self.ctx.resolve_space_id().await;
                 let tag_indexes = match self.ctx.index_manager.as_ref() {
                     Some(im) => im.list_tag_indexes(space_id).await,
                     None => Vec::new(),
@@ -169,7 +169,7 @@ impl Executor {
                 };
                 // Collect all KV writes into one batch → single redb commit
                 // (one fsync) per multi-row INSERT, applied atomically.
-                let space_id = self.ctx.space_id.unwrap_or(1);
+                let space_id = self.ctx.resolve_space_id().await;
                 let edge_indexes = match self.ctx.index_manager.as_ref() {
                     Some(im) => im.list_edge_indexes(space_id).await,
                     None => Vec::new(),

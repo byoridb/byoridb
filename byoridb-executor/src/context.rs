@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 /// Configuration for query execution
 #[derive(Debug, Clone)]
@@ -123,6 +124,11 @@ pub struct ExecutionContext {
     /// Behind an `Arc` so the Graph layer can hand in a shared flag, run the
     /// query, and read the result back across the executor boundary.
     pub full_scan: Arc<AtomicBool>,
+
+    /// Cache for the space id resolved from the space *name* (see
+    /// [`Self::resolve_space_id`]). Populated once per context; a `USE`-derived
+    /// sibling gets a fresh cell so it re-resolves for its own space.
+    resolved_space_id: OnceCell<u32>,
 }
 
 impl ExecutionContext {
@@ -144,7 +150,41 @@ impl ExecutionContext {
             vars: Arc::new(Mutex::new(HashMap::new())),
             profile: Mutex::new(None),
             full_scan: Arc::new(AtomicBool::new(false)),
+            resolved_space_id: OnceCell::new(),
         }
+    }
+
+    /// Resolve the effective space id for storage/index operations.
+    ///
+    /// Prefers an explicitly-set `space_id` (the distributed path sets it from
+    /// Meta). Otherwise resolves it from the space *name* via the persisted
+    /// space definition (`{"id":...}`) and caches the result. Falls back to `1`
+    /// only when no space is set or its definition is missing.
+    ///
+    /// This is the fix for cross-space index contamination: `space_id` was never
+    /// populated on the standalone/embedded path, so every `space_id.unwrap_or(1)`
+    /// collapsed all spaces onto id 1 — index definitions, name uniqueness, and
+    /// LOOKUP/INSERT index selection all merged across logical spaces.
+    pub async fn resolve_space_id(&self) -> u32 {
+        if let Some(id) = self.space_id {
+            return id;
+        }
+        *self
+            .resolved_space_id
+            .get_or_init(|| async {
+                let Some(name) = self.space.as_deref() else {
+                    return 1;
+                };
+                match self.kvstore.get(&crate::key::SchemaKey::space(name)).await {
+                    Ok(Some(bytes)) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .ok()
+                        .and_then(|v| v.get("id").and_then(|i| i.as_u64()))
+                        .map(|i| i as u32)
+                        .unwrap_or(1),
+                    _ => 1,
+                }
+            })
+            .await
     }
 
     /// Use a caller-supplied shared full-scan flag so the embedding layer (the
@@ -276,6 +316,8 @@ impl ExecutionContext {
             vars: self.vars.clone(),
             profile: Mutex::new(self.profile.lock().clone()),
             full_scan: self.full_scan.clone(),
+            // Fresh cell: the derived context resolves space_id for its own space.
+            resolved_space_id: OnceCell::new(),
         }
     }
 

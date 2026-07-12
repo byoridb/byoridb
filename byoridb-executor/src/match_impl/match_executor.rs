@@ -635,7 +635,7 @@ impl MatchExecutor {
             Some(im) => im,
             None => return Ok(None),
         };
-        let space_id = self.ctx.space_id.unwrap_or(1);
+        let space_id = self.ctx.resolve_space_id().await;
         let index_def = match index_manager
             .list_tag_indexes(space_id)
             .await
@@ -1916,7 +1916,7 @@ impl MatchExecutor {
             return Ok(None);
         }
 
-        let space_id = self.ctx.space_id.unwrap_or(1);
+        let space_id = self.ctx.resolve_space_id().await;
         let indexes = index_manager.list_tag_indexes(space_id).await;
         let label_indexes: Vec<_> = indexes
             .iter()

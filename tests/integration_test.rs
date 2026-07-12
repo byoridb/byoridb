@@ -869,6 +869,84 @@ async fn test_index_definitions_survive_across_queries() {
     service.sign_out(session_id, session_id).await;
 }
 
+/// Regression: two spaces with the same tag + same index name + same VID must
+/// stay isolated. Before the fix, `ctx.space_id` was never populated on the
+/// standalone path, so every space collapsed onto id 1 — index definitions and
+/// name-uniqueness merged across spaces, and a LOOKUP in one space returned
+/// another space's data (cross-space index contamination).
+#[tokio::test]
+async fn test_cross_space_index_isolation() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    for (space, name) in [("xspace_a", "Alice"), ("xspace_b", "Bob")] {
+        execute(&service, session_id, &format!("CREATE SPACE {space}")).await;
+        execute(&service, session_id, &format!("USE {space}")).await;
+        execute(&service, session_id, "CREATE TAG person(name STRING)").await;
+        // The SAME index name in each space must succeed: index names are
+        // scoped per-space, not global. (Panics here if the name collides.)
+        execute(
+            &service,
+            session_id,
+            "CREATE TAG INDEX person_name ON person(name)",
+        )
+        .await;
+        execute(
+            &service,
+            session_id,
+            &format!(r#"INSERT VERTEX person(name) VALUES 1:("{name}")"#),
+        )
+        .await;
+    }
+
+    // Space A must find ONLY its own vertex, never space B's — via the index.
+    execute(&service, session_id, "USE xspace_a").await;
+    let a_sees_b = execute(
+        &service,
+        session_id,
+        r#"LOOKUP ON person WHERE person.name == "Bob""#,
+    )
+    .await;
+    assert_eq!(
+        a_sees_b.row_count(),
+        0,
+        "space xspace_a must NOT find xspace_b's 'Bob' (cross-space index leak): {:?}",
+        a_sees_b.rows
+    );
+    let a_sees_a = execute(
+        &service,
+        session_id,
+        r#"LOOKUP ON person WHERE person.name == "Alice""#,
+    )
+    .await;
+    assert_eq!(
+        a_sees_a.row_count(),
+        1,
+        "space xspace_a must find its own 'Alice': {:?}",
+        a_sees_a.rows
+    );
+
+    // And symmetrically for space B.
+    execute(&service, session_id, "USE xspace_b").await;
+    let b_sees_a = execute(
+        &service,
+        session_id,
+        r#"LOOKUP ON person WHERE person.name == "Alice""#,
+    )
+    .await;
+    assert_eq!(
+        b_sees_a.row_count(),
+        0,
+        "space xspace_b must NOT find xspace_a's 'Alice' (cross-space index leak): {:?}",
+        b_sees_a.rows
+    );
+
+    service.sign_out(session_id, session_id).await;
+}
+
 /// Graceful shutdown: once readiness is flipped off, new queries must be
 /// rejected with a clear error (k8s stops routing via /ready; this guards the
 /// window where a connection is already open).

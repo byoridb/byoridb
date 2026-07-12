@@ -869,7 +869,7 @@ impl Executor {
                 // Try to extract indexable condition
                 if let Some((field, value)) = self.extract_eq_condition(where_expr) {
                     // Find applicable index
-                    let space_id = self.ctx.space_id.unwrap_or(1);
+                    let space_id = self.ctx.resolve_space_id().await;
                     let indexes = index_manager.list_tag_indexes(space_id).await;
 
                     // Find an index that covers the field
