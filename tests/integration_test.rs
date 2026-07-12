@@ -1078,6 +1078,68 @@ async fn test_update_delete_maintain_tag_index() {
     service.sign_out(session_id, session_id).await;
 }
 
+/// Regression: UPDATE `WHEN` and DELETE `WHERE` safety predicates must gate the
+/// mutation. Before the fix the executor ignored `plan.conditions`, so an
+/// UPDATE ... WHEN false still wrote and a DELETE ... WHERE false still deleted.
+/// (Observed via an index LOOKUP, which also exercises index maintenance.)
+#[tokio::test]
+async fn test_update_delete_respect_conditions() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE cond_test").await;
+    execute(&service, session_id, "USE cond_test").await;
+    execute(&service, session_id, "CREATE TAG t(n INT64)").await;
+    execute(&service, session_id, "CREATE TAG INDEX t_n ON t(n)").await;
+    execute(&service, session_id, "INSERT VERTEX t(n) VALUES 1:(7)").await;
+
+    let count = |n: i64| {
+        let service = &service;
+        async move {
+            execute(
+                service,
+                session_id,
+                &format!("LOOKUP ON t WHERE t.n == {n}"),
+            )
+            .await
+            .row_count()
+        }
+    };
+
+    // UPDATE WHEN false → no change.
+    execute(
+        &service,
+        session_id,
+        "UPDATE VERTEX ON t 1 SET n = 99 WHEN t.n == 999",
+    )
+    .await;
+    assert_eq!(count(7).await, 1, "WHEN false must NOT modify (n stays 7)");
+    assert_eq!(count(99).await, 0, "WHEN false must NOT write n=99");
+
+    // UPDATE WHEN true → applies.
+    execute(
+        &service,
+        session_id,
+        "UPDATE VERTEX ON t 1 SET n = 42 WHEN t.n == 7",
+    )
+    .await;
+    assert_eq!(count(42).await, 1, "WHEN true must apply (n=42)");
+    assert_eq!(count(7).await, 0, "old value 7 must be gone");
+
+    // DELETE WHERE false → not deleted.
+    execute(&service, session_id, "DELETE VERTEX 1 WHERE t.n == 999").await;
+    assert_eq!(count(42).await, 1, "WHERE false must NOT delete");
+
+    // DELETE WHERE true → deleted.
+    execute(&service, session_id, "DELETE VERTEX 1 WHERE t.n == 42").await;
+    assert_eq!(count(42).await, 0, "WHERE true must delete");
+
+    service.sign_out(session_id, session_id).await;
+}
+
 /// Graceful shutdown: once readiness is flipped off, new queries must be
 /// rejected with a clear error (k8s stops routing via /ready; this guards the
 /// window where a connection is already open).

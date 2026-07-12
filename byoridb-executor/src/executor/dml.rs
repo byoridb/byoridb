@@ -407,6 +407,7 @@ impl Executor {
         let key = format!("{}:vertex:{}", effective_space, vid);
 
         let existing_data = self.ctx.kvstore.get(key.as_bytes()).await?;
+        let existed = existing_data.is_some();
 
         // Upsert: create vertex if it does not exist yet
         let mut vertex_data = if let Some(data) = existing_data {
@@ -433,6 +434,32 @@ impl Executor {
             .iter()
             .map(|t| (t.name.clone(), t.properties.clone()))
             .collect();
+
+        // Evaluate the optional WHEN condition against the CURRENT vertex state.
+        // A conditional UPDATE whose condition is false — or one targeting a
+        // vertex that does not exist — is a no-op. Previously the condition was
+        // ignored and the write always applied.
+        if let Some(cond) = &plan.conditions {
+            let pass = existed && {
+                let mut current: std::collections::HashMap<String, byoridb_common::Value> =
+                    std::collections::HashMap::new();
+                for tag in &vertex_data.tags {
+                    for (k, v) in &tag.properties {
+                        current.insert(format!("{}.{}", tag.name, k), v.clone());
+                        current.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+                let ectx = crate::evaluator::EvalContext::new().with_current(current);
+                crate::evaluator::Evaluator::evaluate_condition(cond, &ectx)?
+            };
+            if !pass {
+                return Ok(ExecutorResult {
+                    columns: vec!["Updated".to_string()],
+                    rows: vec![vec![byoridb_common::Value::Int(0)]],
+                    latency_ms: 0,
+                });
+            }
+        }
 
         // Update props in the matching tag; add the tag if absent
         let tag_exists = vertex_data.tags.iter().any(|t| t.name == *tag_name);
@@ -617,10 +644,36 @@ impl Executor {
         };
         for (vid, (key, exists)) in plan.vids.iter().zip(keys.iter().zip(results.iter())) {
             let Some(data) = exists else { continue };
+            let vertex = VertexCodec::decode_vertex(data).ok();
+
+            // Evaluate the optional WHERE condition; skip vertices that don't
+            // match. Previously the condition was ignored and every listed vid
+            // was deleted unconditionally (`DELETE VERTEX 1 WHERE false` deleted).
+            if let Some(cond) = &plan.conditions {
+                let pass = match &vertex {
+                    Some(v) => {
+                        let mut current: std::collections::HashMap<String, byoridb_common::Value> =
+                            std::collections::HashMap::new();
+                        for tag in &v.tags {
+                            for (k, val) in &tag.properties {
+                                current.insert(format!("{}.{}", tag.name, k), val.clone());
+                                current.entry(k.clone()).or_insert_with(|| val.clone());
+                            }
+                        }
+                        let ectx = crate::evaluator::EvalContext::new().with_current(current);
+                        crate::evaluator::Evaluator::evaluate_condition(cond, &ectx)?
+                    }
+                    None => false,
+                };
+                if !pass {
+                    continue;
+                }
+            }
+
             self.ctx.kvstore.delete(key).await?;
             tombstones.push(key.clone());
             deleted += 1;
-            if let Ok(vertex) = VertexCodec::decode_vertex(data) {
+            if let Some(vertex) = &vertex {
                 for tag in &vertex.tags {
                     for (prop, value) in &tag.properties {
                         if crate::executor::recommend::pack_embedding(value).is_some() {
