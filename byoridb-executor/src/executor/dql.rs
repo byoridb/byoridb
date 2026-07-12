@@ -642,6 +642,22 @@ impl Executor {
             );
         }
 
+        // Apply the WHERE predicate over edge / dest / source properties. Without
+        // this, `GO ... WHERE <cond>` silently returned every neighbor (the plan
+        // carried `where_clause` but the local executor never evaluated it).
+        if let Some(ref where_expr) = plan.where_clause {
+            let mut filtered = Vec::with_capacity(traversal.len());
+            for (src_vid, dst_vid, last_edge) in traversal {
+                if self
+                    .go_row_matches_where(space, src_vid, dst_vid, last_edge.as_ref(), where_expr)
+                    .await?
+                {
+                    filtered.push((src_vid, dst_vid, last_edge));
+                }
+            }
+            traversal = filtered;
+        }
+
         let proj_start = std::time::Instant::now();
 
         // If no explicit YIELD columns, return ["src", "dst"] for backward
@@ -733,6 +749,57 @@ impl Executor {
             rows,
             latency_ms: 0,
         })
+    }
+
+    /// Evaluate a GO `WHERE` predicate for one traversal row. The predicate may
+    /// reference edge properties (bare `prop` or `edgetype.prop`), destination
+    /// vertex properties (`$$.tag.prop`), and source vertex properties
+    /// (`$^.tag.prop`). Errors (e.g. an unresolvable reference) propagate so a
+    /// malformed predicate fails the query rather than being silently ignored.
+    async fn go_row_matches_where(
+        &self,
+        space: &str,
+        src_vid: i64,
+        dst_vid: i64,
+        last_edge: Option<&CodecEdgeData>,
+        where_expr: &Expression,
+    ) -> Result<bool> {
+        let mut current: std::collections::HashMap<String, byoridb_common::Value> =
+            std::collections::HashMap::new();
+        if let Some(e) = last_edge {
+            for (k, v) in &e.properties {
+                current.insert(format!("{}.{}", e.edge_type, k), v.clone());
+                current.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        let mut ctx = crate::evaluator::EvalContext::new();
+        ctx.current = current;
+        ctx.destination = self.vertex_props_flat(space, dst_vid).await;
+        ctx.source = self.vertex_props_flat(space, src_vid).await;
+        crate::evaluator::Evaluator::evaluate_condition(where_expr, &ctx)
+    }
+
+    /// Fetch a vertex's properties as a flat map, keyed both as `tag.prop` and as
+    /// bare `prop` (first tag wins for the bare key). Used to build the GO WHERE
+    /// evaluation context for destination/source vertices.
+    async fn vertex_props_flat(
+        &self,
+        space: &str,
+        vid: i64,
+    ) -> std::collections::HashMap<String, byoridb_common::Value> {
+        let mut out = std::collections::HashMap::new();
+        let key = format!("{}:vertex:{}", space, vid);
+        if let Ok(Some(blob)) = self.ctx.kvstore.get(key.as_bytes()).await {
+            if let Ok(v) = VertexCodec::decode_vertex(&blob) {
+                for tag in &v.tags {
+                    for (p, val) in &tag.properties {
+                        out.insert(format!("{}.{}", tag.name, p), val.clone());
+                        out.entry(p.clone()).or_insert_with(|| val.clone());
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Evaluate a single YIELD expression in the context of a GO traversal row.

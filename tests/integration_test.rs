@@ -947,6 +947,65 @@ async fn test_cross_space_index_isolation() {
     service.sign_out(session_id, session_id).await;
 }
 
+/// Regression: `GO ... WHERE <cond>` must filter on edge/vertex properties.
+/// Before the fix the local GO executor never evaluated `plan.where_clause`, so
+/// the predicate was silently ignored and every neighbor was returned.
+#[tokio::test]
+async fn test_go_where_filters_edges() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE go_where_test").await;
+    execute(&service, session_id, "USE go_where_test").await;
+    execute(&service, session_id, "CREATE TAG p(name STRING)").await;
+    execute(&service, session_id, "CREATE EDGE link(w INT64)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX p(name) VALUES 1:("a"), 2:("b"), 3:("c")"#,
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE link(w) VALUES 1->2:(10), 1->3:(90)",
+    )
+    .await;
+
+    // Sanity: without WHERE, both neighbors are returned.
+    let all = execute(
+        &service,
+        session_id,
+        "GO FROM 1 OVER link YIELD link._dst AS dst",
+    )
+    .await;
+    assert_eq!(
+        all.row_count(),
+        2,
+        "GO without WHERE should return both neighbors: {:?}",
+        all.rows
+    );
+
+    // WHERE on an edge property must filter: only the w=90 edge (dst 3) survives.
+    let filtered = execute(
+        &service,
+        session_id,
+        "GO FROM 1 OVER link WHERE link.w > 50 YIELD link._dst AS dst",
+    )
+    .await;
+    assert_eq!(
+        filtered.row_count(),
+        1,
+        "GO ... WHERE link.w > 50 should return only the w=90 edge: {:?}",
+        filtered.rows
+    );
+
+    service.sign_out(session_id, session_id).await;
+}
+
 /// Graceful shutdown: once readiness is flipped off, new queries must be
 /// rejected with a clear error (k8s stops routing via /ready; this guards the
 /// window where a connection is already open).
