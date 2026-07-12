@@ -65,13 +65,21 @@ def _raw_query(ngql):
         status, body = _post("/api/v1/query", payload)
         return body
     except urllib.error.HTTPError as e:
-        # 401/expired session -> re-login once and retry
-        if e.code in (401, 403):
+        detail = e.read().decode(errors="replace") if hasattr(e, "read") else str(e)
+        # An expired/invalid session surfaces as 401/403 OR as 400 with a session/auth
+        # error body (e.g. after the server restarts). Re-login once, re-pin the memory
+        # space on the fresh session, then retry. Genuine query errors (syntax, etc.)
+        # also return 400 but without a session marker, so they are NOT retried.
+        low = detail.lower()
+        session_lost = e.code in (401, 403) or (
+            e.code == 400 and ("session" in low or "auth" in low)
+        )
+        if session_lost:
             _login()
+            _post("/api/v1/query", {"session_id": _session["id"], "query": f"USE {SPACE}"})
             payload["session_id"] = _session["id"]
             _, body = _post("/api/v1/query", payload)
             return body
-        detail = e.read().decode(errors="replace") if hasattr(e, "read") else str(e)
         raise RuntimeError(f"query failed ({e.code}): {detail}")
 
 
