@@ -35,6 +35,9 @@ use tracing::{info, warn};
 
 /// Single KV table — must match [`crate::store`]'s definition.
 const KV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
+/// Bitemporal history table (T-track). Must be backed up alongside `kv`, else a
+/// restored database loses all `AS OF` history while the current view survives.
+const HISTORY_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("history");
 
 /// redb data file name inside a data directory or backup directory.
 const DATA_FILE: &str = "data.redb";
@@ -388,9 +391,11 @@ fn snapshot_copy(src: &Path, dst: &Path) -> Result<()> {
 
     let dest = Database::create(dst)?;
     let wtx = dest.begin_write()?;
-    {
-        let mut dst_table = wtx.open_table(KV_TABLE)?;
-        match rtx.open_table(KV_TABLE) {
+    // Copy every persisted table: the current view (`kv`) AND the bitemporal
+    // history (`history`). Copying only `kv` silently dropped all AS OF history.
+    for table in [KV_TABLE, HISTORY_TABLE] {
+        let mut dst_table = wtx.open_table(table)?;
+        match rtx.open_table(table) {
             Ok(src_table) => {
                 for entry in src_table.range::<&[u8]>(..)? {
                     let (k, v) = entry?;
@@ -522,6 +527,43 @@ mod tests {
         let rtx = db.begin_read().unwrap();
         let t = rtx.open_table(KV_TABLE).unwrap();
         t.get(key).unwrap().map(|g| g.value().to_vec())
+    }
+
+    /// Regression: a backup must preserve the bitemporal `history` table, not
+    /// just the current-view `kv` table. Previously only `kv` was copied, so a
+    /// restored DB kept the current view but lost all `AS OF` history.
+    #[test]
+    fn test_snapshot_copy_includes_history_table() {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("src.redb");
+        let dst = temp.path().join("dst.redb");
+        {
+            let db = Database::create(&src).unwrap();
+            let wtx = db.begin_write().unwrap();
+            {
+                let mut kv = wtx.open_table(KV_TABLE).unwrap();
+                kv.insert(b"cur".as_slice(), b"v".as_slice()).unwrap();
+            }
+            {
+                let mut h = wtx.open_table(HISTORY_TABLE).unwrap();
+                h.insert(b"hist-key".as_slice(), b"hist-val".as_slice())
+                    .unwrap();
+            }
+            wtx.commit().unwrap();
+        }
+
+        snapshot_copy(&src, &dst).unwrap();
+
+        let db = Database::open(&dst).unwrap();
+        let rtx = db.begin_read().unwrap();
+        let h = rtx.open_table(HISTORY_TABLE).unwrap();
+        assert_eq!(
+            h.get(b"hist-key".as_slice())
+                .unwrap()
+                .map(|g| g.value().to_vec()),
+            Some(b"hist-val".to_vec()),
+            "HISTORY_TABLE must be preserved by snapshot_copy"
+        );
     }
 
     #[test]
