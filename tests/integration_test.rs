@@ -1006,6 +1006,78 @@ async fn test_go_where_filters_edges() {
     service.sign_out(session_id, session_id).await;
 }
 
+/// Regression: UPDATE and DELETE must keep tag secondary indexes consistent.
+/// Before the fix, INSERT wrote index entries but UPDATE/DELETE did not touch
+/// them, so LOOKUP returned the pre-update value (and missed the new one), and
+/// a deleted vertex's stale index entry lingered.
+#[tokio::test]
+async fn test_update_delete_maintain_tag_index() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE idx_maint_test").await;
+    execute(&service, session_id, "USE idx_maint_test").await;
+    execute(&service, session_id, "CREATE TAG person(name STRING)").await;
+    execute(
+        &service,
+        session_id,
+        "CREATE TAG INDEX person_name ON person(name)",
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX person(name) VALUES 1:("Alice")"#,
+    )
+    .await;
+
+    let lookup = |val: &'static str| {
+        let service = &service;
+        async move {
+            execute(
+                service,
+                session_id,
+                &format!(r#"LOOKUP ON person WHERE person.name == "{val}""#),
+            )
+            .await
+            .row_count()
+        }
+    };
+
+    assert_eq!(lookup("Alice").await, 1, "sanity: Alice indexed after INSERT");
+
+    // UPDATE must move the index entry from Alice to Bob.
+    execute(
+        &service,
+        session_id,
+        r#"UPDATE VERTEX ON person 1 SET name = "Bob""#,
+    )
+    .await;
+    assert_eq!(
+        lookup("Alice").await,
+        0,
+        "after UPDATE, the stale 'Alice' index entry must be gone"
+    );
+    assert_eq!(
+        lookup("Bob").await,
+        1,
+        "after UPDATE, the new 'Bob' index entry must exist"
+    );
+
+    // DELETE must remove the index entry entirely.
+    execute(&service, session_id, "DELETE VERTEX 1").await;
+    assert_eq!(
+        lookup("Bob").await,
+        0,
+        "after DELETE, no index entry may survive"
+    );
+
+    service.sign_out(session_id, session_id).await;
+}
+
 /// Graceful shutdown: once readiness is flipped off, new queries must be
 /// rejected with a clear error (k8s stops routing via /ready; this guards the
 /// window where a connection is already open).

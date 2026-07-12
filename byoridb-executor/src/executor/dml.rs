@@ -422,6 +422,18 @@ impl Executor {
             }
         };
 
+        // Snapshot pre-update indexed values so stale tag-index entries can be
+        // removed after the write (UPDATE previously left secondary indexes
+        // pointing at the old property values).
+        let old_tag_props: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, byoridb_common::Value>,
+        > = vertex_data
+            .tags
+            .iter()
+            .map(|t| (t.name.clone(), t.properties.clone()))
+            .collect();
+
         // Update props in the matching tag; add the tag if absent
         let tag_exists = vertex_data.tags.iter().any(|t| t.name == *tag_name);
         if !tag_exists {
@@ -465,6 +477,53 @@ impl Executor {
         // T-트랙: UPDATE 후 현재값을 이력 버전으로 기록.
         self.record_versions(vec![(key.into_bytes(), encoded_data)])
             .await?;
+
+        // Maintain tag secondary indexes: remove entries for the OLD property
+        // values and add entries for the NEW ones. Without this, LOOKUP kept
+        // returning the pre-update value and missed the new one.
+        if let Some(im) = self.ctx.index_manager.as_ref() {
+            let space_id = self.ctx.resolve_space_id().await;
+            for index in im.list_tag_indexes(space_id).await {
+                if let Some(old_props) = old_tag_props.get(&index.schema_name) {
+                    let old_values: Vec<_> = index
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            self.byoridb_value_to_index_value(
+                                old_props.get(f).unwrap_or(&byoridb_common::Value::null()),
+                            )
+                        })
+                        .collect();
+                    im.delete_tag_index(1, index.id, &old_values, vid)
+                        .await
+                        .map_err(|e| {
+                            ExecutionError::InvalidOperation(format!(
+                                "index update (delete old) failed: {e}"
+                            ))
+                        })?;
+                }
+                if let Some(tag) = vertex_data.tags.iter().find(|t| t.name == index.schema_name) {
+                    let new_values: Vec<_> = index
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            self.byoridb_value_to_index_value(
+                                tag.properties
+                                    .get(f)
+                                    .unwrap_or(&byoridb_common::Value::null()),
+                            )
+                        })
+                        .collect();
+                    im.insert_tag_index(1, index.id, &new_values, vid)
+                        .await
+                        .map_err(|e| {
+                            ExecutionError::InvalidOperation(format!(
+                                "index update (insert new) failed: {e}"
+                            ))
+                        })?;
+                }
+            }
+        }
 
         // Keep the dense embedding side-store consistent (PLAN.md R-2a): an
         // updated numeric-list property is re-mirrored; a property that is no
@@ -550,6 +609,12 @@ impl Executor {
             std::collections::HashSet::new();
         // T-트랙: 삭제된 정점의 현재뷰 키를 tombstone 버전으로 기록.
         let mut tombstones: Vec<Vec<u8>> = Vec::new();
+        // Tag indexes to keep consistent as vertices are removed (DELETE
+        // previously left stale index entries pointing at deleted vids).
+        let del_tag_indexes = match self.ctx.index_manager.as_ref() {
+            Some(im) => im.list_tag_indexes(self.ctx.resolve_space_id().await).await,
+            None => Vec::new(),
+        };
         for (vid, (key, exists)) in plan.vids.iter().zip(keys.iter().zip(results.iter())) {
             let Some(data) = exists else { continue };
             self.ctx.kvstore.delete(key).await?;
@@ -563,6 +628,33 @@ impl Executor {
                                 crate::key::SchemaKey::vec_data(&effective_space, prop, *vid);
                             self.ctx.kvstore.delete(&vkey).await?;
                             dirty_vec_props.insert(prop.clone());
+                        }
+                    }
+                }
+                // Remove tag secondary-index entries for the deleted vertex.
+                if let Some(im) = self.ctx.index_manager.as_ref() {
+                    for index in &del_tag_indexes {
+                        if let Some(tag) =
+                            vertex.tags.iter().find(|t| t.name == index.schema_name)
+                        {
+                            let values: Vec<_> = index
+                                .fields
+                                .iter()
+                                .map(|f| {
+                                    self.byoridb_value_to_index_value(
+                                        tag.properties
+                                            .get(f)
+                                            .unwrap_or(&byoridb_common::Value::null()),
+                                    )
+                                })
+                                .collect();
+                            im.delete_tag_index(1, index.id, &values, *vid)
+                                .await
+                                .map_err(|e| {
+                                    ExecutionError::InvalidOperation(format!(
+                                        "index delete failed: {e}"
+                                    ))
+                                })?;
                         }
                     }
                 }
