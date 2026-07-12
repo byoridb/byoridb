@@ -7,4 +7,5 @@ export BYORIDB__SERVER__HTTP_ADDR="@HTTP_ADDR@"
 export BYORIDB__SERVER__GRAPH_ADDR="@GRAPH_ADDR@"
 export RUST_LOG=info
 set +a
+umask 077   # data.redb / logs readable by owner only (memory contents are private)
 exec "@BYORIDB_HOME@/bin/byoridb-server"

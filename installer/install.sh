@@ -107,6 +107,7 @@ render() { # <src-template> <dest>
 
 TARGET="$(detect_target)"
 mkdir -p "$BYORIDB_HOME/bin" "$BYORIDB_HOME/data" "$BYORIDB_HOME/logs"
+chmod 700 "$BYORIDB_HOME" "$BYORIDB_HOME/data" "$BYORIDB_HOME/logs" 2>/dev/null || true
 
 # 1) server binary
 if [ -n "$BINARY" ]; then
@@ -133,20 +134,21 @@ render "$WORK/run-server.sh" "$BYORIDB_HOME/bin/run-server.sh"
 render "$WORK/run-mcp.sh"    "$BYORIDB_HOME/bin/run-mcp.sh"
 chmod +x "$BYORIDB_HOME/bin/run-server.sh" "$BYORIDB_HOME/bin/run-mcp.sh"
 
-# 3) env (generate once; preserve existing so data auth keeps working)
-if [ ! -f "$BYORIDB_HOME/env" ]; then
-  pw="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
-  umask 177
-  cat > "$BYORIDB_HOME/env" <<EOF
+# 3) env: preserve ONLY the root secret across reinstalls (so existing data stays
+#    accessible); always rewrite derived endpoint/user, so an upgrade with changed
+#    ports keeps the server and the MCP client pointed at the SAME address.
+pw=""
+[ -f "$BYORIDB_HOME/env" ] && pw="$(sed -n 's/^BYORIDB_ROOT_PASSWORD=//p' "$BYORIDB_HOME/env")"
+[ -n "$pw" ] || pw="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+umask 177
+cat > "$BYORIDB_HOME/env" <<EOF
 BYORIDB_ROOT_PASSWORD=${pw}
 BYORIDB_HTTP=http://${HTTP_ADDR}
 BYORIDB_USER=root
 EOF
-  umask 022
-  log "generated $BYORIDB_HOME/env (root password, chmod 600)"
-else
-  warn "kept existing $BYORIDB_HOME/env"
-fi
+umask 022
+chmod 600 "$BYORIDB_HOME/env"
+log "wrote $BYORIDB_HOME/env (secret preserved; endpoint=http://${HTTP_ADDR})"
 
 # 4) service (always-on)
 start_service() {
@@ -179,7 +181,8 @@ for _ in $(seq 1 30); do
   if curl -fsS "http://${HTTP_ADDR}/health" >/dev/null 2>&1; then ok=1; break; fi
   sleep 1
 done
-[ "$ok" = 1 ] && log "server healthy" || warn "server not healthy yet — check $BYORIDB_HOME/logs/server.err"
+[ "$ok" = 1 ] || die "server did not become healthy on http://${HTTP_ADDR} — see $BYORIDB_HOME/logs/server.err (not registering MCP)"
+log "server healthy"
 
 # 6) register MCP server with Claude Code
 if [ "$NO_CLAUDE" = 1 ]; then

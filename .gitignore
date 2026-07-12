@@ -21,3 +21,7 @@ CLAUDE.md
 AGENTS.md
 aidlc-docs/
 .kiro/
+
+# python bytecode (installer mcp)
+__pycache__/
+*.pyc

@@ -27,7 +27,9 @@ import urllib.request
 
 HTTP = os.environ.get("BYORIDB_HTTP", "http://127.0.0.1:19669").rstrip("/")
 USER = os.environ.get("BYORIDB_USER", "root")
-PASSWORD = os.environ.get("BYORIDB_PASSWORD") or os.environ.get("BYORIDB_ROOT_PASSWORD", "")
+# The installer sets BYORIDB_ROOT_PASSWORD as the canonical secret; prefer it so a
+# stray inherited BYORIDB_PASSWORD cannot shadow it with a stale/wrong value.
+PASSWORD = os.environ.get("BYORIDB_ROOT_PASSWORD") or os.environ.get("BYORIDB_PASSWORD", "")
 SPACE = os.environ.get("BYORIDB_MEMORY_SPACE", "claude_memory")
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -103,7 +105,18 @@ def _ensure_ready():
             _session["ready"] = True
             log(f"memory space '{SPACE}' ready")
             return
-        except Exception as e:  # noqa: BLE001 - server may still be starting
+        except urllib.error.HTTPError as e:
+            # Fail fast on auth errors: retrying a wrong password would trip the
+            # server's failed-login lockout. Only transient/startup errors retry.
+            if e.code in (401, 403):
+                raise RuntimeError(
+                    f"authentication failed (HTTP {e.code}); check BYORIDB_ROOT_PASSWORD. "
+                    "Aborting without retry to avoid locking the root account."
+                )
+            last = e
+            _session["id"] = None
+            time.sleep(2)
+        except Exception as e:  # noqa: BLE001 - server may still be starting (conn refused, etc.)
             last = e
             _session["id"] = None
             time.sleep(2)
