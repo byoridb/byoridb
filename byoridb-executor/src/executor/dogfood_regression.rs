@@ -10,6 +10,9 @@
 //! - **#2** — `RETURN expr, COUNT(*)` without an explicit `GROUP BY` must
 //!   implicitly group by the non-aggregate columns (previously collapsed to one
 //!   row with the first value).
+//! - **음수 VID** (byori dogfooding, 2026-07-13) — 모든 VID 자리는 음수 정수를
+//!   받아야 한다. 파서가 `-5`를 `UnaryOp(Neg, Int)`로 내보내는데 plan builder가
+//!   bare `Literal::Int`만 매칭해 "must be an integer literal"로 거부했다.
 
 #[cfg(test)]
 mod tests {
@@ -324,5 +327,36 @@ mod tests {
         got.sort();
         // node 3 has out-degree 0 → excluded (count==0 dropped).
         assert_eq!(got, vec![("n1".to_string(), 2), ("n2".to_string(), 1)]);
+    }
+
+    /// 음수 VID: INSERT/FETCH/GO/FIND PATH/UPDATE/DELETE 전 표면 roundtrip.
+    #[tokio::test]
+    async fn negative_vid_full_roundtrip() {
+        let e = create_executor();
+        run(&e, "CREATE TAG note(body STRING)").await;
+        run(&e, "CREATE EDGE rel(kind STRING)").await;
+        run(&e, "INSERT VERTEX note(body) VALUES -5:(\"neg\")").await;
+        run(&e, "INSERT VERTEX note(body) VALUES 7:(\"pos\")").await;
+        run(&e, "INSERT EDGE rel(kind) VALUES -5->7:(\"r\")").await;
+
+        let r = run(&e, "FETCH PROP ON note -5").await;
+        assert_eq!(r.rows.len(), 1, "FETCH must find the negative-vid vertex");
+
+        let r = run(&e, "GO FROM -5 OVER rel YIELD dst(edge) AS d").await;
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(
+            r.rows[0][0],
+            byoridb_common::Value::Int(7),
+            "GO from a negative vid"
+        );
+
+        let r = run(&e, "FIND SHORTEST PATH FROM -5 TO 7 OVER rel").await;
+        assert!(!r.rows.is_empty(), "FIND PATH with a negative endpoint");
+
+        run(&e, "UPDATE VERTEX ON note -5 SET body = \"neg2\"").await;
+        run(&e, "DELETE EDGE rel -5->7").await;
+        run(&e, "DELETE VERTEX -5").await;
+        let r = run(&e, "FETCH PROP ON note -5").await;
+        assert_eq!(r.rows.len(), 0, "negative-vid vertex deleted");
     }
 }

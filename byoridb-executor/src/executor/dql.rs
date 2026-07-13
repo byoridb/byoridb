@@ -1380,7 +1380,7 @@ impl Executor {
         value_expr: &Expression,
     ) -> Option<(String, byoridb_common::Value)> {
         let field = Self::field_name_of(field_expr)?;
-        let value = self.expr_to_value(value_expr)?;
+        let value = Self::expr_to_value(value_expr)?;
         Some((field, value))
     }
 
@@ -1516,7 +1516,7 @@ impl Executor {
     }
 
     /// Convert Expression to byoridb_common::Value
-    pub(super) fn expr_to_value(&self, expr: &Expression) -> Option<byoridb_common::Value> {
+    pub(super) fn expr_to_value(expr: &Expression) -> Option<byoridb_common::Value> {
         match expr {
             Expression::Literal(lit) => Some(match lit {
                 Literal::String(s) => byoridb_common::Value::String(s.clone()),
@@ -1525,6 +1525,15 @@ impl Executor {
                 Literal::Bool(b) => byoridb_common::Value::Bool(*b),
                 Literal::Null => byoridb_common::Value::null(),
             }),
+            // Negative numeric literals arrive as `-(N)` after parsing.
+            Expression::UnaryOp {
+                op: byoridb_parser::ast::UnaryOperator::Neg,
+                operand,
+            } => match Self::expr_to_value(operand) {
+                Some(byoridb_common::Value::Int(i)) => Some(byoridb_common::Value::Int(-i)),
+                Some(byoridb_common::Value::Float(f)) => Some(byoridb_common::Value::Float(-f)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1584,7 +1593,7 @@ impl Executor {
     /// Execute FIND statement (path finding)
     pub(super) async fn execute_find(&self, plan: crate::plan::FindPlan) -> Result<ExecutorResult> {
         // Resolve parameters
-        let from_vid = match self.expr_to_value(&plan.from_vid) {
+        let from_vid = match Self::expr_to_value(&plan.from_vid) {
             Some(byoridb_common::Value::Int(i)) => i,
             _ => {
                 return Err(ExecutionError::InvalidOperation(
@@ -1593,7 +1602,7 @@ impl Executor {
             }
         };
 
-        let to_vid = match self.expr_to_value(&plan.to_vid) {
+        let to_vid = match Self::expr_to_value(&plan.to_vid) {
             Some(byoridb_common::Value::Int(i)) => i,
             _ => {
                 return Err(ExecutionError::InvalidOperation(
