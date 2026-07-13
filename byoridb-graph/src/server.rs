@@ -255,7 +255,9 @@ async fn delete_session(
     // A session can only sign out itself via this endpoint.
     state.service.sign_out(id, id).await;
     info!("Session deleted: {}", id);
-    Ok(Json(serde_json::json!({"session_id": id, "deleted": true})))
+    Ok(Json(
+        serde_json::json!({"session_id": id.to_string(), "deleted": true}),
+    ))
 }
 
 /// Maximum query string length accepted by the HTTP API (1 MiB).
@@ -479,14 +481,49 @@ struct CreateSessionRequest {
     password: String,
 }
 
+/// Serialize an i64 session id as a decimal **string**, and accept it as either
+/// a string or a JSON number on input. Session ids are random 63-bit integers,
+/// ~99.4% of which are not exactly representable by a JavaScript `Number`
+/// (IEEE-754 double). Emitting a number let browser/Electron/Tauri clients round
+/// the id on `JSON.parse`, so their very next request failed with SESSION_EXPIRED.
+mod id_str {
+    use serde::{de, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(id: &i64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&id.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+        struct V;
+        impl de::Visitor<'_> for V {
+            type Value = i64;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a session id as a decimal string or integer")
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<i64, E> {
+                Ok(v)
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<i64, E> {
+                Ok(v as i64)
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<i64, E> {
+                v.trim().parse().map_err(de::Error::custom)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 #[derive(serde::Serialize)]
 struct SessionResponse {
+    #[serde(serialize_with = "id_str::serialize")]
     session_id: i64,
     time_zone: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct QueryRequest {
+    #[serde(deserialize_with = "id_str::deserialize")]
     session_id: i64,
     query: String,
 }
@@ -508,6 +545,34 @@ struct ErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::truncate_query;
+    use super::{QueryRequest, SessionResponse};
+
+    #[test]
+    fn session_id_is_json_string_and_accepts_string_or_number() {
+        // A 63-bit id that a JavaScript Number cannot represent exactly.
+        let big = 9_223_372_036_854_775_806_i64;
+
+        // Response must emit the id as a JSON *string* (JS-safe).
+        let resp = SessionResponse {
+            session_id: big,
+            time_zone: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            json.contains(&format!("\"session_id\":\"{big}\"")),
+            "session_id must serialize as a string, got: {json}"
+        );
+
+        // Request accepts the id as a string (what a JS client round-trips)…
+        let from_str: QueryRequest =
+            serde_json::from_str(&format!(r#"{{"session_id":"{big}","query":"Q"}}"#)).unwrap();
+        assert_eq!(from_str.session_id, big);
+
+        // …and still as a number (back-compat with existing clients).
+        let from_num: QueryRequest =
+            serde_json::from_str(r#"{"session_id":123,"query":"Q"}"#).unwrap();
+        assert_eq!(from_num.session_id, 123);
+    }
 
     #[test]
     fn truncate_query_short_is_unchanged() {
