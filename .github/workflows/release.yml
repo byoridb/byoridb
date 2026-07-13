@@ -121,6 +121,5 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/**/*.tar.gz
-            installer/install.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -147,7 +147,7 @@ mod tests {
         // All partitions should be in valid range [1, partition_num]
         for vid in 0..1000 {
             let part = compute_partition(vid, 10);
-            assert!(part >= 1 && part <= 10, "Partition {} out of range", part);
+            assert!((1..=10).contains(&part), "Partition {} out of range", part);
         }
     }
 

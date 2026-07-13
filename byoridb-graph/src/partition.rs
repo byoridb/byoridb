@@ -198,7 +198,7 @@ mod tests {
         // Test partition is within range [1, partition_num]
         for vid in 0..1000 {
             let part = PartitionRouter::hash_to_partition(vid, 10);
-            assert!(part >= 1 && part <= 10);
+            assert!((1..=10).contains(&part));
         }
     }
 
@@ -214,18 +214,18 @@ mod tests {
         }
 
         // Each partition should have roughly 1000 VIDs (±30%)
-        for i in 1..=partition_num as usize {
+        for (i, count) in counts
+            .iter()
+            .enumerate()
+            .take(partition_num as usize + 1)
+            .skip(1)
+        {
+            assert!(*count > 700, "Partition {} has too few items: {}", i, count);
             assert!(
-                counts[i] > 700,
-                "Partition {} has too few items: {}",
-                i,
-                counts[i]
-            );
-            assert!(
-                counts[i] < 1300,
+                *count < 1300,
                 "Partition {} has too many items: {}",
                 i,
-                counts[i]
+                count
             );
         }
     }
@@ -241,7 +241,7 @@ mod tests {
 
         // Partitions should be in range [1, 3]
         for &part_id in result.keys() {
-            assert!(part_id >= 1 && part_id <= 3);
+            assert!((1..=3).contains(&part_id));
         }
     }
 

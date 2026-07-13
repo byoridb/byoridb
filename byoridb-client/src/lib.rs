@@ -104,7 +104,9 @@ impl Client {
         if let Some(result) = response.result {
             Ok(format_dataset(&result))
         } else {
-            String::from_utf8(response.data)
+            #[allow(deprecated)]
+            let legacy_data = response.data;
+            String::from_utf8(legacy_data)
                 .map_err(|_| anyhow!("Failed to parse response data as utf8"))
         }
     }

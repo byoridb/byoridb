@@ -336,7 +336,7 @@ mod tests {
         // Partition should be in range [1, partition_num]
         for vid in 0..1000 {
             let part = PartitionManager::compute_part_id(vid, 10);
-            assert!(part >= 1 && part <= 10);
+            assert!((1..=10).contains(&part));
         }
     }
 }

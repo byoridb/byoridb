@@ -1,13 +1,20 @@
 # ByoriDB 플랜
 
-마지막 업데이트: 2026-07-01 (**O-12 shape validation(constraint hooks, SHACL식) 구현·배포 완료**
-— PR#18 main 머지 → AKS 자동배포 **sha-58093ca**. required/datatype/value-predicate 제약을
-CREATE SHAPE로 선언, write-time 거부 + CHECK SHAPE 탐지 양경로. 경계 섹션 🟦 "constraint hooks +
-shape validation" primitive 충족. 상세는 O-12 섹션. 함께 배포: README/book/Cargo.toml 의 "분산
-그래프 DB" 단정 표현 정정(다중 노드 배포는 로드맵) + 버전 표기 정정(프로덕션은 semver 릴리스가
-아니라 커밋 SHA 태그 `sha-<short>` 로 연속 배포 — Cargo 0.2.4 / 최신 태그 v0.2.1). 프로덕션 스모크
-미착수. 참고: PR#13~#17(O-11 property chain, COUNT 스트리밍, G-11 ①② max_memory_mb)도 각 main 머지
-시 자동배포됨.
+마지막 업데이트: 2026-07-10 (**T-1~T-4 main 병합, AKS 현재 장애/rollout 대기**
+— PR#22가 `origin/main`의 `025ecc8`로 병합됐고 PR 품질 게이트(Check/Format/Clippy/Test/
+Build Release)는 모두 통과했다. 별도 redb `HISTORY_TABLE`에 vertex/edge 변경 이력을 append하고
+현재 뷰는 기존 `KV_TABLE`에 유지한다. 사용자 표면은 vertex `FETCH ... AS OF <epoch-ms>`까지이며,
+v1은 valid time과 transaction time을 같은 현재 시각으로 기록한다. 명시적 `VALID FROM/TO`,
+temporal MATCH/GO, edge AS OF, BETWEEN은 v2다. 22:03 KST 기준 AKS는 public/headless
+endpoint가 비어 있고 pod `Ready 0/1`, restart 44회다. pod는 기존 `sha-d5ff4e6`에서 redb open
+단계에 머물다 약 65분 후 startup probe로 exit 137 재시작하며, StatefulSet spec만
+`sha-025ecc8`로 바뀐 채 Build & Deploy run #29093255676이 rollout 대기 중이다.
+운영 변경은 수행하지 않았고 T v1 HTTP 스모크도 미착수다.
+로컬 작업트리의 workspace CI 승격/Clippy 정리는 아직 미커밋이며 `origin/main`에는 없다.
+현재 로컬 검증은 fmt/check/clippy와 전체 직렬 테스트(809 passed / 0 failed / 9 ignored),
+분산 E2E(18/18)가 통과했다. 이전 2026-07-06: **O-12/O-13/G-11 AKS HTTP 프로덕션
+스모크 완료**(`sha-0bcab1c`, health/ready OK, pod restart=0). 프로덕션은 semver 릴리스가
+아니라 커밋 SHA 태그 `sha-<short>`로 연속 배포한다(Cargo 0.2.4 / 최신 태그 v0.2.1).
 이전: 방향성 재정의 — **core vs Studio 책임 경계** 확정.
 ByoriDB core = 추론 능력을 가진 semantic graph DB core(Palantir clone 아님),
 Studio = Ontology Workbench + Operational Modeling UX. core 로드맵은 Studio가
@@ -16,8 +23,8 @@ constraint hooks·shape validation)로 역산. datasource mapping/action/writeba
 선 위(Studio)로 이관. 상세는 "프로젝트 방향 > core vs Studio 책임 경계" 섹션.
 또한 Studio-요구 primitive 착수 — **O-10 provenance + explanation(`WHY`) + DRed
 incremental retraction 배포·스모크 완료**(PR#12 sha-413d401). **O-11 property chain
-(prp-spo2) 2-link 구현 완료**(미배포). compound `USE` space 버그도 PR#11(d9d7a6f) 배포.
-상세는 O-10/O-11 섹션.
+(prp-spo2) 2-link 구현·배포 완료**(PR#13 sha-6c3387a). compound `USE` space 버그도
+PR#11(d9d7a6f) 배포. 상세는 O-10/O-11 섹션.
 이전: 온톨로지 핵심 O-1~O-9 + 유사도 추천 R-1~R-3b 구현·배포 완료(sha-1994c43).)
 
 이전의 `ROADMAP.md` / `docs/NEXT_STEPS.md` / `docs/MOCK_REMEDIATION_PLAN.md` /
@@ -28,26 +35,28 @@ incremental retraction 배포·스모크 완료**(PR#12 sha-413d401). **O-11 pro
 
 ## 프로젝트 방향 (2026-05-29 확정)
 
-**ByoriDB의 목표는 property graph DB가 아니라 온톨로지 DB다.**
+**ByoriDB의 목표는 property graph에 머무르지 않고 온톨로지·시간·근거를 네이티브로
+제공하는 semantic graph DB core가 되는 것이다.**
 
 - **코어 모델**: 기존 property graph 코어(KV+Raft+그래프 엔진)를 **유지**하고,
   그 위에 **시맨틱 레이어**(클래스 계층 + 추론 + 시맨틱 관계)를 얹는다.
   RDF triple store로 전면 재설계하지 않는다 — 기존 자산을 재활용하는 점진적 경로.
   (참조 제품: Stardog, Neo4j+n10s, GraphDB)
-- **추론(inference) 전략**: **미정 — 리서치 필요.** 쿼리타임 추론 vs
-  materialization(사전 추론) vs 하이브리드 중 결정해야 함. 이것이 온톨로지 DB
-  성능의 핵심 갈림길. O-0 참조.
+- **추론(inference) 전략**: O-0 리서치 결과 **OWL 2 RL/RDFS-Plus forward-chaining
+  materialization 우선**으로 확정했다. 쿼리타임 backward chaining이 아니라 쓰기 시
+  도출 사실을 저장하며, 삭제는 provenance 기반 DRed(O-10)를 사용한다.
 - **경쟁 상대 재정의**: NebulaGraph(property graph)는 **올바른 벤치 대상이 아니다.**
   진짜 비교군은 추론 엔진을 가진 triple store(Stardog, GraphDB/Ontotext,
   Apache Jena, Virtuoso). 단, property graph 성능 자체(MATCH/GO)는 온톨로지
   추론의 하부 연산이므로 NebulaGraph 대비 개선은 계속 유효하다.
 
-**진척 (2026-06-17 갱신):** 온톨로지 핵심이 구현·배포 완료됐다 — 클래스 계층(O-3),
+**진척 (2026-07-10 갱신):** 온톨로지 핵심이 구현·배포 완료됐다 — 클래스 계층(O-3),
 시맨틱 관계 타입(O-4), 추론 엔진(O-5: edge materialization + domain/range vertex
-타입 추론), 일관성 검사(O-6: disjoint), 시맨틱 쿼리(O-7: `is_a`). 별도 차별화
-트랙으로 유사도 추천(R-1~R-3b: 구조/임베딩 flat·HNSW/하이브리드)도 완료. 남은
-온톨로지 작업은 고급 추론(`sameAs` 동치, 삭제 retraction=B/F, 분산 materialization)
-뿐 — 각각 난이도·리스크 최상이라 별도 결정 필요. 상세·미착수는 **O/R 섹션** 참조.
+타입 추론), 일관성 검사(O-6: disjoint), 시맨틱 쿼리(O-7: `is_a`), sameAs(O-8),
+provenance/WHY/DRed(O-10), property chain(O-11), shape/O-13 동치 규칙까지 포함한다.
+유사도 추천 R-1~R-3b(구조/임베딩 flat·HNSW/하이브리드)도 완료했다. 남은 큰 축은
+분산 materialization, functional/inverse-functional property, vtype WHY, n-link chain,
+edge cardinality/closed-world 제약이다. 상세는 **O/R 섹션** 참조.
 
 ### core vs Studio 책임 경계 (2026-06-30 확정 — 방향성 재정의)
 
@@ -88,25 +97,54 @@ change-feed / constraint hooks / shape validation 이 운영 레이어를 떠받
 
 ## 현재 상태
 
-ByoriDB는 단일 노드와 분산 클러스터 모두에서 동작한다. 운영 배포 로드맵
-Phase 1–10이 모두 완료되었고, mock/hardcoded 청산(PR 1–10) 및 그래프 알고리즘
-최적화(Phase 0–7)도 종결되었다.
+ByoriDB의 운영 토폴로지는 단일 노드이며, **2026-07-10 22:03 KST 현재 AKS endpoint가
+없는 장애 상태**다(G-11 현재 인시던트 참조). Raft/파티셔닝/분산 조회 구성 요소는
+라이브러리와 테스트 수준으로 존재한다. 다중 노드 운영 배포는 `byoridb-server`
+launcher와 K8s/compose wiring이 아직 남아 있어 G-2 후속으로 관리한다. 과거 운영 배포
+로드맵 Phase 1–10이 모두 완료되었고, mock/hardcoded 청산(PR 1–10) 및 그래프
+알고리즘 최적화(Phase 0–7)도 종결되었다.
 
 **검증된 기능**
 
-- 단일 노드: WAL, graceful shutdown, 인증(root/role-based), WHERE 절,
+- 단일 노드: redb ACID(`Durability::Immediate` 기본), graceful shutdown,
+  인증(root/role-based), WHERE 절,
   edge CRUD, Prometheus 메트릭, 구조화 JSON 로그
-- 분산: Raft 합의(커스텀 구현, openraft 호환성 이슈 우회), Consistent Hash Ring,
-  Replica Factor, 자동 failover, FailureDetector, 파티션 재분배, 핫스팟 감지
+- 분산 구성 요소: Raft 합의(커스텀 구현, openraft 호환성 이슈 우회),
+  Consistent Hash Ring, Replica Factor, FailureDetector, 파티션 재분배, 핫스팟 감지
+  구현/테스트 보유. 운영용 다중 노드 launcher는 G-2 후속.
 - 쿼리: nGQL DDL/DML/DQL, MATCH 패턴(다중 hop 노드 필터), FIND PATH
   (unweighted BFS + weighted Dijkstra), GO multi-step, LOOKUP, 인덱스
   (tag/edge, multi-field, prefix-cover 매처), 분산 LOOKUP, 분산 GO
   (source-VID targeted RPC, O(degree)), compound statement
   (`$var = stmt; stmt2`)
+- 시간축 v1: asserted vertex/edge 변경 이력을 별도 `HISTORY_TABLE`에 append하고,
+  vertex `FETCH PROP ON <tag> <vid> AS OF <epoch-ms>` 시점 읽기를 제공. 현재 뷰와
+  추론 materialization은 기존 경로를 유지하며 과거 파생 사실 조회는 지원하지 않음.
 - 운영: 백업/복구(`byoridb-backup`), 부하 테스트(`load_test` — 31K QPS @ 50동시,
-  12.5K QPS @ 100동시, 0% 에러), 장애 복구(WAL 재생 15초 이내)
+  12.5K QPS @ 100동시, 0% 에러), redb immediate durability와 graceful checkpoint
 
-**워크스페이스 테스트**: 519개 통과(2026-05-13 기준).
+**검증 상태(2026-07-10, 로컬 `feat/temporal-storage` 작업트리)**:
+`cargo fmt --all -- --check`, `cargo check --workspace --all-targets --all-features`,
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+`cargo test --workspace --all-features -- --test-threads=1` 통과. 테스트 결과는
+809 passed / 0 failed / 9 ignored. `tests/distributed_e2e_test.rs`도 18/18 통과.
+`cargo build --workspace --release`의 마지막 확인은 2026-07-02이며, PR#22의 GitHub
+Build Release 게이트는 2026-07-10 통과했다.
+
+**운영 스모크(2026-07-06, AKS `sha-0bcab1c`)**:
+HTTP `/health`=`OK`, `/ready`=`READY`. 일회용 space `smoke_20260706183325`에서
+O-12 shape validation(required/predicate 거부, `CHECK SHAPE` 0 rows), O-13
+equivalentClass(`employee` ↔ `human` `is_a`)와 equivalentProperty(`likes` ↔ `enjoys`
+양방향 materialization)를 확인했다. G-11은 StatefulSet image `sha-0bcab1c`,
+`BYORIDB_MAX_MEMORY_MB=8192`, `BYORIDB_CACHE_SIZE_MB=32768`, pod restart 0, Ready=true를
+확인했다. 해당 smoke space는 종료 시 `DROP SPACE IF EXISTS`로 정리했다.
+
+**현재 운영 장애(2026-07-10 22:03 KST)**: `byoridb-public`/`byoridb-headless` endpoint가
+없고 `byoridb-server-0`은 `Ready 0/1`, restart 44회다. 현재/이전 컨테이너 로그가 모두
+`Opening redb KVStore at "/app/data"`에서 멈추며, 직전 실행은 약 65분 후 startup probe로
+exit 137 종료됐다. StatefulSet desired image는 `sha-025ecc8`지만 pod는 `sha-d5ff4e6`이고,
+GitHub Build & Deploy run #29093255676은 `Deploy to AKS` 단계에서 rollout 대기 중이다.
+pod 삭제/rollout restart 등 상태 변경은 수행하지 않았다.
 
 **벤치 기반선** (`byoridb-executor/benches/graph_traversal.rs`, criterion full sample):
 
@@ -121,16 +159,33 @@ Phase 1–10이 모두 완료되었고, mock/hardcoded 청산(PR 1–10) 및 그
 
 ## 알려진 제약
 
+- **Temporal v1은 실험 단계**: main에 병합됐지만 프로덕션 스모크 전이다. 공개 표면은
+  vertex `FETCH ... AS OF`만 지원하고, current/history dual-write가 비원자적이며 같은
+  millisecond 이력 키 충돌과 O(versions/entity) 조회 비용이 있다. 상세는 T 섹션.
 - **Geography 디코딩**: 인코딩만 구현. WKB/WKT 파싱은 미구현(`byoridb-codec/src/row.rs`). 외부 요구 발생 시 진행.
 - **모니터링 대시보드**: Prometheus 메트릭은 `/metrics`로 노출되지만 Grafana 템플릿/알람 규칙이 없음.
 - **로그 수집 파이프라인**: JSON 로그는 출력되지만 Filebeat/Fluentd 같은 중앙 집중 파이프라인 연동 설정이 없음.
 - **트랜잭션**: 분산 그래프 DB의 2PC 비용이 크다고 판단해 의도적으로 미지원.
 - **MATCH pattern reorder**: 가장 selective한 노드부터 시작하도록 자동 reorder가 없음.
 - **label-only MATCH tag-vid 인덱스** ✅ 적용 완료 (2026-05-29): INSERT VERTEX 시 `{space}:tagvid:{tag_name}:{vid}` 보조 인덱스 작성. label-only MATCH 패턴 (`MATCH (p:product)`) 에서 전체 vertex 스캔 대신 tag-vid prefix scan 사용. 기존 데이터(인덱스 기록 전 삽입)는 빈 scan → 풀스캔 폴백 보장. NebulaGraph 벤치마크 대비 MATCH 157배 지연 원인이었음.
-- **`byoridb-server` bin standalone 한계**: `src/main.rs`/`src/config.rs`가 Storage+Graph+HTTP를 같은 프로세스로 standalone 실행만 노출. 분산 클러스터(Raft/peer/cluster ID) 설정을 binary 레벨에서 받지 않음. 라이브러리에는 Raft 합의 구현이 있고 PLAN.md 검증된 기능에도 분산이 포함되어 있으나, `byoridb-server`를 그대로 multi-replica로 배포하면 실제로는 독립된 N개 단일 노드가 됨(docker-compose.yml의 3 컨테이너도 마찬가지). 분산 배포가 필요하면 G-2 작업 선결 필요.
-- **빌드 환경 MSRV**: `base64ct 1.8.3`(transitive)이 Rust edition2024를 요구해 Rust ≥ 1.85 필요. Dockerfile은 2026-05-13에 `1.80 → 1.86`으로 갱신됨. MSRV가 어디에도 명시되어 있지 않아 CI/Docker 환경 드리프트 시 다시 깨질 수 있음.
+- **`byoridb-server` 분산 launcher 부분 구현**: `src/config.rs`에
+  `BYORIDB__CLUSTER__NODE_ID/PEERS/BOOTSTRAP/META_ADDR/ADVERTISE_ADDR`가 있고,
+  `src/main.rs`는 `cluster.peers`가 있으면 Meta gRPC 서버를 시작한다. 하지만
+  Storage/Raft peer bootstrap, compose/K8s env wiring, 다중 노드 E2E까지 아직 닫히지
+  않았다. 현재 `docker-compose.yml`의 3개 컨테이너도 cluster env가 없어 독립 단일
+  노드 3개로 동작한다. 운영용 진짜 분산 배포는 G-2 완료 전까지 불가.
+- **빌드 환경 MSRV**: Rust 1.90을 `rust-toolchain.toml`과 Dockerfile
+  `rust:1.90-slim-bookworm`에 고정. redb 전환으로 RocksDB C++ 빌드 의존은 사라졌고,
+  gRPC codegen용 `protobuf-compiler`와 일부 native crate용 기본 빌드 툴만 필요하다.
+- **workspace dependency 규율 부채** (감사 2026-07-10): member `Cargo.toml`에
+  root `[workspace.dependencies]`를 우회한 직접 버전 지정이 28개 남아 있다. 신규 의존성은
+  이 패턴을 늘리지 말고, 기존 항목 정리는 별도 manifest-only 변경으로 진행한다.
 - **nGQL 문자열 escape** ✅ 해소 (2026-06-22): lexer 정규식 `"[^"]*"`/`'[^']*'`가 escape·내부 따옴표·백슬래시를 못 받아, 값에 `"`나 `\`가 있으면 토큰이 끊겨 "Unexpected end of input"으로 실패했음(예: `Chef's`는 OK지만 `6\" pan`, `C:\dir`은 깨짐). `"([^"\\]|\\.)*"`로 확장 + `parser::unquote`가 `\"`/`\\`/`\n`/`\t` 등 해석(흩어진 5개 호출처 통합). **nexprice 도그푸딩으로 발견** — LDBC(INT64·따옴표 없는 VID)만 검증해 와 드러나지 않았던 갭.
 - **INSERT 실행기 문자열 VID 미지원** (미해결): `CREATE SPACE ... vid_type=FIXED_STRING`은 파서·메타가 받지만, `plan.rs`가 INSERT VERTEX/EDGE의 VID를 `Literal::Int`(i64)로 강제(`"Vertex ID must be an integer literal"`)해 문자열 VID 스페이스엔 한 건도 못 넣는다. 우회: 애플리케이션이 문자열 id를 결정적 해시(blake2b 63bit 양수) INT64로 매핑하고 원본 id는 속성으로 보존. 근본 수정은 VID 타입(i64|String) 전파 필요(plan/executor/codec/key 전반, blast radius 큼). nexprice 도그푸딩으로 발견.
+- **MATCH edge accessor projection 제한** (관찰 2026-07-06): `MATCH (a)-[e:edge]->(b) RETURN src(e), dst(e)`가
+  row는 반환하지만 `src(e)`/`dst(e)` 값은 null로 평가된다. `MATCH ... RETURN id(a), id(b)`는 정상이고,
+  GO/FETCH 계열 edge accessor 회귀와는 별개다. nGQL 호환성을 넓힐 때 `MATCH` projection의 edge
+  variable accessor를 별도 후속으로 처리.
 - **쿼리 정확성 4건** ✅ 수정 (2026-06-23, 커밋 d2dfd62): cah 스페이스 도그푸딩으로 발견. (A) `MATCH (n:tag) WHERE id(n)==X`가 id 바인딩 fast path(`match_executor.rs` start_vid_override)에서 라벨 필터를 건너뛰어 X가 다른 tag여도 매칭 → `matches_node` 검증 추가. (B) `FETCH PROP ON <tag> <vid>`가 tag 멤버십 미검증으로 다른 tag만 가진 정점 blob 반환 → `plan.tags` 필터(local+distributed). (C) `GO ... OVER * YIELD type(edge)/dst(edge)/src(edge)/edge`가 전부 null(`eval_go_yield_expr`가 `edge` 식별자·`FunctionCall` 미처리) → accessor 추가. (#2) `RETURN expr, COUNT(*)`가 암묵 GROUP BY 미지원으로 전체 1행 뭉침 → 집계 시 비집계 RETURN 컬럼으로 암묵 그룹화(명시 `GROUP BY`는 원래 정상). 회귀 `executor/dogfood_regression.rs` 4건. 버그 A/B가 데이터 모델 디버깅(has_brand src가 product가 아니라 sku)을 방해했었음.
 
 ---
@@ -140,7 +195,8 @@ Phase 1–10이 모두 완료되었고, mock/hardcoded 청산(PR 1–10) 및 그
 ### O. 온톨로지 DB 레이어 (P0 — 프로젝트 핵심 방향, 2026-05-29 신설)
 
 property graph 코어 위에 시맨틱 레이어를 얹어 온톨로지 DB로 만든다.
-**현재 구현 0%.** 의존성 순서대로 정렬(아래로 갈수록 위 항목에 의존).
+O-1~O-13까지 핵심 primitive 대부분이 구현·배포되었다. 남은 항목은 각 섹션의
+`미착수/후속` 라벨을 따른다. 의존성 순서대로 정렬(아래로 갈수록 위 항목에 의존).
 
 **O-0 [선결, 리서치] 추론 전략 결정** ✅ 리서치 완료 (2026-05-29, deep-research)
 
@@ -288,10 +344,11 @@ edge-type에 시맨틱 관계를 1급 메타데이터로: `CREATE EDGE <e>(...) 
 JSON(`space:{space}:edge:{name}` → `"semantics": {...}`)에 저장. AST `SemanticFlags`,
 신규 토큰 TRANSITIVE/SYMMETRIC/INVERSE/SUBPROPERTY(+OF 재사용). CREATE 시 INVERSE
 OF/SUBPROPERTY OF 대상 edge 존재 검증 + 자기참조 거부. `subClassOf`는 O-3에서
-이미 제공. `domain`/`range`(vertex 타이핑)·`sameAs`는 후속(ABox 타입 모델/최난도).
+이미 제공. `domain`/`range` vertex 타이핑은 O-5 phase 2, `sameAs`는 O-8에서 완료.
 회귀: 파서 1(DDL 시맨틱 파싱) + 실행기 검증.
 
-**O-5 [P1] 추론 엔진 (O-0 결정 반영)** 🟡 phase 1 (edge-level, insertion-only) 완료 (2026-06-17)
+**O-5 [P1] 추론 엔진 (O-0 결정 반영)** ✅ edge/vtype materialization 완료 (2026-06-17;
+삭제 증분은 O-10에서 완료)
 O-0 결정대로 **RDFS-Plus forward-chaining materialization**. 신규 `executor/
 inference.rs`. INSERT EDGE가 커밋 후 entailed edge를 **fixpoint(worklist)까지** 도출해
 같은 `{space}:edge:`/`in-edge:` 키스페이스에 `__inferred__` 마킹·ranking 0으로 저장
@@ -300,9 +357,10 @@ inference.rs`. INSERT EDGE가 커밋 후 entailed edge를 **fixpoint(worklist)�
   cascading 완전 폐포(예: subPropertyOf→transitive 초프로퍼티). `RelMeta` 인덱스
   로드 + 증분 worklist(seeds=삽입 triple, 기존 그래프와 결합). `max_traversal_nodes`
   write 캡(pathological closure 가드, warn).
-- **scope**: **insertion-only**(삭제 retraction은 후속 B/F 알고리즘). 시맨틱은
-  INSERT 전에 선언(`CREATE EDGE ... TRANSITIVE` → `INSERT`). 기존 데이터에 시맨틱
-  후행 추가 시 재-materialization 필요(미구현, O-1 백필 caveat과 동일 성격).
+- **초기 scope**: phase 1은 insertion-only였으나 DELETE EDGE 증분 retraction은 O-10
+  provenance 기반 DRed로 완료했다. DELETE VERTEX는 O-9 full re-materialization을 유지한다.
+  시맨틱은 INSERT 전에 선언해야 하며 기존 데이터에 후행 선언한 규칙의 재-materialization은
+  여전히 미구현이다.
 
 **O-5 phase 2: domain/range → vertex 타입 추론 ✅ 구현 완료 (2026-06-17)**
 `CREATE EDGE <e>(...) [DOMAIN <class>] [RANGE <class>]`. `(a)-p->(b)`에서 p domain
@@ -313,7 +371,8 @@ DOMAIN/RANGE(RANGE는 PARTITION BY RANGE와 공존 — 파서 양쪽 처리). ma
 worklist가 처리하는 매 triple(asserted+inferred edge)에 domain/range 적용 → 추론
 edge에도 타입 전파. CREATE 시 domain/range 대상 class(tag/class) 존재 검증.
 회귀: domain/range 타입 추론(서브클래스 조상 + MATCH is_a 가시) + 검증 + 파서.
-- **미착수(후속)**: `sameAs`(최난도), 삭제 증분(B/F), 분산 materialization(먼 마일스톤).
+- **후속**: 분산 materialization(먼 마일스톤), 시맨틱 규칙 후행 선언 데이터의 재-materialization.
+  `sameAs`는 O-8, 삭제 증분은 O-10에서 완료했다.
 - 회귀 누적: 규칙(symmetric/inverseOf 양방향/subPropertyOf/transitive/cascading/
   no-semantics/순회 가시성) + domain/range + MATCH is_a.
 - **후속 최적화(리뷰 F-001, 비차단)**: 시맨틱 미선언 space도 INSERT EDGE마다
@@ -396,7 +455,8 @@ sameas 유닛 6(대표선출/out·in-edge rewrite·역인덱스/속성충돌/ide
   이미 대표로 collapse하므로 후보·결과 정규화는 불필요(자동). 유사도로 후보를 *발견*→
   sameAs로 *단언*하는 entity resolution 루프의 역방향 완성. 회귀: recommend 유닛 1
   (merged-away 시드가 대표 임베딩으로 추천).
-- **후속**: 삭제 retraction → **O-9에서 1단계 완료**, 분산 materialization(G-2 선결).
+- **후속**: DELETE EDGE 추론 retraction은 O-10 DRed까지 완료. DELETE VERTEX는 O-9
+  full re-materialization을 유지하며, 분산 materialization은 G-2 선결.
 
 **O-9 [P1] 삭제 retraction (full re-materialization)** ✅ 구현·검증·배포 완료 (2026-06-22,
 AKS sha-1994c43)
@@ -416,14 +476,15 @@ O-0이 정한 **"1단계 full re-materialization → 2단계 B/F, DRed 회피"**
   (DRed 회피 이점). 다른 경로로도 도출되는 inferred(또는 asserted 중복)는 재도출되어 유지.
 - **D4. sameAs 상호작용 없음.** asserted edge·vtype은 이미 대표로 rewrite돼 있어 재mat가
   대표 기준 재도출. sameAs 맵(`{space}:sameas:`)은 비가역이라 불변.
-- **D5. 비용 = O(graph)/delete** (시맨틱 space만). O-0 인정 1단계. B/F(2단계)는 후속.
+- **D5. 당시 비용 = O(graph)/delete** (시맨틱 space만). 이후 DELETE EDGE는 O-10
+  provenance 기반 DRed로 증분화했고 DELETE VERTEX만 full re-materialization을 유지한다.
 - 회귀(inference.rs 5): transitive/symmetric retract, 다른 경로 지원 시 보존,
   domain/range vtype retract, 시맨틱 미선언 no-op. executor lib 187 + integration 46 통과.
 - **프로덕션 스모크 ✅ (2026-06-22)**: AKS(`<AKS-LB-IP>`, sha-1994c43)에서 일회용
   space로 검증. `ancestor` TRANSITIVE에 `1->2`,`2->3` INSERT → `GO FROM 1`이 추론 `1->3`
   포함 {2,3} 반환. `DELETE EDGE 2->3` 후 `GO FROM 1`이 {2}만 반환(추론 `1->3` retract 확인,
   insertion-only였다면 잔존). HTTP API로 기대대로 통과.
-- **후속**: B/F 증분(O-0 2단계, deep-research 선행), DELETE VERTEX edge cascade(별개 이슈).
+- **후속**: DELETE VERTEX 증분 retraction/edge cascade. DELETE EDGE는 O-10 DRed 완료.
 
 **O-10 [P1] 추론 provenance + explanation + incremental retraction (Studio-요구 primitive)** ✅ Phase 1+2+3 구현·**배포·프로덕션 스모크 완료** (2026-06-30, PR#12 sha-413d401)
 
@@ -442,7 +503,7 @@ retraction ③ audit 토대를 동시에 마련.
   cycle/공유 지원은 1회만 표시, 미존재 edge는 "not found". lexer `WHY` 토큰 + AST/plan/RBAC(Read).
   회귀: parser 1 + executor 2.
 - **미착수**: vtype explanation 표면(현재 edge만; executor 로직은 `Fact::Vtype` 이미 처리),
-  provenance 값 컴팩트화(serde_json→bincode), reverse 인덱스(`prov-rev`, Phase 3용).
+  provenance 값 컴팩트화(serde_json→bincode). reverse 인덱스 `prov-rev`는 Phase 3에서 완료.
 - **Phase 3 — incremental retraction (DRed) ✅** (2026-06-30, 배포 완료): 사용자 결정 =
   **provenance 기반 DRed**(O-0의 B/F 대신 — Phase 1에서 bookkeeping=provenance를 이미
   만들었으므로 O-0이 DRed를 피한 이유가 사라짐). reverse provenance 인덱스(`prov-rev`:
@@ -462,7 +523,7 @@ retraction ③ audit 토대를 동시에 마련.
 `ExecutionContext.vars`를 `Arc<Mutex>`로 + `derive_with_space`, `execute_compound`가 USE 절에서
 컨텍스트 파생해 후속 절에 적용. 회귀 2건. 진단 플레이북은 메모리 참조.
 
-**O-11 [P1] property chain (owl:propertyChainAxiom, prp-spo2)** ✅ 2-link 구현 완료 (2026-06-30, 미배포)
+**O-11 [P1] property chain (owl:propertyChainAxiom, prp-spo2)** ✅ 2-link 구현·배포 완료 (2026-06-30, PR#13 sha-6c3387a)
 
 OWL 2 RL의 핵심 규칙이자 transitive의 일반화. `CREATE EDGE <q>() CHAIN <p1>, <p2>` →
 `(a)-p1->(x) ∧ (x)-p2->(b) ⟹ (a)-q->(b)` (예: `grandparent ← parent ∘ parent`,
@@ -506,10 +567,12 @@ O-6 disjoint 일관성 검사의 확장 — property 제약(required / datatype 
   (required/datatype/predicate write-time 거부 · CHECK 리포트 · subclass 상속 · UPDATE 전이 거부
   · no-op 무회귀 · DDL lifecycle · DROP SPACE cleanup). 워크스페이스 lib 전부 통과, fmt·clippy(변경
   크레이트) 클린.
+- **프로덕션 스모크 ✅ (2026-07-06, AKS sha-0bcab1c)**: HTTP 경로에서 일회용 space로
+  CREATE SHAPE, write-time required/predicate 거부, `CHECK SHAPE` clean 결과를 확인.
 - **미착수(후속)**: edge cardinality(관계 수 min/max — 순회 비용), closed-world(선언 외 property
-  금지 / SHACL sh:closed), 프로덕션 스모크(AKS HTTP), 분산 meta 연동(G-2 이후).
+  금지 / SHACL sh:closed), 분산 meta 연동(G-2 이후).
 
-**O-13 [P1] OWL 2 RL: equivalentClass + equivalentProperty ✅ 구현 완료 (2026-07-01, 미배포)**
+**O-13 [P1] OWL 2 RL: equivalentClass + equivalentProperty ✅ 구현·CI·자동배포 완료 (2026-07-01, PR#21 sha-0bcab1c)**
 
 O-11 property chain에 이은 OWL 2 RL 규칙 확장. 4규칙 중 **self-contained 2개**(기존 subClassOf/
 subPropertyOf 양방향)만 이번 MVP. functional/inverse-functional(sameAs 유도)은 Phase 2로 분리.
@@ -527,9 +590,12 @@ subPropertyOf 양방향)만 이번 MVP. functional/inverse-functional(sameAs 유
 - 신규 lexer 토큰 `EQUIVALENT`(`TO` 재사용). CREATE CLASS 절 순서: SUBCLASS OF → EQUIVALENT TO → DISJOINT
   WITH. 회귀: 파서 2 + 실행기 4(equivalentClass is_a 대칭·검증, equivalentProperty materialization 양방향·
   DRed retraction). executor 224 + parser 117 통과, fmt·clippy 클린.
+- **프로덕션 스모크 ✅ (2026-07-06, AKS sha-0bcab1c)**: HTTP 경로에서 equivalentClass
+  `employee` ↔ `human` `is_a` 대칭과 equivalentProperty `likes` ↔ `enjoys` 양방향
+  materialization을 확인. `MATCH` edge projection은 `src(e)/dst(e)` 대신 `id(a)/id(b)`로 검증했다.
 - **미착수(Phase 2)**: functional / inverse-functional property — materialization 도중 sameAs를 유도해 O-8
   canonical merge를 재진입 호출해야 함(D10 "merge 먼저→materialize" 순서와 얽힘). entity resolution 자동화
-  (IFP email→동일 상품 병합)라 가치 크나 복잡. 배포·프로덕션 스모크도 후속.
+  (IFP email→동일 상품 병합)라 가치 크나 복잡.
 
 ### R. 유사도 / 추천 (P1 — 차별화 기능, 2026-06-15 신설)
 
@@ -555,9 +621,10 @@ A=B를 *단언*하는 대신, 가까운 후보를 *발견*한다. 실질적으�
 - **caveat**: 후보 생성이 역방향 인덱스 의존 → O-1 이전 로드된 space는 재로드
   필요(reverse GO/BIDIRECT와 동일). 원시 텍스트 차이(제목 표기 차이)는 못 잡음
   → 공유 속성 노드로 정규화돼 있어야 동작. 그래서 R-2 필요.
-- 미착수: 배포·프로덕션 스모크, 분산 meta 연동(G-2 이후).
+- 배포는 `sha-1994c43`에 포함. R-1 전용 프로덕션 기능 스모크 기록은 없고,
+  분산 meta 연동은 G-2 이후다.
 
-**R-2 [P1] 벡터 임베딩 유사도 (ANN)** 🟡 R-2a 구현 완료 (2026-06-16), R-2b 미착수
+**R-2 [P1] 벡터 임베딩 유사도 (ANN)** ✅ R-2a flat + R-2b HNSW 완료 (2026-06-17)
 정점에 임베딩 벡터 속성 저장 + 코사인/L2 최근접 이웃 검색. 채널마다 제목이
 달라도 의미가 가까우면 매칭 → 사용자 핵심 use case 해결. **R-1(구조적)이 못 잡는
 원시 텍스트 차이를 푸는 단계.**
@@ -670,7 +737,7 @@ landmine 없음). R-2b는 `instant-distance`(더 가벼움, serde 영속화) 우
 - **D7. R-3 연계.** WHERE 절로 그래프/온톨로지 제약(다른 채널, O-3 같은 클래스)
   → ANN 후보 + 그래프 필터 = 하이브리드(R-3).
 
-**R-3 [P1] 하이브리드 온톨로지 인지 추천** 🟡 R-3a 구현 완료 (2026-06-16)
+**R-3 [P1] 하이브리드 온톨로지 인지 추천** ✅ R-3a + R-3b 완료 (2026-06-17)
 R-2 ANN으로 후보 → 그래프/온톨로지 제약으로 필터·재랭킹(다른 채널 한정, O-3
 클래스 계층상 같은 상위 카테고리, 공유 브랜드 노드 가산점). 순수 벡터DB·순수
 그래프DB가 못 하는 영역 = `owl:sameAs` 후보 발견. O-3·R-1·R-2 선결.
@@ -715,6 +782,95 @@ seed 필터 전부 호환. 회귀: 파서 2(blend 파싱·음수 거부) + 실�
   RDFS-Plus 추론 기반 필터는 **O-5(추론 엔진) 선결**. is_a(subclass)는 O-3로
   충분하나, 그 이상의 시맨틱 추론은 O-5 영역.
 
+### P. 병렬 쿼리 실행 (P2 — 성능, 수요 대기, 2026-07-09 신설)
+
+ClickHouse식 granule 병렬 스캔 + partial aggregation 병합을 그래프 스캔에 적용.
+스캔을 키 범위로 쪼개 여러 blocking 스레드에서 동시 조회 후 병합해 벽시계 시간을
+코어 수에 비례 단축. **동기**: 토큰화 텍스트 인덱스 롤백(`640102a`) 후 `CONTAINS`가
+인덱스 없이 단일 태스크 풀스캔 → nexprice(55M) 느림. 병렬 스캔이 역색인 없는 일반해.
+
+**가능 근거**: 모든 스캔이 redb `begin_read`+`table.range(prefix..)`+`spawn_blocking`
+위에서 동작(`store.rs`) → 임의 서브레인지 스캔 + MVCC 동시 read 스냅샷으로 fan-out 가능.
+현재 병목은 `while stream.next().await` 단일 태스크 순차 decode/필터(CPU 작업).
+
+**단계**:
+- **P-1 [P2] 병렬 필터 스캔** — `parallel_scan_filter` 추가, `CONTAINS`/`LOOKUP`/
+  label-scan 연결. 최대 ROI·최저 리스크. 결과 concat 병합.
+- **P-2 [P2] 병렬 집계** — COUNT 부분합(이미 `count_prefixes` 존재), GROUP BY
+  partial-hashmap merge, ORDER BY+LIMIT k-way merge.
+- **P-3 [P3] 경계 샘플링 + 옵티마이저 자동 선택** — 편중 데이터 균등 분할, 스캔 크기
+  보고 병렬/직렬·샤드 수 자동 결정.
+- **(보류) MATCH 순회 병렬화** — 경계 넘는 엣지 = 분산 그래프 과제. seed 스캔만 P-1 재사용.
+
+**주요 리스크**: 범위 균등 분할(redb는 중앙값 키를 싸게 안 줌 — 순차 vid 가정 시작),
+IO-bound 천장(cold cache 디스크 대역폭 상한), `max_memory_mb`(G-11) 피크 N배, fan-out
+캡(코어 수), 작은 스캔 역효과. **상세 설계·미결 결정(D1~D6)·검증 계획**은
+`aidlc-docs/construction/parallel-execution/design.md` (내부). 착수 전 D1~D6 확정 +
+`/cah:construction`. 운영 부하가 실제 병목으로 확인되면 P-1만 우선 승격.
+
+### T. bitemporal 시간축 (P2 — 제품 방향 핵심, 2026-07-10 신설)
+
+**확정 제품 방향**: ByoriDB = 추론(온톨로지)·시간(bitemporal)·근거(provenance)를 코어에
+네이티브로 갖춘 **범용 그래프 DB**. 지식/기억 시스템(AI 에이전트 메모리·회사 두뇌·지식그래프)이
+앱 레이어에서 재구현하는 것을 엔진에서 제공하는 **substrate** 지향. Graphiti/Zep이 Neo4j 위에
+bitemporal을 억지로 얹는 것을 네이티브로 제공하는 게 목표. (GBrain은 마크다운+Postgres로 진짜
+추론/시간 아예 포기 — moat를 검색·MCP·배포에 둠. 범용 메모리 정면 경쟁은 비추.)
+
+각 TAG/엣지의 상태가 시간에 따라 어떻게 변했는지를 1급으로 다룬다. v1은 asserted
+vertex/edge 변경 이력을 저장하고 vertex point lookup의 시점 읽기까지 구현했다. 전체 그래프
+시점 질의와 사용자가 valid time을 지정하는 표면은 아직 없다.
+
+**확정 스코프**:
+- **bitemporal**: valid time(현실 유효기간) + transaction time(기록 시점) 둘 다 1급.
+- **단언 사실만 먼저**: 추론 materialization은 현재 단면(current view)만 유지. 파생사실 temporal
+  미룸(temporal datalog=연구 프론티어). 한계: 시맨틱+시간축 동시 space는 `AS OF 과거`가 과거 추론 못 봄.
+- **B(추론) 비접촉 원칙**: inference는 `space_has_semantics` opt-in(미선언 no-op). 시간축은 저장/write
+  레이어 + "current view" 추상으로 짓고 inference는 current view만 읽음. DELETE=구간닫기가 기존
+  retraction(O-9/O-10) 트리거(시맨틱 없으면 no-op).
+
+**D1 인코딩 확정 (2026-07-10, Graphiti+XTDB 정독)**: **interval-keyed append-only(XTDB 계열) +
+current/history 분리.** 기존 `{space}:vertex:{vid}`/edge 키가 그대로 **current view**(읽기 무회귀)이고,
+별도 `HISTORY_TABLE`의 키는 `entity_key || 0x00 || desc(valid_from) || desc(tx)`,
+값은 `valid_to || payload`다. AS-OF(V,T)는 valid/tx 조건을 만족하는 최신 버전을 고른다.
+DELETE는 빈 payload tombstone을 append하고 현재 키를 제거해 기존 retraction을 트리거한다.
+tx-version-chain(Datomic식)은 valid-time이 1급이 아니라 기각했다. TAG+edge 쓰기에 모두 적용된다.
+
+**프로토타입 실측 (2026-07-10, `byoridb-kvstore/examples/temporal_readbench.rs`)**: N=100k 정점 +
+이력 900k행(10x) 공존 시 **현재뷰 point-get p50 −1.2%(무회귀)** — D1 핵심 검증. AS-OF seek ~8µs(저렴),
+쓰기 +18%. **단 현재뷰 full prefix-scan +88% 회귀**(같은 B-tree 공존 캐시압박) → **D2 정제: 이력을 별도
+redb `HISTORY_TABLE`로 물리 분리**(current view는 기존 `KV_TABLE` 그대로).
+
+**D1~D7 결정과 v1 구현 범위**: valid_to 명시 저장, temporal 집계는 현재 카운트만,
+리텐션/GC 없이 full 보관, 시간은 i64 epoch millis다. KV API는 valid/tx 두 축을 분리하지만
+nGQL v1은 `FETCH ... AS OF <ts>` 하나를 두 축에 같이 적용하고, 쓰기도 valid=tx=now로 기록한다.
+명시적 `VALID FROM/TO`와 lazy migration 표면은 v2로 이월했다. 상세는
+`aidlc-docs/construction/temporal/design.md`.
+
+**미래 최적화(자리만)**: 숫자-핫 속성 valid-time 값축에 Gorilla 무손실 압축 opt-in. 정확/범주형·tx축엔
+부적합. 저장증가 측정 후에만. 구간(계단함수)이 이미 무손실 신호 뼈대 → 압축은 그 위.
+
+**상세 설계·결정(D1~D7)·검증 결과**는 `aidlc-docs/construction/temporal/design.md` (내부).
+
+**✅ v1 구현·main 병합 완료 (2026-07-10, PR#22 `025ecc8`; 프로덕션 스모크 대기):**
+- T-1: kvstore `HISTORY_TABLE` + `put_version`/`scan_history`/`get_as_of`/`batch_put_version`.
+- T-2/T-3/T-4: 쓰기경로(DML INSERT/UPDATE/DELETE VERTEX·EDGE가 current view + 이력 append,
+  DELETE=tombstone) / 읽기표면(vertex `FETCH … AS OF <ts>`) / parser·executor·kvstore 회귀.
+- current view(KV_TABLE) 무회귀, 이력 별도 테이블, 추론(B) 비접촉 유지.
+- **v2 남김**: `VALID FROM/TO`, `BETWEEN`, temporal MATCH/GO, edge AS OF 읽기,
+  이력 열람 API, 리텐션/GC, temporal 집계, 과거 파생 사실, 신호 압축.
+
+**v1 안정성 후속 (코드 감사 2026-07-10):**
+- **비원자적 dual-write**: current view 쓰기와 history append가 서로 다른 redb transaction이다.
+  중간 실패/크래시 시 현재값과 이력이 어긋날 수 있다.
+- **millisecond key 충돌**: history key가 `(entity_key, valid_from, tx)`이고 v1 DML은 두 시각을
+  같은 epoch millis로 쓰므로 동일 엔티티의 같은 millisecond 변경은 이력을 덮을 수 있다.
+- **AS OF 복잡도**: `get_as_of`가 `scan_history` 결과 전체를 `Vec`으로 만든 뒤 고르므로
+  O(versions/entity) 메모리·시간이다. 프로토타입의 ~8µs seek는 현재 executor 보장이 아니다.
+- **테스트 공백**: storage 계약과 parser/executor 단위 회귀는 있으나 public DML write hook부터
+  parse/plan/`FETCH AS OF`까지 잇는 end-to-end 테스트가 없다.
+- **v1.1 우선순위**: dual-write 원자성 → history key sequence → seek 기반 resolution →
+  end-to-end 회귀. 이 네 항목 뒤 기능 표면을 확장한다.
+
 ### S. 보안 강화 (P0, 즉시 — 2026-05-13 심층 분석 결과)
 
 2026-05-13 코드 심층 분석에서 발견된 이슈. Critical/High 우선 순서로 진행.
@@ -750,9 +906,9 @@ nullable 필드 0개 스키마에서 서버 crash.
 타인 세션 강제 종료 가능(DoS).
 - `byoridb-graph/src/service.rs` — sign_out(caller, target) 소유권 검증
 
-**S-8 [High, S] WAL checksum → CRC32C** ✅ 완료 (2026-05-13) (기존 B항목과 통합)
-`wrapping_add` 단순 합은 바이트 swap 미탐지. `crc32fast` 도입.
-- `byoridb-kvstore/src/wal.rs`
+**S-8 [High, S] WAL checksum → CRC32C** ✅ 당시 완료, redb 전환으로 제거 (2026-06-05)
+외부 WAL 시절 `wrapping_add`를 CRC32C로 바꿨으나, redb 전환 후 `wal.rs`와
+`WalKVStore` 자체가 삭제돼 현재 런타임에는 적용되지 않는다.
 
 **S-9 [Medium, S] 메시지 크기 제한 + zip bomb 방어** ✅ 완료 (2026-05-13)
 - `byoridb-graph/src/server.rs` — max_decoding_message_size=64MB
@@ -769,9 +925,12 @@ nullable 필드 0개 스키마에서 서버 crash.
 - 퍼블릭 네트워크 노출이 필요한 경우에는 앞단에 TLS 종료 프록시(nginx, envoy) 배치 권장
 - 규정 준수(PCI-DSS, HIPAA) 요구 시 재검토
 
-**S-13 [Medium, M] RocksDB 메모리 상한 설정** ✅ 완료 (2026-05-13)
-`max_memory_mb` 선언만 되고 미사용. 대량 쓰기 시 OOM.
-- `byoridb-kvstore/src/store.rs` — write_buffer_size=64MB, max_write_buffer_number=3
+**S-13 [Medium, M] KV/cache 메모리 상한 설정** ✅ 완료 (2026-05-13, redb 전환 후 G-11로 결과 메모리 가드 확장)
+초기에는 RocksDB write buffer 상한 성격이었으나, 2026-06-05 redb 전환 후에는
+redb cache sizing(`BYORIDB_CACHE_SIZE_MB`)과 쿼리 결과 메모리 가드(`BYORIDB_MAX_MEMORY_MB`,
+G-11)가 운영 메모리 방어선이다.
+- `src/main.rs`/`byoridb-kvstore/src/store.rs` — redb `cache_size`;
+  `byoridb-executor/src/context.rs` — `max_memory_mb` 결과 예산 가드
 
 **S-14 [Low, S] 해싱 중복 제거 + 기타 소형 수정** ✅ 완료 (2026-05-13)
 - `byoridb-graph/src/auth.rs` — hash/verify를 byoridb_common::crypto로 위임
@@ -818,9 +977,9 @@ HTTP API에 쿼리 크기 제한 없음 (gRPC는 64MB 제한 있음).
   `count_node_matches_unlimited`에서 `scan_prefix_limited(.., None)`로 태그 전 항목(88M)을 `Vec`에
   적재 후 `.len()` → 쿼리당 수 GB, 반복 시 **프로덕션 OOMKill**(2026-06-30 인시던트). `scan_stream`
   (bounded channel)로 스트리밍 카운트 → 메모리 O(1). 정확성 불변(tagvid/full-scan 폴백 동일).
-  **후속**: ① tag별 vertex-count 사전계산 카운터(`{space}:tag_count:{tag}`, INSERT/DELETE VERTEX·
-  sameAs 유지 + 기존 88M 백필)로 O(1) 조회 — 현재는 여전히 O(N) 시간(~6s). ② `max_memory_mb`
-  강제(현재 선언만, 미사용 — S-13)로 무거운 쿼리가 노드를 못 죽이게(단일노드 SPOF 방어).
+  **후속**: tag별 vertex-count 사전계산 카운터(`{space}:tag_count:{tag}`, INSERT/DELETE VERTEX·
+  sameAs 유지 + 기존 88M 백필)로 O(1) 조회 — 현재는 여전히 O(N) 시간(~6s).
+  `max_memory_mb` 강제는 G-11 ①②로 적용 완료.
 - **MATCH pattern execution reorder** — 가장 selective한 노드부터. semantic risk 큼.
 - **LOOKUP range 술어 인덱스 미사용** ([#1](https://github.com/byoridb/byoridb/issues/1)) — `LOOKUP ... WHERE age > 30` 이 인덱스가 있어도 풀스캔으로 폴백. 실행기/플래너 모두 동등(Eq) 조건만 인덱스 경로로 라우팅(`execute_lookup`/`extract_eq_condition`, `explain::lookup_access`/`eq_field`). 근본: `IndexManager::lookup_tag` point-equality만 지원, range index scan 미구현. EXPLAIN/PROFILE 풀스캔 경고(dc5be3b)가 발견.
 - **label-only MATCH reverse index** ✅ 완료 (2026-05-29) — `{space}:tagvid:{tag}:{vid}` 보조 인덱스 도입. INSERT VERTEX 에서 자동 기록, MATCH 에서 label-only 패턴 시 자동 사용.
@@ -917,8 +1076,13 @@ Azure AKS에 실제로 배포해보며 발견된 마찰 포인트.
   2. `1.86` → `byoridb-kvstore/src/backup.rs:490`의 `unsigned_is_multiple_of`가 1.87 stabilize → 16분 42초 만에 실패
   3. `1.90` → 컴파일 통과(이후 `COPY config` 부재 / env Vec 파싱 이슈에서 추가 실패. 이 둘은 G-6, G-7로 분리)
   적용: Dockerfile `rust:1.90-slim-bookworm` 고정 + `rust-toolchain.toml` 추가(channel="1.90"). 로컬/CI/Docker가 동일 toolchain 사용. 후속: CI에 `rustup show && cargo check`로 toolchain 일치 검사 추가는 별건.
-- **G-2 `byoridb-server` 분산 launcher 통합** (High)
-  PLAN.md 검증된 기능에 분산 클러스터가 있지만, `byoridb-server` bin은 single-node only. 분산 모드를 위한 환경변수/CLI 인터페이스 부재(`AppConfig`에 peer list/cluster ID/raft 옵션 없음). 운영용 분산 배포 전에 필수. 인터페이스 예: `BYORIDB__CLUSTER__PEERS`, `BYORIDB__CLUSTER__NODE_ID`, `BYORIDB__CLUSTER__BOOTSTRAP`.
+- **G-2 `byoridb-server` 분산 launcher 통합** (High, 부분 구현)
+  `AppConfig`에는 `BYORIDB__CLUSTER__PEERS`, `BYORIDB__CLUSTER__NODE_ID`,
+  `BYORIDB__CLUSTER__BOOTSTRAP`, `BYORIDB__CLUSTER__META_ADDR`,
+  `BYORIDB__CLUSTER__ADVERTISE_ADDR`가 추가되어 있고, `src/main.rs`는 peers가 있으면
+  Meta gRPC 서버를 시작한다. 그러나 운영용 분산 배포로 보기에는 아직 부족하다.
+  남은 작업: Storage/Raft peer bootstrap을 binary 레벨에서 실제로 연결, `bootstrap` 의미
+  구현/검증, docker-compose/K8s에 cluster env wiring, 다중 노드 E2E/운영 스모크.
 - **G-3 컨테이너 빌드 시간 단축** (Medium — redb 전환으로 우선순위 하락)
   2026-06-05 redb 전환으로 RocksDB C++ 컴파일(수 분)이 사라져 clean build ~28s.
   hot path 상당 부분 해소. 남은 후보:
@@ -949,7 +1113,7 @@ Azure AKS에 실제로 배포해보며 발견된 마찰 포인트.
   2. 코드 측: `Environment::prefix_separator("__")`로 single-underscore env(`BYORIDB_PUBLIC_*`, `BYORIDB_ROOT_PASSWORD` 등)는 config crate가 더 이상 잡지 않음. 단위 테스트로 회귀 차단.
 - **G-9 빌드 1회 비용이 크니 사전 점검 비용도 큼** (관찰)
   배포 1회 시도에서 5번 빌드/재배포 사이클 소요: Rust 1.80→1.86→1.90, `COPY config` 부재, env Vec 파싱. 각 사이클 ~20분 → 누적 비용 매우 큼. G-3(빌드 캐싱) + 사전 CI 통합 우선순위 ↑.
-- **G-11 프로브 관대화 + 캐시 헤드룸 (repair-loop 방어)** ✅ 수정 (2026-06-30, 미배포)
+- **G-11 프로브 관대화 + 캐시 헤드룸 (repair-loop 방어)** ✅ 수정·배포 완료 (2026-06-30, PR#15~#17)
   2026-06-30 인시던트: 무거운 COUNT 반복 → OOMKill → ~60분 redb full repair → 서버 ready
   직후 liveness `/health`(암묵 timeout 1초)가 부하로 느려져 4×15s=60s 실패 → **checkpoint 전
   SIGKILL → unclean → 또 60분 repair → 루프**. 매니페스트 수정(03-statefulset.yaml):
@@ -957,19 +1121,27 @@ Azure AKS에 실제로 배포해보며 발견된 마찰 포인트.
   1→10`·`failureThreshold 1→3`(slow /ready로 LB 이탈 방지), `BYORIDB_CACHE_SIZE_MB 65536→32768`
   (working set 11~20GB 충분 + OOM 헤드룸 — 무거운 쿼리가 노드를 못 죽이게). COUNT OOM 트리거 자체는
   C 섹션(스트리밍, PR#14)으로 별도 해소.
-  **① `max_memory_mb` 강제 ✅ (2026-06-30, 미배포)**: 결과 누적 메모리를 `max_memory_mb`로
+  **① `max_memory_mb` 강제 ✅ (2026-06-30, PR#16 sha-b1618cf 배포)**: 결과 누적 메모리를 `max_memory_mb`로
   bound → 초과 시 OOM 대신 `ExecutionError::ResourceExhausted`. MATCH의 binding-row 누적(phase
   경계 + match_edges 내부 64K마다)과 projection(실제 바이트, 16K마다)에 가드. `ctx.check_result_budget`
   + Value 바이트 추정기. `BYORIDB_MAX_MEMORY_MB` env 노출(prod 8192=8GB — 정당 집계 7.7M행 허용,
   100Gi 한도 대비 큰 헤드룸). 회귀: 1MB cap + 30KB×60행 projection이 ResourceExhausted, 작은 쿼리
   통과. executor 211/211.
-  **② GO/LOOKUP/FETCH 가드 확장 ✅ (2026-06-30, 미배포)**: `estimate_row_bytes`/`estimate_value_bytes`를
+  **② GO/LOOKUP/FETCH 가드 확장 ✅ (2026-06-30, PR#17 sha-94ac546 배포)**: `estimate_row_bytes`/`estimate_value_bytes`를
   `context.rs` 공용으로 이동, `check_result_budget`를 GO_local·LOOKUP 풀스캔·FETCH(local/distributed/
   edges) 누적 루프에 적용(16K행마다 + 최종). 분산 전용 경로(GO_distributed, 분산 LOOKUP fetch)는
   standalone prod 미실행이라 후순위. LOOKUP `results` 스캔 자체의 materialize(max_scan_limit로 바운드)를
   COUNT처럼 완전 스트리밍화하는 건 추가 후속.
-  **미해결(후속)**: ③ 단일노드 SPOF·~60분 repair 다운타임 → HA(G-2 분산 선결) 또는 redb quick-repair
-  (redb #829) 대기. 이번 사건이 우선순위 3(운영)의 실증 근거.
+  **프로덕션 스모크 ✅ (2026-07-06, AKS sha-0bcab1c)**: HTTP `/health`/`/ready` OK,
+  StatefulSet image `sha-0bcab1c`, `BYORIDB_MAX_MEMORY_MB=8192`, `BYORIDB_CACHE_SIZE_MB=32768`,
+  pod restart 0, Ready=true 확인. 운영 데이터 보호를 위해 8GB cap 초과를 유도하는 파괴적 쿼리는
+  실행하지 않았다.
+  **현재 인시던트 ⚠️ (2026-07-10 22:03 KST)**: 기존 `sha-d5ff4e6` pod가 redb open 단계에서
+  startup probe 한도(~60분)를 넘겨 exit 137 재시작하는 패턴이며 restart 44회, Ready 0/1,
+  service endpoint 0이다. `sha-025ecc8` StatefulSet update도 old NotReady pod에서 rollout 대기.
+  **미해결(후속)**: ③ 단일노드 SPOF·60분 초과 open/repair → 우선 운영 복구와 원인 확인,
+  이후 HA(G-2 분산 선결) 또는 redb quick-repair(redb #829). pod 삭제 같은 상태 변경은
+  데이터 보호를 위해 사용자 승인 없이 수행하지 않는다.
 
 ---
 
@@ -1045,7 +1217,7 @@ PR 1~10 Mock/Hardcoded 청산에서 누락됐던 항목. `byoridb-executor/src/p
 | S-10 | 백업 디렉토리 0o700 권한 | ✅ |
 | S-11 | Meta HTTP 기본 바인딩 0.0.0.0 → 127.0.0.1 | ✅ |
 | S-12 | TLS 활성화 | 의도적 미구현 — 네트워크 격리로 대체 (운영 시 VPC/방화벽 필수) |
-| S-13 | RocksDB write_buffer_size=64MB, max_write_buffer_number=3 | ✅ |
+| S-13 | KV/cache 메모리 상한 + redb 전환 후 G-11 결과 메모리 가드 | ✅ |
 | S-14 | auth.rs 해싱 중복 제거, DataType fallback warn, Geography bounds check | ✅ |
 
 **워크스페이스 테스트**: 517개 통과 (S-15 brute-force 테스트 2개 추가).
@@ -1091,8 +1263,8 @@ Phase 0–7 모두 ✅, 커밋 `1d90124`. 핵심 임팩트:
 ## 측정 환경
 
 - 워크스페이스 빌드: `cargo build --workspace`
-- 워크스페이스 테스트: `cargo test --workspace --lib`
-- KVStore 벤치: `cargo bench -p byoridb-kvstore --bench wal_overhead`
+- 워크스페이스 테스트: `cargo test --workspace --all-features -- --test-threads=1`
+- KVStore temporal 프로토타입: `cargo run -p byoridb-kvstore --release --example temporal_readbench`
 - 그래프 알고리즘 벤치: `cargo bench -p byoridb-executor --bench graph_traversal`
 - CRAP 측정: `scripts/crap_check.sh` + `scripts/crap_analyze.py`
 
@@ -1106,13 +1278,13 @@ Phase 0–7 모두 ✅, 커밋 `1d90124`. 핵심 임팩트:
 
 **테스트 작성**
 
-- WAL 체크섬 깨짐 테스트는 *데이터 영역*(키/값 바이트)만 flip. 구조 필드(`key_len`/`value_len`) flip 시 truncate 에러로 갈라짐.
-- `WalKVStore` 테스트는 `#[tokio::test(flavor = "multi_thread")]` 필수. current_thread에서 `block_in_place` panic.
+- 외부 WAL/`WalKVStore`는 redb 전환으로 삭제됐다. 과거 WAL 테스트 패턴을 새 코드에 복원하지 않는다.
+- temporal 경로는 memory/redb 동일 계약 테스트와 current-view 무회귀를 함께 검증한다.
 - backup ID는 Unix-second timestamp — 같은 초 내 다중 backup 디렉토리 충돌, 1초 sleep 회피.
 
 **성능 측정**
 
-- criterion 벤치는 매 iter마다 새 키 사용(LSM 누적 회피). `AtomicU64` monotonic counter.
+- 쓰기 벤치는 매 iter마다 새 키를 사용해 overwrite와 history-key 충돌을 피한다.
 - 디스크 I/O 벤치 `sample_size` 30~50 권장. 100은 시간 낭비.
 - *통제군* 반드시 같이 측정(예: memory backend, batch path). 의도치 않은 영향 확인용.
 - `change p > 0.05`는 noise. 기준선 대비 Δ가 5σ 이상일 때만 의미 있음.

@@ -376,15 +376,15 @@ mod tests {
 
     #[test]
     fn test_as_bool_ok_and_err() {
-        assert_eq!(Value::Bool(true).as_bool().unwrap(), true);
-        assert_eq!(Value::Bool(false).as_bool().unwrap(), false);
+        assert!(Value::Bool(true).as_bool().unwrap());
+        assert!(!Value::Bool(false).as_bool().unwrap());
         assert!(Value::Int(1).as_bool().is_err());
         assert!(Value::null().as_bool().is_err());
     }
 
     #[test]
     fn test_as_float_ok_and_err() {
-        assert_eq!(Value::Float(3.14).as_float().unwrap(), 3.14);
+        assert_eq!(Value::Float(2.5).as_float().unwrap(), 2.5);
         // as_float does NOT convert ints — strict type
         assert!(Value::Int(1).as_float().is_err());
         assert!(Value::String("3.14".into()).as_float().is_err());

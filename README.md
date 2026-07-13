@@ -1,54 +1,82 @@
 # ByoriDB
 
-추론(온톨로지) · 시간(bitemporal) · 근거(provenance)를 코어에 네이티브로 갖춘
-**실험적 temporal ontology graph 데이터베이스** (Rust).
+> **Rust로 작성된 semantic graph database — ontology inference, provenance, bitemporal history.**
 
-> ⚠️ **실험 단계.** 로컬 단일 노드로만 동작합니다. 프로덕션/클라우드 배포는 운영하지
-> 않으며(관련 CD 파이프라인 비활성), 기능·API·nGQL 문법·온디스크 포맷이 예고 없이
-> 바뀔 수 있습니다. 중요한 데이터의 단일 저장소로 쓰지 마세요.
+ByoriDB는 property graph 코어 위에 시맨틱 레이어를 얹은 그래프 데이터베이스입니다.
+nGQL 쿼리, write-time ontology 추론, 추론 근거(`WHY`) 설명, bitemporal history 조회를
+단일 로컬 바이너리로 제공합니다.
 
-## 무엇인가
+> [!NOTE]
+> Claude Code / Codex용 로컬 프로젝트 지식 그래프(agent memory) 제품을 찾는다면
+> **[byoridb/byori](https://github.com/byoridb/byori)** 를 보세요. 이 저장소는 그 아래에서
+> 동작하는 범용 데이터베이스 엔진입니다.
 
-property graph 코어 위에 두 축을 얹은 범용 그래프 엔진입니다.
+## 기능
 
-- **온톨로지 / 추론** — 클래스 계층, 시맨틱 관계 타입(transitive/symmetric/inverse/…),
-  RDFS-Plus·OWL 2 RL forward-chaining materialization, `owl:sameAs` 엔티티 해소,
-  provenance(`WHY`) 설명.
-- **시간 (bitemporal, v1)** — vertex/edge 변경을 별도 이력에 기록하고
-  `FETCH PROP ON <tag> <vid> AS OF <epoch-ms>`로 과거 시점을 읽습니다. 현재 뷰는 무회귀.
+- **Property graph + nGQL**: `MATCH`, `GO`, `FETCH`, `LOOKUP`, `FIND PATH`, DDL/DML
+- **Ontology inference**: class hierarchy와 선택된 RDFS-Plus/OWL 2 RL 규칙의
+  write-time materialization — transitive, symmetric, inverse, subproperty,
+  equivalent property, 2-link property chain
+- **Provenance**: 추론 edge의 rule/premise 근거를 `WHY`로 설명, `DELETE EDGE` 시
+  provenance 기반 incremental retraction, 명시적 `sameAs` canonical merge
+- **Bitemporal history (v1)**: asserted vertex/edge history 기록과
+  vertex `FETCH ... AS OF <epoch-ms>` 조회
+- **Similarity**: 구조(Jaccard)·embedding·hybrid recommendation
+- **운영**: HTTP/gRPC API, CLI, backup/restore, Prometheus metrics
+- **스토리지**: 순수 Rust(redb) — C++ 툴체인 불필요
 
-지향점: 지식·기억 시스템(에이전트 메모리 등)이 앱 레이어에서 재구현하는 것을 엔진에서
-제공하는 **substrate**. 특정 도메인에 묶이지 않는 범용 엔진입니다.
+전체 OWL 2 RL이나 완전한 temporal graph query를 지원한다는 뜻은 아닙니다. 상세 기능
+범위, 제약, 로드맵은 [docs/PLAN.md](docs/PLAN.md)를 참고하세요.
 
-## 빌드 & 실행
+## 아키텍처
+
+storage-compute 분리 구조의 세 서비스로 구성됩니다.
+
+- **Graph Service** (`byoridb-graph`): stateless 쿼리 엔진 — nGQL 파싱, 실행 조정
+- **Meta Service** (`byoridb-meta`): space/schema/user/auth 메타데이터
+- **Storage Service** (`byoridb-storage`): vertex/edge 저장, partitioning
+
+로컬 standalone(단일 프로세스에 세 서비스)이 주 사용 경로입니다. 분산 컴포넌트는
+코드베이스에 있지만 multi-node 운영 wiring은 완성되지 않았습니다.
+
+## 빠른 시작
+
+### 사전 빌드 바이너리
+
+[Releases](https://github.com/byoridb/byoridb/releases)에서 macOS(Apple Silicon/Intel),
+Linux x86_64용 `byoridb-server` / `byoridb-cli`를 받을 수 있습니다.
 
 ```bash
-# 사전: Rust 1.90 (rust-toolchain.toml 고정), protobuf-compiler
-
-cargo build --release
-
-# 로컬 서버 실행
-BYORIDB_ROOT_PASSWORD='<password>' cargo run --release --bin byoridb-server
-
-# CLI
-BYORIDB_USER=root BYORIDB_PASSWORD='<password>' cargo run -p byoridb-client --bin byoridb-cli
-
-# 테스트 (직렬 — redb 파일 락 경합 회피)
-cargo test --workspace -- --test-threads=1
+export BYORIDB_ROOT_PASSWORD='change-me'
+./byoridb-server
+curl -s http://127.0.0.1:19669/health
 ```
 
-## nGQL (요약)
+### 소스에서 빌드
 
-`CREATE/DROP SPACE/TAG/EDGE`, `CREATE TAG INDEX`, `INSERT/UPDATE/DELETE VERTEX/EDGE`,
-`FETCH`, `GO`, `MATCH`(Cypher 스타일), `LOOKUP`, `FIND PATH`,
-온톨로지(`CREATE CLASS … SUBCLASS OF`, `sameAs`, `WHY`, `is_a`), shape 검증,
-`RECOMMEND SIMILAR TO`, 그리고 시간축 `… AS OF <ts>`.
+Rust 1.90(`rust-toolchain.toml` 고정)과 `protobuf-compiler`가 필요합니다.
+Linux/macOS를 지원합니다.
 
-## 상태 / 계획
+```bash
+cargo build --release
+BYORIDB_ROOT_PASSWORD='<password>' cargo run --release --bin byoridb-server
+BYORIDB_USER=root BYORIDB_PASSWORD='<password>' \
+  cargo run -p byoridb-client --bin byoridb-cli
 
-- 로컬 단일 노드. 분산(다중 노드)·클라우드 배포는 비활성(설계만 존재, `docs/PLAN.md` G-2).
-- 현재 상태·로드맵·의사결정 가이드는 [`docs/PLAN.md`](docs/PLAN.md).
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features -- --test-threads=1
+```
+
+HTTP API 세션·쿼리 예시는 [QUICKSTART.md](QUICKSTART.md)를 참고하세요.
+
+## 문서
+
+- [빠른 시작](QUICKSTART.md)
+- [상세 제약, 로드맵, 이력](docs/PLAN.md)
+- [기여 가이드](CONTRIBUTING.md)
+- [Agent memory 제품 (byori)](https://github.com/byoridb/byori)
 
 ## 라이선스
 
-[Apache 2.0](LICENSE)
+[Apache License 2.0](LICENSE)
