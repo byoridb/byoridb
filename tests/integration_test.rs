@@ -1331,6 +1331,44 @@ async fn test_drop_index_removes_stale_entries() {
     service.sign_out(session_id, session_id).await;
 }
 
+/// Regression: `LOOKUP ON <edge-type>` must fail clearly rather than silently
+/// returning an empty/tag-filtered result. The parser can't tell tag from edge,
+/// so the executor detects an edge name and rejects it (edge LOOKUP is a
+/// not-yet-implemented feature; the previous behaviour returned misleading rows).
+#[tokio::test]
+async fn test_edge_lookup_errors_clearly() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE edge_lookup_test").await;
+    execute(&service, session_id, "USE edge_lookup_test").await;
+    execute(&service, session_id, "CREATE TAG t(n INT64)").await;
+    execute(&service, session_id, "CREATE EDGE e(w INT64)").await;
+    execute(&service, session_id, "INSERT VERTEX t(n) VALUES 1:(1)").await;
+
+    // LOOKUP on the edge type must error, not silently return empty.
+    let edge_lookup = service
+        .execute(
+            session_id,
+            "LOOKUP ON e WHERE e.w == 1".to_string(),
+        )
+        .await;
+    assert!(
+        edge_lookup.is_err(),
+        "LOOKUP on an edge type must error clearly: {:?}",
+        edge_lookup.map(|d| d.row_count())
+    );
+
+    // Tag LOOKUP still works.
+    let tag_lookup = execute(&service, session_id, "LOOKUP ON t WHERE t.n == 1").await;
+    assert_eq!(tag_lookup.row_count(), 1, "tag LOOKUP must still work");
+
+    service.sign_out(session_id, session_id).await;
+}
+
 /// Graceful shutdown: once readiness is flipped off, new queries must be
 /// rejected with a clear error (k8s stops routing via /ready; this guards the
 /// window where a connection is already open).

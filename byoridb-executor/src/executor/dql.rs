@@ -926,6 +926,35 @@ impl Executor {
                 vec![format!("{}.src", edge), format!("{}.dst", edge)],
             ),
         };
+
+        // The parser emits `LookupType::Tag` for `LOOKUP ON <name>` (it has no
+        // schema to tell tag from edge). If <name> is actually an edge type, the
+        // tag-only path below would silently return an empty/tag-filtered result.
+        // Reject it clearly — full edge LOOKUP is not implemented yet.
+        if matches!(plan.lookup_type, crate::plan::LookupType::Tag(_)) {
+            let is_tag = self
+                .ctx
+                .kvstore
+                .get(&crate::key::SchemaKey::tag(space, &tag_or_edge_name))
+                .await?
+                .is_some();
+            if !is_tag {
+                let is_edge = self
+                    .ctx
+                    .kvstore
+                    .get(&crate::key::SchemaKey::edge(space, &tag_or_edge_name))
+                    .await?
+                    .is_some();
+                if is_edge {
+                    return Err(ExecutionError::InvalidOperation(format!(
+                        "LOOKUP ON edge type '{}' is not supported yet — only tag LOOKUP is \
+                         implemented",
+                        tag_or_edge_name
+                    )));
+                }
+            }
+        }
+
         let lookup_limit = self.lookup_limit(plan.limit);
         #[cfg(feature = "distributed")]
         let lookup_limit_u32 = self.lookup_limit_u32(plan.limit);
