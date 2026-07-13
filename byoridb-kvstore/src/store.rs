@@ -166,11 +166,38 @@ pub trait KVStore: Send + Sync {
         versions: Vec<(Vec<u8>, i64, i64, i64, Vec<u8>)>,
     ) -> Result<()>;
 
+    /// Atomically apply current-view puts/deletes AND history version appends in
+    /// ONE transaction (T-트랙 v1.1: dual-write 원자성). A crash can no longer
+    /// leave the current view and its history disagreeing. `versions` tuples are
+    /// `(entity_key, valid_from, valid_to, tx, value)`, append-only.
+    ///
+    /// The default is a sequential best-effort fallback for backends without
+    /// cross-keyspace transactions; Redb/Memory override with a truly atomic apply.
+    async fn batch_apply(
+        &self,
+        puts: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+        versions: Vec<(Vec<u8>, i64, i64, i64, Vec<u8>)>,
+    ) -> Result<()> {
+        if !puts.is_empty() {
+            self.batch_put(puts).await?;
+        }
+        if !deletes.is_empty() {
+            self.batch_delete(deletes).await?;
+        }
+        if !versions.is_empty() {
+            self.batch_put_version(versions).await?;
+        }
+        Ok(())
+    }
+
     /// Resolve the value of `entity_key` as-of real-world `valid_at`, according to
     /// knowledge recorded up to transaction time `tx_at`: among versions with
     /// `tx <= tx_at` whose `[valid_from, valid_to)` covers `valid_at`, pick the one
     /// with the greatest `(valid_from, tx)`. Backend-agnostic default over
-    /// [`KVStore::scan_history`].
+    /// [`KVStore::scan_history`] — O(versions); ordered backends override with a
+    /// seek (keys sort newest-first, so the range starting at `(valid_at, tx_at)`
+    /// visits candidates in exactly the preference order).
     async fn get_as_of(
         &self,
         entity_key: &[u8],
@@ -886,6 +913,83 @@ impl KVStore for RedbKVStore {
         })
         .await?
     }
+
+    /// Truly atomic dual-write: KV_TABLE puts/deletes and HISTORY_TABLE appends
+    /// commit in one redb write transaction (T-트랙 v1.1).
+    async fn batch_apply(
+        &self,
+        puts: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+        versions: Vec<(Vec<u8>, i64, i64, i64, Vec<u8>)>,
+    ) -> Result<()> {
+        if puts.is_empty() && deletes.is_empty() && versions.is_empty() {
+            return Ok(());
+        }
+        let db = Arc::clone(&self.db);
+        let durability = self.next_durability();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut wtx = db.begin_write()?;
+            wtx.set_durability(durability)?;
+            {
+                let mut kv = wtx.open_table(KV_TABLE)?;
+                for (k, v) in &puts {
+                    kv.insert(k.as_slice(), v.as_slice())?;
+                }
+                for k in &deletes {
+                    kv.remove(k.as_slice())?;
+                }
+                let mut hist = wtx.open_table(HISTORY_TABLE)?;
+                for (ek, vf, vt, tx, val) in &versions {
+                    let key = history_key(ek, *vf, *tx);
+                    let v = encode_history_value(*vt, val);
+                    hist.insert(key.as_slice(), v.as_slice())?;
+                }
+            }
+            wtx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Seek-based bitemporal resolution. History keys sort newest-first
+    /// (desc valid_from, desc tx), so a range starting at `(valid_at, tx_at)`
+    /// yields candidates in exactly the "greatest (valid_from, tx)" preference
+    /// order — the first row whose tx and interval qualify is the answer.
+    /// O(seek + skipped rows) instead of the trait default's O(all versions).
+    async fn get_as_of(
+        &self,
+        entity_key: &[u8],
+        valid_at: i64,
+        tx_at: i64,
+    ) -> Result<Option<Vec<u8>>> {
+        let db = Arc::clone(&self.db);
+        let prefix = history_prefix(entity_key);
+        let start = history_key(entity_key, valid_at, tx_at);
+        tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let rtx = db.begin_read()?;
+            let table = rtx.open_table(HISTORY_TABLE)?;
+            for entry in table.range(start.as_slice()..)? {
+                let (k, v) = entry?;
+                let kb = k.value();
+                if !kb.starts_with(&prefix) {
+                    break;
+                }
+                // Ordering guarantees valid_from <= valid_at within the range;
+                // tx and valid_to must still be checked per row (an older
+                // valid_from may carry a later tx — e.g. a correction).
+                let (Some((_vf, tx)), Some((valid_to, value))) =
+                    (parse_history_key_times(kb), decode_history_value(v.value()))
+                else {
+                    continue;
+                };
+                if tx <= tx_at && valid_at < valid_to {
+                    return Ok(Some(value));
+                }
+            }
+            Ok(None)
+        })
+        .await?
+    }
 }
 
 /// In-memory KVStore for testing
@@ -949,6 +1053,55 @@ impl KVStore for MemoryKVStore {
             h.insert(history_key(ek, *vf, *tx), encode_history_value(*vt, val));
         }
         Ok(())
+    }
+
+    /// Atomic dual-write: both maps' write locks are held for the whole apply,
+    /// so no reader observes the current view without its history (or vice versa).
+    async fn batch_apply(
+        &self,
+        puts: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+        versions: Vec<(Vec<u8>, i64, i64, i64, Vec<u8>)>,
+    ) -> Result<()> {
+        let mut data = self.data.write().await;
+        let mut h = self.history.write().await;
+        for (k, v) in puts {
+            data.insert(k, v);
+        }
+        for k in &deletes {
+            data.remove(k);
+        }
+        for (ek, vf, vt, tx, val) in &versions {
+            h.insert(history_key(ek, *vf, *tx), encode_history_value(*vt, val));
+        }
+        Ok(())
+    }
+
+    /// Seek-based bitemporal resolution — same ordering argument as the
+    /// `RedbKVStore` override (keys sort newest-first).
+    async fn get_as_of(
+        &self,
+        entity_key: &[u8],
+        valid_at: i64,
+        tx_at: i64,
+    ) -> Result<Option<Vec<u8>>> {
+        let prefix = history_prefix(entity_key);
+        let start = history_key(entity_key, valid_at, tx_at);
+        let h = self.history.read().await;
+        for (k, v) in h.range(start..) {
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            let (Some((_vf, tx)), Some((valid_to, value))) =
+                (parse_history_key_times(k), decode_history_value(v))
+            else {
+                continue;
+            };
+            if tx <= tx_at && valid_at < valid_to {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
     }
 
     async fn scan_history(&self, entity_key: &[u8]) -> Result<Vec<VersionRecord>> {
