@@ -138,11 +138,12 @@ impl Executor {
                     }
                     inserted += 1;
                 }
-                if !batch.is_empty() {
-                    self.ctx.kvstore.batch_put(batch).await?;
-                }
-                // T-트랙: 현재뷰 커밋 후 이력 버전 append (별도 HISTORY_TABLE txn).
-                self.record_versions(vertex_versions).await?;
+                // T-트랙 v1.1: 현재뷰 쓰기 + 이력 버전 append 를 단일 트랜잭션으로
+                // 커밋 (dual-write 원자성).
+                self.ctx
+                    .kvstore
+                    .batch_apply(batch, Vec::new(), Self::build_versions(vertex_versions))
+                    .await?;
                 // Invalidate persisted vector indexes (R-2b) for embedding props
                 // touched by this INSERT — rebuilt lazily on next BY EMBEDDING query.
                 for prop in &dirty_vec_props {
@@ -268,11 +269,11 @@ impl Executor {
                     }
                     inserted += 1;
                 }
-                if !batch.is_empty() {
-                    self.ctx.kvstore.batch_put(batch).await?;
-                }
-                // T-트랙: 현재뷰 커밋 후 이력 버전 append.
-                self.record_versions(edge_versions).await?;
+                // T-트랙 v1.1: 현재뷰 쓰기 + 이력 버전 append 단일 트랜잭션.
+                self.ctx
+                    .kvstore
+                    .batch_apply(batch, Vec::new(), Self::build_versions(edge_versions))
+                    .await?;
                 // Maintain edge-degree counters for the asserted edges (used by
                 // the COUNT fast-path). Atomic increment so concurrent inserts
                 // don't lose updates.
@@ -549,10 +550,15 @@ impl Executor {
         let encoded_data = VertexCodec::encode_vertex(&vertex_data)
             .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
 
-        self.ctx.kvstore.put(key.as_bytes(), &encoded_data).await?;
-
-        // T-트랙: UPDATE 후 현재값을 이력 버전으로 기록.
-        self.record_versions(vec![(key.into_bytes(), encoded_data)])
+        // T-트랙 v1.1: 현재뷰 갱신 + 이력 버전 append 단일 트랜잭션.
+        let key_bytes = key.into_bytes();
+        self.ctx
+            .kvstore
+            .batch_apply(
+                vec![(key_bytes.clone(), encoded_data.clone())],
+                Vec::new(),
+                Self::build_versions(vec![(key_bytes, encoded_data)]),
+            )
             .await?;
 
         // Maintain tag secondary indexes: remove entries for the OLD property
@@ -690,6 +696,8 @@ impl Executor {
             std::collections::HashSet::new();
         // T-트랙: 삭제된 정점의 현재뷰 키를 tombstone 버전으로 기록.
         let mut tombstones: Vec<Vec<u8>> = Vec::new();
+        // 현재뷰에서 지울 키들 — 마지막에 tombstone append 와 한 트랜잭션으로.
+        let mut del_keys: Vec<Vec<u8>> = Vec::new();
         // Tag indexes to keep consistent as vertices are removed (DELETE
         // previously left stale index entries pointing at deleted vids).
         let del_tag_indexes = match self.ctx.index_manager.as_ref() {
@@ -724,7 +732,7 @@ impl Executor {
                 }
             }
 
-            self.ctx.kvstore.delete(key).await?;
+            del_keys.push(key.clone());
             tombstones.push(key.clone());
             deleted += 1;
             if let Some(vertex) = &vertex {
@@ -733,7 +741,7 @@ impl Executor {
                         if crate::executor::recommend::pack_embedding(value).is_some() {
                             let vkey =
                                 crate::key::SchemaKey::vec_data(&effective_space, prop, *vid);
-                            self.ctx.kvstore.delete(&vkey).await?;
+                            del_keys.push(vkey);
                             dirty_vec_props.insert(prop.clone());
                         }
                     }
@@ -766,12 +774,14 @@ impl Executor {
                 }
             }
         }
+        // T-트랙 v1.1: 현재뷰 삭제 + tombstone append 단일 트랜잭션.
+        self.ctx
+            .kvstore
+            .batch_apply(Vec::new(), del_keys, Self::build_tombstones(tombstones))
+            .await?;
         for prop in &dirty_vec_props {
             self.mark_vector_index_dirty(&effective_space, prop).await?;
         }
-
-        // T-트랙: 삭제 tombstone 버전 기록 (현재뷰 삭제 후).
-        self.record_tombstones(tombstones).await?;
 
         // O-9 retraction: re-materialize so any inferred vertex types / edges
         // tied to the removed vertices are retracted. No-op without semantics.
@@ -818,14 +828,21 @@ impl Executor {
             std::collections::HashMap::new();
         // T-트랙: 삭제된 엣지의 현재뷰 키를 tombstone 버전으로 기록.
         let mut tombstones: Vec<Vec<u8>> = Vec::new();
+        // 현재뷰에서 지울 키들(정방향 + 역방향 인덱스) — tombstone 과 한 트랜잭션.
+        let mut del_keys: Vec<Vec<u8>> = Vec::new();
+        // 삭제가 트랜잭션 끝으로 지연되므로, 같은 edge ref 가 중복 나열되면 두 번
+        // 세지 않도록 배치 내 중복을 걸러낸다 (기존 즉시-삭제 시절의 동작 유지).
+        let mut seen_refs: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for (src, dst, ranking) in &plan.edge_refs {
             // Key format: {space}:edge:{src}:{edge_type}:{dst}:{ranking}
             let key = format!(
                 "{}:edge:{}:{}:{}:{}",
                 effective_space, src, plan.edge_name, dst, ranking
             );
-            if self.ctx.kvstore.get(key.as_bytes()).await?.is_some() {
-                self.ctx.kvstore.delete(key.as_bytes()).await?;
+            if seen_refs.insert(key.as_bytes().to_vec())
+                && self.ctx.kvstore.get(key.as_bytes()).await?.is_some()
+            {
+                del_keys.push(key.as_bytes().to_vec());
                 tombstones.push(key.as_bytes().to_vec());
                 // Keep the reverse-edge index in sync (written by INSERT EDGE).
                 let in_edge_key = SchemaKey::in_edge_data(
@@ -835,15 +852,18 @@ impl Executor {
                     *src,
                     *ranking,
                 );
-                self.ctx.kvstore.delete(&in_edge_key).await?;
+                del_keys.push(in_edge_key);
                 *deg_in.entry((plan.edge_name.clone(), *dst)).or_insert(0) -= 1;
                 *deg_out.entry((plan.edge_name.clone(), *src)).or_insert(0) -= 1;
                 deleted += 1;
                 deleted_edges.push((*src, plan.edge_name.clone(), *dst));
             }
         }
-        // T-트랙: 삭제 tombstone 버전 기록.
-        self.record_tombstones(tombstones).await?;
+        // T-트랙 v1.1: 현재뷰 삭제 + tombstone append 단일 트랜잭션.
+        self.ctx
+            .kvstore
+            .batch_apply(Vec::new(), del_keys, Self::build_tombstones(tombstones))
+            .await?;
 
         // Apply the degree-counter decrements (atomic; ≤0 removes the key).
         let counter_deltas: Vec<(Vec<u8>, i64)> =

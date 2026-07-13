@@ -89,6 +89,92 @@ async fn run_suite(store: &dyn KVStore) {
         store.get_as_of(b"sp:vertex:999", 100, 100).await.unwrap(),
         None
     );
+
+    // 경계값: valid_at == valid_from (반열린 구간 [from, to) 는 from 을 포함)
+    assert_eq!(
+        store.get_as_of(e, 100, 10).await.unwrap().as_deref(),
+        Some(b"A".as_slice()),
+        "valid_at == valid_from 포함"
+    );
+    assert_eq!(
+        store.get_as_of(e, 200, 20).await.unwrap().as_deref(),
+        Some(b"B".as_slice()),
+        "open interval 시작 경계"
+    );
+    assert_eq!(
+        store.get_as_of(e, 199, 35).await.unwrap().as_deref(),
+        Some(b"A2".as_slice()),
+        "valid_to 직전(199)은 포함, [from, to) 반열린"
+    );
+
+    // v1.1 ①: batch_apply — 현재뷰 put/delete 와 이력 append 가 한 번에 적용.
+    store.put(b"sp:vertex:7", b"OLD").await.unwrap();
+    store
+        .batch_apply(
+            vec![(b"sp:vertex:8".to_vec(), b"NEW".to_vec())],
+            vec![b"sp:vertex:7".to_vec()],
+            vec![
+                (
+                    b"sp:vertex:8".to_vec(),
+                    500,
+                    VALID_OPEN,
+                    500,
+                    b"NEW".to_vec(),
+                ),
+                (b"sp:vertex:7".to_vec(), 500, VALID_OPEN, 500, Vec::new()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(b"sp:vertex:8").await.unwrap().as_deref(),
+        Some(b"NEW".as_slice())
+    );
+    assert_eq!(store.get(b"sp:vertex:7").await.unwrap(), None);
+    assert_eq!(store.scan_history(b"sp:vertex:8").await.unwrap().len(), 1);
+    let tomb = store.scan_history(b"sp:vertex:7").await.unwrap();
+    assert_eq!(tomb.len(), 1);
+    assert!(tomb[0].value.is_empty(), "tombstone");
+    // 빈 인자는 no-op
+    store
+        .batch_apply(Vec::new(), Vec::new(), Vec::new())
+        .await
+        .unwrap();
+
+    // seek 기반 resolution 스트레스: 버전 다수 + 미래 tx 스킵이 섞여도 정확.
+    let m = b"sp:vertex:many".as_slice();
+    for i in 0..50 {
+        let vf = 1000 + i * 10;
+        store
+            .put_version(m, vf, vf + 10, vf, format!("v{i}").as_bytes())
+            .await
+            .unwrap();
+    }
+    // 정정: [1200,1210) 구간을 미래 tx(9999)로 다시 기록
+    store
+        .put_version(m, 1200, 1210, 9999, b"corrected")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_as_of(m, 1205, 1205).await.unwrap().as_deref(),
+        Some(b"v20".as_slice()),
+        "tx 1205 기준: 정정(tx9999)은 아직 모름"
+    );
+    assert_eq!(
+        store.get_as_of(m, 1205, 10000).await.unwrap().as_deref(),
+        Some(b"corrected".as_slice()),
+        "tx 10000 기준: 정정 반영"
+    );
+    assert_eq!(
+        store.get_as_of(m, 1495, 2000).await.unwrap().as_deref(),
+        Some(b"v49".as_slice()),
+        "마지막 구간 [1490,1500)"
+    );
+    assert_eq!(
+        store.get_as_of(m, 1500, 2000).await.unwrap(),
+        None,
+        "모든 구간이 닫혀 1500 은 미커버"
+    );
 }
 
 #[tokio::test]

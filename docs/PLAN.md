@@ -859,17 +859,23 @@ nGQL v1은 `FETCH ... AS OF <ts>` 하나를 두 축에 같이 적용하고, 쓰�
 - **v2 남김**: `VALID FROM/TO`, `BETWEEN`, temporal MATCH/GO, edge AS OF 읽기,
   이력 열람 API, 리텐션/GC, temporal 집계, 과거 파생 사실, 신호 압축.
 
-**v1 안정성 후속 (코드 감사 2026-07-10):**
-- **비원자적 dual-write**: current view 쓰기와 history append가 서로 다른 redb transaction이다.
-  중간 실패/크래시 시 현재값과 이력이 어긋날 수 있다.
-- **millisecond key 충돌**: history key가 `(entity_key, valid_from, tx)`이고 v1 DML은 두 시각을
-  같은 epoch millis로 쓰므로 동일 엔티티의 같은 millisecond 변경은 이력을 덮을 수 있다.
-- **AS OF 복잡도**: `get_as_of`가 `scan_history` 결과 전체를 `Vec`으로 만든 뒤 고르므로
-  O(versions/entity) 메모리·시간이다. 프로토타입의 ~8µs seek는 현재 executor 보장이 아니다.
-- **테스트 공백**: storage 계약과 parser/executor 단위 회귀는 있으나 public DML write hook부터
-  parse/plan/`FETCH AS OF`까지 잇는 end-to-end 테스트가 없다.
-- **v1.1 우선순위**: dual-write 원자성 → history key sequence → seek 기반 resolution →
-  end-to-end 회귀. 이 네 항목 뒤 기능 표면을 확장한다.
+**✅ v1.1 안정성 완료 (2026-07-13; 코드 감사 2026-07-10의 4개 항목 해소):**
+- **① dual-write 원자성**: `KVStore::batch_apply(puts, deletes, versions)` 신설 — 현재뷰
+  변경과 이력 append 가 단일 redb 트랜잭션(Memory 는 양 lock 동시 보유)으로 커밋.
+  DML 5개 경로(INSERT V/E, UPDATE, DELETE V/E) 전부 전환. DELETE 도 loop 내 per-key
+  delete 에서 배치로 수렴(부수적으로 fsync 1회).
+- **② ms key 충돌 제거**: **키 포맷 변경 없이** tx 를 단조증가로(`tx_now()` =
+  `max(벽시계, last+1)`, 프로세스 전역 AtomicI64). 버전 행마다 고유 tx → 같은
+  엔티티의 같은 ms 쓰기·같은 배치 내 중복도 충돌 불가. 기존 데이터 이행 불필요.
+  지속 >1 write/ms 시 tx 가 벽시계보다 잠시 앞설 수 있음(문서화, 시계 따라잡으면 재동기화).
+- **③ seek 기반 AS-OF**: Redb/Memory 가 `get_as_of` 오버라이드 — desc 키 순서가
+  newest-first 라 `(valid_at, tx_at)` 지점 range seek 의 첫 적격 행이 곧 답.
+  O(seek+스킵행). 트레이트 default(scan 기반)는 다른 백엔드용으로 유지.
+- **④ e2e 회귀**: `executor/temporal.rs` tests — public DML→parse/plan→`FETCH AS OF`
+  (INSERT/UPDATE/DELETE 시간여행, tombstone, 같은 ms 연속 쓰기, 엣지 경로),
+  kvstore 계약 스위트에 batch_apply·경계값·50-버전+미래-tx 정정 seek 스트레스 추가.
+- **다음(v2 기능 표면)**: edge `AS OF` 읽기 → temporal MATCH/GO → `VALID FROM/TO` /
+  `BETWEEN` → 이력 열람 API → 리텐션/GC → temporal 집계(D3).
 
 ### S. 보안 강화 (P0, 즉시 — 2026-05-13 심층 분석 결과)
 
