@@ -533,7 +533,7 @@ mod tests {
         let client = StorageQueryClient::new();
         // Manually add a fake connection for testing
         {
-            let mut cache = client.connections.write();
+            let cache = client.connections.write();
             // We can't add a real channel without connecting, but we can verify the clear works
             assert!(cache.is_empty());
         }

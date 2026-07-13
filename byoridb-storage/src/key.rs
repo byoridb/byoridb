@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_index_value_int_sort_order() {
-        let values = vec![
+        let values = [
             IndexValue::Int(-100),
             IndexValue::Int(-1),
             IndexValue::Int(0),
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_index_value_string_sort_order() {
-        let values = vec![
+        let values = [
             IndexValue::String("aaa".to_string()),
             IndexValue::String("aab".to_string()),
             IndexValue::String("bbb".to_string()),
@@ -342,9 +342,9 @@ mod tests {
             IndexValue::Int(-12345),
             IndexValue::Int(0),
             IndexValue::Int(67890),
-            IndexValue::Float(-3.14),
+            IndexValue::Float(-2.5),
             IndexValue::Float(0.0),
-            IndexValue::Float(2.718),
+            IndexValue::Float(1.25),
             IndexValue::String("hello".to_string()),
             IndexValue::String("".to_string()),
         ];

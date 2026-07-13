@@ -182,19 +182,18 @@ mod tests {
             .unwrap();
 
         // Create tag
-        let tag_id = meta
-            .create_tag(
-                space_id,
-                "test_tag".to_string(),
-                vec![Field {
-                    name: "prop1".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    default: None,
-                }],
-            )
-            .await
-            .unwrap();
+        meta.create_tag(
+            space_id,
+            "test_tag".to_string(),
+            vec![Field {
+                name: "prop1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                default: None,
+            }],
+        )
+        .await
+        .unwrap();
 
         // Alter tag: Add new column
         let operations = vec![AlterOperation::AddColumn(Field {

@@ -508,7 +508,7 @@ mod tests {
         // With 6 nodes, ~1/6 (~17%) should change
         // Allow 5-35% range for statistical variation
         assert!(
-            changed >= 5 && changed <= 35,
+            (5..=35).contains(&changed),
             "Changed: {} (expected ~17%)",
             changed
         );
@@ -555,7 +555,7 @@ mod tests {
         // Partition ID is in valid range
         for vid in 0..1000 {
             let part = ring.get_part_id(vid);
-            assert!(part >= 1 && part <= 10);
+            assert!((1..=10).contains(&part));
         }
     }
 

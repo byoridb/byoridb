@@ -4,7 +4,8 @@
 
 ## 사전 요구사항
 
-- **Rust**: 최신 stable 버전 ([rustup](https://rustup.rs/)을 통해 설치)
+- **Rust**: 1.90 (`rust-toolchain.toml`에 고정, [rustup](https://rustup.rs/)으로 설치)
+- **protobuf-compiler**: gRPC code generation에 필요
 - **Linux/macOS**: Windows는 현재 지원하지 않습니다
 - C++ 빌드 도구가 필요 없습니다 — 스토리지는 순수 Rust(redb)로 구현되었습니다
 
@@ -18,7 +19,8 @@ cd byoridb
 cargo build --release
 ```
 
-독립 실행형 서버(Meta, Storage, Graph 서비스 포함)를 시작합니다:
+독립 실행형 서버(embedded storage + Graph gRPC/HTTP)를 시작합니다. Meta gRPC 서버는
+cluster peers를 설정한 경우에만 함께 시작합니다:
 
 ```bash
 export BYORIDB_ROOT_PASSWORD='change-me-before-production'
@@ -93,8 +95,12 @@ curl http://localhost:19669/health
 curl -X POST http://localhost:19669/api/v1/session \
   -H "Content-Type: application/json" \
   -d '{"username": "root", "password": "change-me-before-production"}'
-# {"session_id":1,"time_zone":"UTC"}
+# {"session_id":"734214891234567890","time_zone":"UTC"}
 ```
+
+`session_id`는 매 로그인마다 생성되는 임의의 decimal string입니다. 아래
+`<SESSION_ID>`를 실제 응답값으로 바꾸세요. JSON number로 변환하면 JavaScript에서
+정밀도가 손실될 수 있으므로 문자열 그대로 전달합니다.
 
 ### 쿼리 실행
 
@@ -102,27 +108,27 @@ curl -X POST http://localhost:19669/api/v1/session \
 # Space 생성
 curl -X POST http://localhost:19669/api/v1/query \
   -H "Content-Type: application/json" \
-  -d '{"session_id": 1, "query": "CREATE SPACE test(partition_num=10, replica_factor=1)"}'
+  -d '{"session_id":"<SESSION_ID>","query":"CREATE SPACE test(partition_num=10, replica_factor=1)"}'
 
 # Space 사용
 curl -X POST http://localhost:19669/api/v1/query \
   -H "Content-Type: application/json" \
-  -d '{"session_id": 1, "query": "USE test"}'
+  -d '{"session_id":"<SESSION_ID>","query":"USE test"}'
 
 # Tag 생성
 curl -X POST http://localhost:19669/api/v1/query \
   -H "Content-Type: application/json" \
-  -d '{"session_id": 1, "query": "CREATE TAG person(name STRING, age INT64)"}'
+  -d '{"session_id":"<SESSION_ID>","query":"CREATE TAG person(name STRING, age INT64)"}'
 
 # Vertex 삽입
 curl -X POST http://localhost:19669/api/v1/query \
   -H "Content-Type: application/json" \
-  -d '{"session_id": 1, "query": "INSERT VERTEX person(name, age) VALUES 1:(\"Alice\", 30)"}'
+  -d '{"session_id":"<SESSION_ID>","query":"INSERT VERTEX person(name, age) VALUES 1:(\"Alice\", 30)"}'
 
 # Lookup
 curl -X POST http://localhost:19669/api/v1/query \
   -H "Content-Type: application/json" \
-  -d '{"session_id": 1, "query": "LOOKUP ON person"}'
+  -d '{"session_id":"<SESSION_ID>","query":"LOOKUP ON person"}'
 ```
 
 ### Prometheus 메트릭

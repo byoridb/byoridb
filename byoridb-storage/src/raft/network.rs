@@ -423,7 +423,6 @@ pub enum RaftNetworkError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::ClusterConfig;
 
     #[tokio::test]
     async fn test_network_client_creation() {
@@ -447,7 +446,7 @@ mod tests {
     async fn test_add_nodes_from_info() {
         let client = RaftNetworkClient::new(1);
 
-        let nodes = vec![
+        let nodes = [
             NodeInfo {
                 id: 2,
                 addr: "localhost".to_string(),
