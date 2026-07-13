@@ -697,16 +697,7 @@ impl ExecutionPlanBuilder {
                             .vertices
                             .into_iter()
                             .map(|v| {
-                                let vid = match v.vid {
-                                    byoridb_parser::ast::Expression::Literal(
-                                        byoridb_parser::ast::Literal::Int(i),
-                                    ) => i,
-                                    _ => {
-                                        return Err(crate::error::ExecutionError::InvalidOperation(
-                                            "Vertex ID must be an integer literal".to_string(),
-                                        ))
-                                    }
-                                };
+                                let vid = Self::expr_to_vid(v.vid, "Vertex ID")?;
                                 Ok(VertexInsert {
                                     vid,
                                     tags: v
@@ -733,28 +724,9 @@ impl ExecutionPlanBuilder {
                             .edges
                             .into_iter()
                             .map(|e| {
-                                let src = match e.src_vid {
-                                    byoridb_parser::ast::Expression::Literal(
-                                        byoridb_parser::ast::Literal::Int(i),
-                                    ) => i,
-                                    _ => {
-                                        return Err(crate::error::ExecutionError::InvalidOperation(
-                                            "Edge source vertex ID must be an integer literal"
-                                                .to_string(),
-                                        ))
-                                    }
-                                };
-                                let dst = match e.dst_vid {
-                                    byoridb_parser::ast::Expression::Literal(
-                                        byoridb_parser::ast::Literal::Int(i),
-                                    ) => i,
-                                    _ => {
-                                        return Err(crate::error::ExecutionError::InvalidOperation(
-                                            "Edge destination vertex ID must be an integer literal"
-                                                .to_string(),
-                                        ))
-                                    }
-                                };
+                                let src = Self::expr_to_vid(e.src_vid, "Edge source vertex ID")?;
+                                let dst =
+                                    Self::expr_to_vid(e.dst_vid, "Edge destination vertex ID")?;
                                 let mut props = std::collections::HashMap::new();
                                 for (k, v_expr) in e.props {
                                     props.insert(k, Self::expr_to_value(v_expr)?);
@@ -773,16 +745,7 @@ impl ExecutionPlanBuilder {
             }
             Statement::Update(update) => {
                 let space = update.space.unwrap_or_default();
-                let vid = match update.vid {
-                    byoridb_parser::ast::Expression::Literal(
-                        byoridb_parser::ast::Literal::Int(i),
-                    ) => i,
-                    _ => {
-                        return Err(crate::error::ExecutionError::InvalidOperation(
-                            "Vertex ID must be an integer literal".to_string(),
-                        ))
-                    }
-                };
+                let vid = Self::expr_to_vid(update.vid, "Vertex ID")?;
                 let mut updates = std::collections::HashMap::new();
                 for (k, v_expr) in update.updates {
                     updates.insert(k, Self::expr_to_value(v_expr)?);
@@ -803,14 +766,7 @@ impl ExecutionPlanBuilder {
                         let vids = delete
                             .vids
                             .into_iter()
-                            .map(|v| match v {
-                                byoridb_parser::ast::Expression::Literal(
-                                    byoridb_parser::ast::Literal::Int(i),
-                                ) => Ok(i),
-                                _ => Err(crate::error::ExecutionError::InvalidOperation(
-                                    "Vertex ID must be an integer literal".to_string(),
-                                )),
-                            })
+                            .map(|v| Self::expr_to_vid(v, "Vertex ID"))
                             .collect::<Result<Vec<_>>>()?;
                         Ok(ExecutionPlan::Delete(DeletePlan {
                             space,
@@ -823,22 +779,8 @@ impl ExecutionPlanBuilder {
                             .edge_refs
                             .into_iter()
                             .map(|e| {
-                                let src = match e.src_vid {
-                                    byoridb_parser::ast::Expression::Literal(
-                                        byoridb_parser::ast::Literal::Int(i),
-                                    ) => Ok(i),
-                                    _ => Err(crate::error::ExecutionError::InvalidOperation(
-                                        "Edge src VID must be an integer literal".to_string(),
-                                    )),
-                                }?;
-                                let dst = match e.dst_vid {
-                                    byoridb_parser::ast::Expression::Literal(
-                                        byoridb_parser::ast::Literal::Int(i),
-                                    ) => Ok(i),
-                                    _ => Err(crate::error::ExecutionError::InvalidOperation(
-                                        "Edge dst VID must be an integer literal".to_string(),
-                                    )),
-                                }?;
+                                let src = Self::expr_to_vid(e.src_vid, "Edge src VID")?;
+                                let dst = Self::expr_to_vid(e.dst_vid, "Edge dst VID")?;
                                 let ranking = e.ranking.unwrap_or(0);
                                 Ok((src, dst, ranking))
                             })
@@ -866,14 +808,7 @@ impl ExecutionPlanBuilder {
                     let ints: Vec<i64> = fetch
                         .vids
                         .into_iter()
-                        .map(|v| match v {
-                            byoridb_parser::ast::Expression::Literal(
-                                byoridb_parser::ast::Literal::Int(i),
-                            ) => Ok(i),
-                            _ => Err(crate::error::ExecutionError::InvalidOperation(
-                                "Edge VID must be an integer literal".to_string(),
-                            )),
-                        })
+                        .map(|v| Self::expr_to_vid(v, "Edge VID"))
                         .collect::<Result<Vec<_>>>()?;
                     for pair in ints.chunks(2) {
                         if pair.len() == 2 {
@@ -884,14 +819,7 @@ impl ExecutionPlanBuilder {
                     vids = fetch
                         .vids
                         .into_iter()
-                        .map(|v| match v {
-                            byoridb_parser::ast::Expression::Literal(
-                                byoridb_parser::ast::Literal::Int(i),
-                            ) => Ok(i),
-                            _ => Err(crate::error::ExecutionError::InvalidOperation(
-                                "Vertex ID must be an integer literal".to_string(),
-                            )),
-                        })
+                        .map(|v| Self::expr_to_vid(v, "Vertex ID"))
                         .collect::<Result<Vec<_>>>()?;
                 }
 
@@ -911,14 +839,7 @@ impl ExecutionPlanBuilder {
                     .from_clause
                     .vids
                     .into_iter()
-                    .map(|v| match v {
-                        byoridb_parser::ast::Expression::Literal(
-                            byoridb_parser::ast::Literal::Int(i),
-                        ) => Ok(i),
-                        _ => Err(crate::error::ExecutionError::InvalidOperation(
-                            "Vertex ID must be an integer literal".to_string(),
-                        )),
-                    })
+                    .map(|v| Self::expr_to_vid(v, "Vertex ID"))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(ExecutionPlan::Go(GoPlan {
                     from_clause: FromClause {
@@ -1043,6 +964,18 @@ impl ExecutionPlanBuilder {
                     plan: Box::new(inner_plan),
                 })
             }
+        }
+    }
+
+    /// Helper: resolve a VID expression to i64. Negative VIDs arrive from the
+    /// parser as `UnaryOp(Neg, Int)`, not as a bare integer literal, so fold
+    /// through `expr_to_value` instead of matching `Literal::Int` directly.
+    fn expr_to_vid(expr: byoridb_parser::ast::Expression, what: &str) -> Result<i64> {
+        match Self::expr_to_value(expr) {
+            Ok(byoridb_common::Value::Int(i)) => Ok(i),
+            _ => Err(crate::error::ExecutionError::InvalidOperation(format!(
+                "{what} must be an integer literal"
+            ))),
         }
     }
 
