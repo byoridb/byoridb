@@ -328,8 +328,16 @@ impl Executor {
             V::Bool(_) => t == "Bool",
             V::Int(_) => matches!(
                 t,
-                "Int8" | "Int16" | "Int32" | "Int64" | "Float" | "Double" | "Timestamp" | "Date"
-                    | "Time" | "DateTime"
+                "Int8"
+                    | "Int16"
+                    | "Int32"
+                    | "Int64"
+                    | "Float"
+                    | "Double"
+                    | "Timestamp"
+                    | "Date"
+                    | "Time"
+                    | "DateTime"
             ),
             V::Float(_) => matches!(t, "Float" | "Double"),
             V::String(_) => matches!(
@@ -372,10 +380,7 @@ impl Executor {
             if !Self::value_assignable(value, pdef["data_type"].as_str()) {
                 return Err(ExecutionError::TypeMismatch(format!(
                     "field '{}' of tag '{}' expects type {}, got {:?}",
-                    field,
-                    tag_name,
-                    pdef["data_type"],
-                    value
+                    field, tag_name, pdef["data_type"], value
                 )));
             }
         }
@@ -416,10 +421,7 @@ impl Executor {
             if !Self::value_assignable(value, pdef["data_type"].as_str()) {
                 return Err(ExecutionError::TypeMismatch(format!(
                     "field '{}' of edge '{}' expects type {}, got {:?}",
-                    field,
-                    edge_type,
-                    pdef["data_type"],
-                    value
+                    field, edge_type, pdef["data_type"], value
                 )));
             }
         }
@@ -577,7 +579,11 @@ impl Executor {
                             ))
                         })?;
                 }
-                if let Some(tag) = vertex_data.tags.iter().find(|t| t.name == index.schema_name) {
+                if let Some(tag) = vertex_data
+                    .tags
+                    .iter()
+                    .find(|t| t.name == index.schema_name)
+                {
                     let new_values: Vec<_> = index
                         .fields
                         .iter()
@@ -735,8 +741,7 @@ impl Executor {
                 // Remove tag secondary-index entries for the deleted vertex.
                 if let Some(im) = self.ctx.index_manager.as_ref() {
                     for index in &del_tag_indexes {
-                        if let Some(tag) =
-                            vertex.tags.iter().find(|t| t.name == index.schema_name)
+                        if let Some(tag) = vertex.tags.iter().find(|t| t.name == index.schema_name)
                         {
                             let values: Vec<_> = index
                                 .fields

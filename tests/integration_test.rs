@@ -1047,7 +1047,11 @@ async fn test_update_delete_maintain_tag_index() {
         }
     };
 
-    assert_eq!(lookup("Alice").await, 1, "sanity: Alice indexed after INSERT");
+    assert_eq!(
+        lookup("Alice").await,
+        1,
+        "sanity: Alice indexed after INSERT"
+    );
 
     // UPDATE must move the index entry from Alice to Bob.
     execute(
@@ -1153,12 +1157,7 @@ async fn test_insert_rejects_type_mismatch() {
 
     execute(&service, session_id, "CREATE SPACE type_test").await;
     execute(&service, session_id, "USE type_test").await;
-    execute(
-        &service,
-        session_id,
-        "CREATE TAG t(age INT64, name STRING)",
-    )
-    .await;
+    execute(&service, session_id, "CREATE TAG t(age INT64, name STRING)").await;
 
     // A string into an INT64 column must be rejected (was silently accepted).
     let bad = service
@@ -1308,7 +1307,12 @@ async fn test_drop_index_removes_stale_entries() {
     )
     .await;
     execute(&service, session_id, "CREATE TAG INDEX t_name ON t(name)").await;
-    execute(&service, session_id, r#"INSERT VERTEX t(name) VALUES 1:("Alice")"#).await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX t(name) VALUES 1:("Alice")"#,
+    )
+    .await;
 
     // Drop the name index, then create a city index that may reuse the id.
     execute(&service, session_id, "DROP INDEX TAG t_name").await;
@@ -1351,10 +1355,7 @@ async fn test_edge_lookup_errors_clearly() {
 
     // LOOKUP on the edge type must error, not silently return empty.
     let edge_lookup = service
-        .execute(
-            session_id,
-            "LOOKUP ON e WHERE e.w == 1".to_string(),
-        )
+        .execute(session_id, "LOOKUP ON e WHERE e.w == 1".to_string())
         .await;
     assert!(
         edge_lookup.is_err(),

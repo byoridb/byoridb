@@ -70,20 +70,13 @@ impl SessionManager {
     }
 
     fn random_session_id() -> i64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        use std::time::SystemTime;
-        // Use system time + thread id as entropy source (no extra dep needed)
-        // For production-grade randomness auth.rs uses OsRng; this path is
-        // only used in tests / standalone SessionManager usage.
-        let mut h = DefaultHasher::new();
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos()
-            .hash(&mut h);
-        std::thread::current().id().hash(&mut h);
-        (h.finish() as i64).abs()
+        use argon2::password_hash::rand_core::{OsRng, RngCore};
+        // Cryptographically-random, collision-resistant id. The old
+        // SystemTime-nanos + thread-id hash collided under concurrency (a few
+        // tokio worker threads share the same coarse nanosecond), which dropped
+        // sessions and risked session-id *reuse*. `>> 1` clears the sign bit so
+        // the id is non-negative without the `i64::MIN.abs()` overflow hazard.
+        (OsRng.next_u64() >> 1) as i64
     }
 
     /// Create a session with a specific ID (used when AuthManager provides the ID)
