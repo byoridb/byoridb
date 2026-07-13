@@ -1,7 +1,8 @@
-# ByoriDB Memory-Wiki — 온톨로지 설계 초안 (draft)
+# ByoriDB Memory-Wiki — dogfood prototype
 
-> 상태: **설계 초안 / 미커밋**. "작업할수록 지식 그래프가 쌓여 LLM Wiki처럼 읽히는"
-> 방향의 타당성 검토용. PoC(§6)로 실제 traversal 체감 후 정식 트랙 여부 결정.
+> 상태: **설계 + dogfood PoC 검증 완료**. "작업할수록 지식 그래프가 쌓여 LLM Wiki처럼
+> 읽히는" 방향의 기술적 타당성을 확인한 문서다. 다만 clean install은 아직 `note`/`rel`
+> schema만 자동 생성하며, typed wiki bootstrap과 repository 자동 ingestion은 미구현이다.
 > 작성 계기: 2026-07-11 대화 (파일 메모리 vs 그래프 메모리 → 타입드 지식그래프 비전).
 
 ---
@@ -37,21 +38,24 @@ naive "매 턴 LLM이 엔티티·관계 마구 추출" = 반드시 쓰레기통�
 
 ## 4. 온톨로지 스키마 (핵심: 좁게)
 
-### 4.1 노드 타입 (tag)
+아래 §4는 **목표 schema**다. §7 PoC는 타당성 검증에 필요한 subset만 생성했으며,
+fresh installer는 이 schema가 아니라 `note`/`rel`만 생성한다.
+
+### 4.1 목표 노드 타입 (tag)
 
 | tag | 의미 | 핵심 property |
 |---|---|---|
 | `module` | 코드 모듈/크레이트/서브시스템 | name, path, summary, ts |
-| `decision` | 결정 + 근거 | name, body(why 포함), status(active/superseded), ts |
-| `bug` | 버그/함정 + 해소 여부 | name, body, status(open/fixed), ts |
+| `decision` | 결정 + 근거 | name, body(why 포함), state(active/superseded), ts |
+| `bug` | 버그/함정 + 해소 여부 | name, body, state(open/fixed), ts |
 | `incident` | 운영 사고 | name, body, resolved(bool), ts |
 | `concept` | 도메인/설계 개념 | name, body, ts |
 | `entity` | 데이터 엔티티(도그푸딩 대상) | name, body, ts |
-| `task` | 작업/트랙 항목 | name, body, status, ts |
+| `task` | 작업/트랙 항목 | name, body, state, ts |
 
 > 최소셋으로 시작. 새 타입은 "3번 이상 억지로 뭉개진 뒤"에만 승격. 임의 추가 금지.
 
-### 4.2 엣지 타입 (edge)
+### 4.2 목표 엣지 타입 (edge)
 
 의미 있는 것만. 각 엣지는 방향이 있다.
 
@@ -144,17 +148,22 @@ GO FROM 3001 OVER depends_on YIELD $$.concept.name
 ## 8. 로드맵 + 진행 상황
 
 - **Phase 1 (경량)**: `rel.kind`/`note.kind`로 타입 인코딩 (스키마 변경 0). — 개념 확인.
-- **Phase 2 (타입 승격)** ✅: 별도 tag/edge 생성 → `LOOKUP ON module`, `GO ... OVER caused_by`
-  직접 지원. PoC(§7)로 검증. 기억 스킬을 이 타입드 온톨로지로 업그레이드해 미래 세션이 실제로 사용.
-- **Phase 3 (추출 자동화)** ✅: 체크포인트 리듬을 전역 훅으로 자동화 (아래 참조).
-- **Phase 4 (추론 연결)** ✅ 시연: 저장 안 한 관계를 forward-chaining으로 노출 (아래 참조).
+- **Phase 2 (타입 승격 PoC)** ✅: 별도 tag/edge 생성 → `LOOKUP ON module`,
+  `GO ... OVER caused_by` 직접 지원. §7의 dogfood space에서 검증했지만 clean install
+  bootstrap에는 아직 포함되지 않는다.
+- **Phase 3 (체크포인트 보조)** 🟡: 전역 훅이 recall/capture 리마인더를 주입하고,
+  실제 추출·기록은 skill을 따르는 에이전트가 수행한다. 자동 ingestion은 미구현이다.
+- **Phase 4 (추론 연결 PoC)** ✅: 저장하지 않은 관계를 forward-chaining으로 노출하는
+  core 동작을 dogfood space에서 시연했다.
 
-### Phase 3 결과 — 체크포인트 자동화 훅 (전역 `~/.claude/settings.json`)
+### Phase 3 결과 — 체크포인트 reminder 훅 (전역 `~/.claude/settings.json`)
 
 `.claude`가 gitignore라 훅은 리포에 커밋되지 않음 → 교차 프로젝트로 동작하는 전역 설정에 배치.
 - **SessionStart 훅**: 세션 시작 시 "기억 그래프가 있으니 비자명 작업 전 recall / 체크포인트에서 capture" 컨텍스트 주입.
 - **PreToolUse(Bash) 훅**: 커맨드에 `git commit`이 포함될 때만 "커밋=체크포인트, 그래프 기록 확인" 리마인더 주입. 그 외엔 무출력·**비차단**(리마인더만).
-- 검증: JSON 유효·기존 설정 보존·매치/비매치 동작 확인. PreToolUse 훅 라이브 발동 확인.
+- 검증: JSON 유효·매치/비매치 동작과 PreToolUse 훅 라이브 발동 확인.
+- 주의: 현재 설치기의 `jq -s '.[0] * .[1]'`은 top-level 설정은 보존하지만 같은
+  event의 기존 hook 배열은 append하지 않고 교체한다. 설치 전 settings 백업이 필요하다.
 - 한계: 훅은 MCP를 직접 호출 못 함(리마인더 주입만). 실제 기록은 여전히 에이전트가 수행.
 
 ### Phase 4 결과 — 온톨로지 추론 (claude_memory에서 실측)
@@ -167,11 +176,12 @@ forward-chaining은 `INSERT EDGE` 시 **자동**, `WHY <s> -> <d> OVER <e>`로 �
 CREATE EDGE evolves_to() TRANSITIVE
 INSERT EDGE evolves_to() VALUES 2001->2002:(), 2002->915327909379232758:()   -- 체인 2개만 저장
 
-GO FROM 2001 OVER evolves_to   → typed(asserted) + automated(INFERRED, 저장 안 함) 둘 다
+GO FROM 2001 OVER evolves_to   → typed(asserted) + automated(inferred, 직접 단언하지 않음) 둘 다
 WHY 2001 -> 915327909379232758 OVER evolves_to
   → status=inferred, rule=transitive, premises=[2001->2002, 2002->automated]
 ```
-즉 "minimal이 무엇으로 진화했나"에 저장하지 않은 automated까지 추론으로 나오고, 그 근거가 설명됨.
+즉 "minimal이 무엇으로 진화했나"에 직접 단언하지 않은 automated edge까지 엔진이
+materialize해 저장하고, 그 추론 근거가 설명됨.
 `depends_on` 전이성, `sameAs` 엔티티 병합(O-8) 등으로 확장 가능.
 
 **최대 리스크는 코드가 아니라 추출 규율.** 여기서 무너지면 §3의 쓰레기통이 된다.
