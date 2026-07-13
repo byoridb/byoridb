@@ -175,6 +175,42 @@ async fn run_suite(store: &dyn KVStore) {
         None,
         "모든 구간이 닫혀 1500 은 미커버"
     );
+
+    // v2-a: scan_history_entity_keys — prefix 아래 distinct 엔티티 열거
+    // (버전 다수 → 1개로 dedupe, 삭제-전용(tombstone) 엔티티 포함, prefix 경계).
+    store
+        .put_version(b"sp:edge:1:rel:2:0", 10, VALID_OPEN, 10, b"e1")
+        .await
+        .unwrap();
+    store
+        .put_version(b"sp:edge:1:rel:2:0", 20, VALID_OPEN, 20, b"e1v2")
+        .await
+        .unwrap();
+    store
+        .put_version(
+            b"sp:edge:1:rel:3:0",
+            10,
+            VALID_OPEN,
+            10,
+            Vec::new().as_slice(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_version(b"sp:edge:2:rel:9:0", 10, VALID_OPEN, 10, b"other-src")
+        .await
+        .unwrap();
+    let ents = store.scan_history_entity_keys(b"sp:edge:1:").await.unwrap();
+    assert_eq!(
+        ents,
+        vec![b"sp:edge:1:rel:2:0".to_vec(), b"sp:edge:1:rel:3:0".to_vec()],
+        "dedupe + tombstone-전용 포함 + 다른 src 제외"
+    );
+    assert!(store
+        .scan_history_entity_keys(b"sp:edge:9:")
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

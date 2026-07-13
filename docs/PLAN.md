@@ -874,8 +874,14 @@ nGQL v1은 `FETCH ... AS OF <ts>` 하나를 두 축에 같이 적용하고, 쓰�
 - **④ e2e 회귀**: `executor/temporal.rs` tests — public DML→parse/plan→`FETCH AS OF`
   (INSERT/UPDATE/DELETE 시간여행, tombstone, 같은 ms 연속 쓰기, 엣지 경로),
   kvstore 계약 스위트에 batch_apply·경계값·50-버전+미래-tx 정정 seek 스트레스 추가.
-- **다음(v2 기능 표면)**: edge `AS OF` 읽기 → temporal MATCH/GO → `VALID FROM/TO` /
-  `BETWEEN` → 이력 열람 API → 리텐션/GC → temporal 집계(D3).
+**✅ v2-a: edge `AS OF` 읽기 (2026-07-13):** `FETCH PROP ON <edge|*> src->dst AS OF <ts>` —
+kvstore `scan_history_entity_keys(prefix)` 신설(삭제돼 현재뷰에 없는 엣지도 이력에서
+열거, ranking/타입 와일드카드 대응) 후 엔티티별 `get_as_of` resolution.
+부수 수정: edge ref 의 음수 VID 가 `Minus Integer` lex 로 vertex fetch 로 오인되던
+파서 갭(`peek_is_edge_ref`/`consume_signed_integer`) — PR#31 보완.
+
+- **다음(v2 기능 표면)**: temporal MATCH/GO → `VALID FROM/TO` / `BETWEEN` →
+  이력 열람 API → 리텐션/GC → temporal 집계(D3).
 
 ### S. 보안 강화 (P0, 즉시 — 2026-05-13 심층 분석 결과)
 
