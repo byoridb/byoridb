@@ -1024,8 +1024,13 @@ impl Executor {
                 )))
             };
         };
+        // Delete the index *data* too, not just the definition. Otherwise the
+        // entries linger, and because a fresh IndexManager rebuilds next_index_id
+        // from surviving defs, a later CREATE INDEX can reuse the dropped id and
+        // reinterpret the stale entries as its own (cross-index contamination).
+        let partition_ids: Vec<u32> = (1..=self.ctx.get_partition_num().unwrap_or(1)).collect();
         match index_manager
-            .drop_index(self.ctx.resolve_space_id().await, &name)
+            .drop_index_with_data(self.ctx.resolve_space_id().await, &name, &partition_ids)
             .await
         {
             Ok(()) => Ok(ExecutorResult::empty()),
@@ -1080,8 +1085,13 @@ impl Executor {
                 )))
             };
         };
+        // Delete the index *data* too, not just the definition. Otherwise the
+        // entries linger, and because a fresh IndexManager rebuilds next_index_id
+        // from surviving defs, a later CREATE INDEX can reuse the dropped id and
+        // reinterpret the stale entries as its own (cross-index contamination).
+        let partition_ids: Vec<u32> = (1..=self.ctx.get_partition_num().unwrap_or(1)).collect();
         match index_manager
-            .drop_index(self.ctx.resolve_space_id().await, &name)
+            .drop_index_with_data(self.ctx.resolve_space_id().await, &name, &partition_ids)
             .await
         {
             Ok(()) => Ok(ExecutorResult::empty()),

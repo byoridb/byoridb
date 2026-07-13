@@ -1287,6 +1287,50 @@ async fn test_lookup_unsupported_predicate_not_fail_open() {
     service.sign_out(session_id, session_id).await;
 }
 
+/// Regression: DROP INDEX must delete the index *data*, not only its definition.
+/// A fresh IndexManager rebuilds next_index_id from surviving defs, so a later
+/// CREATE INDEX can reuse the dropped id — if the old entries linger they are
+/// reinterpreted as the new index's, leaking stale rows.
+#[tokio::test]
+async fn test_drop_index_removes_stale_entries() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE drop_idx_test").await;
+    execute(&service, session_id, "USE drop_idx_test").await;
+    execute(
+        &service,
+        session_id,
+        "CREATE TAG t(name STRING, city STRING)",
+    )
+    .await;
+    execute(&service, session_id, "CREATE TAG INDEX t_name ON t(name)").await;
+    execute(&service, session_id, r#"INSERT VERTEX t(name) VALUES 1:("Alice")"#).await;
+
+    // Drop the name index, then create a city index that may reuse the id.
+    execute(&service, session_id, "DROP INDEX TAG t_name").await;
+    execute(&service, session_id, "CREATE TAG INDEX t_city ON t(city)").await;
+
+    // The stale name-index entry "Alice" must NOT surface via the city index.
+    let leak = execute(
+        &service,
+        session_id,
+        r#"LOOKUP ON t WHERE t.city == "Alice""#,
+    )
+    .await;
+    assert_eq!(
+        leak.row_count(),
+        0,
+        "dropped index data must not leak into a reused index id: {:?}",
+        leak.rows
+    );
+
+    service.sign_out(session_id, session_id).await;
+}
+
 /// Graceful shutdown: once readiness is flipped off, new queries must be
 /// rejected with a clear error (k8s stops routing via /ready; this guards the
 /// window where a connection is already open).
