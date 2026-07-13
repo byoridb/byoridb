@@ -1241,6 +1241,52 @@ async fn test_indexed_match_not_truncated_at_1000() {
     service.sign_out(session_id, session_id).await;
 }
 
+/// Regression: a LOOKUP predicate the pushdown can't express must NOT silently
+/// match everything. Before the fix an unconvertible WHERE (e.g. CONTAINS) fell
+/// back to `FilterExpr::True`, returning every vertex of the tag.
+#[tokio::test]
+async fn test_lookup_unsupported_predicate_not_fail_open() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE lookup_failopen_test").await;
+    execute(&service, session_id, "USE lookup_failopen_test").await;
+    execute(&service, session_id, "CREATE TAG person(name STRING)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX person(name) VALUES 1:("Alice"), 2:("Bob"), 3:("Carol")"#,
+    )
+    .await;
+
+    // A supported predicate (no index → fallback scan) still filters correctly.
+    let ok = execute(
+        &service,
+        session_id,
+        r#"LOOKUP ON person WHERE person.name == "Alice""#,
+    )
+    .await;
+    assert_eq!(ok.row_count(), 1, "== predicate must filter to just Alice");
+
+    // An unsupported predicate must be rejected, not fail open to all 3 rows.
+    let bad = service
+        .execute(
+            session_id,
+            r#"LOOKUP ON person WHERE person.name CONTAINS "li""#.to_string(),
+        )
+        .await;
+    assert!(
+        bad.is_err(),
+        "unsupported LOOKUP predicate must error, not return every row: {:?}",
+        bad.map(|d| d.row_count())
+    );
+
+    service.sign_out(session_id, session_id).await;
+}
+
 /// Graceful shutdown: once readiness is flipped off, new queries must be
 /// rejected with a clear error (k8s stops routing via /ready; this guards the
 /// window where a connection is already open).

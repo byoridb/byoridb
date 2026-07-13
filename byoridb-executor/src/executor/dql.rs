@@ -1185,12 +1185,20 @@ impl Executor {
 
         let vertex_prefix = format!("{}:vertex:", space);
 
-        // Convert WHERE clause to FilterExpr for predicate pushdown
-        let filter_expr = plan
-            .where_clause
-            .as_ref()
-            .and_then(|expr| self.expr_to_filter_expr(expr))
-            .unwrap_or(FilterExpr::True);
+        // Convert WHERE clause to FilterExpr for predicate pushdown. A predicate
+        // the pushdown can't express (e.g. CONTAINS / STARTS WITH / regex, or a
+        // field-to-field comparison) must NOT silently become `True` — that
+        // returned every row (fail-open). Reject it with a clear error instead.
+        let filter_expr = match plan.where_clause.as_ref() {
+            None => FilterExpr::True,
+            Some(expr) => self.expr_to_filter_expr(expr).ok_or_else(|| {
+                ExecutionError::InvalidOperation(format!(
+                    "unsupported LOOKUP predicate — only ==, !=, <, <=, >, >=, AND, OR, NOT \
+                     over a field and a literal are supported here: {:?}",
+                    expr
+                ))
+            })?,
+        };
 
         let tag_name_filter = tag_or_edge_name.clone();
         let is_tag_lookup = matches!(plan.lookup_type, crate::plan::LookupType::Tag(_));
