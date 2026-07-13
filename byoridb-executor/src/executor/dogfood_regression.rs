@@ -252,6 +252,42 @@ mod tests {
         );
     }
 
+    /// #2: a duplicate edge INSERT (same src/type/dst/rank) overwrites the single
+    /// current-view edge, so its degree must be counted once — not once per
+    /// INSERT. Previously two identical inserts left one edge but a degree count
+    /// of two (a later delete then left a ghost count).
+    #[tokio::test]
+    async fn duplicate_edge_insert_counts_degree_once() {
+        let e = create_executor();
+        run(&e, "CREATE TAG category(name STRING)").await;
+        run(&e, "CREATE EDGE in_category()").await;
+        run(&e, "INSERT VERTEX category(name) VALUES 100:(\"elec\")").await;
+        run(&e, "INSERT EDGE in_category() VALUES 1->100:()").await;
+        // Same edge again — must NOT double-count the degree.
+        run(&e, "INSERT EDGE in_category() VALUES 1->100:()").await;
+
+        let r = run(
+            &e,
+            "MATCH (c:category)<-[:in_category]-() RETURN c.category.name AS k, COUNT(*) AS n",
+        )
+        .await;
+        let got: Vec<(String, i64)> = r
+            .rows
+            .iter()
+            .filter_map(|row| match (&row[0], &row[1]) {
+                (byoridb_common::Value::String(s), byoridb_common::Value::Int(n)) => {
+                    Some((s.clone(), *n))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![("elec".to_string(), 1)],
+            "duplicate edge must count degree once, not twice"
+        );
+    }
+
     /// Forward direction (`->`) of the same fast-path: count out-edges per node.
     #[tokio::test]
     async fn match_edge_degree_group_count_forward() {

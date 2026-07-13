@@ -186,6 +186,10 @@ impl Executor {
                     std::collections::HashMap::new();
                 let mut deg_out: std::collections::HashMap<(String, i64), i64> =
                     std::collections::HashMap::new();
+                // Current-view edge keys newly asserted in this batch, to count a
+                // duplicate edge's degree at most once.
+                let mut seen_edges: std::collections::HashSet<Vec<u8>> =
+                    std::collections::HashSet::new();
                 for edge in edges {
                     // Schema validation: verify edge type and its fields exist
                     let edge_type_name = edge.edge_type.clone();
@@ -206,6 +210,13 @@ impl Executor {
                     let data = VertexCodec::encode_edge(&codec_edge)
                         .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
                     let key_bytes = key.into_bytes();
+                    // A duplicate edge (same src/type/dst/rank) overwrites the one
+                    // current-view key, so its degree must be counted at most once
+                    // — both within this batch (`seen_edges`) and against edges
+                    // already persisted. Otherwise re-inserting inflated the degree
+                    // counter, and a later delete left a ghost count.
+                    let edge_is_new = seen_edges.insert(key_bytes.clone())
+                        && self.ctx.kvstore.get(&key_bytes).await?.is_none();
                     // T-트랙: 현재뷰 엣지 blob을 이력 버전으로도 기록.
                     edge_versions.push((key_bytes.clone(), data.clone()));
                     batch.push((key_bytes, data.clone()));
@@ -247,12 +258,14 @@ impl Executor {
                         batch.push((idx_key, Vec::new()));
                     }
                     new_triples.push((edge.src, edge_type_name.clone(), edge.dst));
-                    *deg_in
-                        .entry((edge_type_name.clone(), edge.dst))
-                        .or_insert(0) += 1;
-                    *deg_out
-                        .entry((edge_type_name.clone(), edge.src))
-                        .or_insert(0) += 1;
+                    if edge_is_new {
+                        *deg_in
+                            .entry((edge_type_name.clone(), edge.dst))
+                            .or_insert(0) += 1;
+                        *deg_out
+                            .entry((edge_type_name.clone(), edge.src))
+                            .or_insert(0) += 1;
+                    }
                     inserted += 1;
                 }
                 if !batch.is_empty() {
