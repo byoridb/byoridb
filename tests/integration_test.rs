@@ -1190,6 +1190,57 @@ async fn test_insert_rejects_type_mismatch() {
     service.sign_out(session_id, session_id).await;
 }
 
+/// Regression: an indexed MATCH must not silently truncate candidates at a
+/// hard-coded 1000. With 1001 matching vertices the pattern must return all
+/// 1001 (bounded only by the configurable scan cap, default 100k).
+#[tokio::test]
+async fn test_indexed_match_not_truncated_at_1000() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE match_cap_test").await;
+    execute(&service, session_id, "USE match_cap_test").await;
+    execute(&service, session_id, "CREATE TAG person(city STRING)").await;
+    execute(
+        &service,
+        session_id,
+        "CREATE TAG INDEX person_city ON person(city)",
+    )
+    .await;
+
+    // 1001 vertices all with city = "Seoul" (one row over the old 1000 cap).
+    let mut values = String::new();
+    for vid in 1..=1001 {
+        if vid > 1 {
+            values.push_str(", ");
+        }
+        values.push_str(&format!(r#"{vid}:("Seoul")"#));
+    }
+    execute(
+        &service,
+        session_id,
+        &format!("INSERT VERTEX person(city) VALUES {values}"),
+    )
+    .await;
+
+    let matched = execute(
+        &service,
+        session_id,
+        r#"MATCH (n:person {city: "Seoul"}) RETURN n"#,
+    )
+    .await;
+    assert_eq!(
+        matched.row_count(),
+        1001,
+        "indexed MATCH must return all 1001 matches, not a truncated 1000"
+    );
+
+    service.sign_out(session_id, session_id).await;
+}
+
 /// Graceful shutdown: once readiness is flipped off, new queries must be
 /// rejected with a clear error (k8s stops routing via /ready; this guards the
 /// window where a connection is already open).

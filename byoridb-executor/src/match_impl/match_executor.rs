@@ -1935,9 +1935,14 @@ impl MatchExecutor {
         let mut vids = Vec::new();
         let mut lookup_succeeded = false;
 
+        // Use the configured scan cap (default 100k, overridable via
+        // BYORIDB_MAX_SCAN_LIMIT; 0 = unbounded) instead of a hard-coded 1000
+        // that silently truncated indexed MATCH candidates and treated the
+        // truncated set as complete.
+        let scan_cap = self.ctx.config.max_scan_limit;
         for part_id in 1..=partition_num {
             match index_manager
-                .lookup_tag(part_id, index_def, &lookup_values, 1000)
+                .lookup_tag(part_id, index_def, &lookup_values, scan_cap)
                 .await
             {
                 Ok(part_vids) => {
