@@ -310,9 +310,35 @@ impl Executor {
                 format!("{}:edge:{}:{}:", effective_space, src, edge_type)
             };
 
-            let entries = self.ctx.kvstore.scan_prefix(prefix.as_bytes()).await?;
+            // T-트랙 v2: `AS OF <ts>` 는 현재뷰 대신 이력에서 resolution 한다.
+            // 이력에 존재했던 엔티티(삭제돼 현재뷰에 없는 엣지 포함)를 열거하고
+            // 각각 (ts, ts) 시점 값을 고른다. 빈 payload = tombstone = 그 시점 부재.
+            let values: Vec<Vec<u8>> = if let Some(ts) = plan.as_of {
+                let mut vals = Vec::new();
+                for ekey in self
+                    .ctx
+                    .kvstore
+                    .scan_history_entity_keys(prefix.as_bytes())
+                    .await?
+                {
+                    if let Some(v) = self.ctx.kvstore.get_as_of(&ekey, ts, ts).await? {
+                        if !v.is_empty() {
+                            vals.push(v);
+                        }
+                    }
+                }
+                vals
+            } else {
+                self.ctx
+                    .kvstore
+                    .scan_prefix(prefix.as_bytes())
+                    .await?
+                    .into_iter()
+                    .map(|(_k, v)| v)
+                    .collect()
+            };
 
-            for (_key, value) in entries {
+            for value in values {
                 match VertexCodec::decode_edge(&value) {
                     Ok(edge) if edge.dst_vid == *dst => {
                         let edge_json = VertexCodec::edge_to_json(&edge);

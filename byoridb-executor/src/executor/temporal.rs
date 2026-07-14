@@ -152,6 +152,67 @@ mod tests {
         assert_eq!(r.rows.len(), 0, "현재뷰에서도 삭제됨");
     }
 
+    /// v2-a: edge `AS OF` — 삽입/덮어쓰기/삭제를 각 시점으로 되짚는다.
+    /// 삭제된 엣지도 이력 열거(scan_history_entity_keys)로 과거 시점엔 보인다.
+    #[tokio::test]
+    async fn edge_fetch_as_of_time_travel() {
+        let (e, kv) = create();
+        run(&e, "CREATE TAG t(name STRING)").await;
+        run(&e, "CREATE EDGE rel(kind STRING)").await;
+        run(&e, "INSERT VERTEX t(name) VALUES 1:(\"a\")").await;
+        run(&e, "INSERT VERTEX t(name) VALUES 2:(\"b\")").await;
+        run(&e, "INSERT EDGE rel(kind) VALUES 1->2:(\"first\")").await;
+        run(&e, "INSERT EDGE rel(kind) VALUES 1->2:(\"second\")").await;
+        run(&e, "DELETE EDGE rel 1->2").await;
+
+        let hist = kv.scan_history(b"default:edge:1:rel:2:0").await.unwrap();
+        assert_eq!(hist.len(), 3);
+        let (t3, t2, t1) = (hist[0].tx, hist[1].tx, hist[2].tx); // newest-first
+
+        let r = run(&e, &format!("FETCH PROP ON rel 1->2 AS OF {t1}")).await;
+        assert_eq!(r.rows.len(), 1);
+        assert!(
+            row_text(&r).contains("first"),
+            "t1: 최초 payload: {:?}",
+            r.rows
+        );
+
+        let r = run(&e, &format!("FETCH PROP ON rel 1->2 AS OF {t2}")).await;
+        assert_eq!(r.rows.len(), 1);
+        assert!(row_text(&r).contains("second"), "t2: 덮어쓴 payload");
+
+        let r = run(&e, &format!("FETCH PROP ON rel 1->2 AS OF {t3}")).await;
+        assert_eq!(r.rows.len(), 0, "t3(삭제) 이후엔 부재");
+
+        // 현재뷰엔 없지만(삭제됨) 과거 시점 조회는 이력에서 살아 있다.
+        let r = run(&e, "FETCH PROP ON rel 1->2").await;
+        assert_eq!(r.rows.len(), 0, "현재뷰 부재");
+
+        // 와일드카드 edge type 도 같은 경로.
+        let r = run(&e, &format!("FETCH PROP ON * 1->2 AS OF {t2}")).await;
+        assert_eq!(r.rows.len(), 1, "OVER * 시점 조회");
+    }
+
+    /// PR#31 보완: edge ref 의 음수 VID 는 `Minus Integer` 로 lex 되어
+    /// vertex fetch 로 오인되던 파서 갭 — `FETCH PROP ON rel -5->7`.
+    #[tokio::test]
+    async fn edge_fetch_accepts_negative_vids() {
+        let (e, kv) = create();
+        run(&e, "CREATE TAG t(name STRING)").await;
+        run(&e, "CREATE EDGE rel(kind STRING)").await;
+        run(&e, "INSERT VERTEX t(name) VALUES -5:(\"n\")").await;
+        run(&e, "INSERT VERTEX t(name) VALUES 7:(\"p\")").await;
+        run(&e, "INSERT EDGE rel(kind) VALUES -5->7:(\"r\")").await;
+
+        let r = run(&e, "FETCH PROP ON rel -5->7").await;
+        assert_eq!(r.rows.len(), 1, "음수 src edge ref 현재뷰 조회");
+
+        let hist = kv.scan_history(b"default:edge:-5:rel:7:0").await.unwrap();
+        let t1 = hist[0].tx;
+        let r = run(&e, &format!("FETCH PROP ON rel -5->7 AS OF {t1}")).await;
+        assert_eq!(r.rows.len(), 1, "음수 src edge ref 시점 조회");
+    }
+
     /// v1.1 ①: DML 의 현재뷰 변경과 이력 append 는 항상 짝을 이룬다
     /// (batch_apply 단일 트랜잭션 — 엣지 쓰기/삭제 경로 포함).
     #[tokio::test]

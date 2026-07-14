@@ -159,6 +159,13 @@ pub trait KVStore: Send + Sync {
     /// All stored versions of `entity_key`, newest-first (valid_from desc, tx desc).
     async fn scan_history(&self, entity_key: &[u8]) -> Result<Vec<VersionRecord>>;
 
+    /// Distinct entity keys with at least one history version under
+    /// `entity_prefix` (a current-view key prefix), ascending. Includes entities
+    /// whose current-view key no longer exists (deleted → tombstoned), which is
+    /// what point-in-time reads over a key *range* need — e.g. edge `AS OF`
+    /// where ranking/edge-type is enumerated rather than known.
+    async fn scan_history_entity_keys(&self, entity_prefix: &[u8]) -> Result<Vec<Vec<u8>>>;
+
     /// Append many versions in one transaction (bulk write path). Each tuple is
     /// `(entity_key, valid_from, valid_to, tx, value)`. Append-only.
     async fn batch_put_version(
@@ -914,6 +921,34 @@ impl KVStore for RedbKVStore {
         .await?
     }
 
+    async fn scan_history_entity_keys(&self, entity_prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let db = Arc::clone(&self.db);
+        let prefix = entity_prefix.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<Vec<Vec<u8>>> {
+            let rtx = db.begin_read()?;
+            let table = rtx.open_table(HISTORY_TABLE)?;
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            for entry in table.range(prefix.as_slice()..)? {
+                let (k, _v) = entry?;
+                let kb = k.value();
+                if !kb.starts_with(&prefix) {
+                    break;
+                }
+                // history key = entity || 0x00 || 16B(times) — strip the suffix.
+                if kb.len() < 17 || kb[kb.len() - 17] != 0x00 {
+                    continue;
+                }
+                let entity = &kb[..kb.len() - 17];
+                // One entity's versions are key-consecutive → last-check dedupes.
+                if out.last().map(|e| e.as_slice()) != Some(entity) {
+                    out.push(entity.to_vec());
+                }
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
     /// Truly atomic dual-write: KV_TABLE puts/deletes and HISTORY_TABLE appends
     /// commit in one redb write transaction (T-트랙 v1.1).
     async fn batch_apply(
@@ -1053,6 +1088,24 @@ impl KVStore for MemoryKVStore {
             h.insert(history_key(ek, *vf, *tx), encode_history_value(*vt, val));
         }
         Ok(())
+    }
+
+    async fn scan_history_entity_keys(&self, entity_prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let h = self.history.read().await;
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for (k, _v) in h.range(entity_prefix.to_vec()..) {
+            if !k.starts_with(entity_prefix) {
+                break;
+            }
+            if k.len() < 17 || k[k.len() - 17] != 0x00 {
+                continue;
+            }
+            let entity = &k[..k.len() - 17];
+            if out.last().map(|e| e.as_slice()) != Some(entity) {
+                out.push(entity.to_vec());
+            }
+        }
+        Ok(out)
     }
 
     /// Atomic dual-write: both maps' write locks are held for the whole apply,
