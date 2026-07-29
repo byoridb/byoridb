@@ -4,6 +4,7 @@
 
 //! Session management with lock-free concurrent access and expiration
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use std::time::{Duration, SystemTime};
 
@@ -54,19 +55,22 @@ impl SessionManager {
 
     /// Create a new session and return its ID (cryptographically random)
     pub async fn create_session(&self, username: String) -> i64 {
-        let id = Self::random_session_id();
-        let now = SystemTime::now();
-        let session = Session {
-            id,
-            username,
-            space: None,
-            created_at: now,
-            expires_at: now + self.ttl,
-            last_accessed: now,
-        };
-
-        self.sessions.insert(id, session);
-        id
+        let username = Self::normalize_username(&username);
+        loop {
+            let id = Self::random_session_id();
+            if let Entry::Vacant(entry) = self.sessions.entry(id) {
+                let now = SystemTime::now();
+                entry.insert(Session {
+                    id,
+                    username: username.clone(),
+                    space: None,
+                    created_at: now,
+                    expires_at: now + self.ttl,
+                    last_accessed: now,
+                });
+                return id;
+            }
+        }
     }
 
     fn random_session_id() -> i64 {
@@ -76,11 +80,33 @@ impl SessionManager {
         // tokio worker threads share the same coarse nanosecond), which dropped
         // sessions and risked session-id *reuse*. `>> 1` clears the sign bit so
         // the id is non-negative without the `i64::MIN.abs()` overflow hazard.
-        (OsRng.next_u64() >> 1) as i64
+        // Zero is excluded because several client/protocol paths reserve it as
+        // an authentication failure sentinel.
+        loop {
+            let candidate = (OsRng.next_u64() >> 1) as i64;
+            if candidate > 0 {
+                return candidate;
+            }
+        }
+    }
+
+    fn normalize_username(username: &str) -> String {
+        username.trim().to_string()
     }
 
     /// Create a session with a specific ID (used when AuthManager provides the ID)
-    pub async fn create_session_with_id(&self, id: i64, username: String) {
+    /// Returns false instead of overwriting an existing session or accepting a
+    /// non-positive ID.
+    pub async fn create_session_with_id(&self, id: i64, username: String) -> bool {
+        if id <= 0 {
+            return false;
+        }
+
+        let username = Self::normalize_username(&username);
+        if username.is_empty() {
+            return false;
+        }
+
         let now = SystemTime::now();
         let session = Session {
             id,
@@ -91,12 +117,34 @@ impl SessionManager {
             last_accessed: now,
         };
 
-        self.sessions.insert(id, session);
+        match self.sessions.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert(session);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
     }
 
     /// Remove a session by ID
     pub async fn remove_session(&self, session_id: i64) {
         self.sessions.remove(&session_id);
+    }
+
+    /// Remove every graph session owned by `username`, returning the removed
+    /// session IDs in deterministic order.
+    pub async fn remove_sessions_for_user(&self, username: &str) -> Vec<i64> {
+        let username = Self::normalize_username(username);
+        let mut removed = Vec::new();
+        self.sessions.retain(|session_id, session| {
+            let keep = session.username != username;
+            if !keep {
+                removed.push(*session_id);
+            }
+            keep
+        });
+        removed.sort_unstable();
+        removed
     }
 
     /// Check if a session exists and is not expired.
@@ -151,13 +199,13 @@ impl SessionManager {
             if session_ref.is_expired() {
                 drop(session_ref);
                 self.sessions.remove(&session_id);
-                return Err(format!("Session {} expired", session_id));
+                return Err("Session expired".to_string());
             }
             session_ref.space = Some(space);
             session_ref.last_accessed = SystemTime::now();
             Ok(())
         } else {
-            Err(format!("Session {} not found", session_id))
+            Err("Session not found".to_string())
         }
     }
 
@@ -239,6 +287,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_session_with_id_rejects_invalid_and_collision() {
+        let manager = SessionManager::new();
+
+        assert!(!manager.create_session_with_id(0, "zero".to_string()).await);
+        assert!(
+            !manager
+                .create_session_with_id(-1, "negative".to_string())
+                .await
+        );
+        assert!(
+            manager
+                .create_session_with_id(42, "first".to_string())
+                .await
+        );
+        assert!(
+            !manager
+                .create_session_with_id(42, "attacker".to_string())
+                .await
+        );
+
+        let session = manager.get_session(42).await.unwrap();
+        assert_eq!(session.username, "first");
+        assert_eq!(manager.session_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_remove_sessions_for_user_only_removes_matching_username() {
+        let manager = SessionManager::new();
+        let alice_1 = manager.create_session("Alice".to_string()).await;
+        let alice_2 = manager.create_session(" Alice ".to_string()).await;
+        let lowercase_alice = manager.create_session("alice".to_string()).await;
+        let bob = manager.create_session("bob".to_string()).await;
+
+        let mut expected = vec![alice_1, alice_2];
+        expected.sort_unstable();
+        assert_eq!(manager.remove_sessions_for_user(" Alice ").await, expected);
+        assert!(!manager.has_session(alice_1).await);
+        assert!(!manager.has_session(alice_2).await);
+        assert!(manager.has_session(lowercase_alice).await);
+        assert!(manager.has_session(bob).await);
+    }
+
+    #[tokio::test]
     async fn test_set_space() {
         let manager = SessionManager::new();
         let id = manager.create_session("user".to_string()).await;
@@ -307,8 +398,11 @@ mod tests {
         }
 
         // Wait for all tasks to complete
+        let mut ids = std::collections::HashSet::new();
         for handle in handles {
-            handle.await.unwrap();
+            let id = handle.await.unwrap();
+            assert!(id > 0);
+            assert!(ids.insert(id), "duplicate session id: {id}");
         }
 
         // All sessions should be created

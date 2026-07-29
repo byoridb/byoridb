@@ -1,84 +1,160 @@
-# ByoriDB에 기여하기
+# Contributing to ByoriDB
 
-ByoriDB에 기여하는 데 관심을 가져주셔서 감사합니다! 커뮤니티의 기여를 환영합니다.
+[한국어](CONTRIBUTING.ko.md)
 
-## 시작하기
+Thank you for helping improve ByoriDB. Bug reports, focused fixes, tests, and
+documentation improvements are welcome.
 
-### 사전 요구사항
+Do not open a public issue for a suspected vulnerability. Follow the private
+reporting process in [SECURITY.md](SECURITY.md).
 
-- **Rust**: `rust-toolchain.toml`에 고정된 Rust 1.90을 사용합니다. [rustup](https://rustup.rs/)으로 설치하세요.
-- **protobuf-compiler**: tonic/gRPC code generation에 필요합니다.
-- C++ 빌드 도구가 필요 없습니다 — 스토리지는 순수 Rust(redb)로 구현되었습니다.
+## Before you start
 
-### 프로젝트 빌드하기
+- Search existing issues and pull requests to avoid duplicate work.
+- For a large feature, storage-format change, query-language change, or
+  distributed-systems change, open an issue first and describe the proposed
+  behavior and compatibility impact.
+- Read [docs/PLAN.md](docs/PLAN.md) for current implementation constraints and
+  known regression areas.
+- Keep changes focused. Do not mix unrelated formatting, refactors, and feature
+  work in one pull request.
 
-1. 저장소를 클론합니다:
-   ```bash
-   git clone https://github.com/byoridb/byoridb.git
-   cd byoridb
-   ```
+## Development environment
 
-2. 프로젝트를 빌드합니다:
-   ```bash
-   cargo build
-   ```
+Required tools:
 
-3. git 훅을 설정합니다 (권장):
-   ```bash
-   ./scripts/setup-hooks.sh
-   ```
-   이렇게 하면 코드 포매팅을 자동으로 검사하는 pre-commit 훅이 활성화됩니다.
+- Linux or macOS
+- Rust 1.90 from `rust-toolchain.toml`
+- `protobuf-compiler` for gRPC code generation
 
-### 테스트 실행하기
+The embedded storage backend is redb and does not require a C++ toolchain.
 
-Pull Request를 제출하기 전에 전체 workspace 테스트를 직렬로 실행합니다. redb 파일
-락과 임시 DB 경합을 피하기 위해 `--test-threads=1`이 필요합니다.
+```bash
+git clone https://github.com/byoridb/byoridb.git
+cd byoridb
+cargo build
+```
+
+Enable the repository's formatting pre-commit hook if desired:
+
+```bash
+./scripts/setup-hooks.sh
+```
+
+## Repository layout
+
+| Path | Responsibility |
+|---|---|
+| `src/` | `byoridb-server` and `byoridb-backup` entry points |
+| `byoridb-common/` | Shared graph values, records, datasets, and crypto helpers |
+| `byoridb-kvstore/` | redb current view, temporal history, and backup support |
+| `byoridb-codec/` | Binary row encoding and decoding |
+| `byoridb-storage/` | Vertex/edge storage, partitioning, and custom Raft |
+| `byoridb-meta/` | Spaces, schemas, partitions, and metadata services |
+| `byoridb-parser/` | Lexer, AST, and nGQL-style parsers |
+| `byoridb-executor/` | Plans, query execution, inference, paths, and recommendation |
+| `byoridb-graph/` | HTTP/gRPC, authentication, sessions, and query coordination |
+| `byoridb-client/` | Rust client and `byoridb-cli` |
+| `byoridb-bulkloader/` | Bulk-loading binary and library |
+| `tests/` | Workspace integration and distributed tests |
+| `book/` | mdBook user and operations documentation |
+| `docs/` | Implementation status, decisions, and migration plans |
+
+The removed `byoridb-core/` crate must not be recreated.
+
+## Code conventions
+
+- Follow Rust naming conventions: `snake_case` for functions and modules,
+  `PascalCase` for types, and `SCREAMING_SNAKE_CASE` for constants.
+- Library crates should expose typed errors with `thiserror`; service and binary
+  boundaries may add context with `anyhow`.
+- Do not add `unwrap()` or `expect()` to production paths. They are allowed in
+  tests when the failure message remains useful.
+- Use structured `tracing` events in production code. Do not commit `println!`,
+  `eprintln!`, or `dbg!` in production paths.
+- Register shared third-party dependencies under `[workspace.dependencies]` in
+  the root `Cargo.toml`, then reference them with `workspace = true` from member
+  crates.
+- Add focused tests for new behavior. Prefer an inline `#[cfg(test)]` module for
+  unit behavior and `tests/` for cross-crate behavior.
+- Keep `byoridb-executor/src/executor/mod.rs` as a router; put substantial new
+  execution logic in a purpose-specific module.
+- Never commit credentials, `.env` files, private data, or generated databases.
+
+## Documentation conventions
+
+English is the canonical documentation language. When changing a public English
+document, update its Korean mirror (`*.ko.md`) in the same pull request. Keep
+commands, identifiers, paths, and query examples identical between languages.
+
+Document behavior that exists in the current code. Mark incomplete or
+experimental behavior explicitly; in particular, do not describe the current
+multi-node launcher as production-ready.
+
+## Required checks
+
+Format and lint the complete workspace:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+Run all tests serially. Serial execution is required because temporary redb
+databases can contend for files and locks:
 
 ```bash
 cargo test --workspace --all-features -- --test-threads=1
 ```
 
-특정 테스트를 실행하려면:
+Useful narrower commands while iterating:
 
 ```bash
-cargo test --package byoridb-executor test_name
+cargo test --package byoridb-executor
+cargo test --package byoridb-graph
+cargo test --package byoridb-kvstore --test temporal
 ```
 
-## 코드 스타일
+The full workspace command is still the final gate.
 
-표준 Rust 코딩 컨벤션을 따릅니다.
+### High-risk areas
 
-- **포매팅**: 코드를 `rustfmt`로 포매팅했는지 확인해 주세요.
-  ```bash
-  cargo fmt --all
-  ```
+- **Space/tag/edge identifiers:** review the H-series regressions in
+  `docs/PLAN.md` and rerun their regression tests when changing schema keys,
+  planning, lookup, fetch, traversal, or multi-pattern matching.
+- **Temporal paths:** verify current-view behavior and history together. Run the
+  temporal KV test, parser/executor `fetch_as_of` tests, and the full serial
+  workspace suite.
+- **Custom Raft:** understand log, snapshot, and membership behavior before
+  editing `byoridb-storage/src/raft/`; run
+  `tests/distributed_e2e_test.rs` with all features.
+- **Authentication and authorization:** add a negative test for every privilege
+  boundary, including nested/compound statements and session invalidation.
 
-- **Clippy**: 흔한 실수를 잡기 위해 clippy를 실행하세요.
-  ```bash
-  cargo clippy --workspace --all-targets --all-features -- -D warnings
-  ```
+## Pull-request workflow
 
-## 개발 워크플로
+1. Fork the repository and create a focused branch.
+2. Implement the smallest coherent change with tests and documentation.
+3. Run the required checks above.
+4. Use a concise conventional commit such as
+   `fix(executor): preserve temporal history`.
+5. Push your branch and open a pull request using the repository template.
 
-1. 저장소를 포크합니다.
-2. 기능 또는 수정 사항을 위한 새 브랜치를 생성합니다 (`git checkout -b feature/my-feature`).
-3. `<type>(<scope>): <subject>` 형식으로 커밋합니다
-   (`git commit -am 'fix(executor): preserve temporal history'`).
-4. 브랜치에 푸시합니다 (`git push origin feature/my-feature`).
-5. Pull Request를 엽니다.
+In the pull request, explain:
 
-## 프로젝트 구조
+- the problem and intended behavior;
+- important design choices and compatibility risks;
+- exactly which commands you ran and their results;
+- migration, deployment, or rollback considerations;
+- documentation changed with the implementation.
 
-- `byoridb-common`: 핵심 데이터 타입 (Value, Vertex, Edge, DataSet).
-- `byoridb-kvstore`: KV 스토리지 계층 (redb, 순수 Rust).
-- `byoridb-codec`: 스키마 버저닝을 지원하는 행(row) 인코딩/디코딩.
-- `byoridb-storage`: 스토리지 서비스, Raft 합의, 인덱싱.
-- `byoridb-meta`: 메타데이터 관리, 파티션 할당.
-- `byoridb-parser`: nGQL 쿼리 언어 파서.
-- `byoridb-executor`: 쿼리 계획 수립 및 실행 엔진.
-- `byoridb`: Graph 서비스, HTTP/gRPC 서버.
-- `byoridb-client`: 클라이언트 라이브러리 및 CLI.
+All contributions are submitted under the repository's
+[Apache License 2.0](LICENSE) unless explicitly stated otherwise.
 
-## 도움 받기
+## Getting help
 
-질문이 있으면 이슈를 열거나 커뮤니티 토론에 참여해 주세요.
+Open a GitHub issue for reproducible bugs and focused feature discussions. Include
+the ByoriDB revision, operating system, relevant configuration with secrets
+removed, a minimal query sequence, and the observed error. Use the private
+security process for anything that may expose credentials, data, or an access
+control bypass.

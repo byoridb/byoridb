@@ -1,17 +1,22 @@
-# 빠른 시작 가이드
+# ByoriDB quick start
 
-이 가이드는 ByoriDB를 설치하고 실행하는 데 도움을 줍니다.
+[한국어](QUICKSTART.ko.md)
 
-## 사전 요구사항
+This guide builds a local standalone server, connects with the CLI, exercises
+the HTTP API, and creates a backup. Standalone single-node operation is the
+primary supported path; the current cluster launcher is not production-ready.
 
-- **Rust**: 1.90 (`rust-toolchain.toml`에 고정, [rustup](https://rustup.rs/)으로 설치)
-- **protobuf-compiler**: gRPC code generation에 필요
-- **Linux/macOS**: Windows는 현재 지원하지 않습니다
-- C++ 빌드 도구가 필요 없습니다 — 스토리지는 순수 Rust(redb)로 구현되었습니다
+## 1. Prerequisites
 
-## 1. 빌드 및 실행
+- Linux or macOS (native Windows is not currently supported)
+- Rust 1.90, installed with [rustup](https://rustup.rs/) and pinned by
+  `rust-toolchain.toml`
+- `protobuf-compiler` (`protoc`) for gRPC code generation
 
-프로젝트를 클론하고 빌드합니다:
+The storage backend is pure Rust (redb), so a C++ build toolchain is not
+required.
+
+## 2. Build the workspace
 
 ```bash
 git clone https://github.com/byoridb/byoridb.git
@@ -19,175 +24,267 @@ cd byoridb
 cargo build --release
 ```
 
-독립 실행형 서버(embedded storage + Graph gRPC/HTTP)를 시작합니다. Meta gRPC 서버는
-cluster peers를 설정한 경우에만 함께 시작합니다:
+## 3. Start the standalone server
+
+Set a strong root password before starting the binary:
 
 ```bash
-export BYORIDB_ROOT_PASSWORD='change-me-before-production'
+export BYORIDB_ROOT_PASSWORD='replace-with-a-strong-local-secret'
 cargo run --release --bin byoridb-server
 ```
 
-기본 포트:
-- **gRPC**: 9669
-- **HTTP**: 19669
+`byoridb-server` fails closed when `BYORIDB_ROOT_PASSWORD` is missing, empty,
+or whitespace-only. It does not print or generate a retrievable root password.
+For deployment, inject this value through a secret manager instead of storing
+it in a repository, image, or committed `.env` file.
 
-## 2. CLI 클라이언트로 연결하기
+Default listeners:
+
+| Protocol | Address | Purpose |
+|---|---|---|
+| gRPC | `0.0.0.0:9669` | Native client and CLI |
+| HTTP | `0.0.0.0:19669` | REST-style session/query API and metrics |
+
+Confirm liveness and readiness:
 
 ```bash
-# 새 터미널에서
+curl --fail http://127.0.0.1:19669/health
+# OK
+
+curl --fail http://127.0.0.1:19669/ready
+# READY
+```
+
+These listeners do not provide native TLS. Keep them on a trusted network or
+place them behind TLS termination before using them outside a local environment.
+
+## 4. Connect with the CLI
+
+Open another terminal and provide both credentials explicitly:
+
+```bash
 export BYORIDB_USER=root
-export BYORIDB_PASSWORD='change-me-before-production'
+export BYORIDB_PASSWORD='replace-with-a-strong-local-secret'
 cargo run -p byoridb-client --bin byoridb-cli
 ```
 
-ByoriDB는 항상 `root` 사용자를 생성합니다. root 비밀번호는
-`BYORIDB_ROOT_PASSWORD`에서 가져오며, 설정되지 않은 경우 서버가 무작위
-비밀번호를 생성하여 시작 시 한 번 로그에 기록합니다.
+Equivalent flags are available through `--user` and `--password`, but the
+password environment variable avoids placing the secret directly in shell
+history and process arguments. The CLI has no default user or password.
 
-## 3. 기본 쿼리 (CLI)
+## 5. Run basic queries
 
-연결되면 다음 nGQL 쿼리를 실행해 보세요:
-
-### Space 생성
+At the `byoridb>` prompt, create a space and select it:
 
 ```sql
 CREATE SPACE my_space(partition_num=10, replica_factor=1, vid_type=INT64);
 USE my_space;
 ```
 
-### 스키마 정의
+Define a schema:
 
 ```sql
 CREATE TAG person(name STRING, age INT64);
-CREATE EDGE follow(degree INT64);
+CREATE EDGE follows(since INT64);
 ```
 
-### 데이터 삽입
+Insert data:
 
 ```sql
-INSERT VERTEX person(name, age) VALUES 100:('Tom', 20);
-INSERT VERTEX person(name, age) VALUES 101:('Jerry', 22);
-INSERT EDGE follow(degree) VALUES 100->101:(95);
+INSERT VERTEX person(name, age) VALUES 100:("Tom", 20);
+INSERT VERTEX person(name, age) VALUES 101:("Jerry", 22);
+INSERT EDGE follows(since) VALUES 100->101:(2026);
 ```
 
-### 데이터 조회
+Read it back:
 
 ```sql
 FETCH PROP ON person 100;
-GO FROM 100 OVER follow;
+GO FROM 100 OVER follows;
 LOOKUP ON person WHERE person.age > 20;
+MATCH (a:person)-[e:follows]->(b:person) RETURN a, e, b;
 ```
 
-## 4. HTTP REST API
+History is recorded for asserted vertex and edge writes. An epoch-millisecond
+timestamp captured from your application can be used with the current
+point-in-time read surface:
 
-HTTP API를 직접 사용할 수도 있습니다:
-
-### 헬스 체크
-
-```bash
-curl http://localhost:19669/health
-# OK
+```sql
+FETCH PROP ON person 100 AS OF <EPOCH_MS>;
+FETCH PROP ON follows 100->101 AS OF <EPOCH_MS>;
 ```
 
-### 세션 생성
+Replace `<EPOCH_MS>` with the point-in-time value captured by your application.
+Temporal `MATCH`, temporal `GO`,
+`BETWEEN`, and user-supplied `VALID FROM/TO` are not currently supported.
+
+## 6. Use the HTTP API
+
+### Create a session
 
 ```bash
-curl -X POST http://localhost:19669/api/v1/session \
-  -H "Content-Type: application/json" \
-  -d '{"username": "root", "password": "change-me-before-production"}'
-# {"session_id":"734214891234567890","time_zone":"UTC"}
+curl --fail-with-body -X POST http://127.0.0.1:19669/api/v1/session \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"root","password":"replace-with-a-strong-local-secret"}'
 ```
 
-`session_id`는 매 로그인마다 생성되는 임의의 decimal string입니다. 아래
-`<SESSION_ID>`를 실제 응답값으로 바꾸세요. JSON number로 변환하면 JavaScript에서
-정밀도가 손실될 수 있으므로 문자열 그대로 전달합니다.
+The response has this shape:
 
-### 쿼리 실행
+```json
+{"session_id":"734214891234567890","time_zone":"UTC"}
+```
+
+The session ID is emitted as a decimal JSON string because most random 63-bit
+values cannot be represented exactly by a JavaScript `Number`. Preserve it as a
+string and replace `<SESSION_ID>` below with the returned value. A session ID is
+a bearer credential: do not publish or log it.
+
+### Execute queries
 
 ```bash
-# Space 생성
-curl -X POST http://localhost:19669/api/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{"session_id":"<SESSION_ID>","query":"CREATE SPACE test(partition_num=10, replica_factor=1)"}'
+curl --fail-with-body -X POST http://127.0.0.1:19669/api/v1/query \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"<SESSION_ID>","query":"CREATE SPACE api_demo(partition_num=10, replica_factor=1)"}'
 
-# Space 사용
-curl -X POST http://localhost:19669/api/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{"session_id":"<SESSION_ID>","query":"USE test"}'
+curl --fail-with-body -X POST http://127.0.0.1:19669/api/v1/query \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"<SESSION_ID>","query":"USE api_demo"}'
 
-# Tag 생성
-curl -X POST http://localhost:19669/api/v1/query \
-  -H "Content-Type: application/json" \
+curl --fail-with-body -X POST http://127.0.0.1:19669/api/v1/query \
+  -H 'Content-Type: application/json' \
   -d '{"session_id":"<SESSION_ID>","query":"CREATE TAG person(name STRING, age INT64)"}'
 
-# Vertex 삽입
-curl -X POST http://localhost:19669/api/v1/query \
-  -H "Content-Type: application/json" \
+curl --fail-with-body -X POST http://127.0.0.1:19669/api/v1/query \
+  -H 'Content-Type: application/json' \
   -d '{"session_id":"<SESSION_ID>","query":"INSERT VERTEX person(name, age) VALUES 1:(\"Alice\", 30)"}'
 
-# Lookup
-curl -X POST http://localhost:19669/api/v1/query \
-  -H "Content-Type: application/json" \
+curl --fail-with-body -X POST http://127.0.0.1:19669/api/v1/query \
+  -H 'Content-Type: application/json' \
   -d '{"session_id":"<SESSION_ID>","query":"LOOKUP ON person"}'
 ```
 
-### Prometheus 메트릭
+Query strings larger than 1 MiB are rejected. `/api/v1/query/json` provides the
+same query operation as a raw JSON response string.
+
+### Inspect metrics and active queries
+
+Prometheus metrics and the small metrics descriptor are currently unauthenticated:
 
 ```bash
-curl http://localhost:19669/metrics
+curl --fail http://127.0.0.1:19669/metrics
+curl --fail http://127.0.0.1:19669/api/v1/metrics
 ```
 
-## 5. 설정
+Active-query diagnostics require a live `GOD` or `ADMIN` session presented as a
+Bearer token:
 
-### 환경 변수
+```bash
+curl --fail-with-body http://127.0.0.1:19669/api/v1/diagnostics/queries \
+  -H 'Authorization: Bearer <SESSION_ID>'
+```
 
-| 변수 | 기본값 | 설명 |
-|----------|---------|-------------|
-| `BYORIDB__SERVER__GRAPH_ADDR` | `0.0.0.0:9669` | gRPC 서버 주소 |
-| `BYORIDB__SERVER__HTTP_ADDR` | `0.0.0.0:19669` | HTTP 서버 주소 |
-| `BYORIDB__STORAGE__DATA_PATHS` | `data/storage` | 데이터 디렉터리 |
+Diagnostics omit raw session IDs and redact password-bearing query text.
 
-### 설정 파일
+### Sign out
 
-`byoridb.toml`을 생성합니다:
+```bash
+curl --fail-with-body -X DELETE \
+  http://127.0.0.1:19669/api/v1/session/<SESSION_ID>
+```
+
+The sign-out route carries the bearer value in its path. Configure proxies and
+access logs so this path is not recorded with the raw session ID.
+
+## 7. Understand users and roles
+
+`root` receives the `GOD` role. User and role administration, `SHOW USER`,
+`SHOW SESSIONS`, and `BALANCE` require `GOD` or `ADMIN`. For example:
+
+```sql
+CREATE USER reader WITH PASSWORD "replace-with-a-different-secret" ROLE GUEST;
+GRANT ROLE USER TO reader;
+REVOKE ROLE GUEST FROM reader;
+ALTER USER reader WITH PASSWORD "replace-again";
+DROP USER reader;
+```
+
+Changing a user's password or role, disabling the user, or dropping the user
+invalidates that user's sessions in the current server process. Live session
+state is not distributed to other processes. The `root` account cannot be
+created, dropped, or altered through these statements; rotate its password by
+changing `BYORIDB_ROOT_PASSWORD` and restarting the server.
+
+The built-in roles are `GOD`, `ADMIN`, `DBA`, `USER`, and `GUEST`. Their current
+permissions use the wildcard space `*`; there is no space-scoped `GRANT` syntax.
+Do not use these roles as a multi-tenant isolation boundary. See
+[SECURITY.md](SECURITY.md) for the full deployment model.
+
+The current introspection surface is limited: `SHOW USER` returns only the
+built-in root placeholder. `SHOW SESSIONS` lists active users and selected
+spaces but deliberately omits bearer session IDs. The public parser accepts
+neither `SHOW USERS` nor `SHOW ROLES`.
+
+## 8. Configure the server
+
+Create an optional `byoridb.toml` in the working directory:
 
 ```toml
 [server]
-graph_addr = "0.0.0.0:9669"
-http_addr = "0.0.0.0:19669"
+graph_addr = "127.0.0.1:9669"
+http_addr = "127.0.0.1:19669"
 
 [storage]
 data_paths = ["data/storage"]
 ```
 
-설정과 함께 실행합니다:
+Configuration environment variables use a double underscore between sections
+and keys:
 
-```bash
-cargo run --release --bin byoridb-server
-```
+| Variable | Default | Meaning |
+|---|---|---|
+| `BYORIDB_ROOT_PASSWORD` | none; required | Standalone root credential |
+| `BYORIDB__SERVER__GRAPH_ADDR` | `0.0.0.0:9669` | gRPC listen address |
+| `BYORIDB__SERVER__HTTP_ADDR` | `0.0.0.0:19669` | HTTP listen address |
+| `BYORIDB__STORAGE__DATA_PATHS` | `data/storage` | Comma-separated data directories |
+| `BYORIDB_CACHE_SIZE_MB` | `256` | redb page-cache size in MiB |
+| `BYORIDB_DURABILITY` | immediate | Set to `relaxed`, `none`, or `eventual` only for reloadable bulk imports |
 
-## 6. 백업 및 복원
+Relaxed durability skips per-commit fsync and can lose recent commits after a
+crash. Do not use it for steady-state serving.
 
-### 백업 생성
+Cluster variables exist under `BYORIDB__CLUSTER__*`, but the end-to-end
+multi-node deployment path is incomplete. Leave `cluster.peers` empty for the
+supported standalone path.
+
+## 9. Back up and restore
+
+The backup contains both the current KV view and temporal history.
 
 ```bash
 cargo run --release --bin byoridb-backup -- create \
   --db data/storage \
-  --backup-dir /path/to/backups \
-  --label "daily"
-```
+  --backup-dir ./backups \
+  --label daily
 
-### 백업 복원
+cargo run --release --bin byoridb-backup -- list \
+  --backup-dir ./backups
 
-```bash
+cargo run --release --bin byoridb-backup -- verify \
+  --backup-dir ./backups \
+  --backup-id <BACKUP_ID>
+
 cargo run --release --bin byoridb-backup -- restore \
-  --backup-dir /path/to/backups \
-  -i backup_20240101_120000 \
-  --target /path/to/restore
+  --backup-dir ./backups \
+  --backup-id <BACKUP_ID> \
+  --target ./restored-data
 ```
 
-## 다음 단계
+Restore refuses to replace an existing target unless `--overwrite` is supplied.
+Verify a restored database before replacing an active data directory.
 
-- [아키텍처 개요](book/src/architecture/overview.md)를 읽고 동작 방식을 이해하세요
-- 전체 쿼리 레퍼런스는 [nGQL 문법](book/src/guide/ngql-syntax.md)을 확인하세요
-- 프로젝트 개선에 참여하려면 [기여하기](CONTRIBUTING.md)를 참고하세요
+## Next steps
+
+- Read the [architecture overview](book/src/architecture/overview.md).
+- Browse the [nGQL guide](book/src/guide/ngql-syntax.md).
+- Review [security and deployment guidance](SECURITY.md).
+- See [CONTRIBUTING.md](CONTRIBUTING.md) before submitting changes.

@@ -1,53 +1,109 @@
-# nGQL 문법 가이드
+[한국어](../ko/guide/ngql-syntax.html)
 
-ByoriDB는 그래프 데이터베이스를 위한 SQL과 유사한 쿼리 언어인 nGQL(Graph Query Language)을 사용합니다.
+# nGQL syntax
 
-## 개요
+ByoriDB implements an nGQL-compatible graph query language. It is a focused
+subset with ByoriDB extensions; syntax from another nGQL implementation is not
+automatically supported.
 
-nGQL은 세 가지 범주의 문을 지원합니다:
+## Statement families
 
-- **DDL (Data Definition Language)**: 스키마와 스페이스를 정의
-- **DML (Data Manipulation Language)**: 데이터를 삽입, 수정, 삭제
-- **DQL (Data Query Language)**: 그래프를 쿼리하고 순회
+| Family | Current statements |
+| --- | --- |
+| Spaces and schema | `CREATE`, `ALTER`, `DROP`, `SHOW`, `DESCRIBE`, `USE` |
+| Data mutation | `INSERT VERTEX`, `UPDATE VERTEX`, `DELETE VERTEX`, `INSERT EDGE`, `DELETE EDGE` |
+| Query | `FETCH PROP`, `GO`, `MATCH`, `LOOKUP`, `FIND`, `RECOMMEND` |
+| Ontology | `CREATE CLASS`, `CREATE SHAPE`, `CHECK CONSISTENCY`, `CHECK SHAPE`, `WHY` |
+| Administration | `CREATE/ALTER/DROP USER`, `GRANT/REVOKE ROLE`, `SHOW SESSIONS`, `BALANCE` |
+| Inspection | `EXPLAIN <statement>`, `PROFILE <statement>` |
 
-## 인증
+See the linked guide pages for execution limitations. For example,
+`UPDATE EDGE` is accepted by the parser but is not wired to a working executor,
+and `LOOKUP` currently operates on tags rather than edge types.
 
-사용자 이름과 비밀번호로 ByoriDB에 연결합니다:
+## Lexical rules
 
+- Keywords are case-insensitive: `CREATE` and `create` are equivalent.
+- User-defined identifiers retain their spelling and are case-sensitive in
+  stored schema and user lookups.
+- Both single-quoted and double-quoted string literals are accepted.
+- `--` starts a line comment.
+- A trailing semicolon is optional.
+
+Multiple semicolon-separated statements sent in one request form a compound
+statement and run in order. There is no transaction-control syntax, so separate
+requests do not form a transaction.
+
+```sql
+CREATE SPACE demo; USE demo; SHOW TAGS;
 ```
-Username: root
-Password: value of BYORIDB_ROOT_PASSWORD, or the generated password logged at startup
+
+Compound statements may bind a result for a later clause:
+
+```sql
+$friends = GO FROM 1 OVER follows YIELD dst(edge) AS vid;
+FETCH PROP ON person $friends.vid;
 ```
 
-## 빠른 참조
+This is the supported composition mechanism; a `|` pipeline operator is not
+implemented.
 
-| 범주 | 문 |
-|----------|------------|
-| DDL | `CREATE SPACE`, `DROP SPACE`, `CREATE TAG`, `ALTER TAG`, `DROP TAG`, `CREATE EDGE`, `ALTER EDGE`, `DROP EDGE` |
-| DML | `INSERT VERTEX`, `UPDATE VERTEX`, `DELETE VERTEX`, `INSERT EDGE`, `DELETE EDGE` |
-| DQL | `FETCH PROP`, `GO`, `MATCH`, `LOOKUP`, `FIND PATH`, `RECOMMEND` |
+## Property types
 
-## 데이터 타입
+The property-schema parser currently accepts:
 
-| 타입 | 설명 | 예시 |
-|------|-------------|---------|
-| `BOOL` | 불리언 | `true`, `false` |
-| `INT8` | 8비트 정수 | `127` |
-| `INT16` | 16비트 정수 | `32767` |
-| `INT32` | 32비트 정수 | `2147483647` |
-| `INT64` | 64비트 정수 | `42` |
-| `FLOAT` | 32비트 부동소수점 | `3.14` |
-| `DOUBLE` | 64비트 부동소수점 | `3.14159` |
-| `STRING` | 가변 길이 텍스트 | `'hello'` |
-| `TIMESTAMP` | Unix 타임스탬프 | `1234567890` |
-| `DATE` | 날짜 | `2024-01-15` |
-| `DATETIME` | 날짜와 시간 | `2024-01-15T10:30:00` |
+| Type | Notes |
+| --- | --- |
+| `BOOL` | Boolean |
+| `INT8`, `INT16`, `INT32`, `INT64` | Signed integers; `INT` is an alias for `INT64` |
+| `FLOAT`, `DOUBLE` | Floating-point numbers |
+| `STRING` | Text |
+| `TIMESTAMP` | Integer epoch value or accepted temporal string |
+| `DATE`, `TIME`, `DATETIME` | Temporal value represented by an accepted string or integer where supported |
 
-> **참고:** 정수 타입에는 `INT` 대신 `INT64`를 사용하세요.
+The AST contains additional type variants, but `FIXED_STRING` and `GEOGRAPHY`
+are not currently accepted as tag/edge property declarations by the parser.
+Do not document or deploy against those variants until their parser and
+execution paths are complete.
 
-## 참고 사항
+## Vertex IDs
 
-1. **대소문자 구분**: 키워드는 대소문자를 구분하지 않지만(`CREATE` = `create`), 식별자는 대소문자를 구분합니다.
-2. **문자열 따옴표**: 문자열 값에는 작은따옴표를 사용합니다: `'hello'`
-3. **세미콜론**: 문 끝에서 선택 사항입니다.
-4. **버텍스 ID**: 정수(`INT64`)여야 합니다.
+Current DML and query planning requires integer vertex IDs. Use the default
+`INT64` VID type:
+
+```sql
+CREATE SPACE demo (vid_type = INT64);
+```
+
+`FIXED_STRING(N)` can be parsed as space metadata, but current INSERT/FETCH/GO
+planning still rejects string VIDs. It is not an operational string-VID mode.
+
+## Expressions
+
+Predicates support comparison and boolean operators such as `==`, `!=`, `<`,
+`<=`, `>`, `>=`, `AND`, and `OR`. `MATCH` supports functions and aggregates
+including `id`, `count`, `sum`, `avg`, `min`, and `max` in the execution paths
+described in the query guide.
+
+Mutation assignment values are more restricted than query expressions. In
+particular, `UPDATE VERTEX ... SET` currently plans literal and list values, not
+arithmetic expressions such as `score = score + 1`.
+
+## Authentication and authorization
+
+Authentication happens before statements are executed. User and role
+administration, `SHOW SESSIONS`, and `BALANCE` require a `GOD` or `ADMIN`
+session. Other statements are checked against the authenticated session's
+built-in roles, including every clause inside compound statements and the inner
+statement executed by `PROFILE`.
+
+The built-in roles currently apply to all spaces. There is no nGQL syntax for a
+space-scoped grant, so these roles are not a tenant-isolation mechanism.
+
+## Guide pages
+
+- [Spaces](./ngql/spaces.md)
+- [Schema](./ngql/schema.md)
+- [Data mutation](./ngql/dml.md)
+- [Data queries](./ngql/dql.md)
+- [Users and roles](./ngql/users.md)

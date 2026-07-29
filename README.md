@@ -1,82 +1,151 @@
 # ByoriDB
 
-> **Rust로 작성된 semantic graph database — ontology inference, provenance, bitemporal history.**
+[한국어](README.ko.md)
 
-ByoriDB는 property graph 코어 위에 시맨틱 레이어를 얹은 그래프 데이터베이스입니다.
-nGQL 쿼리, write-time ontology 추론, 추론 근거(`WHY`) 설명, bitemporal history 조회를
-단일 로컬 바이너리로 제공합니다.
+> A semantic graph database written in Rust, with ontology inference,
+> provenance, and point-in-time history.
+
+ByoriDB combines a property-graph core with a semantic layer. It provides an
+nGQL-style query surface, write-time ontology materialization, explanations for
+inferred edges, and temporal reads from one standalone server process.
 
 > [!NOTE]
-> Claude Code / Codex용 로컬 프로젝트 지식 그래프(agent memory) 제품을 찾는다면
-> **[byoridb/byori](https://github.com/byoridb/byori)** 를 보세요. 이 저장소는 그 아래에서
-> 동작하는 범용 데이터베이스 엔진입니다.
+> Looking for the local knowledge graph and agent-memory product for Claude
+> Code, Codex, and other coding agents? See
+> **[byoridb/byori](https://github.com/byoridb/byori)**. This repository is the
+> general-purpose database engine used underneath it.
 
-## 기능
+> [!CAUTION]
+> The standalone, single-node launcher is the primary supported path. The
+> repository contains distributed components, but storage/Raft peer bootstrap
+> and multi-node operational wiring are not complete. Do not treat the current
+> cluster mode as production-ready.
 
-- **Property graph + nGQL**: `MATCH`, `GO`, `FETCH`, `LOOKUP`, `FIND PATH`, DDL/DML
-- **Ontology inference**: class hierarchy와 선택된 RDFS-Plus/OWL 2 RL 규칙의
-  write-time materialization — transitive, symmetric, inverse, subproperty,
-  equivalent property, 2-link property chain
-- **Provenance**: 추론 edge의 rule/premise 근거를 `WHY`로 설명, `DELETE EDGE` 시
-  provenance 기반 incremental retraction, 명시적 `sameAs` canonical merge
-- **Bitemporal history (v1)**: asserted vertex/edge history 기록과
-  vertex `FETCH ... AS OF <epoch-ms>` 조회
-- **Similarity**: 구조(Jaccard)·embedding·hybrid recommendation
-- **운영**: HTTP/gRPC API, CLI, backup/restore, Prometheus metrics
-- **스토리지**: 순수 Rust(redb) — C++ 툴체인 불필요
+## Capabilities
 
-전체 OWL 2 RL이나 완전한 temporal graph query를 지원한다는 뜻은 아닙니다. 상세 기능
-범위, 제약, 로드맵은 [docs/PLAN.md](docs/PLAN.md)를 참고하세요.
+- **Property graph and nGQL-style queries:** `MATCH`, `GO`, `FETCH`, `LOOKUP`,
+  `FIND PATH`, schema operations, and data mutation.
+- **Ontology inference:** write-time materialization for class hierarchies and
+  selected RDFS-Plus/OWL 2 RL-style rules, including transitive, symmetric,
+  inverse, subproperty, equivalent-property, and two-link property-chain rules.
+- **Provenance:** `WHY` explains the rule and premises behind an inferred edge;
+  provenance supports incremental retraction when asserted edges are deleted.
+- **Identity merging:** explicit `sameAs` edges perform an irreversible
+  canonical merge. This is intentionally narrower than complete OWL semantics.
+- **Temporal history:** asserted vertex and edge writes update the current view
+  and append history atomically. `FETCH PROP ... AS OF <epoch-ms>` reads a
+  vertex or edge at a point in time.
+- **Similarity:** structural Jaccard, embedding, and hybrid recommendation.
+- **Operations:** HTTP and gRPC APIs, an interactive CLI, backup/restore,
+  readiness checks, and Prometheus metrics.
+- **Pure-Rust storage:** redb provides the embedded KV layer; no C++ toolchain is
+  required.
 
-## 아키텍처
+ByoriDB does not implement the complete OWL 2 RL rule set or a general temporal
+query language. In the current temporal model, valid time and transaction time
+are generated together by the server; temporal `MATCH`, `GO`, `BETWEEN`, and
+user-supplied `VALID FROM/TO` are not supported. Inference uses the current view
+and does not reconstruct historical inferred facts. See
+[the implementation plan](docs/PLAN.md) for detailed status and constraints.
 
-storage-compute 분리 구조의 세 서비스로 구성됩니다.
+## Architecture
 
-- **Graph Service** (`byoridb-graph`): stateless 쿼리 엔진 — nGQL 파싱, 실행 조정
-- **Meta Service** (`byoridb-meta`): space/schema/user/auth 메타데이터
-- **Storage Service** (`byoridb-storage`): vertex/edge 저장, partitioning
+The standalone binary hosts three logical services in one process:
 
-로컬 standalone(단일 프로세스에 세 서비스)이 주 사용 경로입니다. 분산 컴포넌트는
-코드베이스에 있지만 multi-node 운영 wiring은 완성되지 않았습니다.
+- **Graph service** (`byoridb-graph`) parses, authorizes, plans, and coordinates
+  queries. Authentication and session state are process-local while the server
+  is running.
+- **Meta service** (`byoridb-meta`) manages spaces, schemas, partitions, and
+  related metadata.
+- **Storage service** (`byoridb-storage`) stores vertices and edges and contains
+  the partitioning and custom Raft implementation.
 
-## 빠른 시작
+User records are durable, but live sessions are not shared across processes.
+Restarting a server invalidates its sessions, and current multi-instance
+deployments do not coordinate session revocation.
 
-### 사전 빌드 바이너리
+## Quick start
 
-[Releases](https://github.com/byoridb/byoridb/releases)에서 macOS(Apple Silicon/Intel),
-Linux x86_64용 `byoridb-server` / `byoridb-cli`를 받을 수 있습니다.
+### Prerequisites
+
+- Linux or macOS
+- Rust 1.90, pinned by `rust-toolchain.toml`
+- `protobuf-compiler` for gRPC code generation
+
+### Build and run
+
+The standalone server refuses to start unless `BYORIDB_ROOT_PASSWORD` contains
+a nonblank value. Use a secret manager for deployments and a strong local
+secret for development.
 
 ```bash
-export BYORIDB_ROOT_PASSWORD='change-me'
-./byoridb-server
-curl -s http://127.0.0.1:19669/health
+git clone https://github.com/byoridb/byoridb.git
+cd byoridb
+cargo build --release
+
+export BYORIDB_ROOT_PASSWORD='replace-with-a-strong-secret'
+cargo run --release --bin byoridb-server
 ```
 
-### 소스에서 빌드
-
-Rust 1.90(`rust-toolchain.toml` 고정)과 `protobuf-compiler`가 필요합니다.
-Linux/macOS를 지원합니다.
+The default listeners are gRPC on `0.0.0.0:9669` and HTTP on
+`0.0.0.0:19669`.
 
 ```bash
-cargo build --release
-BYORIDB_ROOT_PASSWORD='<password>' cargo run --release --bin byoridb-server
-BYORIDB_USER=root BYORIDB_PASSWORD='<password>' \
-  cargo run -p byoridb-client --bin byoridb-cli
+curl --fail http://127.0.0.1:19669/health
+curl --fail http://127.0.0.1:19669/ready
+```
 
+In another terminal, start the CLI:
+
+```bash
+export BYORIDB_USER=root
+export BYORIDB_PASSWORD='replace-with-a-strong-secret'
+cargo run -p byoridb-client --bin byoridb-cli
+```
+
+The CLI has no default credentials; both the user and password must be supplied
+through these environment variables or command-line flags.
+
+For SQL examples and the HTTP session flow, continue with the
+[quick-start guide](QUICKSTART.md).
+
+## Development checks
+
+Integration tests must run serially because temporary redb databases can
+otherwise contend for files and locks.
+
+```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features -- --test-threads=1
 ```
 
-HTTP API 세션·쿼리 예시는 [QUICKSTART.md](QUICKSTART.md)를 참고하세요.
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
-## 문서
+## Security and deployment boundaries
 
-- [빠른 시작](QUICKSTART.md)
-- [상세 제약, 로드맵, 이력](docs/PLAN.md)
-- [기여 가이드](CONTRIBUTING.md)
-- [Agent memory 제품 (byori)](https://github.com/byoridb/byori)
+ByoriDB currently provides no native TLS termination and no general-purpose
+login rate limiter. Put HTTP and gRPC behind trusted TLS termination, restrict
+network access, and add rate limiting before exposing either listener.
 
-## 라이선스
+The built-in roles apply their permissions to `*` (every space), and the
+current query language has no space-scoped `GRANT` syntax. They are therefore
+not a tenant-isolation boundary. Treat session IDs as bearer credentials and do
+not place them in logs.
 
-[Apache License 2.0](LICENSE)
+See [SECURITY.md](SECURITY.md) for the supported security model, deployment
+checklist, and private vulnerability-reporting instructions.
+
+## Documentation
+
+- [Quick start](QUICKSTART.md)
+- [User and operations guide](book/src/SUMMARY.md)
+- [Implementation status, constraints, and roadmap](docs/PLAN.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [Open-source notices](NOTICES.md)
+- [Korean documentation index](README.ko.md)
+
+## License
+
+ByoriDB is licensed under the [Apache License 2.0](LICENSE).

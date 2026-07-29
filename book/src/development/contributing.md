@@ -1,235 +1,174 @@
-# 기여하기
+# Contributing
 
-ByoriDB에 대한 기여를 환영합니다.
+[한국어](../ko/development/contributing.html)
 
-## 시작하기
+Contributions to ByoriDB are welcome. This page summarizes the workflow that is
+actually enforced by the repository. Read the root `CONTRIBUTING.md` as well.
+If your local checkout includes an `AGENTS.md`, follow those repository-local
+agent instructions for AI-assisted changes.
 
-### 사전 요구 사항
+## Prerequisites
 
-- Rust 1.90+
-- protobuf-compiler (gRPC 코드 생성용)
 - Git
+- Rust 1.90, selected by `rust-toolchain.toml`
+- `protobuf-compiler` (`protoc`) for gRPC code generation
+- Linux or macOS
 
-### 설정
+The production KV engine is pure Rust, so RocksDB/C++ is not a prerequisite.
+
+## Set up a checkout
 
 ```bash
-# Clone the repository
 git clone https://github.com/byoridb/byoridb.git
 cd byoridb
 
-# Setup git hooks
-./scripts/setup-hooks.sh
+# Make the repository's formatting hook active.
+bash scripts/setup-hooks.sh
 
-# Build
 cargo build
-
-# Run tests
-cargo test
 ```
 
-## 개발 워크플로
+Create a focused branch from the current `main` branch and open the pull
+request back to `main`. The repository has no active `develop` branch, so do
+not base the workflow on one.
 
-### 브랜치 전략
+## Workspace layout
 
-- `main` - 안정 릴리스
-- `develop` - 개발 브랜치
-- `feature/*` - 기능 브랜치
-- `fix/*` - 버그 수정 브랜치
+Choose the crate that owns the behavior:
 
-### 기능 브랜치 생성
+| Change | Location |
+|---|---|
+| Shared values and graph types | `byoridb-common` |
+| Persistent KV behavior and backup implementation | `byoridb-kvstore` |
+| Vertex/edge/row encoding | `byoridb-codec` |
+| Storage, indexes, partitions, or Raft | `byoridb-storage` |
+| Metadata services | `byoridb-meta` |
+| Lexer, AST, or grammar | `byoridb-parser` |
+| Query plans and execution | `byoridb-executor` |
+| Authentication, sessions, gRPC, or HTTP | `byoridb-graph` |
+| Rust client or CLI | `byoridb-client` |
+| Offline import | `byoridb-bulkloader` |
+| Server or backup binary | root `src/` |
 
-```bash
-git checkout develop
-git pull origin develop
-git checkout -b feature/my-feature
-```
+Do not recreate the removed `byoridb-core` crate. Keep the executor router in
+`byoridb-executor/src/executor/mod.rs` small; add purpose-specific modules for
+new execution logic.
 
-### 변경 작업
+## Code conventions
 
-1. 코드를 작성합니다
-2. 테스트를 추가합니다
-3. 검사를 실행합니다:
+- Use `snake_case` for functions, variables, and modules; `PascalCase` for
+  types; and `SCREAMING_SNAKE_CASE` for constants.
+- Use typed `thiserror` errors in library crates. At service/binary boundaries,
+  add context with `anyhow`.
+- Do not add `unwrap()` or `expect()` to production code.
+- Use structured `tracing` fields instead of `println!`, `eprintln!`, or `dbg!`
+  in production code.
+- Register a dependency in root `[workspace.dependencies]` first and reference
+  it with `workspace = true` from member crates.
+- Add inline unit tests for new behavior and integration tests where a
+  cross-crate path matters.
 
-```bash
-# Format code
-cargo fmt --all
-
-# Run linter
-cargo clippy --all-targets --all-features -- -D warnings
-
-# Run tests
-cargo test
-```
-
-### 사전 커밋(Pre-commit) 훅
-
-저장소에는 포매팅을 검사하는 사전 커밋 훅이 포함되어 있습니다:
-
-```bash
-# Runs automatically on commit
-cargo fmt -- --check
-```
-
-훅이 실패하면 다음을 실행하세요:
-
-```bash
-cargo fmt --all
-git add -A
-git commit
-```
-
-### 커밋 메시지
-
-conventional commits를 사용하세요:
-
-```
-type(scope): description
-
-[optional body]
-
-[optional footer]
-```
-
-타입:
-- `feat` - 새 기능
-- `fix` - 버그 수정
-- `docs` - 문서
-- `style` - 포매팅
-- `refactor` - 코드 구조 개선
-- `test` - 테스트 추가
-- `chore` - 유지보수
-
-예시:
-
-```
-feat(parser): add ALTER TAG statement support
-fix(storage): resolve race condition in batch write
-docs(readme): update installation instructions
-```
-
-### 풀 리퀘스트(Pull Request)
-
-1. 브랜치를 푸시합니다:
-
-```bash
-git push origin feature/my-feature
-```
-
-2. `develop`을 대상으로 PR을 생성합니다
-3. PR 템플릿을 작성합니다
-4. CI 검사를 기다립니다
-5. 리뷰 코멘트를 반영합니다
-6. 승인 후 병합합니다
-
-## 코드 스타일
-
-### Rust 가이드라인
-
-- [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)를 따르세요
-- 포매팅에 `rustfmt`를 사용하세요
-- 린팅에 `clippy`를 사용하세요
-
-### 문서화
-
-- 공개 API에 doc 주석을 추가하세요
-- 문서에 예제를 포함하세요
+Example library error:
 
 ```rust
-/// Executes a query and returns results.
-///
-/// # Arguments
-///
-/// * `query` - The nGQL query string
-///
-/// # Example
-///
-/// ```
-/// let result = executor.execute("SHOW SPACES")?;
-/// ```
-pub fn execute(&self, query: &str) -> Result<DataSet> {
-    // ...
+#[derive(Debug, thiserror::Error)]
+pub enum ExecutorError {
+    #[error("space not selected")]
+    NoSpace,
 }
 ```
 
-### 오류 처리
-
-- 애플리케이션 코드에는 `anyhow::Result`를 사용하세요
-- 라이브러리 오류 타입에는 `thiserror`를 사용하세요
-- 오류에 컨텍스트를 추가하세요
+Example structured log:
 
 ```rust
-use anyhow::{Context, Result};
-
-fn read_config(path: &Path) -> Result<Config> {
-    let content = fs::read_to_string(path)
-        .context("Failed to read config file")?;
-
-    toml::from_str(&content)
-        .context("Failed to parse config")
-}
+tracing::info!(space = %space_name, "query executed");
 ```
 
-## 테스트
+## Required local checks
 
-### 단위 테스트
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_create_space() {
-        let query = "CREATE SPACE test(vid_type=INT64)";
-        let ast = parse(query).unwrap();
-        assert!(matches!(ast, Statement::CreateSpace(_)));
-    }
-}
-```
-
-### 통합 테스트
-
-`tests/` 디렉터리에 배치합니다:
-
-```rust
-// tests/integration_test.rs
-
-#[tokio::test]
-async fn test_full_workflow() {
-    let server = TestServer::start().await;
-    let client = Client::connect(&server.addr()).await?;
-
-    client.execute("CREATE SPACE test(vid_type=INT64)").await?;
-    // ...
-}
-```
-
-### 테스트 실행
+Run the same broad gates expected for a pull request:
 
 ```bash
-# All tests
-cargo test
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features -- --test-threads=1
+```
 
-# Specific package
+Integration tests must run serially because temporary redb databases can
+otherwise contend for files. Useful narrower commands while iterating include:
+
+```bash
 cargo test --package byoridb-parser
-
-# Specific test
-cargo test --package byoridb-parser test_parse_alter
+cargo test --package byoridb-executor <test-name>
 ```
 
-## 아키텍처 결정
+The GitHub workflow also checks the workspace and builds release binaries after
+the format, lint, and test jobs pass.
 
-중요한 변경의 경우 RFC를 작성하세요:
+## High-risk areas
 
-1. `docs/rfcs/template.md`를 복사합니다
-2. 제안 내용을 작성합니다
-3. PR로 제출합니다
-4. PR 코멘트에서 논의합니다
-5. 피드백을 바탕으로 수정합니다
-6. 승인 후 구현합니다
+Some modules require additional regression gates.
 
-## 도움 받기
+### Query correctness regressions
 
-- 버그는 이슈를 열어 주세요
-- 질문은 디스커션을 시작해 주세요
-- 커뮤니티 채팅에 참여하세요
+If a change touches the H-series paths described in `docs/PLAN.md`, rerun the
+H-1 through H-6 regression coverage, including the multi-pattern MATCH tests.
+Do not reintroduce a fallback `space_id`, `tag_id`, or `edge_id` of zero.
+
+### Temporal storage
+
+Changes to current/history storage, temporal DML, parsing, or planning must
+preserve both the current view and history:
+
+```bash
+cargo test -p byoridb-kvstore --test temporal
+cargo test -p byoridb-parser fetch_as_of
+cargo test -p byoridb-executor fetch_as_of
+```
+
+Then run the full serial workspace suite. Verify vertex and edge `AS OF`,
+tombstones, same-millisecond writes, and atomic current/history application as
+applicable.
+
+### Raft and distributed code
+
+Understand the custom Raft state machine, log, snapshots, membership, and
+network driver before changing `byoridb-storage/src/raft/`. Run:
+
+```bash
+cargo test --workspace --all-features --test distributed_e2e_test -- --test-threads=1
+```
+
+Passing component tests does not make the unfinished cluster launcher a
+production-ready deployment; document that boundary explicitly.
+
+### Authentication and authorization
+
+For user, role, session, or protocol changes, test both HTTP and gRPC behavior,
+durable-user cache reconciliation, session invalidation, compound statements,
+and `PROFILE` authorization. Never include credentials or raw session IDs in
+logs, metrics, diagnostics, or error responses.
+
+## Documentation changes
+
+English pages under `book/src/` are canonical. Maintain the corresponding
+Korean page under `book/src.ko/` and keep commands, feature status, and
+limitations semantically aligned. Do not publish measured performance numbers
+without a reproducible environment and result artifact.
+
+When mdBook is installed, build both language trees using the repository's
+documentation workflow/configuration.
+
+## Pull requests
+
+Keep a pull request focused and include:
+
+- the problem and the chosen behavior;
+- security, compatibility, and data-migration implications;
+- tests added and exact commands run;
+- documentation updates for user-visible behavior;
+- links to related issues when applicable.
+
+Do not commit `.env` files, credentials, generated database files, or
+machine-specific build output. The pull-request template and CI results are the
+authoritative submission checklist.

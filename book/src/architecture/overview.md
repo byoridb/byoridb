@@ -1,129 +1,122 @@
-# 아키텍처 개요
+# Architecture overview
 
-ByoriDB는 세 개의 주요 서비스로 구성된 스토리지-컴퓨팅 분리 아키텍처를 사용합니다.
+[한국어](../ko/architecture/overview.html)
 
-## 시스템 아키텍처
+ByoriDB is a Rust workspace whose default server composes query, metadata, and
+storage logic in one process. This is the architecture that the checked-in
+standalone binary and current deployment manifests actually run.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                         Clients                              │
-│              (CLI, SDKs, HTTP, gRPC)                        │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      Graph Service                           │
-│  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
-│  │ Parser  │→ │ Planner  │→ │ Executor │→ │ Results  │    │
-│  └─────────┘  └──────────┘  └──────────┘  └──────────┘    │
-└─────────────────────────────────────────────────────────────┘
-           │                              │
-           ▼                              ▼
-┌─────────────────────┐      ┌─────────────────────────────────┐
-│    Meta Service     │      │       Storage Service           │
-│  ┌───────────────┐  │      │  ┌───────────┐  ┌───────────┐  │
-│  │ Schema Cache  │  │      │  │  Part 1   │  │  Part 2   │  │
-│  │ Space Config  │  │      │  │  (Raft)   │  │  (Raft)   │  │
-│  │ User Auth     │  │      │  └───────────┘  └───────────┘  │
-│  └───────────────┘  │      └─────────────────────────────────┘
-└─────────────────────┘                    │
-           │                               ▼
-           ▼                      ┌─────────────────┐
-    ┌──────────────┐              │    KVStore      │
-    │   KVStore    │              │    (redb)       │
-    │    (redb)    │              └─────────────────┘
-    └──────────────┘
+```text
+                    +-----------------------+
+                    | Rust CLI / gRPC / HTTP|
+                    +-----------+-----------+
+                                |
+                    +-----------v-----------+
+                    | shared GraphService   |
+                    | auth, RBAC, sessions  |
+                    +-----------+-----------+
+                                |
+                    +-----------v-----------+
+                    | parser -> plan ->     |
+                    | executor              |
+                    +-----------+-----------+
+                                |
+                 +--------------v---------------+
+                 | KVStore + indexes + metadata |
+                 +--------------+---------------+
+                                |
+                    +-----------v-----------+
+                    | redb/data.redb        |
+                    | kv + history tables   |
+                    +-----------------------+
 ```
 
-## 구성 요소
+## Standalone request path
 
-### Graph Service
+1. The gRPC or HTTP adapter receives credentials or a query.
+2. Both protocols use the same in-process `GraphService`, so they share users,
+   roles, sessions, active-query tracking, and shutdown state.
+3. The service validates the session, parses the statement, and recursively
+   checks authorization, including compound and `PROFILE` statements.
+4. The planner creates an executor backed by the same `KVStore`.
+5. The executor reads or updates graph data, schemas, indexes, ontology state,
+   and user records in redb.
+6. The protocol adapter converts the resulting `DataSet` to protobuf or JSON.
 
-다음을 담당하는 무상태(stateless) 쿼리 엔진입니다.
+The Graph service is therefore **not stateless** in the current runtime.
+Non-root user records are durable and loaded into the authentication cache on
+login, but sessions and active authentication state remain process-local.
 
-- **쿼리 파싱**: `byoridb-parser`를 사용해 nGQL → AST 변환
-- **쿼리 계획**: AST → 실행 계획(Execution Plan)
-- **쿼리 실행**: Meta 및 Storage 서비스와 협력
-- **결과 집계**: 여러 파티션의 결과를 결합
+## Main component boundaries
 
-주요 특성:
-- 수평 확장 가능 (무상태)
-- gRPC 및 HTTP 엔드포인트 제공
-- 하위 서비스에 대한 커넥션 풀링
+### Graph layer
 
-### Meta Service
+`byoridb-graph` owns:
 
-모든 메타데이터를 관리합니다.
+- authentication and built-in role checks;
+- session lifecycle and selected-space tracking;
+- query parsing/authorization orchestration;
+- gRPC and HTTP adapters;
+- active-query diagnostics, metrics, and graceful-drain integration.
 
-- **Spaces**: 논리적 데이터베이스
-- **Schemas**: Tag, Edge, Index
-- **Partitions**: 데이터 분산 매핑
-- **Users**: 인증 및 권한 부여
-- **Schema Versions**: 온라인 스키마 변경용
+The standalone binary creates one `Arc<GraphService>` and passes it to both
+network servers. Embedded users can construct the service directly.
 
-주요 특성:
-- 단일 리더 (Raft를 통해 복제 가능)
-- TTL을 갖는 인메모리 스키마 캐시
-- KVStore에 영속 저장
+### Parser and executor
 
-### Storage Service
+`byoridb-parser` converts the nGQL-inspired language into an AST.
+`byoridb-executor` builds plans and implements DDL, DML, graph traversal,
+pattern matching, indexes, ontology reasoning, recommendations, temporal
+reads, `EXPLAIN`, and `PROFILE`.
 
-그래프 데이터를 저장하고 조회합니다.
+The executor uses logical key namespaces in a `KVStore`. In standalone mode it
+does not make a network hop to a separate Storage service.
 
-- **Vertices**: VID를 키로 하는 Tag 데이터
-- **Edges**: (src, edge_type, rank, dst)를 키로 하는 Edge 데이터
-- **Partitioning**: VID 기반 consistent hashing
-- **Replication**: Raft 합의를 통한 다중 복제
+### Storage and codecs
 
-주요 특성:
-- VID 기준으로 수평 분할
-- 각 파티션은 자체 Raft 그룹을 가짐
-- predicate pushdown 지원
+`byoridb-kvstore` supplies the storage abstraction and the production redb
+implementation. `byoridb-codec` encodes new vertex and edge records with
+protobuf and retains a JSON decode fallback for legacy records.
 
-### KVStore
+The redb file has two primary tables:
 
-기반 스토리지 엔진입니다.
+- `kv`: current data, schemas, indexes, users, and materialized state;
+- `history`: append-only versions and tombstones for asserted vertex/edge
+  point-in-time reads.
 
-- **redb**: 순수 Rust로 구현된 임베디드 B-tree 스토리지
-- **Raft**: 분산 합의 프로토콜
-- **Snapshots**: 특정 시점(point-in-time) 백업
-- **Compaction**: 백그라운드 최적화
+See [Storage engine](storage.html) for transaction and temporal details.
 
-## 데이터 흐름
+### Meta, partition, RPC, and Raft components
 
-### 쓰기 경로(Write Path)
+`byoridb-meta` and `byoridb-storage` contain Meta/Storage RPC services,
+partition allocation and migration code, and a custom per-partition Raft
+implementation. The distributed query executor can route selected operations
+through Meta and Storage clients when explicitly constructed with those
+clients.
 
-```
-1. Client → Graph Service (INSERT VERTEX)
-2. Graph Service → Meta Service (get partition info)
-3. Graph Service → Storage Service (write to leader)
-4. Storage Leader → Raft Log (replicate)
-5. Storage Leader → redb (apply)
-6. Ack back to client
-```
+Those pieces are not fully connected by `byoridb-server`: setting cluster peers
+starts a Meta gRPC server, but does not bootstrap Storage/Raft peers or switch
+the Graph executor to remote partition routing. They must not be interpreted as
+a supported high-availability deployment. See
+[Distributed systems](distributed.html).
 
-### 읽기 경로(Read Path)
+## Data and consistency boundaries
 
-```
-1. Client → Graph Service (FETCH PROP)
-2. Graph Service → Meta Service (get schema + partition)
-3. Graph Service → Storage Service (read from any replica)
-4. Storage → redb → Return data
-5. Graph Service → Apply schema version transformation
-6. Return to client
-```
+- A redb write transaction is ACID and write transactions are serialized.
+- Multi-row DML uses batched writes. The executor's `batch_apply` path commits
+  its current-view entity mutations and matching history versions together in
+  one redb transaction.
+- There is no user-visible multi-statement transaction syntax. Compound
+  statements execute sequentially and do not roll back earlier clauses after a
+  later failure.
+- Inference is materialized into the current view. Historical reads preserve
+  asserted facts, not a historical inference closure.
+- A clean shutdown first stops readiness, drains active queries, and then
+  checkpoints redb.
 
-## 크레이트 의존 관계
+## Deployment boundary
 
-```
-byoridb-client
-    └── byoridb
-            ├── byoridb-executor
-            │       └── byoridb-parser
-            ├── byoridb-meta
-            │       └── byoridb-kvstore
-            └── byoridb-storage
-                    ├── byoridb-codec
-                    └── byoridb-kvstore
-                            └── byoridb-common
-```
+The repository provides a Docker Compose file and Azure AKS assets. Compose
+starts independent standalone databases, while the AKS StatefulSet declares
+one replica with a ReadWriteOnce volume. These files describe repository
+deployment intent; they do not prove the state of any live environment.

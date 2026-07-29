@@ -1,27 +1,58 @@
-## 설명
+<!-- Default template: English. Korean: pull_request_template.ko.md -->
 
-<!-- Describe your changes in detail -->
+## Summary
 
-## 변경 유형
+<!-- What problem does this PR solve, and why is this change needed? -->
 
-- [ ] 버그 수정 (이슈를 수정하는 비파괴적 변경)
-- [ ] 신규 기능 (기능을 추가하는 비파괴적 변경)
-- [ ] 파괴적 변경 (기존 기능이 예상대로 동작하지 않게 만드는 수정 또는 기능)
-- [ ] 문서 업데이트
-- [ ] 리팩토링 (기능 변경 없음)
+## Changes
 
-## 체크리스트
+<!-- List the important implementation and documentation changes. -->
 
-- [ ] 내 코드는 프로젝트의 코드 스타일을 따른다 (`cargo fmt`)
-- [ ] `cargo clippy`를 실행하고 모든 경고를 수정했다
-- [ ] 수정/기능이 동작함을 증명하는 테스트를 추가했다
-- [ ] 기존 테스트가 모두 통과한다 (`cargo test`)
-- [ ] 필요한 경우 문서를 업데이트했다
+-
 
-## 관련 이슈
+## Change type
 
-<!-- Link any related issues here: Fixes #123 -->
+- [ ] Bug fix
+- [ ] New feature
+- [ ] Breaking or migration-requiring change
+- [ ] Refactor with no intended behavior change
+- [ ] Documentation only
+- [ ] Build, CI, deployment, or operations
+- [ ] Security hardening
 
-## 테스트 계획
+## Validation
 
-<!-- Describe how you tested your changes -->
+<!-- List exact commands and results. Explain any check that was not run. -->
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features -- --test-threads=1
+```
+
+Additional targeted tests:
+
+-
+
+## Risk, compatibility, and rollout
+
+<!-- Note API/storage/query compatibility, migration, deployment, rollback, and data risks. -->
+
+- Compatibility impact:
+- Rollout or migration:
+- Rollback:
+
+## Checklist
+
+- [ ] The change is focused and follows the repository's code conventions.
+- [ ] New or changed behavior has focused positive and negative tests.
+- [ ] Production code contains no new `unwrap()`, `expect()`, `println!`, `eprintln!`, or `dbg!`.
+- [ ] New shared dependencies are declared in root `[workspace.dependencies]` with rationale.
+- [ ] English canonical documentation and its Korean mirror are both updated where needed.
+- [ ] Incomplete or experimental behavior is labeled accurately.
+- [ ] No credentials, `.env` files, private data, generated databases, or raw session IDs are included.
+- [ ] Security-sensitive details were reported privately rather than placed in this public PR.
+
+## Related issues
+
+<!-- Example: Fixes #123 -->

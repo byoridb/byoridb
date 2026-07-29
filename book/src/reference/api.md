@@ -1,217 +1,237 @@
-# API 레퍼런스
+# API reference
 
-ByoriDB는 gRPC와 HTTP API를 제공합니다.
+[한국어](../ko/reference/api.html)
 
-## 연결
+ByoriDB exposes Graph APIs over gRPC and HTTP from the same in-process
+`GraphService`. They share users, roles, sessions, the selected space, active
+query diagnostics, and shutdown state.
 
-### 기본 포트
+| Protocol | Default listener | Transport |
+|---|---|---|
+| Graph gRPC | `0.0.0.0:9669` | plaintext HTTP/2 |
+| Graph HTTP | `0.0.0.0:19669` | plaintext HTTP (JSON) |
 
-| 서비스 | gRPC 포트 | HTTP 포트 |
-|---------|-----------|-----------|
-| Graph | 9669 | 19669 |
-| Meta | 9559 | - |
-| Storage | 9779 | - |
+Native TLS is not implemented. Use trusted TLS termination and network access
+controls outside the process.
 
-### 인증
+## Authentication and sessions
 
-ByoriDB는 시작 시 `root` 슈퍼유저를 생성합니다. 재시작 후에도 비밀번호를 동일하게
-유지하려면 서버를 시작하기 전에 `BYORIDB_ROOT_PASSWORD`를 설정하세요. 이 변수가
-없으면 서버가 무작위 비밀번호를 생성하고 한 번 로그에 출력합니다.
+The server requires a non-blank root secret at startup:
 
-## gRPC API
+```bash
+export BYORIDB_ROOT_PASSWORD='replace-with-a-managed-secret'
+byoridb-server
+```
 
-### 서비스 정의
+The root user is created from that value and has the `GOD` role. Non-root users
+are stored in redb and loaded into the authentication cache when they log in.
+User/role/password changes revoke that user's existing sessions.
+
+Session IDs are cryptographically random positive 63-bit integers. Session and
+auth state is process-local: it does not survive a restart and is not shared
+across replicas. The default TTL is 24 hours. Treat a session ID as a bearer
+credential and never place it in logs or telemetry.
+
+## gRPC GraphService
+
+The source definition is `byoridb-graph/proto/graph.proto`:
 
 ```protobuf
 service GraphService {
-    rpc Execute(ExecuteRequest) returns (ExecuteResponse);
-    rpc ExecuteJson(ExecuteJsonRequest) returns (ExecuteJsonResponse);
+  rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
+  rpc SignOut(SignOutRequest) returns (SignOutResponse);
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  rpc ExecuteJson(ExecuteRequest) returns (ExecuteJsonResponse);
+}
+
+message AuthenticateRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message AuthenticateResponse {
+  int64 session_id = 1;
+  int32 error_code = 2;
+  string error_msg = 3;
 }
 
 message ExecuteRequest {
-    bytes session_id = 1;
-    string statement = 2;
+  int64 session_id = 1;
+  string statement = 2;
 }
 
 message ExecuteResponse {
-    ErrorCode error_code = 1;
-    string error_msg = 2;
-    DataSet data = 3;
+  int32 error_code = 1;
+  string error_msg = 2;
+  int64 latency_us = 3;
+  bytes data = 4 [deprecated = true];
+  DataSet result = 5;
 }
 ```
 
-### 클라이언트 연결
+The protobuf session ID remains an `int64`; protobuf clients preserve it
+without the JavaScript JSON number precision problem.
+
+For `Execute` and `ExecuteJson`, current application error codes are:
+
+| Code | Meaning |
+|---:|---|
+| `0` | Success |
+| `1` | Query, parse, authorization, or execution error |
+| `2` | Session missing or expired |
+
+`Authenticate` uses `0` for success and `1` for authentication failure.
+`SignOut` currently returns `0` after attempting to remove the caller's own
+session.
+
+### Result representation
+
+`ExecuteResponse.result` is the preferred structured result. It contains
+column names and rows. Boolean, integer, float, string, and null values have
+first-class protobuf variants; complex ByoriDB values currently use a
+`json_value` string fallback. The deprecated `data` field is populated with a
+JSON-encoded legacy result for older clients.
+
+The server accepts gzip and zstd compressed gRPC requests and can send gzip or
+zstd responses according to negotiation. Incoming decoded gRPC messages are
+limited to 64 MiB.
+
+### Rust client
 
 ```rust
 use byoridb_client::Client;
 
 let mut client = Client::connect(
-    "localhost:9669".to_string(),
+    "127.0.0.1:9669".to_string(),
     "root".to_string(),
     std::env::var("BYORIDB_ROOT_PASSWORD")?,
 ).await?;
 
-let result = client.execute("SHOW SPACES").await?;
+let text = client.execute("SHOW SPACES").await?;
+let json = client.execute_json("SHOW SPACES").await?;
+let response = client.execute_raw("SHOW SPACES").await?;
+
+client.close().await?;
 ```
 
-### 세션 관리
+`execute_raw` is the programmatic structured-protobuf path. `execute` renders a
+text table-like representation and `execute_json` returns `serde_json::Value`.
 
-세션은 인증 중에 생성됩니다. Rust 클라이언트는 `Client::connect` 이후 세션 ID를
-내부적으로 관리합니다.
+## HTTP endpoints
 
-## HTTP API
+| Method | Path | Authentication | Purpose |
+|---|---|---|---|
+| `GET` | `/health` | none | Process liveness handler |
+| `GET` | `/ready` | none | Query-acceptance readiness |
+| `GET` | `/metrics` | none | Prometheus text metrics |
+| `GET` | `/api/v1/metrics` | none | Metrics discovery JSON |
+| `GET` | `/api/v1/diagnostics/queries` | GOD/ADMIN Bearer header | Active queries |
+| `POST` | `/api/v1/session` | username/password body | Authenticate |
+| `DELETE` | `/api/v1/session/{id}` | session ID in path | Sign out that session |
+| `POST` | `/api/v1/query` | session ID in body | Execute and return JSON object |
+| `POST` | `/api/v1/query/json` | session ID in body | Execute and return raw JSON text |
 
-### 엔드포인트
-
-| 엔드포인트 | 메서드 | 설명 |
-|----------|--------|-------------|
-| `/health` | GET | 헬스 체크 |
-| `/metrics` | GET | Prometheus 지표 |
-| `/api/v1/session` | POST | 인증된 세션 생성 |
-| `/api/v1/session/{id}` | DELETE | 세션 종료 |
-| `/api/v1/query` | POST | 쿼리 실행 |
-| `/api/v1/query/json` | POST | 쿼리를 실행하고 JSON 반환 |
-
-### 세션 생성
+### Create a session
 
 ```bash
-curl -X POST http://localhost:19669/api/v1/session \
-  -H "Content-Type: application/json" \
-  -d '{
+curl -sS http://127.0.0.1:19669/api/v1/session \
+  -H 'Content-Type: application/json' \
+  --data '{
     "username": "root",
-    "password": "change-me-before-production"
+    "password": "replace-with-a-managed-secret"
   }'
 ```
 
-### 쿼리 실행
+Response:
+
+```json
+{
+  "session_id": "734817462937615829",
+  "time_zone": "UTC"
+}
+```
+
+HTTP serializes session IDs as **decimal strings** because most random 63-bit
+values cannot be represented exactly by a JavaScript `Number`. Query requests
+accept either a decimal string or a JSON integer for compatibility; clients
+should send a string.
+
+### Execute a query
 
 ```bash
-curl -X POST http://localhost:19669/api/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "session_id": 1,
+curl -sS http://127.0.0.1:19669/api/v1/query \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "session_id": "734817462937615829",
     "query": "SHOW SPACES"
   }'
 ```
 
-응답:
+Example response shape (metadata values depend on the database):
 
 ```json
 {
-  "columns": ["Name"],
-  "rows": [["my_space"], ["test_space"]]
-}
-```
-
-### 헬스 체크
-
-```bash
-curl http://localhost:19669/health
-
-# Response
-OK
-```
-
-### 지표(Metrics)
-
-```bash
-curl http://localhost:19669/metrics
-
-# Response (Prometheus format)
-# HELP byoridb_query_total Total queries
-# TYPE byoridb_query_total counter
-byoridb_query_total{type="read"} 1234
-byoridb_query_total{type="write"} 567
-```
-
-## 에러 코드
-
-| 코드 | 이름 | 설명 |
-|------|------|-------------|
-| 0 | SUCCEEDED | 작업 성공 |
-| -1 | E_DISCONNECTED | 클라이언트 연결 끊김 |
-| -2 | E_FAIL_TO_CONNECT | 연결 실패 |
-| -3 | E_RPC_FAILURE | RPC 오류 |
-| -4 | E_SESSION_INVALID | 유효하지 않은 세션 |
-| -5 | E_SESSION_TIMEOUT | 세션 만료 |
-| -6 | E_SYNTAX_ERROR | 쿼리 구문 오류 |
-| -7 | E_SEMANTIC_ERROR | 쿼리 의미 오류 |
-| -8 | E_EXECUTION_ERROR | 쿼리 실행 실패 |
-| -9 | E_SPACE_NOT_FOUND | Space를 찾을 수 없음 |
-| -10 | E_TAG_NOT_FOUND | Tag를 찾을 수 없음 |
-| -11 | E_EDGE_NOT_FOUND | Edge 타입을 찾을 수 없음 |
-| -12 | E_VERTEX_NOT_FOUND | Vertex를 찾을 수 없음 |
-| -13 | E_INDEX_NOT_FOUND | Index를 찾을 수 없음 |
-| -14 | E_USER_NOT_FOUND | 사용자를 찾을 수 없음 |
-| -15 | E_BAD_USERNAME_PASSWORD | 인증 실패 |
-
-## 데이터 타입
-
-### Protocol Buffer 타입
-
-```protobuf
-message Value {
-    oneof value {
-        bool bool_val = 1;
-        int64 int_val = 2;
-        double float_val = 3;
-        string str_val = 4;
-        Date date_val = 5;
-        Time time_val = 6;
-        DateTime datetime_val = 7;
-        Vertex vertex_val = 8;
-        Edge edge_val = 9;
-        Path path_val = 10;
-        List list_val = 11;
-        Map map_val = 12;
+  "results": [
+    {
+      "ID": 1,
+      "Name": "example",
+      "Partition Num": 100,
+      "Replica Factor": 1,
+      "Vid Type": "INT64"
     }
-}
-
-message Vertex {
-    int64 vid = 1;
-    repeated Tag tags = 2;
-}
-
-message Edge {
-    int64 src = 1;
-    int64 dst = 2;
-    int32 type = 3;
-    string name = 4;
-    int64 ranking = 5;
-    map<string, Value> props = 6;
+  ],
+  "latency_ms": 0,
+  "row_count": 1,
+  "column_names": ["ID", "Name", "Partition Num", "Replica Factor", "Vid Type"]
 }
 ```
 
-### JSON 타입
+`/api/v1/query/json` accepts the same request and serializes the same fields as
+raw JSON text. An HTTP query string is limited to 1 MiB; a larger request
+returns HTTP 413.
 
-| nGQL 타입 | JSON 타입 |
-|-----------|-----------|
-| BOOL | boolean |
-| INT8/16/32/64 | number |
-| FLOAT/DOUBLE | number |
-| STRING | string |
-| DATE | string (ISO 8601) |
-| DATETIME | string (ISO 8601) |
-| LIST | array |
-| MAP | object |
+Common JSON error responses from the session and `/api/v1/query` routes are:
 
-## 속도 제한(Rate Limiting)
+| Route | Status | Code | Condition |
+|---|---:|---|---|
+| `/api/v1/query` | `400` | `QUERY_ERROR` | Parse, authorization, or execution failure |
+| `/api/v1/session` | `401` | `AUTH_FAILED` | Session creation failed |
+| `/api/v1/query` | `401` | `SESSION_EXPIRED` | Query session is missing or expired |
+| `/api/v1/query` | `413` | `QUERY_TOO_LARGE` | Query string exceeds 1 MiB |
 
-기본 제한값:
+`/api/v1/query/json` puts `QUERY_ERROR` or `SESSION_EXPIRED` in its raw JSON
+text for the corresponding failures, but its HTTP 413 response is a plain
+string without a `QUERY_TOO_LARGE` code. Error text is not a stable machine
+interface; use the status and a code where that route provides one.
 
-| 제한 항목 | 값 |
-|-------|-------|
-| IP당 최대 연결 수 | 100 |
-| 초당 최대 쿼리 수 | 1000 |
-| 최대 쿼리 크기 | 4 MB |
-| 쿼리 타임아웃 | 300초 |
+### Sign out
 
-제한값 설정:
-
-```toml
-[limits]
-max_connections_per_ip = 100
-max_queries_per_second = 1000
-max_query_size_bytes = 4194304
-query_timeout_secs = 300
+```bash
+curl -sS -X DELETE \
+  http://127.0.0.1:19669/api/v1/session/734817462937615829
 ```
+
+The current HTTP endpoint identifies the caller by the same ID in the path and
+only signs out that session. Avoid retaining URLs containing live session IDs
+in access logs.
+
+### Active queries
+
+```bash
+curl -sS http://127.0.0.1:19669/api/v1/diagnostics/queries \
+  -H 'Authorization: Bearer 734817462937615829'
+```
+
+The route returns HTTP 401 without a valid Bearer session and 403 unless that
+session has `GOD` or `ADMIN`. Results omit session credentials and redact
+password statements.
+
+## Current limits and compatibility
+
+- There is no application-level IP/QPS rate limiter. Enforce traffic limits at
+  the proxy or network edge.
+- HTTP and gRPC endpoints are versioned only by their current path/protobuf
+  definitions; review release changes before upgrading clients.
+- HTTP session IDs are strings on output, while gRPC uses protobuf `int64`.
+- Sessions are not durable or cluster-wide.
+- Health and metrics routes are unauthenticated and should be network-restricted.

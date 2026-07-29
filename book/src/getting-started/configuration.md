@@ -1,97 +1,115 @@
-# 설정
+[한국어](../ko/getting-started/configuration.html)
 
-ByoriDB는 명령줄 인자 또는 설정 파일을 통해 구성할 수 있습니다.
+# Configuration
 
-## 명령줄 옵션
+The standalone server reads built-in defaults, then an optional `byoridb.toml`
+in its working directory, then `BYORIDB__...` environment variables. Environment
+variables use double underscores to separate configuration keys.
 
-### 서버
+The server does not currently expose command-line flags for these settings.
 
-서버는 `byoridb.toml`과 `BYORIDB__...` 환경변수를 읽습니다.
+## Minimal local configuration
 
-### CLI 옵션
-
-```bash
-byoridb-cli [OPTIONS]
-
-Options:
-  --addr <ADDR>          Server address (default: 127.0.0.1:9669)
-  --user <USER>          Username (required, env: BYORIDB_USER)
-  --password <PASS>      Password (required, env: BYORIDB_PASSWORD)
-  --execute <QUERY>      Execute a single query and exit
-```
-
-## 설정 파일
-
-`byoridb.toml` 파일을 생성합니다:
+Use loopback listeners for a workstation-only server:
 
 ```toml
+# byoridb.toml
 [server]
-graph_addr = "0.0.0.0:9669"
-http_addr = "0.0.0.0:19669"
-storage_addr = "0.0.0.0:44500"
+graph_addr = "127.0.0.1:9669"
+http_addr = "127.0.0.1:19669"
+storage_addr = "127.0.0.1:44500"
 
 [storage]
-data_paths = ["/var/lib/byoridb/storage"]
+data_paths = ["data/storage"]
 ```
 
-## 환경변수
+`storage_addr` is retained in the configuration model, but the current
+standalone launcher embeds storage rather than starting a public Storage gRPC
+listener.
 
-| 변수 | 설명 | 기본값 |
-|----------|-------------|---------|
-| `BYORIDB__SERVER__GRAPH_ADDR` | gRPC 수신 주소 | `0.0.0.0:9669` |
-| `BYORIDB__SERVER__HTTP_ADDR` | HTTP 수신 주소 | `0.0.0.0:19669` |
-| `BYORIDB__SERVER__STORAGE_ADDR` | 스토리지 서비스 수신 주소 | `0.0.0.0:44500` |
-| `BYORIDB__STORAGE__DATA_PATHS` | 스토리지 데이터 경로 | `data/storage` |
-| `BYORIDB_ROOT_PASSWORD` | Root 사용자 비밀번호 | 설정하지 않으면 생성되어 한 번만 로그에 출력됨 |
-| `BYORIDB_USER` | CLI 사용자명 | 없음 |
-| `BYORIDB_PASSWORD` | CLI 비밀번호 | 없음 |
+## Server configuration keys
 
-## Root 사용자
+| Key | Environment variable | Default |
+| --- | --- | --- |
+| `server.graph_addr` | `BYORIDB__SERVER__GRAPH_ADDR` | `0.0.0.0:9669` |
+| `server.http_addr` | `BYORIDB__SERVER__HTTP_ADDR` | `0.0.0.0:19669` |
+| `server.storage_addr` | `BYORIDB__SERVER__STORAGE_ADDR` | `0.0.0.0:44500` |
+| `storage.data_paths` | `BYORIDB__STORAGE__DATA_PATHS` | `data/storage` |
 
-`root` 사용자는 항상 생성됩니다. 알려진 비밀번호를 사용하려면 시작 전에
-`BYORIDB_ROOT_PASSWORD`를 설정하세요. 설정하지 않으면 서버가 생성된 비밀번호를 한 번 로그에 출력합니다.
-
-## 디렉터리 구조
-
-서버를 시작한 후:
-
-```
-data/
-├── meta/          # Metadata storage
-├── storage/       # Graph data storage
-└── wal/           # Write-ahead logs
-```
-
-## 성능 튜닝
-
-### 메모리 설정
-
-고성능 워크로드의 경우:
-
-```toml
-[storage]
-block_cache_size = "1GB"
-write_buffer_size = "128MB"
-max_write_buffer_number = 4
-```
-
-### 압축
-
-디스크 사용량을 줄이려면 압축을 활성화합니다:
-
-```toml
-[storage]
-compression = "lz4"  # Options: none, snappy, lz4, zstd
-```
-
-## 로깅
-
-ByoriDB는 구조적 로깅(structured logging)을 사용합니다. 로그 출력을 설정하려면:
+The parser accepts multiple data paths as a comma-separated environment value:
 
 ```bash
-# JSON format
-BYORIDB_LOG_FORMAT=json ./byoridb-server
-
-# Enable debug logs for specific modules
-RUST_LOG=byoridb_graph=debug,byoridb_storage=info ./byoridb-server
+export BYORIDB__STORAGE__DATA_PATHS='/data/one,/data/two'
 ```
+
+The current storage environment opens only the first path. Additional entries
+are retained in configuration but do not provide striping or failover.
+
+## Credentials
+
+`BYORIDB_ROOT_PASSWORD` is separate from the double-underscore configuration
+tree. The standalone binary requires a non-blank value before it starts.
+
+```bash
+export BYORIDB_ROOT_PASSWORD='value-from-your-secret-manager'
+```
+
+Root credentials cannot be rotated through nGQL. Change the managed secret and
+restart the process. The server never logs the password.
+
+The CLI uses separate variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `BYORIDB_USER` | Required CLI username |
+| `BYORIDB_PASSWORD` | Required CLI password |
+
+## Runtime tuning
+
+These variables are read directly by the current process:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BYORIDB_CACHE_SIZE_MB` | `256` | redb page-cache size in MiB; values must be positive |
+| `BYORIDB_DURABILITY` | immediate durability | `none`, `relaxed`, or `eventual` selects relaxed durability |
+| `BYORIDB_MAX_MEMORY_MB` | `1024` | Soft per-query materialized-result memory cap; `0` disables it |
+| `BYORIDB_MAX_SCAN_LIMIT` | `100000` | Maximum rows from one fallback scan; `0` disables it |
+| `RUST_LOG` | subscriber default | Rust tracing filter, for example `byoridb_graph=debug` |
+
+Relaxed durability can lose recent commits after a crash. Use it only for data
+that can be reloaded, not normal serving.
+
+## Cluster settings
+
+The configuration model also accepts:
+
+```toml
+[cluster]
+node_id = 1
+peers = []
+advertise_addr = "127.0.0.1:9559"
+bootstrap = false
+meta_addr = "0.0.0.0:9559"
+```
+
+The matching variables are
+`BYORIDB__CLUSTER__NODE_ID`, `BYORIDB__CLUSTER__PEERS`,
+`BYORIDB__CLUSTER__ADVERTISE_ADDR`, `BYORIDB__CLUSTER__BOOTSTRAP`, and
+`BYORIDB__CLUSTER__META_ADDR`. A comma-separated non-empty `peers` value enables
+the Meta launcher.
+
+Cluster startup is still incomplete: Storage/Raft peer bootstrap, deployment
+wiring, and multi-node operational end-to-end coverage are not closed. Do not
+treat the current cluster switches or the three services in `docker-compose.yml`
+as a production distributed deployment.
+
+## Network security
+
+The gRPC and HTTP servers do not terminate TLS and there is no built-in
+network-level login rate limiter. For any non-local deployment:
+
+- terminate TLS at a trusted ingress or proxy;
+- restrict listener access with a firewall or network policy;
+- add rate limiting at the edge;
+- inject `BYORIDB_ROOT_PASSWORD` from a secret manager; and
+- avoid the default `0.0.0.0` listeners unless network controls are in place.

@@ -93,12 +93,21 @@ impl Executor for ByoriDBExecutorAdapter {
             &self.stmt,
             Statement::Show(byoridb_parser::ast::ShowStatement::Sessions)
         ) {
+            if !self
+                .caller_roles
+                .iter()
+                .any(|role| role == "GOD" || role == "ADMIN")
+            {
+                return Err(crate::error::GraphError::AuthFailed(
+                    "SHOW SESSIONS requires GOD or ADMIN role".to_string(),
+                ));
+            }
+
             let rows = if let Some(ref sm) = self.session_manager {
                 sm.list_sessions()
                     .into_iter()
-                    .map(|(sid, user, space)| {
+                    .map(|(_sid, user, space)| {
                         vec![
-                            byoridb_common::Value::Int(sid),
                             byoridb_common::Value::String(user),
                             byoridb_common::Value::String(space.unwrap_or_else(|| "-".to_string())),
                         ]
@@ -108,11 +117,7 @@ impl Executor for ByoriDBExecutorAdapter {
                 vec![]
             };
             let dataset = byoridb_common::DataSet::with_rows(
-                vec![
-                    "SessionID".to_string(),
-                    "User".to_string(),
-                    "Space".to_string(),
-                ],
+                vec!["User".to_string(), "Space".to_string()],
                 rows,
             );
             return Ok(dataset);
@@ -144,5 +149,54 @@ impl Executor for ByoriDBExecutorAdapter {
 
     fn full_scan_flag(&self) -> Option<Arc<AtomicBool>> {
         Some(self.full_scan.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use byoridb_kvstore::MemoryKVStore;
+    use byoridb_parser::ast::ShowStatement;
+
+    fn show_sessions_adapter(
+        roles: Vec<String>,
+        sessions: Arc<SessionManager>,
+    ) -> ByoriDBExecutorAdapter {
+        ByoriDBExecutorAdapter::new(
+            Statement::Show(ShowStatement::Sessions),
+            None,
+            Arc::new(MemoryKVStore::new()),
+        )
+        .with_caller_roles(roles)
+        .with_session_manager(sessions)
+    }
+
+    #[tokio::test]
+    async fn show_sessions_requires_admin_role() {
+        let sessions = Arc::new(SessionManager::new());
+        sessions.create_session("guest".to_string()).await;
+        let adapter = show_sessions_adapter(vec!["GUEST".to_string()], sessions);
+
+        let err = adapter
+            .execute()
+            .await
+            .expect_err("GUEST must not enumerate sessions");
+        assert!(matches!(err, crate::error::GraphError::AuthFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn show_sessions_never_returns_bearer_session_ids() {
+        let sessions = Arc::new(SessionManager::new());
+        let session_id = sessions.create_session("root".to_string()).await;
+        let adapter = show_sessions_adapter(vec!["ADMIN".to_string()], sessions);
+
+        let dataset = adapter.execute().await.expect("ADMIN may list sessions");
+
+        assert_eq!(dataset.column_names, vec!["User", "Space"]);
+        assert_eq!(dataset.rows.len(), 1);
+        assert_eq!(dataset.rows[0].len(), 2);
+        assert!(dataset.rows[0]
+            .iter()
+            .all(|value| value != &byoridb_common::Value::Int(session_id)));
     }
 }

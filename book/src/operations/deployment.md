@@ -1,218 +1,150 @@
-# 배포
+# Deployment
 
-프로덕션 환경에 ByoriDB를 배포하기 위한 가이드입니다.
+[한국어](../ko/operations/deployment.html)
 
-## 배포 모드
+The supported runtime shape is one `byoridb-server` process with one local redb
+data directory. The server exposes Graph gRPC on port `9669` and HTTP on port
+`19669` by default.
 
-### 단독(Standalone) 모드
+Do not deploy multiple independent processes as a shared cluster. The
+distributed components are not fully wired into the launcher; see
+[Distributed systems](../architecture/distributed.html).
 
-모든 서비스가 단일 프로세스에서 실행됩니다 — 개발 및 테스트에 적합합니다:
+## Required secret
 
-```bash
-byoridb-server --data-dir /var/lib/byoridb
-```
-
-### 분산(Distributed) 모드
-
-프로덕션 확장성을 위해 서비스를 분리합니다:
-
-```bash
-# Meta Service (1-3 nodes for HA)
-byoridb-meta --config /etc/byoridb/meta.toml
-
-# Storage Service (3+ nodes)
-byoridb-storage --config /etc/byoridb/storage.toml
-
-# Graph Service (2+ nodes, stateless)
-byoridb --config /etc/byoridb/graph.toml
-```
-
-## 하드웨어 권장 사양
-
-### Meta Service
-
-| 구성 요소 | 최소 | 권장 |
-|-----------|---------|-------------|
-| CPU | 2 cores | 4 cores |
-| Memory | 4 GB | 8 GB |
-| Disk | 10 GB SSD | 50 GB SSD |
-
-### Storage Service
-
-| 구성 요소 | 최소 | 권장 |
-|-----------|---------|-------------|
-| CPU | 4 cores | 8+ cores |
-| Memory | 8 GB | 32+ GB |
-| Disk | 100 GB SSD | NVMe SSD |
-
-### Graph Service
-
-| 구성 요소 | 최소 | 권장 |
-|-----------|---------|-------------|
-| CPU | 4 cores | 8+ cores |
-| Memory | 4 GB | 16 GB |
-| Disk | 최소 | 최소 |
-
-## Docker 배포
-
-### Docker Compose
-
-```yaml
-version: '3.8'
-
-services:
-  meta:
-    image: byoridb/meta:latest
-    ports:
-      - "9559:9559"
-    volumes:
-      - meta-data:/data
-
-  storage:
-    image: byoridb/storage:latest
-    ports:
-      - "9779:9779"
-    volumes:
-      - storage-data:/data
-    depends_on:
-      - meta
-
-  graph:
-    image: byoridb/graph:latest
-    ports:
-      - "9669:9669"
-      - "19669:19669"
-    depends_on:
-      - meta
-      - storage
-
-volumes:
-  meta-data:
-  storage-data:
-```
-
-다음 명령으로 시작합니다:
+The standalone server refuses to start unless `BYORIDB_ROOT_PASSWORD` is set to
+a non-blank value:
 
 ```bash
-docker-compose up -d
+export BYORIDB_ROOT_PASSWORD='replace-with-a-managed-secret'
 ```
 
-## Kubernetes 배포
+Inject it from the environment's secret manager. Do not place it in an image,
+ConfigMap, checked-in `.env` file, shell history, or command-line argument.
+Root credentials are replaced only by changing this environment value and
+restarting the server.
 
-### 기본 StatefulSet
+## Run from source
 
-```yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: byoridb-storage
-spec:
-  serviceName: byoridb-storage
-  replicas: 3
-  selector:
-    matchLabels:
-      app: byoridb-storage
-  template:
-    metadata:
-      labels:
-        app: byoridb-storage
-    spec:
-      containers:
-      - name: storage
-        image: byoridb/storage:latest
-        ports:
-        - containerPort: 9779
-        volumeMounts:
-        - name: data
-          mountPath: /data
-  volumeClaimTemplates:
-  - metadata:
-      name: data
-    spec:
-      accessModes: ["ReadWriteOnce"]
-      resources:
-        requests:
-          storage: 100Gi
+```bash
+cargo build --release --bin byoridb-server
+
+export BYORIDB_ROOT_PASSWORD='replace-with-a-managed-secret'
+export BYORIDB__STORAGE__DATA_PATHS=/var/lib/byoridb/data
+./target/release/byoridb-server
 ```
 
-## 프로덕션 설정
+`byoridb-server` does not accept a `--data-dir` flag. Configuration comes from
+defaults, an optional `byoridb` configuration file in the working directory,
+and environment variables in the form `BYORIDB__SECTION__KEY`.
 
-### Meta Service
+An equivalent minimal `byoridb.toml` is:
 
 ```toml
 [server]
-bind_addr = "0.0.0.0:9559"
-data_dir = "/var/lib/byoridb/meta"
-
-[cluster]
-peers = ["meta1:9559", "meta2:9559", "meta3:9559"]
-
-[raft]
-election_timeout_ms = 2000
-heartbeat_interval_ms = 200
-```
-
-### Storage Service
-
-```toml
-[server]
-bind_addr = "0.0.0.0:9779"
-data_dir = "/var/lib/byoridb/storage"
-
-[meta]
-addrs = ["meta1:9559", "meta2:9559", "meta3:9559"]
-
-[storage]
-block_cache_size = "4GB"
-write_buffer_size = "128MB"
-```
-
-### Graph Service
-
-```toml
-[server]
-grpc_addr = "0.0.0.0:9669"
+graph_addr = "0.0.0.0:9669"
 http_addr = "0.0.0.0:19669"
-
-[meta]
-addrs = ["meta1:9559", "meta2:9559", "meta3:9559"]
+storage_addr = "0.0.0.0:44500"
 
 [storage]
-addrs = ["storage1:9779", "storage2:9779", "storage3:9779"]
+data_paths = ["/var/lib/byoridb/data"]
 ```
 
-## 보안
-
-### TLS 설정
-
-```toml
-[tls]
-enabled = true
-cert_file = "/etc/byoridb/server.crt"
-key_file = "/etc/byoridb/server.key"
-ca_file = "/etc/byoridb/ca.crt"
-```
-
-### 인증
-
-시작 전에 root 비밀번호를 설정하고 배포 시크릿 매니저에 저장하세요:
+Only the first `data_paths` entry is currently opened. Storage cache and
+durability overrides are separate variables:
 
 ```bash
-export BYORIDB_ROOT_PASSWORD='strong-password'
+export BYORIDB_CACHE_SIZE_MB=4096
+# Do not set BYORIDB_DURABILITY during normal serving.
 ```
 
-`root`로 접속한 후 nGQL로 애플리케이션 사용자를 생성하세요.
+Size the redb page cache and query memory guard from measured working-set and
+query behavior; there is no universal CPU, memory, or disk recommendation.
 
-## 헬스 체크
+## Docker
 
-### HTTP 헬스 엔드포인트
+Build the image directly:
 
 ```bash
-curl http://localhost:19669/health
+docker build -t byoridb-server:local .
+docker run --rm \
+  -e BYORIDB_ROOT_PASSWORD \
+  -e BYORIDB__STORAGE__DATA_PATHS=/app/data \
+  -p 9669:9669 \
+  -p 19669:19669 \
+  -v byoridb-data:/app/data \
+  byoridb-server:local
 ```
 
-### gRPC 헬스 체크
+Or run one service from the checked-in Compose file:
 
 ```bash
-grpc_health_probe -addr=localhost:9669
+export BYORIDB_ROOT_PASSWORD='replace-with-a-managed-secret'
+docker compose up --build byoridb-server-1
 ```
+
+The three services in `docker-compose.yml` use separate named volumes and no
+cluster settings. Starting all three creates three unrelated databases on
+different host ports, not replicas.
+
+## Repository AKS deployment
+
+The Azure assets under `deploy/azure/` describe a single-node deployment:
+
+- `bootstrap.sh` provisions Azure resources, builds an image, creates a root
+  Secret if absent, restricts the public load balancer to an operator CIDR, and
+  applies the manifests;
+- `k8s/01-configmap.yaml` sets listener and data-path configuration;
+- `k8s/03-statefulset.yaml` declares one replica, a ReadWriteOnce premium PVC,
+  resource limits, graceful termination, and HTTP probes;
+- `k8s/04-services.yaml` declares headless and public LoadBalancer Services;
+- `.github/workflows/deploy.yml` substitutes a commit-tagged image before
+  applying manifests and preserves the live load-balancer source ranges.
+
+Read and adapt every value before running the bootstrap script. The checked-in
+Service uses a documentation-only CIDR placeholder; it is not an allowlist for
+your environment. Applying the raw StatefulSet can also reintroduce its
+placeholder image instead of the intended commit image, so use the supported
+rendering workflow.
+
+The manifest's one replica and one PVC are intentional. Increasing the replica
+count does not create a ByoriDB cluster.
+
+These files show repository configuration, not the observed health, image, or
+rollout status of a live AKS environment. Inspect the target environment at
+deployment time.
+
+## Health and shutdown
+
+The Graph HTTP server exposes:
+
+```bash
+curl -f http://127.0.0.1:19669/health
+curl -f http://127.0.0.1:19669/ready
+```
+
+- `/health` returns `OK` when the HTTP process can serve the handler.
+- `/ready` returns `READY` while the service accepts new queries and changes to
+  HTTP 503 once graceful shutdown begins.
+
+There is no registered standard gRPC health service. Use the HTTP endpoints for
+the checked-in Kubernetes probes.
+
+On `SIGTERM` or Ctrl+C, the process fails readiness, waits up to 25 seconds for
+in-flight queries, signals the network servers, and checkpoints redb. The AKS
+manifest gives the pod a 300-second termination grace period so the process is
+not killed during this sequence.
+
+## Network security
+
+ByoriDB currently serves plaintext HTTP and gRPC and has no native TLS
+configuration. For any non-local deployment:
+
+- terminate TLS at a trusted ingress, proxy, or load balancer;
+- restrict both ports with private networking, firewall rules, security groups,
+  or source ranges;
+- keep `/metrics` and health endpoints off the public internet;
+- add external request/rate limits appropriate to the environment;
+- rotate and audit the secret source used for `BYORIDB_ROOT_PASSWORD`.
+
+Authentication does not compensate for an exposed plaintext transport.

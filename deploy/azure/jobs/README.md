@@ -1,115 +1,176 @@
-# Bulk load runbook (AKS)
+# Offline bulk-load runbook for AKS
 
-Offline bulk import of large datasets via `byoridb-bulkloader`, which writes
-directly into the redb store — bypassing nGQL/HTTP and assigning sequential
-INT64 vids so the B-tree stays append-friendly (avoids the random-VID write
-amplification that makes HTTP seqload slow at this scale).
+> **English** | [한국어](README.ko.md)
 
-> **Why a Job, not HTTP:** at ~240M elements (89M nodes + 151M edges) HTTP
-> `INSERT` is slow and degrades as the B-tree grows (commit `39f726e`), and its
-> hash-mapped random VIDs hurt query performance too. The loader is single-pass,
-> sorted, and uses relaxed durability.
+This directory contains manually applied Kubernetes Jobs. Files here are not
+part of the normal manifest apply loop under `deploy/azure/k8s/`.
 
-## One-time: image must contain the loader
+`bulkload-nexprice.yaml` is a **dataset- and environment-specific example**. It
+contains a namespace, PVC name, registry path, node selector, resource sizing,
+schema names, and CSV paths that must be reviewed before every run. The presence
+of the file does not imply that an AKS cluster is currently running.
 
-The loader binary ships in the `byoridb-server` image as of the 2026-06-25
-Dockerfile change (`--bin byoridb-server --bin byoridb-bulkloader`). **Redeploy
-first** so the live `byoridb-server:<sha>` image has `/usr/local/bin/byoridb-bulkloader`.
+## Safety model
 
-## Steps
+`byoridb-bulkloader` opens the same redb database as the server and writes keys
+directly. It bypasses HTTP, gRPC, sessions, and nGQL validation.
 
-### 1. DDL via the server (server still running)
+- Stop every process that can open the target redb database before starting the
+  loader. The Kubernetes `ReadWriteOnce` access mode alone does not enforce this
+  process-level exclusivity.
+- Scaling the StatefulSet to zero causes downtime. Obtain operator approval and
+  a tested backup or volume snapshot first.
+- Never delete or replace a PVC as part of this runbook.
+- Use `--durability=relaxed` only for reproducible imports. A crash can lose
+  recent batches. Steady-state serving should use the server default,
+  immediate durability.
+- The example is lenient: duplicate node IDs and dangling edges are counted and
+  skipped. Add `--strict` when either condition must abort the import.
 
-The loader only *reads* metadata — create the space/tags/edges first. For a full
-re-import, drop the old space first.
+## What the loader does
 
-```sql
-DROP SPACE IF EXISTS nexprice;
-CREATE SPACE nexprice (vid_type = INT64);
+The loader:
+
+1. Reads existing space, tag, and edge schemas from redb.
+2. Assigns sequential `INT64` VIDs while loading node CSV files.
+3. Persists the original ID-to-VID mapping.
+4. Loads edge CSV files after all node files and writes forward/reverse edge
+   entries and degree counters.
+5. Preserves CSV columns as properties, converting values when a declared
+   schema type is available.
+
+It supports plain CSV and gzip-compressed CSV files. The default columns are
+`id`, `src`, and `dst`; override them with `--id-column`, `--src-column`, and
+`--dst-column`.
+
+The exact edge type `sameAs` is reserved for the engine's irreversible
+`owl:sameAs` canonical merge. The sample dataset therefore uses `same_as`.
+
+## Preflight
+
+Run all commands from the repository root. The examples assume namespace
+`byoridb` and StatefulSet `byoridb-server`; change them for your environment.
+
+1. Confirm the maintenance window and backup/restore procedure.
+2. Review the Job before applying it:
+
+   ```bash
+   kubectl apply --dry-run=client -f deploy/azure/jobs/bulkload-nexprice.yaml
+   kubectl -n byoridb get statefulset byoridb-server
+   kubectl -n byoridb get pvc data-byoridb-server-0
+   ```
+
+3. Capture the exact deployed image before scaling down:
+
+   ```bash
+   DEPLOYED_IMAGE=$(kubectl -n byoridb get statefulset byoridb-server \
+     -o jsonpath='{.spec.template.spec.containers[0].image}')
+   test -n "$DEPLOYED_IMAGE"
+   echo "$DEPLOYED_IMAGE"
+   ```
+
+4. Confirm that image contains `/usr/local/bin/byoridb-bulkloader`. Image
+   contents, not a dated documentation claim, are the source of truth.
+5. Upload CSV files to the paths referenced by the Job. For large files, use a
+   storage-native transfer method and compare checksums after upload.
+
+## Prepare schemas
+
+The loader reads metadata but does not create schemas. While the server is still
+running, create the target space and every tag/edge referenced by the Job.
+
+The sample expects an `INT64` space and these names:
+
+```ngql
+CREATE SPACE IF NOT EXISTS nexprice (vid_type = INT64);
 USE nexprice;
 
-CREATE TAG sku(...);
-CREATE TAG product(...);
-CREATE TAG brand(...);
-CREATE TAG category(...);
-CREATE TAG channel(...);
+CREATE TAG IF NOT EXISTS sku(...);
+CREATE TAG IF NOT EXISTS product(...);
+CREATE TAG IF NOT EXISTS brand(...);
+CREATE TAG IF NOT EXISTS category(...);
+CREATE TAG IF NOT EXISTS channel(...);
 
--- Edge type MUST be `same_as` (underscore), NOT `sameAs` — the loader rejects
--- `sameAs` because that name triggers the engine's owl:sameAs union-find merge.
-CREATE EDGE same_as();
-CREATE EDGE sold_on();
-CREATE EDGE in_category();
-CREATE EDGE has_brand();
-CREATE EDGE child_of();
+CREATE EDGE IF NOT EXISTS same_as();
+CREATE EDGE IF NOT EXISTS sold_on();
+CREATE EDGE IF NOT EXISTS in_category();
+CREATE EDGE IF NOT EXISTS has_brand();
+CREATE EDGE IF NOT EXISTS child_of();
 ```
 
-Column names in the CSVs must match the loader flags: node id column `id`,
-edge endpoint columns `src` / `dst` (override with `--id-column` /
-`--src-column` / `--dst-column` in the Job if your headers differ). Every CSV
-column is preserved as a property; the id column also drives vid assignment.
+Replace `...` with real property definitions that match the CSV headers and
+types. Do not copy the placeholders into a production query.
 
-### 2. Upload CSVs to the data PVC (`/app/data/import/`)
+Dropping an existing space is destructive and is intentionally not included in
+this runbook. If a clean re-import requires it, make that a separately reviewed
+operation with a verified backup.
 
-The data PVC is ReadWriteOnce, so upload while the server still holds it (a
-helper pod can co-mount it on the same node) or during a short scale-down.
-For 8.6GB, prefer Azure Blob + `azcopy` over `kubectl cp` (the latter is slow
-and flaky at multi-GB):
+## Run the Job
 
-```bash
-# Helper pod sharing the data PVC, then azcopy from Blob into /app/data/import.
-# (Server must be scaled to 0 first if you mount RWO from a separate pod.)
-```
+1. Stop the server and wait until no server pod remains:
 
-### 3. Scale the server down (release the RWO PVC)
+   ```bash
+   kubectl -n byoridb scale statefulset byoridb-server --replicas=0
+   kubectl -n byoridb rollout status statefulset/byoridb-server --timeout=180s
+   kubectl -n byoridb get pods -l app.kubernetes.io/name=byoridb
+   ```
 
-```bash
-kubectl -n byoridb scale statefulset byoridb-server --replicas=0
-kubectl -n byoridb rollout status statefulset byoridb-server --timeout=120s
-```
+2. Render the Job with the captured server image without editing the checked-in
+   manifest, then apply it:
 
-### 4. Pin the image tag and run the Job
+   ```bash
+   kubectl set image -f deploy/azure/jobs/bulkload-nexprice.yaml \
+     bulkloader="$DEPLOYED_IMAGE" --local -o yaml \
+     | kubectl apply -f -
+   ```
 
-```bash
-SHA=$(kubectl -n byoridb get statefulset byoridb-server \
-  -o jsonpath='{.spec.template.spec.containers[0].image}' | sed 's/.*://')
-# (capture the sha BEFORE scaling down if the field clears; or read from ACR / the deploy log)
+   Kubernetes Job pod templates are immutable. If a previous Job with this name
+   exists, inspect its status and logs first. Delete only that Job object after
+   explicit confirmation, then apply the new manifest.
 
-sed "s/PLACEHOLDER_SHA/$SHA/" deploy/azure/jobs/bulkload-nexprice.yaml \
-  | kubectl apply -f -
+3. Follow progress and inspect the terminal condition:
 
-kubectl -n byoridb logs -f job/byoridb-bulkload-nexprice
-```
+   ```bash
+   kubectl -n byoridb logs -f job/byoridb-bulkload-nexprice
+   kubectl -n byoridb wait --for=condition=complete \
+     job/byoridb-bulkload-nexprice --timeout=24h
+   kubectl -n byoridb get job/byoridb-bulkload-nexprice -o wide
+   ```
 
-The loader logs per-file progress and a final summary (vertices / tagvid_entries
-/ edges / duplicate_ids / dangling_edges). `dangling_edges > 0` means some edge
-endpoint id was not among the loaded nodes — investigate the CSVs.
+The final summary reports vertices, tag-to-VID entries, edges, duplicate IDs,
+and dangling edges. Treat nonzero duplicate or dangling counts as data-quality
+signals, even in lenient mode.
 
-### 5. Scale the server back up
+The sample omits `--verify` because that option scans the full keyspace. Enable
+it for small or medium imports, or run targeted queries after a large import.
+
+## Return to service
+
+Do not start the server until the Job pod has exited and no process holds the
+redb database.
 
 ```bash
 kubectl -n byoridb scale statefulset byoridb-server --replicas=1
-kubectl -n byoridb rollout status statefulset byoridb-server --timeout=180s
+kubectl -n byoridb rollout status statefulset/byoridb-server --timeout=600s
+kubectl -n byoridb port-forward statefulset/byoridb-server 19669:19669
 ```
 
-### 6. Verify with real queries
+In another shell:
 
-```sql
-USE nexprice;
-MATCH (n:sku) RETURN count(n);
-MATCH (n:product) RETURN count(n);
-GO FROM <some_product_vid> OVER same_as YIELD dst(edge);
-GO FROM <some_sku_vid> OVER same_as REVERSELY YIELD dst(edge);   -- reverse index
+```bash
+curl --fail http://127.0.0.1:19669/health
+curl --fail http://127.0.0.1:19669/ready
 ```
 
-## Notes
+Then authenticate and run dataset-specific counts and a small sample of forward
+and reverse traversals. Compare them with independent source-file tallies; do
+not rely only on the loader log.
 
-- **Memory:** the id map (original-id → vid) is held in RAM for the whole load:
-  ~89M entries ≈ 6–8GB. The Job requests 16Gi / limits 32Gi.
-- **Durability:** the Job uses `--durability relaxed`. A crash mid-load loses the
-  last ≤64 commits; just re-run (vid assignment is deterministic per run, and a
-  full re-import is idempotent if the space is dropped+recreated first).
-- **Steady state:** the StatefulSet currently sets `BYORIDB_DURABILITY=none`
-  (bulk-load mode). Per the comment in `03-statefulset.yaml`, remove that env var
-  after loading so serving uses Immediate (fsync) durability.
-- **`--verify`** is intentionally omitted from the Job: it scans the whole
-  keyspace. Trust the loader's tallies; spot-check with the queries above.
+## Failure handling
+
+- If the Job fails, leave the server stopped until the loader pod has terminated.
+- Preserve logs, Job YAML, image digest, CSV checksums, and final counters.
+- A relaxed-durability partial import may need to be rerun or restored from the
+  preflight snapshot. Choose based on the dataset's documented idempotency.
+- If redb cannot reopen, do not delete the PVC. Escalate to the tested recovery
+  procedure and work from a copy or snapshot whenever possible.

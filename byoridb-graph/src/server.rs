@@ -7,7 +7,7 @@
 use super::service::GraphService;
 use axum::{
     extract::{Json, Path, State},
-    http::StatusCode,
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     routing::{delete, get, post},
     Router,
 };
@@ -21,16 +21,22 @@ use tracing::{error, info};
 
 /// Graph gRPC server
 pub struct GraphServer {
-    service: GraphService,
+    service: Arc<GraphService>,
     addr: SocketAddr,
 }
 
 impl GraphServer {
     pub fn new(addr: SocketAddr, kvstore: Arc<dyn KVStore>) -> Self {
         GraphServer {
-            service: GraphService::new(kvstore),
+            service: Arc::new(GraphService::new(kvstore)),
             addr,
         }
+    }
+
+    /// Construct a gRPC server around an existing graph service. The standalone
+    /// binary uses this to share one authentication/session authority with HTTP.
+    pub fn with_service(addr: SocketAddr, service: Arc<GraphService>) -> Self {
+        GraphServer { service, addr }
     }
 
     /// Like [`GraphServer::new`] but sharing the binary-wide readiness/drain
@@ -42,14 +48,13 @@ impl GraphServer {
         shutdown: Arc<crate::shutdown::ShutdownState>,
     ) -> Self {
         GraphServer {
-            service: GraphService::new(kvstore).with_shutdown_state(shutdown),
+            service: Arc::new(GraphService::new(kvstore).with_shutdown_state(shutdown)),
             addr,
         }
     }
 
     /// Start the gRPC server with compression support
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
-        use std::sync::Arc;
         use std::time::Duration;
 
         info!(
@@ -63,7 +68,7 @@ impl GraphServer {
             crate::service::DEFAULT_SESSION_CLEANUP_INTERVAL_SECS,
         ));
 
-        let grpc_service = crate::grpc::GrpcService::new(Arc::new(self.service));
+        let grpc_service = crate::grpc::GrpcService::new(self.service);
 
         // Enable compression for both receiving and sending
         // This can reduce network I/O by 30-50% for large responses
@@ -108,6 +113,12 @@ impl HttpServer {
             service: Arc::new(GraphService::new(kvstore)),
             addr,
         }
+    }
+
+    /// Construct an HTTP server around an existing graph service. Sharing this
+    /// instance with gRPC keeps users, roles, and sessions protocol-consistent.
+    pub fn with_service(addr: SocketAddr, service: Arc<GraphService>) -> Self {
+        HttpServer { service, addr }
     }
 
     /// Like [`HttpServer::new`] but sharing the binary-wide readiness/drain
@@ -208,12 +219,59 @@ async fn metrics_json() -> Json<serde_json::Value> {
 /// Diagnostics: list queries currently executing on the server. Useful for
 /// seeing what a long-running load is doing and whether work continues after a
 /// client-side HTTP timeout.
-async fn list_active_queries(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let queries = state.service.list_active_queries();
-    Json(serde_json::json!({
+async fn list_active_queries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let session_id = bearer_session_id(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "A valid Bearer session is required".to_string(),
+                code: "AUTH_REQUIRED".to_string(),
+            }),
+        )
+    })?;
+
+    if !state.service.is_admin_session(session_id).await {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "GOD or ADMIN role is required".to_string(),
+                code: "ADMIN_REQUIRED".to_string(),
+            }),
+        ));
+    }
+
+    let queries: Vec<serde_json::Value> = state
+        .service
+        .list_active_queries()
+        .iter()
+        .map(active_query_to_json)
+        .collect();
+    Ok(Json(serde_json::json!({
         "count": queries.len(),
         "queries": queries,
-    }))
+    })))
+}
+
+fn bearer_session_id(headers: &HeaderMap) -> Option<i64> {
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    token.trim().parse().ok()
+}
+
+fn active_query_to_json(query: &crate::service::RunningQuery) -> serde_json::Value {
+    serde_json::json!({
+        "id": query.id,
+        "query_type": query.query_type,
+        "query": crate::service::redact_sensitive_query(&query.query),
+        "space": query.space,
+        "started_at_ms": query.started_at_ms,
+    })
 }
 
 /// Create a new session (authenticate)
@@ -221,13 +279,14 @@ async fn create_session(
     State(state): State<AppState>,
     Json(payload): Json<CreateSessionRequest>,
 ) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let username = payload.username;
     match state
         .service
-        .authenticate(payload.username, payload.password)
+        .authenticate(username.clone(), payload.password)
         .await
     {
         Ok(session_id) => {
-            info!("Session created: {}", session_id);
+            info!(user = %username, "Session created");
             Ok(Json(SessionResponse {
                 session_id,
                 time_zone: Some("UTC".to_string()),
@@ -254,10 +313,8 @@ async fn delete_session(
     // HTTP endpoint: caller is identified by the session ID in the path.
     // A session can only sign out itself via this endpoint.
     state.service.sign_out(id, id).await;
-    info!("Session deleted: {}", id);
-    Ok(Json(
-        serde_json::json!({"session_id": id.to_string(), "deleted": true}),
-    ))
+    info!("Session deleted");
+    Ok(Json(serde_json::json!({"deleted": true})))
 }
 
 /// Maximum query string length accepted by the HTTP API (1 MiB).
@@ -290,10 +347,11 @@ async fn execute_query(
     {
         Ok(dataset) => {
             let latency_ms = start.elapsed().as_millis() as u64;
+            let redacted_query = crate::service::redact_sensitive_query(&payload.query);
             info!(
-                "Query executed in {}ms: {}",
                 latency_ms,
-                truncate_query(&payload.query)
+                query = %truncate_query(&redacted_query),
+                "Query executed"
             );
 
             // Convert DataSet to JSON results
@@ -307,16 +365,26 @@ async fn execute_query(
             }))
         }
         Err(e) => {
-            error!("Query execution failed: {}", e);
-            let (status, code) = if matches!(e, crate::error::GraphError::SessionNotFound(_)) {
-                (StatusCode::UNAUTHORIZED, "SESSION_EXPIRED")
-            } else {
-                (StatusCode::BAD_REQUEST, "QUERY_ERROR")
-            };
+            let (status, code, message) =
+                if matches!(&e, crate::error::GraphError::SessionNotFound(_)) {
+                    error!("Query rejected: invalid or expired session");
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        "SESSION_EXPIRED",
+                        "Query execution failed: session is invalid or expired".to_string(),
+                    )
+                } else {
+                    error!(err = %e, "Query execution failed");
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "QUERY_ERROR",
+                        format!("Query execution failed: {e}"),
+                    )
+                };
             Err((
                 status,
                 Json(ErrorResponse {
-                    error: format!("Query execution failed: {}", e),
+                    error: message,
                     code: code.to_string(),
                 }),
             ))
@@ -360,13 +428,22 @@ async fn execute_query_json(
             Ok(response.to_string())
         }
         Err(e) => {
-            let (status, code) = if matches!(e, crate::error::GraphError::SessionNotFound(_)) {
-                (StatusCode::UNAUTHORIZED, "SESSION_EXPIRED")
-            } else {
-                (StatusCode::BAD_REQUEST, "QUERY_ERROR")
-            };
+            let (status, code, message) =
+                if matches!(&e, crate::error::GraphError::SessionNotFound(_)) {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        "SESSION_EXPIRED",
+                        "Query execution failed: session is invalid or expired".to_string(),
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "QUERY_ERROR",
+                        format!("Query execution failed: {e}"),
+                    )
+                };
             let error_response = serde_json::json!({
-                "error": format!("Query execution failed: {}", e),
+                "error": message,
                 "code": code
             });
             Err((status, error_response.to_string()))
@@ -544,8 +621,170 @@ struct ErrorResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_query;
-    use super::{QueryRequest, SessionResponse};
+    use super::{
+        active_query_to_json, bearer_session_id, execute_query, execute_query_json,
+        list_active_queries, truncate_query, AppState, GraphServer, HttpServer, QueryRequest,
+        SessionResponse,
+    };
+    use crate::auth::AuthManager;
+    use crate::service::{GraphService, RunningQuery};
+    use axum::extract::{Json, State};
+    use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue, StatusCode};
+    use byoridb_kvstore::{KVStore, MemoryKVStore};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn bearer_session_parser_requires_bearer_scheme_and_integer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer 12345"));
+        assert_eq!(bearer_session_id(&headers), Some(12345));
+
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic 12345"));
+        assert_eq!(bearer_session_id(&headers), None);
+
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer not-a-number"),
+        );
+        assert_eq!(bearer_session_id(&headers), None);
+    }
+
+    #[test]
+    fn grpc_and_http_can_share_one_graph_service() {
+        let service = Arc::new(GraphService::new(Arc::new(MemoryKVStore::new())));
+        let grpc = GraphServer::with_service("127.0.0.1:0".parse().unwrap(), service.clone());
+        let http = HttpServer::with_service("127.0.0.1:0".parse().unwrap(), service.clone());
+
+        assert!(Arc::ptr_eq(&grpc.service, &service));
+        assert!(Arc::ptr_eq(&http.service, &service));
+        assert!(Arc::ptr_eq(&grpc.service, &http.service));
+    }
+
+    #[test]
+    fn active_query_json_excludes_session_credentials_and_redacts_passwords() {
+        let query = RunningQuery {
+            id: 7,
+            session_id: 9_876_543_210,
+            query_type: "create",
+            query: "CREATE USER alice WITH PASSWORD 'top-secret' ROLE USER".to_string(),
+            space: "default".to_string(),
+            started_at_ms: 123,
+        };
+
+        let json = active_query_to_json(&query);
+        let encoded = json.to_string();
+        assert!(json.get("session_id").is_none());
+        assert!(!encoded.contains("9876543210"));
+        assert!(!encoded.contains("top-secret"));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_requires_an_admin_bearer_session() {
+        let auth = AuthManager::with_config("root-password", Duration::from_secs(60));
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let service = Arc::new(GraphService::with_auth(kvstore.clone(), auth));
+        let root_session = service
+            .authenticate("root".to_string(), "root-password".to_string())
+            .await
+            .unwrap();
+        service
+            .execute(
+                root_session,
+                r#"CREATE USER diagnostics_guest WITH PASSWORD "guest-password" ROLE GUEST"#
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        let stored_user: crate::auth::User = serde_json::from_slice(
+            &kvstore
+                .get(b"__user_diagnostics_guest")
+                .await
+                .unwrap()
+                .expect("CREATE USER must persist the durable user"),
+        )
+        .unwrap();
+        assert!(byoridb_common::crypto::verify_password(
+            "guest-password",
+            &stored_user.password_hash
+        ));
+        let guest_session = service
+            .authenticate(
+                "diagnostics_guest".to_string(),
+                "guest-password".to_string(),
+            )
+            .await
+            .unwrap();
+        let state = AppState { service };
+
+        let missing = list_active_queries(State(state.clone()), HeaderMap::new()).await;
+        match missing {
+            Err((status, _)) => assert_eq!(status, StatusCode::UNAUTHORIZED),
+            Ok(_) => panic!("missing bearer token must be rejected"),
+        }
+
+        let mut guest_headers = HeaderMap::new();
+        guest_headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {guest_session}")).unwrap(),
+        );
+        let guest = list_active_queries(State(state.clone()), guest_headers).await;
+        match guest {
+            Err((status, _)) => assert_eq!(status, StatusCode::FORBIDDEN),
+            Ok(_) => panic!("GUEST bearer token must be rejected"),
+        }
+
+        let mut root_headers = HeaderMap::new();
+        root_headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {root_session}")).unwrap(),
+        );
+        assert!(list_active_queries(State(state), root_headers)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_session_errors_do_not_reflect_bearer_ids() {
+        let state = AppState {
+            service: Arc::new(GraphService::new(Arc::new(MemoryKVStore::new()))),
+        };
+        let bearer_id = 8_765_432_109_876_543_210_i64;
+
+        let regular = execute_query(
+            State(state.clone()),
+            Json(QueryRequest {
+                session_id: bearer_id,
+                query: "SHOW SPACES".to_string(),
+            }),
+        )
+        .await;
+        let regular_body = match regular {
+            Err((status, Json(body))) => {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                serde_json::to_string(&body).unwrap()
+            }
+            Ok(_) => panic!("unknown bearer token must be rejected"),
+        };
+        assert!(!regular_body.contains(&bearer_id.to_string()));
+
+        let raw_json = execute_query_json(
+            State(state),
+            Json(QueryRequest {
+                session_id: bearer_id,
+                query: "SHOW SPACES".to_string(),
+            }),
+        )
+        .await;
+        let raw_json_body = match raw_json {
+            Err((status, body)) => {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                body
+            }
+            Ok(_) => panic!("unknown bearer token must be rejected"),
+        };
+        assert!(!raw_json_body.contains(&bearer_id.to_string()));
+    }
 
     #[test]
     fn session_id_is_json_string_and_accepts_string_or_number() {

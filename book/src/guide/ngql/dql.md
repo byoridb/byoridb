@@ -1,289 +1,178 @@
-# 데이터 쿼리
+[한국어](../../ko/guide/ngql/dql.html)
 
-그래프 데이터를 쿼리하고 순회합니다.
+# Data queries
+
+Query statements use the space selected by the authenticated session.
 
 ## FETCH PROP
 
-특정 버텍스의 속성을 조회합니다:
+Fetch vertices by integer VID:
 
 ```sql
-FETCH PROP ON <tag_name> <vid> [, <vid>, ...];
-```
-
-**예시:**
-
-```sql
--- Single vertex
 FETCH PROP ON person 1;
-
--- Multiple vertices
 FETCH PROP ON person 1, 2, 3;
-
--- All tags on a vertex
 FETCH PROP ON * 1;
 ```
 
-## GO (그래프 순회)
-
-엣지를 따라 그래프를 순회합니다:
+Fetch edges by endpoint pair:
 
 ```sql
-GO FROM <vid> [, <vid>, ...]
-OVER <edge_name> [, <edge_name>, ...]
-[REVERSELY]
-[YIELD <expression> [AS <alias>], ...];
+FETCH PROP ON knows 1->2;
+FETCH PROP ON * 1->2;
 ```
 
-**기본 순회:**
+The current temporal read surface accepts an epoch-millisecond timestamp for
+both vertices and edges:
 
 ```sql
--- Find who user 1 follows
-GO FROM 1 OVER follow;
-
--- Traverse multiple edges
-GO FROM 1 OVER follow, knows;
-
--- Reverse traversal (find followers)
-GO FROM 1 OVER follow REVERSELY;
+FETCH PROP ON person 1 AS OF 1785283200000;
+FETCH PROP ON knows 1->2 AS OF 1785283200000;
 ```
 
-**멀티홉 순회:**
+`AS OF` resolves asserted history using the same timestamp for valid time and
+transaction time. Historical MATCH, GO, and RECOMMEND are not implemented, and
+past inferred facts are not guaranteed to be reconstructed.
+
+## GO
+
+Traverse one or more outgoing edge types:
 
 ```sql
--- 2-hop traversal
-GO 2 STEPS FROM 1 OVER follow;
-
--- 1 to 3 hops
-GO 1 TO 3 STEPS FROM 1 OVER follow;
+GO FROM 1 OVER knows;
+GO FROM 1 OVER knows, follows;
+GO FROM 1 OVER *;
 ```
 
-**YIELD 사용:**
+Use exact or ranged hop counts and a direction:
 
 ```sql
-GO FROM 1 OVER follow
-YIELD $$.person.name AS friend_name, $$.person.age AS friend_age;
-
-GO FROM 1 OVER purchase
-YIELD properties(edge).quantity AS qty, properties(edge).price AS price;
+GO 2 STEPS FROM 1 OVER knows;
+GO 1..3 STEPS FROM 1 OVER knows;
+GO FROM 1 OVER knows REVERSELY;
+GO FROM 1 OVER knows BIDIRECT;
 ```
 
-**특수 변수:**
-
-| 변수 | 설명 |
-|----------|-------------|
-| `$$` | 대상 버텍스 |
-| `$^` | 출발 버텍스 |
-| `$-` | 파이프로부터의 입력 |
-
-## MATCH (패턴 매칭)
-
-Cypher 스타일의 패턴 매칭:
+Filter and project edge or destination properties:
 
 ```sql
-MATCH <pattern>
-[WHERE <condition>]
-RETURN <expression> [AS <alias>], ...
-[ORDER BY <expression> [ASC|DESC]]
-[LIMIT <n>];
+GO FROM 1 OVER knows
+WHERE knows.since >= 2020
+YIELD src(edge) AS src, dst(edge) AS dst, knows.since AS since;
+
+GO FROM 1 OVER knows
+YIELD $$.person.name AS friend_name;
 ```
 
-**버텍스 찾기:**
+The configured execution guard rejects GO ranges above 20 steps by default.
+
+## MATCH
+
+Match vertex and edge patterns:
 
 ```sql
--- All persons
-MATCH (n:person) RETURN n;
+MATCH (p:person) RETURN id(p) AS vid, p.person.name AS name;
 
--- With filter
-MATCH (n:person) WHERE n.age > 25 RETURN n.name, n.age;
-
--- With limit
-MATCH (n:person) RETURN n LIMIT 10;
+MATCH (a:person)-[e:knows]->(b:person)
+WHERE a.person.name == "Alice" AND b.person.age >= 20
+RETURN b.person.name AS friend;
 ```
 
-**경로 찾기:**
+Literal property maps and variable-length edges are supported:
 
 ```sql
--- One-hop
-MATCH (a:person)-[e:follow]->(b:person)
-RETURN a.name, b.name;
-
--- With conditions
-MATCH (a:person)-[e:follow]->(b:person)
-WHERE a.name = 'Alice' AND b.age > 20
-RETURN b.name, b.age;
-
--- Variable-length paths
-MATCH (a:person)-[e:follow*1..3]->(b:person)
-WHERE a.name = 'Alice'
-RETURN b.name;
+MATCH (p:person {name: "Alice"}) RETURN p;
+MATCH (a:person)-[:knows*1..3]->(b:person) RETURN id(b) AS vid;
 ```
 
-**온톨로지 클래스 매칭 (`is_a`):**
+Multiple comma-separated patterns join on shared variables. `OPTIONAL MATCH`,
+`GROUP BY`, `ORDER BY`, `LIMIT`, and `OFFSET` are also available in the current
+MATCH path.
 
-`is_a(<변수>, "<클래스>")`는 변수에 바인딩된 정점의 tag가 해당 클래스이거나 그
-**하위 클래스**(O-3 `SUBCLASS OF` 계층)면 참입니다. label은 정확 매칭이므로,
-계층 인지 매칭은 `WHERE is_a(...)`로 표현합니다.
+Aggregates include `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`:
 
 ```sql
--- dog SUBCLASS OF animal 이면, dog 정점도 animal로 매칭
-MATCH (n:dog) WHERE is_a(n, "animal") RETURN id(n);
+MATCH (p:person)
+RETURN p.person.city AS city, COUNT(*) AS people
+GROUP BY p.person.city
+ORDER BY people DESC
+LIMIT 10;
 ```
 
-## LOOKUP (인덱스 쿼리)
-
-인덱스를 사용하여 버텍스나 엣지를 쿼리합니다:
+For ontology-aware membership, use `is_a`:
 
 ```sql
-LOOKUP ON <tag_name|edge_name>
-[WHERE <condition>]
-[YIELD <expression>, ...];
+MATCH (n:dog) WHERE is_a(n, "animal") RETURN id(n) AS vid;
 ```
 
-**예시:**
+## LOOKUP
+
+Current `LOOKUP` targets tags:
 
 ```sql
--- Find by indexed property
-LOOKUP ON person WHERE person.name == 'Alice';
-
--- With yield
-LOOKUP ON person
-WHERE person.age > 25
-YIELD person.name, person.age;
-
--- Edge lookup
-LOOKUP ON follow
-WHERE follow.since > 1609459200
-YIELD src(edge), dst(edge);
+LOOKUP ON person WHERE person.name == "Alice";
+LOOKUP ON person WHERE person.age >= 21 YIELD person.name, person.age LIMIT 20;
 ```
 
-> **참고:** LOOKUP은 쿼리 대상 속성에 인덱스가 필요합니다.
+A tag index can accelerate a matching predicate, but the executor may use a
+bounded fallback scan when an index is unavailable. The default fallback scan
+limit is 100,000 rows and is configurable. `LOOKUP` on an edge type currently
+returns an error rather than performing an edge lookup.
 
-## FIND PATH
-
-버텍스 사이의 경로를 찾습니다:
+## FIND paths
 
 ```sql
-FIND SHORTEST PATH FROM <src_vid> TO <dst_vid> OVER <edge_name>;
-FIND SHORTEST PATH FROM <src_vid> TO <dst_vid> OVER <edge_name> WEIGHT BY <property>;
-FIND ALL PATH FROM <src_vid> TO <dst_vid> OVER <edge_name>;
+FIND SHORTEST PATH FROM 1 TO 3 OVER knows;
+FIND SHORTEST PATH FROM 1 TO 3 OVER road WEIGHT BY distance;
+FIND SHORTEST PATH FROM 1 TO 3 OVER knows BIDIRECT UPTO 5 STEPS;
+FIND ALL SHORTEST PATHS FROM 1 TO 3 OVER knows UPTO 5 STEPS;
 ```
 
-**예시:**
+The `OVER` target is one edge type or `*`, not a comma-separated edge list.
+Path traversal and all-shortest-path enumeration are bounded by executor
+resource caps.
+
+## RECOMMEND
+
+Structural mode ranks candidates by Jaccard overlap of outgoing neighbors:
 
 ```sql
--- Shortest path
-FIND SHORTEST PATH FROM 1 TO 100 OVER follow;
-
--- Weighted shortest path
-FIND SHORTEST PATH FROM 1 TO 100 OVER road WEIGHT BY distance;
-
--- All paths (with limit)
-FIND ALL PATH FROM 1 TO 100 OVER follow UPTO 5 STEPS;
-
--- With multiple edges
-FIND SHORTEST PATH FROM 1 TO 100 OVER follow, knows;
-```
-
-## RECOMMEND (유사 버텍스 추천)
-
-특정 버텍스와 가장 유사한 버텍스 top-k를 추천합니다. 유사도 정의는 세 가지(구조적 ·
-임베딩 · 둘의 가중 결합)이며, 모두 `WHERE` 필터와 조합할 수 있습니다.
-
-```sql
--- 구조적 (공유 이웃 Jaccard)
-RECOMMEND SIMILAR TO <vid> OVER <edge>[, <edge> ...]|* [WHERE <조건>] [LIMIT k];
--- 임베딩 (코사인 최근접 이웃)
-RECOMMEND SIMILAR TO <vid> BY EMBEDDING <prop> [WHERE <조건>] [LIMIT k];
--- 블렌드 (가중 결합)
-RECOMMEND SIMILAR TO <vid>
-  BLEND EMBEDDING <prop> <w_emb> OVER <edge>[, ...] <w_struct>
-  [WHERE <조건>] [LIMIT k];
-```
-
-기본 `LIMIT`은 10입니다.
-
-### 구조적 유사도 (OVER)
-
-공유 이웃 겹침(Jaccard)으로 계산합니다: `sim(a,b) = |N(a)∩N(b)| / |N(a)∪N(b)|`.
-`N(v)`는 지정한 edge 타입에 대한 `v`의 out-이웃 집합이며, `OVER *`는 모든 edge
-타입을 뜻합니다. 상품을 공유 속성 노드(브랜드·카테고리·스펙)로 연결해두면 "공유
-이웃이 많을수록 유사"로 동작합니다. 결과 컬럼은 `vid / score / shared`.
-
-```sql
--- has_brand, in_category로 연결된 공유 속성 기준 유사 상품 5개
 RECOMMEND SIMILAR TO 1001 OVER has_brand, in_category LIMIT 5;
+RECOMMEND SIMILAR TO 1001 OVER * WHERE channel != seed.channel LIMIT 5;
 ```
 
-### 임베딩 유사도 (BY EMBEDDING)
-
-리스트형 임베딩 속성에 대한 **코사인 최근접 이웃**입니다. 채널마다 제목 표기가
-달라도 의미가 가까우면 매칭됩니다. 임베딩 벡터는 외부 모델이 생성해 INSERT 시
-숫자 리스트 속성으로 넣습니다(DB는 저장·검색만 담당). 결과 컬럼은 `vid / score`.
+Embedding mode uses cosine similarity over a numeric-list property:
 
 ```sql
--- 임베딩 속성을 가진 버텍스 삽입 (벡터는 외부에서 계산)
-INSERT VERTEX product(emb) VALUES 1001:([0.12, -0.04, 0.88, ...]);
-
--- 1001과 의미상 가장 가까운 상품
-RECOMMEND SIMILAR TO 1001 BY EMBEDDING emb LIMIT 5;
+RECOMMEND SIMILAR TO 1001 BY EMBEDDING embedding LIMIT 5;
 ```
 
-벡터 수가 적으면 정확한 전수 코사인(flat)으로, 많아지면 영속 HNSW 근사 인덱스로
-자동 전환됩니다(쿼리 구문은 동일). INSERT/UPDATE/DELETE 시 인덱스는 자동 갱신됩니다.
-
-### 블렌드 (BLEND) — 임베딩 + 구조 가중 결합
-
-임베딩 코사인과 구조적 Jaccard를 **쿼리별 가중치**로 결합해 재랭킹합니다:
-`score = w_emb · max(0, 코사인) + w_struct · jaccard`. 두 신호의 합집합을 후보로
-삼고(한쪽 신호만 있으면 그 신호 0 기여), 코사인은 [0,1]로 클램프해 두 0..1 신호를
-같은 스케일에서 더합니다. 결과 컬럼은 `vid / score / emb / struct`.
+Blend both signals with query-time weights:
 
 ```sql
--- 임베딩 0.7 : 구조 0.3 비중으로 결합
-RECOMMEND SIMILAR TO 1001 BLEND EMBEDDING emb 0.7 OVER has_brand 0.3 LIMIT 5;
+RECOMMEND SIMILAR TO 1001
+BLEND EMBEDDING embedding 0.7 OVER has_brand, in_category 0.3
+LIMIT 5;
 ```
 
-### WHERE 필터 (하이브리드)
+The default recommendation limit is 10. Small vector collections use an exact
+scan; above the implementation threshold, a persisted HNSW index is used and
+maintained by current mutation paths.
 
-세 모드 모두 후보를 속성 술어로 필터링할 수 있습니다.
+## Compound queries and inspection
 
-- `seed.<prop>`은 시드(기준) 버텍스의 속성을 가리켜 "시드와 다른 채널" 같은
-  상대 비교를 값 하드코딩 없이 표현합니다.
-- `is_a("<class>")`는 후보의 tag가 해당 클래스이거나 그 **하위 클래스**(O-3
-  `SUBCLASS OF` 계층)면 참입니다 — 온톨로지 클래스 계층 인지 필터.
+Bind a result to a variable and consume its VID column in a later clause:
 
 ```sql
--- 1001과 유사하되 'coupang' 채널인 상품
-RECOMMEND SIMILAR TO 1001 BY EMBEDDING emb WHERE channel = "coupang" LIMIT 5;
-
--- 1001과 유사하되 시드와 '다른' 채널인 상품
-RECOMMEND SIMILAR TO 1001 BY EMBEDDING emb WHERE channel != seed.channel LIMIT 5;
-
--- 1001과 유사하되 animal(또는 그 하위 클래스, 예: dog)인 상품
-RECOMMEND SIMILAR TO 1001 BY EMBEDDING emb WHERE is_a("animal") LIMIT 5;
+$first = GO FROM 1 OVER knows YIELD dst(edge) AS vid;
+GO FROM $first.vid OVER knows YIELD dst(edge) AS vid;
 ```
 
-## 집계
+Send the entire compound query as one request. There is no `|` pipeline syntax.
 
-YIELD 또는 RETURN과 함께 사용합니다:
-
-```sql
--- Count
-MATCH (n:person) RETURN count(n);
-
--- Sum, Avg, Min, Max
-GO FROM 1 OVER purchase YIELD sum(properties(edge).price);
-
-MATCH (n:person)
-WHERE n.age > 20
-RETURN avg(n.age), max(n.age), min(n.age);
-```
-
-## 쿼리 결합 (파이프)
-
-파이프 연산자로 쿼리를 연결합니다:
+Use `EXPLAIN` to inspect a logical plan without executing it and `PROFILE` to
+execute it with operator metrics:
 
 ```sql
-GO FROM 1 OVER follow YIELD dst(edge) AS id
-| GO FROM $-.id OVER follow YIELD dst(edge);
+EXPLAIN MATCH (p:person) RETURN p;
+PROFILE GO FROM 1 OVER knows;
 ```

@@ -1,41 +1,42 @@
-# 요약
+# Summary
 
-[소개](./introduction.md)
+[Introduction](./introduction.md)
 
-# 시작하기
+# Getting started
 
-- [빠른 시작](./getting-started/quickstart.md)
-- [설치](./getting-started/installation.md)
-- [설정](./getting-started/configuration.md)
+- [Installation](./getting-started/installation.md)
+- [Quickstart](./getting-started/quickstart.md)
+- [Configuration](./getting-started/configuration.md)
 
-# 사용자 가이드
+# User guide
 
-- [nGQL 문법](./guide/ngql-syntax.md)
-  - [Space 관리](./guide/ngql/spaces.md)
-  - [스키마 정의](./guide/ngql/schema.md)
-  - [데이터 조작](./guide/ngql/dml.md)
-  - [데이터 조회](./guide/ngql/dql.md)
-  - [사용자 관리](./guide/ngql/users.md)
-- [CLI 사용법](./guide/cli.md)
+- [nGQL syntax](./guide/ngql-syntax.md)
+  - [Spaces](./guide/ngql/spaces.md)
+  - [Schema](./guide/ngql/schema.md)
+  - [Data manipulation](./guide/ngql/dml.md)
+  - [Data queries](./guide/ngql/dql.md)
+  - [Users and roles](./guide/ngql/users.md)
+- [Command-line client](./guide/cli.md)
 
-# 아키텍처
+# Architecture
 
-- [개요](./architecture/overview.md)
-- [분산 시스템](./architecture/distributed.md)
-- [스토리지 엔진](./architecture/storage.md)
+- [Overview](./architecture/overview.md)
+- [Storage](./architecture/storage.md)
+- [Distribution status](./architecture/distributed.md)
 
-# 운영
+# Operations
 
-- [배포](./operations/deployment.md)
-- [백업 및 복구](./operations/backup.md)
-- [모니터링](./operations/monitoring.md)
+- [Security](./operations/security.md)
+- [Deployment](./operations/deployment.md)
+- [Backup and restore](./operations/backup.md)
+- [Monitoring](./operations/monitoring.md)
 
-# 개발
+# Development
 
-- [기여하기](./development/contributing.md)
-- [로드맵](./development/roadmap.md)
+- [Contributing](./development/contributing.md)
+- [Roadmap](./development/roadmap.md)
 
-# 레퍼런스
+# Reference
 
-- [성능](./reference/performance.md)
-- [API 레퍼런스](./reference/api.md)
+- [HTTP and gRPC API](./reference/api.md)
+- [Performance and limits](./reference/performance.md)

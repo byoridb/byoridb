@@ -1,128 +1,89 @@
-# CLI 사용법
+[한국어](../ko/guide/cli.html)
 
-ByoriDB CLI는 쿼리를 실행할 수 있는 대화형 셸을 제공합니다.
+# Command-line client
 
-## CLI 시작하기
+`byoridb-cli` is a small authenticated gRPC client. It supports a one-line REPL
+and a single-query non-interactive mode; it is not a full administrative shell.
+
+## Connect
+
+Credentials are required. Prefer environment variables so the password does not
+appear in the command line or shell history:
 
 ```bash
-# Connect to local server
-BYORIDB_USER=root BYORIDB_PASSWORD='<root-password>' byoridb-cli
-
-# Connect to remote server
-byoridb-cli --addr 192.168.1.100:9669
-
-# With authentication
-byoridb-cli --user root --password mypassword
+export BYORIDB_USER=root
+export BYORIDB_PASSWORD='your-root-password'
+cargo run --release -p byoridb-client --bin byoridb-cli
 ```
 
-## CLI 명령어
+For another endpoint:
 
-### 연결 명령어
-
-| 명령어 | 설명 |
-|---------|-------------|
-| `:help` | 도움말 메시지 표시 |
-| `:quit` 또는 `:exit` | CLI 종료 |
-| `:clear` | 화면 지우기 |
-
-### 실행
-
-nGQL 문을 입력하고 Enter를 눌러 실행합니다:
-
-```
-(root@localhost:9669) > CREATE SPACE test(vid_type=INT64);
-Execution succeeded
-
-(root@localhost:9669) > USE test;
-Switched to space `test`
-
-(root@localhost:9669) [test] > SHOW TAGS;
-Empty set
+```bash
+byoridb-cli --addr 192.0.2.10:9669
 ```
 
-### 여러 줄 문
+The current transport is plaintext gRPC. Use a private network, VPN, or a
+trusted TLS tunnel for remote connections.
 
-긴 쿼리의 경우, 줄 끝에 `\`를 붙여 이어 입력합니다:
+## Options
 
-```
-(root@localhost:9669) [test] > INSERT VERTEX person(name, age) VALUES \
-                              > 1:('Alice', 30), \
-                              > 2:('Bob', 25);
-Execution succeeded
-```
+| Option | Meaning |
+| --- | --- |
+| `-a, --addr <ADDR>` | gRPC address; default `127.0.0.1:9669` |
+| `-u, --user <USER>` | Required username; also `BYORIDB_USER` |
+| `-p, --password <PASSWORD>` | Required password; also `BYORIDB_PASSWORD` |
+| `-e, --execute <QUERY>` | Execute one query and exit |
+| `-h, --help` | Show generated help |
+| `-V, --version` | Show the client version |
 
-### 쿼리 결과
+Passing `--password` exposes the value to shell history and may expose it to
+local process inspection. `BYORIDB_PASSWORD` is the safer built-in option.
 
-결과는 표 형식으로 표시됩니다:
+## REPL behavior
 
-```
-(root@localhost:9669) [test] > FETCH PROP ON person 1;
-+----+--------+-----+
-| id | name   | age |
-+----+--------+-----+
-| 1  | Alice  | 30  |
-+----+--------+-----+
-1 row in set
-```
+After authentication, the prompt is:
 
-## 세션 관리
-
-### 현재 스페이스
-
-현재 스페이스는 프롬프트에 표시됩니다:
-
-```
-(root@localhost:9669) [my_space] >
+```text
+Connected to byoridb-server at 127.0.0.1:9669
+byoridb>
 ```
 
-### 스페이스 전환
+Enter one logical request per line:
 
 ```sql
-USE another_space;
+CREATE SPACE demo;
+USE demo;
+SHOW TAGS;
 ```
 
-## 팁
+The REPL provides line editing and up/down history through `rustyline`. It saves
+accepted lines to `history.txt` in the current working directory when it exits.
+That file can contain sensitive query text, including passwords in `CREATE USER`
+or `ALTER USER` statements. Protect or remove it as appropriate.
 
-1. **탭 자동완성**: Tab을 눌러 키워드를 자동완성합니다
-2. **히스토리**: 위/아래 화살표로 명령어 히스토리를 탐색합니다
-3. **세미콜론**: 문 끝에서 선택 사항입니다
-4. **주석**: 한 줄 주석에는 `--`를 사용합니다
+The only built-in exit words are `quit` and `exit` (case-insensitive). Ctrl-C
+and Ctrl-D also close the REPL. Colon commands such as `:help`, multiline
+continuations, and tab completion are not implemented. Put a compound request
+on one line if it contains semicolon-separated clauses.
 
-```sql
--- This is a comment
-CREATE TAG person(name STRING);  -- inline comment
-```
+## Results
 
-## 비대화형 모드
+Datasets are rendered as Unicode tables. A data query with columns but no rows
+prints `Empty set.`; a successful statement without a dataset prints
+`Executed successfully.`. Other JSON values use pretty-printed JSON as a
+fallback.
 
-명령줄에서 쿼리를 실행합니다:
+## Execute one query
 
 ```bash
-# Single query
-byoridb-cli --execute "SHOW SPACES;"
-
-# From file
-while IFS= read -r query; do
-  byoridb-cli --execute "$query"
-done < queries.ngql
-
-# With connection options
-byoridb-cli --addr remote.server:9669 --execute "SHOW SPACES;"
+BYORIDB_USER=root \
+BYORIDB_PASSWORD='your-root-password' \
+byoridb-cli --execute 'SHOW SPACES;'
 ```
 
-## 출력
+The command exits with a non-zero status if connection, authentication, query
+execution, or JSON decoding fails.
 
-```bash
-# Results are printed as tables in interactive mode.
-byoridb-cli
-```
-
-## 오류 메시지
-
-```
-(root@localhost:9669) [test] > SELECT * FROM person;
-Error: Syntax error near 'SELECT'
-
-(root@localhost:9669) > USE nonexistent;
-Error: Space 'nonexistent' not found
-```
+For scripts, prefer the structured client library or HTTP API when you need to
+handle multiple statements and results reliably. The CLI has no native
+`--file` option.

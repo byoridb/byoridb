@@ -1,8 +1,24 @@
 mod config;
 
 use crate::config::AppConfig;
+use anyhow::Context;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
+
+fn validate_root_password(value: Option<&str>) -> anyhow::Result<()> {
+    if value.is_some_and(|password| !password.trim().is_empty()) {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "BYORIDB_ROOT_PASSWORD must be set to a non-empty value before starting the server"
+    )
+}
+
+fn require_root_password() -> anyhow::Result<()> {
+    let password = std::env::var(byoridb_graph::auth::ROOT_PASSWORD_ENV).ok();
+    validate_root_password(password.as_deref())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,8 +33,12 @@ async fn main() -> anyhow::Result<()> {
     let _metrics_handle = byoridb_graph::init_metrics();
     info!("Metrics initialized (Prometheus endpoint: /metrics)");
 
+    // A random password printed to logs is not a safe server bootstrap path.
+    // Production and local orchestration must inject the root credential.
+    require_root_password()?;
+
     // 2. Load Configuration
-    let config = AppConfig::load().expect("Failed to load configuration");
+    let config = AppConfig::load().context("Failed to load configuration")?;
     info!("Configuration loaded: {:?}", config);
 
     // 3. Create shutdown channel + shared readiness/drain state.
@@ -40,11 +60,9 @@ async fn main() -> anyhow::Result<()> {
         );
         let meta_config = byoridb_meta::MetaServerConfig {
             data_path: std::path::PathBuf::from("data/meta"),
-            grpc_addr: config
-                .cluster
-                .meta_addr
-                .parse()
-                .expect("Invalid cluster.meta_addr"),
+            grpc_addr: config.cluster.meta_addr.parse().with_context(|| {
+                format!("Invalid cluster.meta_addr: {}", config.cluster.meta_addr)
+            })?,
             http_addr: None,
             advertise_host: config
                 .cluster
@@ -64,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
         };
         let mut meta_server = byoridb_meta::MetaServer::with_config(meta_config)
             .await
-            .expect("Failed to initialize Meta server");
+            .context("Failed to initialize Meta server")?;
         let mut meta_shutdown_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             tokio::select! {
@@ -129,17 +147,21 @@ async fn main() -> anyhow::Result<()> {
     // Get KVStore from storage server
     let kvstore = storage_server
         .env()
-        .expect("Storage server not started")
+        .context("Storage server did not expose its environment after startup")?
         .kvstore
         .clone();
 
-    // 5. Start Graph Service (gRPC)
-    let graph_addr = config.server.graph_addr;
-    let graph_server = byoridb_graph::server::GraphServer::new_with_shutdown(
-        graph_addr,
-        kvstore.clone(),
-        shutdown_state.clone(),
+    // 5. Create one graph service shared by gRPC and HTTP. Authentication,
+    // authorization changes, and sessions must have a single authority.
+    let graph_service = std::sync::Arc::new(
+        byoridb_graph::service::GraphService::new(kvstore.clone())
+            .with_shutdown_state(shutdown_state.clone()),
     );
+
+    // 5.1 Start Graph Service (gRPC)
+    let graph_addr = config.server.graph_addr;
+    let graph_server =
+        byoridb_graph::server::GraphServer::with_service(graph_addr, graph_service.clone());
     let mut graph_shutdown_rx = shutdown_tx.subscribe();
 
     let graph_handle = tokio::spawn(async move {
@@ -157,13 +179,10 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 6. Start HTTP Service
+    // 6. Start HTTP Service with the same auth/session state as gRPC.
     let http_addr = config.server.http_addr;
-    let http_server = byoridb_graph::server::HttpServer::new_with_shutdown(
-        http_addr,
-        kvstore.clone(),
-        shutdown_state.clone(),
-    );
+    let http_server =
+        byoridb_graph::server::HttpServer::with_service(http_addr, graph_service.clone());
     let mut http_shutdown_rx = shutdown_tx.subscribe();
 
     let http_handle = tokio::spawn(async move {
@@ -257,13 +276,34 @@ async fn main() -> anyhow::Result<()> {
 async fn terminate_signal() {
     use tokio::signal::unix::{signal, SignalKind};
 
-    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
-
-    sigterm.recv().await;
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            sigterm.recv().await;
+        }
+        Err(error) => {
+            error!(err = %error, "Failed to register SIGTERM handler");
+            // Keep this branch pending so a registration failure cannot be
+            // mistaken for a real termination request. Ctrl+C remains active.
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// On non-Unix platforms, this never completes
 #[cfg(not(unix))]
 async fn terminate_signal() {
     std::future::pending::<()>().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_root_password;
+
+    #[test]
+    fn root_password_is_required_and_must_not_be_blank() {
+        assert!(validate_root_password(None).is_err());
+        assert!(validate_root_password(Some("")).is_err());
+        assert!(validate_root_password(Some("   ")).is_err());
+        assert!(validate_root_password(Some("configured-secret")).is_ok());
+    }
 }

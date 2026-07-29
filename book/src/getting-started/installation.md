@@ -1,132 +1,100 @@
-# 설치
+[한국어](../ko/getting-started/installation.html)
 
-## 시스템 요구사항
+# Installation
 
-### 지원 플랫폼
-- Linux (Ubuntu 20.04+, CentOS 7+, Debian 10+)
-- macOS (10.15+)
+ByoriDB is currently built from source. The repository pins Rust 1.90, so a
+`rustup` installation will select the expected compiler automatically.
 
-> **참고:** Windows는 현재 지원되지 않습니다.
+## Supported systems
 
-### 하드웨어 요구사항
-- CPU: 2코어 이상 권장
-- 메모리: 4GB 이상 권장
-- 디스크: 프로덕션 환경에서는 SSD 권장
+- Linux
+- macOS
 
-### 소프트웨어 의존성
-- Rust 1.90 이상
-- protobuf-compiler (gRPC 코드 생성용)
-- pkg-config
+Windows is not currently supported. ByoriDB uses the pure-Rust `redb` storage
+engine, so RocksDB and a C++ RocksDB toolchain are not required.
 
-스토리지 엔진은 순수 Rust(redb)이므로 **C++ 툴체인**(cmake/clang)이 필요하지
-않습니다. `build-essential`/`pkg-config`로 몇 안 되는 네이티브 크레이트(zstd, openssl)를 처리할 수 있습니다.
+## Build requirements
 
-## 의존성 설치
+- Git
+- Rust 1.90 with Cargo, rustfmt, and Clippy
+- `protoc` (`protobuf-compiler`) for gRPC code generation
+- The platform's standard C build tools, which some transitive dependencies may
+  compile during a source build
 
-### Ubuntu/Debian
+Install the common prerequisites on Ubuntu or Debian:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential pkg-config protobuf-compiler
+sudo apt install -y build-essential protobuf-compiler
 ```
 
-### macOS
+On macOS:
 
 ```bash
 xcode-select --install
 brew install protobuf
 ```
 
-### CentOS/RHEL
-
-```bash
-sudo yum groupinstall -y "Development Tools"
-sudo yum install -y protobuf-compiler
-```
-
-## Rust 설치
+Install Rust with [rustup](https://rustup.rs/) if it is not already available:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
+source "$HOME/.cargo/env"
 ```
 
-설치 확인:
-
-```bash
-rustc --version
-cargo --version
-```
-
-## ByoriDB 빌드
-
-### 저장소 클론
+## Build ByoriDB
 
 ```bash
 git clone https://github.com/byoridb/byoridb.git
 cd byoridb
+cargo build --workspace --release
 ```
 
-### 디버그 빌드
+The principal binaries are:
+
+| Binary | Output path | Purpose |
+| --- | --- | --- |
+| `byoridb-server` | `target/release/byoridb-server` | Standalone server |
+| `byoridb-cli` | `target/release/byoridb-cli` | gRPC command-line client |
+| `byoridb-backup` | `target/release/byoridb-backup` | Backup utility |
+
+To build only the server or CLI:
 
 ```bash
-cargo build
+cargo build --release --bin byoridb-server
+cargo build --release -p byoridb-client --bin byoridb-cli
 ```
 
-### 릴리스 빌드 (권장)
+## Verify the checkout
+
+Integration tests must run serially because temporary redb databases can
+otherwise contend for file locks:
 
 ```bash
-cargo build --release
+cargo test --workspace --all-features -- --test-threads=1
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-릴리스 빌드는 더 나은 성능을 위해 LTO(Link-Time Optimization)를 활성화합니다.
+## Start the server
 
-### 빌드 산출물
-
-빌드 후 다음 항목을 찾을 수 있습니다:
-
-| 바이너리 | 위치 | 설명 |
-|--------|----------|-------------|
-| `byoridb-server` | `target/release/` | 독립 실행형 서버 |
-| `byoridb-cli` | `target/release/` | CLI 클라이언트 |
-
-## 설치 확인
+The standalone binary refuses to start without a non-blank root password. It
+never generates and prints a recoverable password to the logs.
 
 ```bash
-# Run tests
-cargo test
-
-# Start server
+export BYORIDB_ROOT_PASSWORD='replace-with-a-long-random-secret'
 ./target/release/byoridb-server
-
-# In another terminal, connect with CLI
-./target/release/byoridb-cli
 ```
 
-## 문제 해결
+See [Configuration](./configuration.md) before exposing a server outside a
+development machine. The built-in listeners do not provide TLS.
 
-### Protobuf 컴파일러를 찾을 수 없음
+## Troubleshooting
 
-gRPC 빌드가 `protoc` 누락으로 실패하는 경우:
-
-```bash
-# Ubuntu/Debian
-sudo apt install -y protobuf-compiler
-
-# macOS
-brew install protobuf
-```
-
-### 링킹 오류
+If a build reports that `protoc` is missing, install `protobuf-compiler` on
+Linux or `protobuf` through Homebrew on macOS. If a release build exhausts local
+memory, reduce Cargo's parallelism:
 
 ```bash
-# Ensure pkg-config can find libraries
-export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
-```
-
-### 빌드 중 메모리 부족
-
-```bash
-# Limit parallel jobs
-cargo build --release -j 2
+cargo build --workspace --release -j 2
 ```

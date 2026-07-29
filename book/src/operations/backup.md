@@ -1,178 +1,161 @@
-# 백업 및 복원
+# Backup and restore
 
-정기적인 백업으로 데이터를 보호하세요.
+[한국어](../ko/operations/backup.html)
 
-## 백업 방법
+ByoriDB ships one snapshot backup tool: `byoridb-backup`. It copies the redb
+current-view and history tables into a separate `data.redb` file and records
+metadata beside it.
 
-### 스냅샷 백업
+The tool does **not** implement incremental backup, WAL archiving, point-in-time
+recovery, per-space restore, S3/object-store output, or encryption. Arrange
+off-site copying and encryption with external tooling after a snapshot succeeds.
 
-일관된 특정 시점(point-in-time) 스냅샷을 생성합니다:
-
-```bash
-# Create snapshot of all spaces
-byoridb-admin backup snapshot --output /backup/snapshot_$(date +%Y%m%d)
-
-# Create snapshot of specific space
-byoridb-admin backup snapshot --space my_space --output /backup/my_space_backup
-```
-
-### 증분 백업
-
-마지막 백업 이후 변경된 내용을 백업합니다:
+## Build the tool
 
 ```bash
-# First full backup
-byoridb-admin backup full --output /backup/full
-
-# Subsequent incremental backups
-byoridb-admin backup incremental --base /backup/full --output /backup/incr_1
+cargo build --release --bin byoridb-backup
+export PATH="$PWD/target/release:$PATH"
 ```
 
-### 연속 백업 (WAL 아카이빙)
+The database argument is a directory containing `data.redb`, not the redb file
+itself. The standalone default is `data/storage` unless
+`BYORIDB__STORAGE__DATA_PATHS` changes it.
 
-특정 시점 복구를 위해 write-ahead log를 아카이빙합니다:
+## Backups require exclusive access
 
-```toml
-[backup]
-wal_archive_enabled = true
-wal_archive_path = "/backup/wal"
-wal_archive_interval_secs = 60
-```
+The standalone server and the backup CLI are separate processes. redb prevents
+the CLI from opening a database that the server already has open, so a live
+backup currently fails with `Database already open. Cannot acquire lock.`
 
-## 백업 저장소
+Use a coordinated offline window:
 
-### 로컬 디스크
+1. stop traffic and stop `byoridb-server` gracefully;
+2. confirm the server exited, allowing its final redb checkpoint to complete;
+3. run `byoridb-backup create` against the data directory;
+4. inspect the new backup and perform the checks below;
+5. restart the server.
+
+Do not copy a changing `data.redb` with `cp`. The backup implementation opens a
+read transaction and copies both `kv` and `history` into a newly created redb
+file.
+
+## Create and inspect a snapshot
 
 ```bash
-byoridb-admin backup snapshot --output /mnt/backup/byoridb
+byoridb-backup create \
+  --db /var/lib/byoridb/data \
+  --backup-dir /var/lib/byoridb/backups \
+  --label "daily-before-upgrade"
 ```
 
-### 클라우드 스토리지 (S3)
+The command creates a timestamp-based directory such as:
+
+```text
+/var/lib/byoridb/backups/backup_1785313593/
+├── backup_metadata.json
+└── data.redb
+```
+
+On Unix, a newly created backup root is set to mode `0700`. Files contain raw
+database data, including password hashes and graph properties, so retain
+restrictive ownership after copying them elsewhere.
+
+List and inspect catalog entries:
 
 ```bash
-byoridb-admin backup snapshot --output s3://bucket/byoridb/backup
+byoridb-backup list --backup-dir /var/lib/byoridb/backups
+byoridb-backup list --backup-dir /var/lib/byoridb/backups --format json
+byoridb-backup info \
+  --backup-dir /var/lib/byoridb/backups \
+  --backup-id backup_1785313593
 ```
 
-필요한 환경변수:
+`--no-flush` remains in the CLI for compatibility, but the redb implementation
+does not use a separate WAL flush and the option is currently a no-op. It does
+not make a live backup possible.
+
+## Verification limits
 
 ```bash
-export AWS_ACCESS_KEY_ID=your_key
-export AWS_SECRET_ACCESS_KEY=your_secret
-export AWS_REGION=us-west-2
+byoridb-backup verify \
+  --backup-dir /var/lib/byoridb/backups \
+  --backup-id backup_1785313593
 ```
 
-## 복원
+The current `verify` command checks that a backup can be found in the catalog;
+it does not walk every table, validate application records, compare row counts,
+or execute queries. A failed `create` can also leave a timestamp-named
+directory, so do not treat `verify` alone as proof of a usable snapshot.
 
-### 스냅샷에서 복원
+For each important backup:
+
+- require a successful `create` exit code;
+- confirm `backup_metadata.json` and a non-empty `data.redb` exist;
+- restore into a new directory;
+- start an isolated server on that directory with non-production ports;
+- authenticate and check representative current and `AS OF` queries.
+
+## Restore
+
+Stop any process using the destination first. Restore to a new directory when
+possible:
 
 ```bash
-# Stop the service first
-systemctl stop byoridb
-
-# Restore data
-byoridb-admin restore --input /backup/snapshot_20240115 --data-dir /var/lib/byoridb
-
-# Start service
-systemctl start byoridb
+byoridb-backup restore \
+  --backup-dir /var/lib/byoridb/backups \
+  --backup-id backup_1785313593 \
+  --target /var/lib/byoridb/restored-data
 ```
 
-### 특정 시점 복구 (Point-in-Time Recovery)
+Point `BYORIDB__STORAGE__DATA_PATHS` at the restored directory before starting
+the verification server:
 
 ```bash
-# Restore to specific point in time
-byoridb-admin restore \
-  --base /backup/full \
-  --wal-dir /backup/wal \
-  --target-time "2024-01-15T10:30:00Z" \
-  --data-dir /var/lib/byoridb
+export BYORIDB_ROOT_PASSWORD='managed-secret-for-this-environment'
+export BYORIDB__STORAGE__DATA_PATHS=/var/lib/byoridb/restored-data
+byoridb-server
 ```
 
-### 특정 space 복원
+The root password is not restored from a user record; root is always defined by
+`BYORIDB_ROOT_PASSWORD` at server startup. Durable non-root user records are
+inside the database snapshot.
+
+`restore --overwrite` recursively removes an existing target directory before
+copying the snapshot. Verify the exact target and retain a rollback copy before
+using it.
+
+## Retention commands
+
+Delete one known backup:
 
 ```bash
-byoridb-admin restore \
-  --input /backup/snapshot \
-  --space my_space \
-  --data-dir /var/lib/byoridb
+byoridb-backup delete \
+  --backup-dir /var/lib/byoridb/backups \
+  --backup-id backup_1785313593
 ```
 
-## 백업 스케줄
-
-### Cron 사용
+Keep only the five newest catalog entries:
 
 ```bash
-# /etc/cron.d/byoridb-backup
-
-# Daily snapshot at 2 AM
-0 2 * * * root /usr/bin/byoridb-admin backup snapshot --output /backup/daily/$(date +\%Y\%m\%d)
-
-# Weekly full backup on Sunday
-0 3 * * 0 root /usr/bin/byoridb-admin backup full --output /backup/weekly/$(date +\%Y\%m\%d)
-
-# Clean up backups older than 30 days
-0 4 * * * root find /backup/daily -mtime +30 -delete
+byoridb-backup cleanup \
+  --backup-dir /var/lib/byoridb/backups \
+  --keep 5
 ```
 
-### 백업 스크립트
+Both commands ask for confirmation unless `--force` is supplied. Review the
+list before automated cleanup, especially after any failed create attempt.
 
-```bash
-#!/bin/bash
-# backup.sh
+`scripts/backup.sh` wraps `create`, count-based cleanup, and listing. It does
+not stop the server or arrange exclusive access; an operator must provide that
+coordination before scheduling the script.
 
-BACKUP_DIR="/backup/byoridb"
-DATE=$(date +%Y%m%d_%H%M%S)
-RETENTION_DAYS=7
+## Operational checklist
 
-# Create backup
-byoridb-admin backup snapshot --output "${BACKUP_DIR}/${DATE}"
-
-# Verify backup
-byoridb-admin backup verify --input "${BACKUP_DIR}/${DATE}"
-if [ $? -ne 0 ]; then
-    echo "Backup verification failed!" | mail -s "ByoriDB Backup Failed" admin@example.com
-    exit 1
-fi
-
-# Cleanup old backups
-find "${BACKUP_DIR}" -maxdepth 1 -mtime +${RETENTION_DAYS} -type d -exec rm -rf {} \;
-
-echo "Backup completed: ${BACKUP_DIR}/${DATE}"
-```
-
-## 검증
-
-항상 백업을 검증하세요:
-
-```bash
-# Verify backup integrity
-byoridb-admin backup verify --input /backup/snapshot_20240115
-
-# List contents
-byoridb-admin backup list --input /backup/snapshot_20240115
-```
-
-## 모범 사례
-
-1. **정기적인 테스트**: 주기적으로 테스트 환경에 백업을 복원해 보세요
-2. **오프사이트 저장**: 백업을 주 데이터와 다른 위치에 보관하세요
-3. **암호화**: 민감한 데이터가 포함된 백업은 암호화하세요
-4. **모니터링**: 백업 실패 시 알림을 설정하세요
-5. **문서화**: 복구 절차를 문서화하고 테스트하세요
-
-## 재해 복구
-
-### 복구 시간 목표 (RTO)
-
-| 방법 | 일반적인 RTO |
-|--------|-------------|
-| 스냅샷 복원 | 수 분 |
-| 특정 시점 복구 | 수 분에서 수 시간 |
-| 전체 + 증분 | 수 시간 |
-
-### 복구 시점 목표 (RPO)
-
-| 방법 | 일반적인 RPO |
-|--------|-------------|
-| 연속 WAL 아카이브 | 수 초 |
-| 시간별 스냅샷 | 1시간 |
-| 일별 스냅샷 | 24시간 |
+- Keep backups on a failure domain separate from the primary data volume.
+- Encrypt snapshots at rest and in transit with external, audited tooling.
+- Monitor command exit codes and the presence/size of expected files.
+- Test a full restore and representative temporal queries regularly.
+- Record an environment-specific RPO/RTO from measured backup and restore
+  drills; ByoriDB does not publish a universal value.
+- Preserve the application build/configuration needed to read the snapshot and
+  test upgrades on a copy before replacing production data.

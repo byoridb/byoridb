@@ -127,6 +127,12 @@ impl Executor {
         &self,
         plan: crate::plan::BalancePlan,
     ) -> Result<ExecutorResult> {
+        if !self.ctx.is_admin() {
+            return Err(ExecutionError::InvalidOperation(
+                "BALANCE requires GOD or ADMIN role".to_string(),
+            ));
+        }
+
         match plan {
             crate::plan::BalancePlan::Leader => {
                 // Trigger leader rebalance
@@ -231,6 +237,12 @@ impl Executor {
             ));
         }
 
+        if username.eq_ignore_ascii_case("root") {
+            return Err(ExecutionError::InvalidOperation(
+                "The root username is reserved".to_string(),
+            ));
+        }
+
         let user_key = format!("{}{}", USER_KEY_PREFIX, username);
 
         // Check if user already exists
@@ -282,10 +294,16 @@ impl Executor {
         username: String,
         if_exists: bool,
     ) -> Result<ExecutorResult> {
+        if !self.ctx.is_admin() {
+            return Err(ExecutionError::InvalidOperation(
+                "DROP USER requires GOD or ADMIN role".to_string(),
+            ));
+        }
+
         let user_key = format!("{}{}", USER_KEY_PREFIX, username);
 
         // Prevent deletion of root user
-        if username == "root" {
+        if username.eq_ignore_ascii_case("root") {
             return Err(ExecutionError::InvalidOperation(
                 "Cannot delete the root user".to_string(),
             ));
@@ -320,6 +338,19 @@ impl Executor {
         username: &str,
         new_password: Option<String>,
     ) -> Result<ExecutorResult> {
+        if !self.ctx.is_admin() {
+            return Err(ExecutionError::InvalidOperation(
+                "ALTER USER requires GOD or ADMIN role".to_string(),
+            ));
+        }
+
+        if username.eq_ignore_ascii_case("root") {
+            return Err(ExecutionError::InvalidOperation(
+                "Root credentials must be rotated with BYORIDB_ROOT_PASSWORD and a restart"
+                    .to_string(),
+            ));
+        }
+
         let user_key = format!("{}{}", USER_KEY_PREFIX, username);
 
         // Get existing user data
@@ -360,6 +391,11 @@ impl Executor {
 
 /// Hash password using centralized implementation in `byoridb_common::crypto`
 fn hash_password(password: &str) -> Result<String> {
+    if password.trim().is_empty() {
+        return Err(ExecutionError::InvalidOperation(
+            "Password must not be empty".to_string(),
+        ));
+    }
     byoridb_common::crypto::hash_password(password)
         .map_err(|e| ExecutionError::InvalidOperation(format!("Password hashing failed: {}", e)))
 }
@@ -377,4 +413,84 @@ fn validate_and_normalize_role(role: &str) -> Result<String> {
         )));
     }
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::ExecutionContext;
+    use crate::plan::{AlterPlan, BalancePlan, DropPlan, ExecutionPlan};
+    use byoridb_kvstore::MemoryKVStore;
+    use std::sync::Arc;
+
+    fn executor_with_roles(roles: Vec<&str>) -> Executor {
+        let context = ExecutionContext::new(Arc::new(MemoryKVStore::new())).with_caller_roles(
+            roles
+                .into_iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+        );
+        Executor::new(Arc::new(context))
+    }
+
+    #[tokio::test]
+    async fn executor_defense_in_depth_rejects_non_admin_admin_operations() {
+        let executor = executor_with_roles(vec!["USER"]);
+        let plans = [
+            ExecutionPlan::Balance(BalancePlan::Status),
+            ExecutionPlan::Drop(DropPlan::User {
+                name: "victim".to_string(),
+                if_exists: true,
+            }),
+            ExecutionPlan::Alter(AlterPlan::User {
+                name: "victim".to_string(),
+                new_password: Some("replacement".to_string()),
+            }),
+        ];
+
+        for plan in plans {
+            let error = executor
+                .execute(plan)
+                .await
+                .expect_err("non-admin operation must be rejected before storage access");
+            assert!(matches!(error, ExecutionError::InvalidOperation(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn root_username_is_reserved_and_query_password_rotation_is_rejected() {
+        let executor = executor_with_roles(vec!["ADMIN"]);
+
+        let create_error = executor
+            .handle_create_user(
+                "ROOT".to_string(),
+                false,
+                "replacement".to_string(),
+                Some("GOD".to_string()),
+            )
+            .await
+            .expect_err("root alias must be reserved");
+        assert!(matches!(create_error, ExecutionError::InvalidOperation(_)));
+
+        let alter_error = executor
+            .execute_alter_user("root", Some("replacement".to_string()))
+            .await
+            .expect_err("root password must be rotated out-of-band");
+        assert!(matches!(alter_error, ExecutionError::InvalidOperation(_)));
+    }
+
+    #[tokio::test]
+    async fn blank_passwords_are_rejected() {
+        let executor = executor_with_roles(vec!["ADMIN"]);
+        let error = executor
+            .handle_create_user(
+                "blank_user".to_string(),
+                false,
+                "  \t".to_string(),
+                Some("USER".to_string()),
+            )
+            .await
+            .expect_err("blank passwords must be rejected");
+        assert!(matches!(error, ExecutionError::InvalidOperation(_)));
+    }
 }

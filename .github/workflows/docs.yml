@@ -7,7 +7,7 @@ on:
       - 'book/**'
       - '.github/workflows/docs.yml'
   pull_request:
-    branches: [main, develop]
+    branches: [main]
     paths:
       - 'book/**'
       - '.github/workflows/docs.yml'
@@ -29,11 +29,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache mdBook binary
         id: cache-mdbook
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/mdbook
           key: mdbook-${{ env.MDBOOK_VERSION }}-x86_64-unknown-linux-gnu
@@ -48,8 +48,25 @@ jobs:
       - name: Add mdBook to PATH
         run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      - name: Build book
+      - name: Verify English/Korean page parity
+        shell: bash
+        run: |
+          find book/src -type f -name '*.md' -print \
+            | sed 's#^book/src/##' | sort > /tmp/byoridb-docs-en.txt
+          find book/src.ko -type f -name '*.md' -print \
+            | sed 's#^book/src.ko/##' | sort > /tmp/byoridb-docs-ko.txt
+          diff -u /tmp/byoridb-docs-en.txt /tmp/byoridb-docs-ko.txt
+
+      - name: Build English book
         run: mdbook build book
+
+      - name: Build Korean book
+        run: mdbook build book/ko
+
+      - name: Verify bilingual output
+        run: |
+          test -f book/book/index.html
+          test -f book/book/ko/index.html
 
       - name: Setup Pages
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

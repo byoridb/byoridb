@@ -1,99 +1,130 @@
-# 로드맵
+# Roadmap
 
-ByoriDB의 현재 상태와 향후 계획입니다.
+[한국어](../ko/development/roadmap.html)
 
-## 현재 버전 (v0.1)
+This page summarizes the direction visible in the current source tree. It is
+not a release schedule or a compatibility promise. `docs/PLAN.md` is the
+detailed engineering source of truth; historical incident notes in that file
+should not be interpreted as a statement about a live environment today.
 
-### 핵심 기능
+## Available on the current main line
 
-- [x] nGQL 파서
-  - [x] DDL 문 (CREATE/DROP SPACE/TAG/EDGE)
-  - [x] DML 문 (INSERT/UPDATE/DELETE VERTEX/EDGE)
-  - [x] DQL 문 (FETCH, GO, MATCH, LOOKUP, FIND PATH)
-  - [x] ALTER TAG/EDGE ADD (온라인 스키마 변경)
+### Graph and query core
 
-- [x] 스토리지 엔진
-  - [x] Pure-Rust KV (redb) 통합
-  - [x] Vertex/Edge 인코딩
-  - [x] 스키마 버전 지원
-  - [x] Bloom filter
-  - [x] Block cache
+- spaces, tags, edge types, vertices, edges, and tag/edge indexes;
+- vertex `INSERT`, `UPDATE`, and `DELETE`, plus edge `INSERT` and `DELETE`;
+- `FETCH`, `GO`, `MATCH`, `LOOKUP`, and path finding;
+- variable-length MATCH paths, reverse-edge traversal, grouping and common
+  aggregates;
+- `EXPLAIN` access-path reporting and runtime `PROFILE` observations;
+- multi-row batched DML and resource guards for scans, traversal, and result
+  materialization.
 
-- [x] 분산 시스템
-  - [x] Raft 합의(consensus)
-  - [x] 리더 선출(Leader election)
-  - [x] 로그 복제(Log replication)
-  - [x] 스냅샷
+### Ontology and recommendations
 
-- [x] Meta Service
-  - [x] Space 관리
-  - [x] 스키마 관리
-  - [x] 스키마 버저닝 (lazy migration)
-  - [x] 사용자 인증
+- class hierarchies, disjointness, equivalent classes and properties;
+- transitive, symmetric, inverse, subproperty, domain/range, and two-link
+  property-chain semantics;
+- current-view forward materialization, inference provenance, `WHY`, and
+  incremental edge retraction support;
+- `owl:sameAs` canonical merging with documented irreversible behavior;
+- shape declarations, write-time checks, and consistency queries;
+- structural, embedding, and blended recommendations, including persisted HNSW
+  indexes for larger vector sets.
 
-## 예정 (v0.2)
+### Storage and temporal state
 
-### 쿼리 개선
+- pure-Rust redb current-view storage with protobuf vertex/edge payloads;
+- a physically separate asserted-fact history table;
+- atomic redb application of the current entity mutation and matching history
+  version on the executor's temporal DML path;
+- monotonic transaction timestamps that avoid same-millisecond history-key
+  collisions;
+- vertex and edge `FETCH PROP ... AS OF <epoch-ms>`, including tombstones;
+- snapshot backup and restore that preserve current and history tables.
 
-- [ ] 서브쿼리
-- [ ] 공통 테이블 표현식 (WITH)
-- [ ] 윈도우 함수
-- [ ] 전문 검색(Full-text search)
+### Service and operations
 
-### 스키마 연산
+- authenticated gRPC and HTTP query services sharing one service instance;
+- durable non-root users, built-in roles, recursive statement authorization,
+  session invalidation after security-state changes, and admin-only query
+  diagnostics;
+- Prometheus query metrics, health/readiness endpoints, and graceful draining;
+- an interactive Rust CLI, offline CSV bulk loader, Docker assets, and a
+  single-replica Azure AKS deployment definition.
 
-- [ ] ALTER TAG/EDGE DROP column
-- [ ] ALTER TAG/EDGE MODIFY column
-- [ ] 온라인 인덱스 생성
+## Current product boundaries
 
-### 성능
+The following limitations are part of the current status, not completed
+features:
 
-- [ ] 쿼리 플랜 캐싱
-- [ ] 병렬 쿼리 실행
-- [ ] 벡터화 실행(Vectorized execution)
-- [ ] 비용 기반 옵티마이저(Cost-based optimizer)
+- **Multi-node operation:** partition, RPC, Meta, migration, and custom Raft
+  components exist, but the launcher does not wire a complete Storage/Raft
+  cluster or route normal Graph queries through it.
+- **Temporal semantics:** valid time is not user-specified; one epoch-ms value
+  is used for valid and transaction time. Temporal `MATCH`/`GO`, intervals, and
+  historical inferred facts are absent.
+- **Sessions:** session and active-auth state is in process, is cleared on
+  restart, and is not shared across replicas.
+- **Transport security:** the server has no native TLS. Deployments need trusted
+  TLS termination, network restrictions, and external traffic controls.
+- **Transactions:** redb operations are transactional, but the query language
+  has no general multi-statement transaction or compound rollback.
+- **Edge updates:** `UPDATE EDGE` is accepted by the parser, but the current
+  plan/executor path only implements vertex updates.
+- **API maturity:** gRPC complex values use a JSON fallback in the structured
+  response; the older JSON byte field remains for compatibility.
+- **Operational packaging:** there is no supported Kubernetes operator, Helm
+  chart, or automated multi-node upgrade procedure.
 
-### 운영
+## Active engineering directions
 
-- [ ] 온라인 백업
-- [ ] 특정 시점 복구(Point-in-time recovery)
-- [ ] 클러스터 리밸런싱
+### Complete the distributed runtime
 
-## 향후 (v0.3+)
+The largest architecture gap is to connect and validate what is already present:
 
-### 고급 기능
+- Storage RPC and per-partition Raft startup;
+- peer discovery, bootstrap, membership changes, and leader routing;
+- distributed Graph execution parity across query types;
+- replication/recovery/failover tests in real multi-process deployments;
+- a session and authorization design for multiple Graph replicas;
+- upgrade, snapshot, migration, and observability runbooks.
 
-- [ ] 그래프 알고리즘 (PageRank, 최단 경로 등)
-- [ ] 시간성 그래프(Temporal graphs)
-- [ ] 지리공간(Geospatial) 지원
-- [ ] 그래프 신경망(Graph neural network) 통합
+This work must close before documentation can recommend replicas greater than
+one for shared data.
 
-### 엔터프라이즈 기능
+### Expand bitemporal queries
 
-- [ ] 멀티테넌시(Multi-tenancy)
-- [ ] 역할 기반 접근 제어(Role-based access control)
-- [ ] 감사 로깅(Audit logging)
-- [ ] 저장 데이터 암호화(Encryption at rest)
+Likely next temporal increments include explicit valid-time intervals,
+independent transaction-time selection, interval queries, temporal graph
+traversal/pattern matching, and a defined policy for inferred history. Any
+extension must preserve current-view performance and backup compatibility.
 
-### 에코시스템
+### Improve execution scalability
 
-- [ ] Python 클라이언트
-- [ ] Java 클라이언트
-- [ ] JavaScript 클라이언트
-- [ ] JDBC 드라이버
-- [ ] Spark 커넥터
+Parallel execution and better cost-based planning remain measurement-driven
+work. Priorities include bounding memory, avoiding accidental full scans,
+improving large aggregation paths, and publishing reproducible benchmarks
+instead of fixed marketing QPS numbers.
 
-### 클라우드 네이티브
+### Harden operations and security
 
-- [ ] Kubernetes operator
-- [ ] Helm charts
-- [ ] 오토스케일링(Auto-scaling)
-- [ ] 다중 리전 복제(Multi-region replication)
+Further work includes native or formally documented TLS integration, external
+rate limiting, more complete space-scoped authorization administration,
+cluster-wide session revocation, backup automation, restore drills, and
+metrics whose declared storage/session/partition series are fed by runtime
+state.
 
-## 기여하기
+### Mature client and wire formats
 
-기능 개발에 기여하고 싶으신가요? [기여 가이드](./contributing.md)를 확인하세요.
+The Rust client is the implemented client surface. Rich first-class protobuf
+representations for complex values and additional language clients should
+follow an explicit compatibility policy rather than ad-hoc wire changes.
 
-## 기능 요청
+## How to help
 
-아이디어가 있으신가요? `enhancement` 라벨을 붙여 이슈를 열어 주세요.
+Choose an issue or a concrete item in `docs/PLAN.md`, keep the change scoped,
+and follow the [contribution guide](contributing.html). For distributed, Raft,
+temporal, authentication, and storage changes, include the specialized
+regression tests and document the remaining boundary as carefully as the new
+capability.
