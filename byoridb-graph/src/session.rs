@@ -151,13 +151,13 @@ impl SessionManager {
             if session_ref.is_expired() {
                 drop(session_ref);
                 self.sessions.remove(&session_id);
-                return Err(format!("Session {} expired", session_id));
+                return Err("Session expired".to_string());
             }
             session_ref.space = Some(space);
             session_ref.last_accessed = SystemTime::now();
             Ok(())
         } else {
-            Err(format!("Session {} not found", session_id))
+            Err("Session not found".to_string())
         }
     }
 
@@ -178,6 +178,23 @@ impl SessionManager {
                 )
             })
             .collect()
+    }
+
+    /// Remove every graph-layer session owned by `username`. Authentication
+    /// changes revoke the corresponding AuthManager sessions at the same time;
+    /// clearing both stores keeps diagnostics and cleanup state consistent.
+    pub fn remove_user_sessions(&self, username: &str) -> usize {
+        let ids: Vec<i64> = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.value().username == username)
+            .map(|entry| *entry.key())
+            .collect();
+        let count = ids.len();
+        for id in ids {
+            self.sessions.remove(&id);
+        }
+        count
     }
 
     /// Remove all expired sessions. Returns the number of sessions removed.

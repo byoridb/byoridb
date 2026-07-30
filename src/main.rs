@@ -21,6 +21,20 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::load().expect("Failed to load configuration");
     info!("Configuration loaded: {:?}", config);
 
+    // A network server must never start with an unknown or logged bootstrap
+    // credential. Embedded callers may choose their own AuthManager, but the
+    // standalone process requires an explicit secret and fails before opening
+    // listeners or storage when it is absent.
+    let root_password = std::env::var(byoridb_graph::auth::ROOT_PASSWORD_ENV)
+        .ok()
+        .filter(|password| !password.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} must be set to a non-empty value",
+                byoridb_graph::auth::ROOT_PASSWORD_ENV
+            )
+        })?;
+
     // 3. Create shutdown channel + shared readiness/drain state.
     // The gRPC and HTTP services both report in-flight queries into this
     // state; the signal handler uses it to fail readiness and drain before
@@ -133,13 +147,26 @@ async fn main() -> anyhow::Result<()> {
         .kvstore
         .clone();
 
-    // 5. Start Graph Service (gRPC)
-    let graph_addr = config.server.graph_addr;
-    let graph_server = byoridb_graph::server::GraphServer::new_with_shutdown(
-        graph_addr,
-        kvstore.clone(),
-        shutdown_state.clone(),
+    // 5. Construct one graph service for both protocols. This is the security
+    // boundary: HTTP and gRPC must share users and bearer sessions rather than
+    // generating separate root credentials and disconnected auth caches.
+    let graph_service = std::sync::Arc::new(
+        byoridb_graph::GraphService::with_auth(
+            kvstore.clone(),
+            byoridb_graph::AuthManager::with_config(
+                &root_password,
+                std::time::Duration::from_secs(byoridb_graph::auth::DEFAULT_SESSION_TTL_SECS),
+            ),
+        )
+        .with_shutdown_state(shutdown_state.clone()),
     );
+    graph_service.hydrate_persisted_users().await?;
+    drop(root_password);
+
+    // 5.1 Start Graph Service (gRPC)
+    let graph_addr = config.server.graph_addr;
+    let graph_server =
+        byoridb_graph::server::GraphServer::with_service(graph_addr, graph_service.clone());
     let mut graph_shutdown_rx = shutdown_tx.subscribe();
 
     let graph_handle = tokio::spawn(async move {
@@ -157,13 +184,10 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 6. Start HTTP Service
+    // 6. Start HTTP Service over the same authentication/session state.
     let http_addr = config.server.http_addr;
-    let http_server = byoridb_graph::server::HttpServer::new_with_shutdown(
-        http_addr,
-        kvstore.clone(),
-        shutdown_state.clone(),
-    );
+    let http_server =
+        byoridb_graph::server::HttpServer::with_service(http_addr, graph_service.clone());
     let mut http_shutdown_rx = shutdown_tx.subscribe();
 
     let http_handle = tokio::spawn(async move {

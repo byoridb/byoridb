@@ -182,19 +182,39 @@ pub fn record_latency(query_type: QueryType, duration: Duration) {
 
 /// Record a query error
 pub fn record_error(query_type: QueryType, error_type: &str) {
+    let error_type = bounded_error_type(error_type);
     counter!(
         metric_names::QUERY_ERRORS,
         "type" => query_type.as_str(),
-        "error" => error_type.to_string()
+        "error" => error_type
     )
     .increment(1);
 }
 
+/// Keep Prometheus label cardinality bounded and prevent dynamic error text
+/// (which can contain query literals, PII, or credentials) from reaching the
+/// metrics endpoint.
+fn bounded_error_type(error_type: &str) -> &'static str {
+    match error_type {
+        "auth_failed" => "auth_failed",
+        "session_not_found" => "session_not_found",
+        "parse_error" => "parse_error",
+        "validation_error" => "validation_error",
+        "planning_error" => "planning_error",
+        "execution_error" => "execution_error",
+        "storage_error" => "storage_error",
+        "bad_syntax" => "bad_syntax",
+        "semantic_error" => "semantic_error",
+        "invalid_operation" => "invalid_operation",
+        "internal_error" => "internal_error",
+        _ => "unknown_error",
+    }
+}
+
 /// Record a slow query.
 ///
-/// Beyond bumping the per-type counter, this emits a structured `warn` log
-/// carrying the query text and whether the query fell back to a full scan —
-/// the two things an operator needs to triage a slow query.
+/// Beyond bumping the per-type counter, this emits a structured `warn` log with
+/// safe metadata. Raw query text is neither retained nor logged.
 pub fn record_slow_query(query_type: QueryType, duration_ms: u64, query: &str, full_scan: bool) {
     counter!(
         metric_names::SLOW_QUERIES,
@@ -206,7 +226,7 @@ pub fn record_slow_query(query_type: QueryType, duration_ms: u64, query: &str, f
         query_type = query_type.as_str(),
         duration_ms = duration_ms,
         full_scan = full_scan,
-        query = query,
+        query_length_bytes = query.len(),
         "Slow query detected"
     );
 }
@@ -303,7 +323,7 @@ pub struct QueryTimer {
     space: String,
     start: Instant,
     slow_threshold_ms: u64,
-    query: String,
+    query_length_bytes: usize,
 }
 
 impl QueryTimer {
@@ -314,7 +334,7 @@ impl QueryTimer {
             space: space.to_string(),
             start: Instant::now(),
             slow_threshold_ms: 1000, // Default 1 second
-            query: String::new(),
+            query_length_bytes: 0,
         }
     }
 
@@ -324,9 +344,9 @@ impl QueryTimer {
         self
     }
 
-    /// Attach the raw query text so the slow-query log can include it.
+    /// Attach query size metadata without retaining the raw statement.
     pub fn with_query(mut self, query: &str) -> Self {
-        self.query = query.to_string();
+        self.query_length_bytes = query.len();
         self
     }
 
@@ -344,7 +364,12 @@ impl QueryTimer {
 
         // Check for slow query
         if duration_ms > self.slow_threshold_ms {
-            record_slow_query(self.query_type, duration_ms, &self.query, full_scan);
+            record_slow_query_with_length(
+                self.query_type,
+                duration_ms,
+                self.query_length_bytes,
+                full_scan,
+            );
         }
 
         duration
@@ -362,6 +387,27 @@ impl QueryTimer {
 
         duration
     }
+}
+
+fn record_slow_query_with_length(
+    query_type: QueryType,
+    duration_ms: u64,
+    query_length_bytes: usize,
+    full_scan: bool,
+) {
+    counter!(
+        metric_names::SLOW_QUERIES,
+        "type" => query_type.as_str()
+    )
+    .increment(1);
+
+    tracing::warn!(
+        query_type = query_type.as_str(),
+        duration_ms = duration_ms,
+        full_scan = full_scan,
+        query_length_bytes = query_length_bytes,
+        "Slow query detected"
+    );
 }
 
 /// Metrics summary for API responses
@@ -407,5 +453,21 @@ mod tests {
         let duration = timer.finish(false);
 
         assert!(duration.as_millis() >= 10);
+    }
+
+    #[test]
+    fn error_labels_are_bounded() {
+        assert_eq!(bounded_error_type("parse_error"), "parse_error");
+        assert_eq!(
+            bounded_error_type("INSERT VERTEX person VALUES 1:(\"private@example.com\")"),
+            "unknown_error"
+        );
+    }
+
+    #[test]
+    fn query_timer_retains_only_length() {
+        let secret = "CREATE USER alice WITH PASSWORD \"do-not-retain\"";
+        let timer = QueryTimer::new(QueryType::Create, "default").with_query(secret);
+        assert_eq!(timer.query_length_bytes, secret.len());
     }
 }

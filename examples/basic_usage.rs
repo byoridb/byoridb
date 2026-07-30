@@ -73,14 +73,19 @@ async fn use_graph_service() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_dir_all(&temp_dir); // Clean up if exists
     let kvstore = Arc::new(RedbKVStore::open(&temp_dir, KVStoreOptions::default())?);
 
+    // Network-facing authentication requires an explicit root credential.
+    // The service reads the same environment variable as the standalone
+    // server, and the example never prints the bearer session it receives.
+    let root_password = std::env::var(byoridb_graph::auth::ROOT_PASSWORD_ENV)?;
+
     // Create a graph service
     let graph_service = GraphService::new(kvstore);
 
     // Authenticate and create a session
     let session_id = graph_service
-        .authenticate("user".to_string(), "pass".to_string())
+        .authenticate("root".to_string(), root_password)
         .await?;
-    println!("Created session: {}", session_id);
+    println!("Created authenticated session");
 
     // Execute a query
     let result = graph_service

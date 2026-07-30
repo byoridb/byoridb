@@ -23,38 +23,51 @@ redb는 단일 파일 기반의 copy-on-write **B-tree** 저장소로, 완전한
 └─────────────────────────────────────────────┘
 ```
 
-모든 행(row)은 원시 바이트(raw bytes)를 키로 하는 단일 redb 테이블(`"kv"`)에
-저장되며, prefix scan은 정렬된 키 공간(keyspace)에 대한 범위 쿼리로 처리됩니다.
+현재 상태는 원시 바이트 키를 쓰는 redb `kv` 테이블에 저장되며, bitemporal 버전은
+별도 `history` 테이블에 저장됩니다. prefix scan은 정렬된 키 공간(keyspace)에 대한
+범위 쿼리로 처리됩니다.
 
 ## 키 인코딩
 
 ### Vertex 키
 
-```
-[space_id:4][partition:4][tag_id:4][vid:8]
+```text
+{space}:vertex:{vid}
 ```
 
 ### Edge 키
 
+```text
+{space}:edge:{src}:{edge_type}:{dst}:{ranking}
+{space}:in-edge:{dst}:{edge_type}:{src}:{ranking}
 ```
-[space_id:4][partition:4][edge_type:4][src_vid:8][rank:8][dst_vid:8]
+
+### History 키
+
+```text
+entity_key || 0x00 || desc(valid_from) || desc(transaction_time)
 ```
+
+값은 `valid_to`와 해당 시점의 binary payload이며, 삭제는 빈 payload tombstone으로
+기록됩니다. current view 변경과 history append는 한 redb write transaction으로
+커밋됩니다.
 
 ### 값 인코딩
 
 ```
-[schema_version:4][null_bitmap:N][field_values:...]
+[0xCA magic][protobuf VertexData 또는 EdgeData]
 ```
 
-schema version은 온라인 스키마 변경 시 지연(lazy) 마이그레이션을 가능하게 합니다.
+현재 graph vertex/edge 쓰기 경로는 magic byte가 붙은 Protocol Buffers를 사용하며, 읽기는
+이전 JSON record도 fallback으로 디코딩합니다. `byoridb-codec`에는 별도의
+schema-versioned row codec도 있지만 위 current-view graph record 형식과는 구분됩니다.
 
 ## 성능 튜닝
 
 redb는 노출하는 설정 표면이 작습니다. 주요 조정 항목은 page cache 크기입니다.
 
-```toml
-[storage]
-cache_size = "256MB"  # redb page cache; increase for read-heavy workloads
+```bash
+export BYORIDB_CACHE_SIZE_MB=256  # redb page cache; increase for read-heavy workloads
 ```
 
 내구성(Durability)은 기본값이 `Immediate`로, 모든 commit이 fsync되고 체크섬으로
@@ -69,8 +82,8 @@ memtable/bloom-filter/compression 조정 항목이 없습니다. 그것들은 Ro
 ```
 Tag Data:
 ┌─────────────────────────────────────────────┐
-│  Key: space|part|tag|vid                    │
-│  Value: version|nulls|name|age|...          │
+│  Key: {space}:vertex:{vid}                  │
+│  Value: 0xCA + protobuf VertexData          │
 └─────────────────────────────────────────────┘
 ```
 
@@ -81,14 +94,14 @@ Tag Data:
 ```
 Out-Edge:
 ┌─────────────────────────────────────────────┐
-│  Key: space|part|edge|src|rank|dst          │
-│  Value: version|nulls|properties...         │
+│  Key: {space}:edge:{src}:{type}:{dst}:{rank}│
+│  Value: 0xCA + protobuf EdgeData            │
 └─────────────────────────────────────────────┘
 
 In-Edge (for reverse traversal):
 ┌─────────────────────────────────────────────┐
-│  Key: space|part|edge|dst|rank|src          │
-│  Value: (same as out-edge)                  │
+│  Key: {space}:in-edge:{dst}:{type}:{src}:{rank}│
+│  Value: same denormalized EdgeData           │
 └─────────────────────────────────────────────┘
 ```
 
@@ -101,9 +114,10 @@ In-Edge (for reverse traversal):
 └─────────────────────────────────────────────┘
 ```
 
-## 스키마 버전 처리
+## 스키마 버전 row codec
 
-온라인 스키마 변경을 위해 스토리지 계층은 여러 스키마 버전을 처리합니다.
+`byoridb-codec`의 row codec은 schema version을 읽어 이전 row를 현재 schema로 변환하는
+기능을 제공합니다.
 
 ```
 Read Path:
@@ -118,10 +132,9 @@ Read Path:
    - Return data
 ```
 
-이러한 지연(lazy) 마이그레이션 방식은:
-- 스키마 변경 중 다운타임 없음
-- 다음 쓰기 시점에 행이 갱신됨
-- 시간이 지나면서 점진적으로 마이그레이션됨
+이는 codec 수준의 기능입니다. 현재 graph vertex/edge current-view record는 위의
+Protocol Buffers 형식을 사용하므로 모든 record가 이 row 경로를 거치거나 자동으로
+재작성된다고 가정하면 안 됩니다.
 
 ## 공간 회수(Space Reclamation)
 
@@ -131,18 +144,14 @@ redb에는 LSM compaction이 없습니다. copy-on-write B-tree이므로 free pa
 
 ## 스냅샷
 
-특정 시점(point-in-time)의 일관된 스냅샷:
+`byoridb-backup`은 source redb에 MVCC read snapshot을 열고 current view와 history
+테이블을 새 redb 파일로 복사합니다.
 
 ```bash
-# Create snapshot
-byoridb-admin snapshot create --space my_space
-
-# List snapshots
-byoridb-admin snapshot list
-
-# Restore from snapshot
-byoridb-admin snapshot restore --id <snapshot_id>
+byoridb-backup create --db /var/lib/byoridb --backup-dir /backup/byoridb
+byoridb-backup list --backup-dir /backup/byoridb
+byoridb-backup restore --backup-dir /backup/byoridb \
+  --backup-id <backup_id> --target /var/lib/byoridb-restored
 ```
 
-스냅샷은 단일 redb 파일에 대해 읽기 트랜잭션(MVCC 스냅샷)을 열고 이를 독립적인
-백업 파일로 복사하여 생성됩니다.
+space 단위 백업, 증분 백업과 WAL 기반 point-in-time recovery는 지원하지 않습니다.

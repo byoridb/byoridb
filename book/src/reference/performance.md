@@ -4,54 +4,20 @@
 
 ## 벤치마크
 
-### 테스트 환경
-
-- CPU: 8-core AMD EPYC
-- Memory: 32 GB
-- Storage: NVMe SSD
-- Dataset: 10M vertices, 100M edges
-
-### 쿼리 성능
-
-| 쿼리 유형 | p50 | p95 | p99 |
-|------------|-----|-----|-----|
-| FETCH single vertex | 0.2ms | 0.5ms | 1ms |
-| FETCH batch (100) | 2ms | 5ms | 10ms |
-| GO 1-hop | 1ms | 3ms | 5ms |
-| GO 2-hop | 10ms | 30ms | 50ms |
-| MATCH simple | 5ms | 15ms | 30ms |
-| LOOKUP indexed | 1ms | 3ms | 5ms |
-
-### 처리량(Throughput)
-
-| 작업 | 단일 노드 | 3노드 클러스터 |
-|-----------|-------------|----------------|
-| Point reads | 50K QPS | 150K QPS |
-| Point writes | 20K QPS | 15K QPS |
-| Mixed workload | 30K QPS | 80K QPS |
+환경과 dataset이 없는 고정 latency/QPS 표는 제거했습니다. 재현 가능한 최신 명령과
+측정값은 [docs/PLAN.md](https://github.com/byoridb/byoridb/blob/main/docs/PLAN.md)의
+측정 환경/벤치 기반선을 기준으로 합니다.
+multi-node launcher가 완성되지 않았으므로 3노드 처리량을 검증된 수치로 제시하지 않습니다.
 
 ## 튜닝 가이드라인
 
 ### 메모리 튜닝
 
-#### Block Cache
+#### redb page cache와 쿼리 메모리
 
-읽기 중심 워크로드에서는 늘리세요.
-
-```toml
-[storage]
-block_cache_size = "4GB"  # 25% of available memory
-```
-
-#### Write Buffer
-
-쓰기 중심 워크로드에서는 늘리세요.
-
-```toml
-[storage]
-write_buffer_size = "128MB"
-max_write_buffer_number = 4
-```
+읽기 중심 워크로드에서는 노드 메모리 범위 안에서 `BYORIDB_CACHE_SIZE_MB`를 조정합니다.
+대형 결과의 OOM을 막는 `BYORIDB_MAX_MEMORY_MB`와 scan cap인
+`BYORIDB_MAX_SCAN_LIMIT`도 함께 고려하세요.
 
 ### 쿼리 튜닝
 
@@ -88,40 +54,12 @@ MATCH (n:person) WHERE id(n) == 1 RETURN n;
 
 ### 스토리지 튜닝
 
-#### 압축(Compression)
+redb는 copy-on-write B-tree라 RocksDB식 compression, write-buffer, background
+compaction 설정을 제공하지 않습니다. 기본 durability는 commit마다 fsync하는
+`immediate`입니다. `BYORIDB_DURABILITY=relaxed`는 최근 commit 손실을 감수할 수 있는
+재적재 가능한 bulk import에서만 사용하세요.
 
-CPU를 소비하는 대신 디스크 공간을 절약합니다.
-
-```toml
-[storage]
-compression = "lz4"  # Good balance
-# compression = "zstd"  # More compression, more CPU
-```
-
-#### Compaction
-
-워크로드에 맞게 조정하세요.
-
-```toml
-[storage]
-# Write-heavy: more compaction threads
-max_background_compactions = 4
-
-# Read-heavy: smaller files for faster seeks
-target_file_size_base = "32MB"
-```
-
-### 네트워크 튜닝
-
-#### 커넥션 풀링
-
-```toml
-[client]
-connection_pool_size = 10
-connection_timeout_ms = 5000
-```
-
-#### 배치 작업
+### 배치 쓰기
 
 ```sql
 -- Instead of individual inserts
@@ -140,30 +78,17 @@ INSERT VERTEX person VALUES
 ### 쿼리 프로파일링
 
 ```sql
-PROFILE {
-    GO FROM 1 OVER follow YIELD $$.person.name;
-}
+PROFILE GO FROM 1 OVER follow YIELD $$.person.name;
 ```
 
-출력:
-```
-+------------------+----------+-------+
-| Operator         | Time(ms) | Rows  |
-+------------------+----------+-------+
-| GetNeighbors     | 2.5      | 100   |
-| Project          | 0.3      | 100   |
-+------------------+----------+-------+
-Total: 2.8ms
-```
+출력 컬럼은 `id`, `operator`, `rows`, `time(us)`, `access`, `detail`입니다.
 
 ### 실행 계획 설명(Explain Plan)
 
 ```sql
-EXPLAIN {
-    MATCH (a:person)-[e:follow]->(b:person)
-    WHERE a.name == 'Alice'
-    RETURN b.name;
-}
+EXPLAIN MATCH (a:person)-[e:follow]->(b:person)
+WHERE a.name == 'Alice'
+RETURN b.name;
 ```
 
 ## 성능 모니터링
@@ -171,25 +96,30 @@ EXPLAIN {
 주시해야 할 주요 지표:
 
 - `byoridb_query_latency_seconds` - 쿼리 지연 시간
-- `byoridb_storage_bytes` - 스토리지 사용량
-- `byoridb_partition_hotspot_ratio` - 파티션 편향(skew)
+- `byoridb_query_errors_total` - query 오류 수
+- `byoridb_slow_queries_total` - slow threshold 초과 수
+- `byoridb_inflight_queries` - 현재 실행 중인 query 수
+- `byoridb_rows_written_total` - operation별 기록 행 수
+
+`byoridb_storage_bytes`와 partition metric 갱신 함수는 아직 standalone 경로에 연결되지
+않았습니다. 디스크 사용량과 container resource는 외부 exporter로 수집하세요.
 
 ## 자주 발생하는 문제
 
 ### 높은 지연 시간
 
-1. 캐시 적중률 확인 (90% 이상이어야 함)
+1. working set 대비 redb page cache 크기 확인
 2. full scan 여부 확인 (EXPLAIN 사용)
 3. 쿼리 패턴에 맞는 인덱스가 존재하는지 검증
 
 ### 낮은 처리량
 
 1. CPU 사용률 확인
-2. 커넥션 풀 크기 검증
+2. full scan과 결과 materialization 크기 확인
 3. 배치 작업 사용
 
 ### 높은 디스크 사용량
 
-1. 압축 활성화
-2. 오래된 스냅샷 확인
-3. compaction이 동작 중인지 검증
+1. `history` 보존량과 불필요한 데이터 확인
+2. 별도 backup 디렉터리 보존 정책 확인
+3. 리텐션/GC가 아직 미구현임을 용량 계획에 반영

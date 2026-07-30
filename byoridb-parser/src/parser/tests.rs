@@ -18,6 +18,26 @@ fn test_parse_show_spaces() {
 }
 
 #[test]
+fn test_parse_show_users_accepts_canonical_plural_and_legacy_singular() {
+    for query in ["SHOW USERS", "SHOW USER", "show users"] {
+        assert!(
+            matches!(parse(query), Ok(Statement::Show(ShowStatement::Users))),
+            "query should parse as SHOW USERS: {query}"
+        );
+    }
+}
+
+#[test]
+fn test_parse_show_roles_accepts_canonical_plural_and_singular_alias() {
+    for query in ["SHOW ROLES", "SHOW ROLE", "show roles"] {
+        assert!(
+            matches!(parse(query), Ok(Statement::Show(ShowStatement::Roles))),
+            "query should parse as SHOW ROLES: {query}"
+        );
+    }
+}
+
+#[test]
 fn test_parse_fetch_as_of() {
     // T-트랙: FETCH ... AS OF <ts> 시점 질의 파싱.
     let result = parse("FETCH PROP ON person 1 AS OF 100");

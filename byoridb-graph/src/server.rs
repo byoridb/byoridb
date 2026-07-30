@@ -6,9 +6,9 @@
 
 use super::service::GraphService;
 use axum::{
-    extract::{Json, Path, State},
-    http::StatusCode,
-    routing::{delete, get, post},
+    extract::{Json, State},
+    http::{HeaderMap, StatusCode},
+    routing::{get, post},
     Router,
 };
 use byoridb_kvstore::KVStore;
@@ -21,14 +21,14 @@ use tracing::{error, info};
 
 /// Graph gRPC server
 pub struct GraphServer {
-    service: GraphService,
+    service: Arc<GraphService>,
     addr: SocketAddr,
 }
 
 impl GraphServer {
     pub fn new(addr: SocketAddr, kvstore: Arc<dyn KVStore>) -> Self {
         GraphServer {
-            service: GraphService::new(kvstore),
+            service: Arc::new(GraphService::new(kvstore)),
             addr,
         }
     }
@@ -42,14 +42,20 @@ impl GraphServer {
         shutdown: Arc<crate::shutdown::ShutdownState>,
     ) -> Self {
         GraphServer {
-            service: GraphService::new(kvstore).with_shutdown_state(shutdown),
+            service: Arc::new(GraphService::new(kvstore).with_shutdown_state(shutdown)),
             addr,
         }
     }
 
+    /// Build a protocol server around an existing service. The standalone
+    /// launcher uses this for HTTP and gRPC so credentials, sessions, user
+    /// updates, active-query state, and shutdown state are all shared.
+    pub fn with_service(addr: SocketAddr, service: Arc<GraphService>) -> Self {
+        Self { service, addr }
+    }
+
     /// Start the gRPC server with compression support
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
-        use std::sync::Arc;
         use std::time::Duration;
 
         info!(
@@ -63,7 +69,7 @@ impl GraphServer {
             crate::service::DEFAULT_SESSION_CLEANUP_INTERVAL_SECS,
         ));
 
-        let grpc_service = crate::grpc::GrpcService::new(Arc::new(self.service));
+        let grpc_service = crate::grpc::GrpcService::new(self.service);
 
         // Enable compression for both receiving and sending
         // This can reduce network I/O by 30-50% for large responses
@@ -86,7 +92,7 @@ impl GraphServer {
 
     /// Get the graph service
     pub fn service(&self) -> &GraphService {
-        &self.service
+        self.service.as_ref()
     }
 }
 
@@ -123,6 +129,11 @@ impl HttpServer {
         }
     }
 
+    /// Build an HTTP server around the same service used by other protocols.
+    pub fn with_service(addr: SocketAddr, service: Arc<GraphService>) -> Self {
+        Self { service, addr }
+    }
+
     /// Start the HTTP server
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
         use std::time::Duration;
@@ -146,8 +157,10 @@ impl HttpServer {
             .route("/metrics", get(metrics_endpoint))
             .route("/api/v1/metrics", get(metrics_json))
             .route("/api/v1/diagnostics/queries", get(list_active_queries))
-            .route("/api/v1/session", post(create_session))
-            .route("/api/v1/session/:id", delete(delete_session))
+            .route(
+                "/api/v1/session",
+                post(create_session).delete(delete_session),
+            )
             .route("/api/v1/query", post(execute_query))
             .route("/api/v1/query/json", post(execute_query_json))
             .with_state(state);
@@ -205,15 +218,64 @@ async fn metrics_json() -> Json<serde_json::Value> {
     }))
 }
 
-/// Diagnostics: list queries currently executing on the server. Useful for
-/// seeing what a long-running load is doing and whether work continues after a
-/// client-side HTTP timeout.
-async fn list_active_queries(State(state): State<AppState>) -> Json<serde_json::Value> {
+/// Bearer session header used for HTTP operations that cannot safely put a
+/// session ID in the URL. Header names are case-insensitive.
+const SESSION_ID_HEADER: &str = "x-byoridb-session-id";
+
+type HttpApiError = (StatusCode, Json<ErrorResponse>);
+
+fn session_id_from_headers(headers: &HeaderMap) -> Result<i64, HttpApiError> {
+    let session_id = headers
+        .get(SESSION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "A valid session header is required".to_string(),
+                    code: "AUTH_REQUIRED".to_string(),
+                }),
+            )
+        })?;
+    Ok(session_id)
+}
+
+/// Diagnostics: list safe metadata for queries currently executing. This is an
+/// authenticated administrative endpoint; it never returns bearer session IDs
+/// or raw query text.
+async fn list_active_queries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, HttpApiError> {
+    let session_id = session_id_from_headers(&headers)?;
+    match state.service.is_admin_session(session_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    error: "GOD or ADMIN role required".to_string(),
+                    code: "FORBIDDEN".to_string(),
+                }),
+            ));
+        }
+        Err(_) => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "Invalid or expired session".to_string(),
+                    code: "AUTH_REQUIRED".to_string(),
+                }),
+            ));
+        }
+    }
     let queries = state.service.list_active_queries();
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "count": queries.len(),
         "queries": queries,
-    }))
+    })))
 }
 
 /// Create a new session (authenticate)
@@ -227,18 +289,23 @@ async fn create_session(
         .await
     {
         Ok(session_id) => {
-            info!("Session created: {}", session_id);
+            info!("Session created");
             Ok(Json(SessionResponse {
                 session_id,
                 time_zone: Some("UTC".to_string()),
             }))
         }
         Err(e) => {
-            error!("Authentication failed: {}", e);
+            error!(
+                error_type = GraphService::error_kind(&e),
+                "Authentication failed"
+            );
             Err((
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse {
-                    error: format!("Authentication failed: {}", e),
+                    // Never disclose whether the account exists, is disabled,
+                    // locked, or merely received a wrong password.
+                    error: "Invalid credentials".to_string(),
                     code: "AUTH_FAILED".to_string(),
                 }),
             ))
@@ -249,15 +316,27 @@ async fn create_session(
 /// Delete a session (sign out)
 async fn delete_session(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // HTTP endpoint: caller is identified by the session ID in the path.
-    // A session can only sign out itself via this endpoint.
-    state.service.sign_out(id, id).await;
-    info!("Session deleted: {}", id);
-    Ok(Json(
-        serde_json::json!({"session_id": id.to_string(), "deleted": true}),
-    ))
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, HttpApiError> {
+    // Session IDs are bearer credentials, so logout authenticates through a
+    // header and never places the token in a URL or response body.
+    let session_id = session_id_from_headers(&headers)?;
+    state
+        .service
+        .validate_session(session_id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "Invalid or expired session".to_string(),
+                    code: "AUTH_REQUIRED".to_string(),
+                }),
+            )
+        })?;
+    state.service.sign_out(session_id, session_id).await;
+    info!("Session deleted");
+    Ok(Json(serde_json::json!({"deleted": true})))
 }
 
 /// Maximum query string length accepted by the HTTP API (1 MiB).
@@ -291,9 +370,11 @@ async fn execute_query(
         Ok(dataset) => {
             let latency_ms = start.elapsed().as_millis() as u64;
             info!(
-                "Query executed in {}ms: {}",
-                latency_ms,
-                truncate_query(&payload.query)
+                query_type = crate::logging::safe_statement_type(&payload.query),
+                query_length_bytes = payload.query.len(),
+                latency_ms = latency_ms,
+                row_count = dataset.row_count(),
+                "Query executed"
             );
 
             // Convert DataSet to JSON results
@@ -307,7 +388,11 @@ async fn execute_query(
             }))
         }
         Err(e) => {
-            error!("Query execution failed: {}", e);
+            error!(
+                error_type = GraphService::error_kind(&e),
+                query_length_bytes = payload.query.len(),
+                "Query execution failed"
+            );
             let (status, code) = if matches!(e, crate::error::GraphError::SessionNotFound(_)) {
                 (StatusCode::UNAUTHORIZED, "SESSION_EXPIRED")
             } else {
@@ -460,20 +545,6 @@ fn value_to_json(value: &byoridb_common::Value) -> serde_json::Value {
     }
 }
 
-/// Truncate query for logging — to the first 100 *characters*, not bytes.
-///
-/// Slicing at a fixed byte offset (`&query[..100]`) panics when byte 100 lands
-/// inside a multi-byte UTF-8 sequence (e.g. Korean text in a long INSERT). That
-/// panic happened in the request handler *after* the query succeeded, so the
-/// connection was dropped before the response was sent — surfacing to clients
-/// as a connection reset. Char-based truncation is always on a valid boundary.
-fn truncate_query(query: &str) -> &str {
-    match query.char_indices().nth(100) {
-        Some((idx, _)) => &query[..idx],
-        None => query,
-    }
-}
-
 /// Request types for HTTP API
 #[derive(serde::Deserialize)]
 struct CreateSessionRequest {
@@ -536,7 +607,7 @@ struct QueryResponse {
     column_names: Vec<String>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 struct ErrorResponse {
     error: String,
     code: String,
@@ -544,8 +615,10 @@ struct ErrorResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_query;
-    use super::{QueryRequest, SessionResponse};
+    use super::*;
+    use crate::auth::AuthManager;
+    use byoridb_kvstore::MemoryKVStore;
+    use std::time::Duration;
 
     #[test]
     fn session_id_is_json_string_and_accepts_string_or_number() {
@@ -574,32 +647,133 @@ mod tests {
         assert_eq!(from_num.session_id, 123);
     }
 
-    #[test]
-    fn truncate_query_short_is_unchanged() {
-        assert_eq!(
-            truncate_query("INSERT VERTEX t() VALUES 1:()"),
-            "INSERT VERTEX t() VALUES 1:()"
-        );
+    fn test_state(auth: AuthManager) -> AppState {
+        AppState {
+            service: Arc::new(GraphService::with_auth(
+                Arc::new(MemoryKVStore::new()),
+                auth,
+            )),
+        }
+    }
+
+    fn session_headers(session_id: i64) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_ID_HEADER, session_id.to_string().parse().unwrap());
+        headers
+    }
+
+    async fn failed_http_auth(
+        state: AppState,
+        username: &str,
+        password: &str,
+    ) -> (StatusCode, ErrorResponse) {
+        match create_session(
+            State(state),
+            Json(CreateSessionRequest {
+                username: username.to_string(),
+                password: password.to_string(),
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("invalid credentials unexpectedly authenticated"),
+            Err((status, Json(error))) => (status, error),
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_requires_live_admin_session() {
+        let auth = AuthManager::with_config("root-password", Duration::from_secs(3600));
+        auth.create_user("reader", "reader-password", vec!["USER".to_string()])
+            .await
+            .unwrap();
+        let state = test_state(auth);
+
+        let missing = list_active_queries(State(state.clone()), HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(missing.0, StatusCode::UNAUTHORIZED);
+
+        let reader = state
+            .service
+            .authenticate("reader".to_string(), "reader-password".to_string())
+            .await
+            .unwrap();
+        let forbidden = list_active_queries(State(state.clone()), session_headers(reader))
+            .await
+            .unwrap_err();
+        assert_eq!(forbidden.0, StatusCode::FORBIDDEN);
+
+        let root = state
+            .service
+            .authenticate("root".to_string(), "root-password".to_string())
+            .await
+            .unwrap();
+        let Json(response) = list_active_queries(State(state), session_headers(root))
+            .await
+            .unwrap();
+        assert_eq!(response["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn authentication_failures_do_not_enumerate_accounts() {
+        let auth = AuthManager::with_config("root-password", Duration::from_secs(3600));
+        auth.create_user(
+            "disabled-user",
+            "disabled-password",
+            vec!["USER".to_string()],
+        )
+        .await
+        .unwrap();
+        auth.set_user_enabled("disabled-user", false).await.unwrap();
+        auth.create_user("locked-user", "locked-password", vec!["USER".to_string()])
+            .await
+            .unwrap();
+        for _ in 0..crate::auth::MAX_FAILED_ATTEMPTS {
+            let _ = auth.authenticate("locked-user", "wrong-password").await;
+        }
+        let state = test_state(auth);
+
+        for (username, password) in [
+            ("missing-user", "wrong-password"),
+            ("root", "wrong-password"),
+            ("disabled-user", "disabled-password"),
+            ("locked-user", "locked-password"),
+        ] {
+            let (status, error) = failed_http_auth(state.clone(), username, password).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(error.error, "Invalid credentials");
+            assert_eq!(error.code, "AUTH_FAILED");
+        }
+    }
+
+    #[tokio::test]
+    async fn logout_uses_header_and_does_not_echo_bearer_token() {
+        let state = test_state(AuthManager::with_config(
+            "root-password",
+            Duration::from_secs(3600),
+        ));
+        let root = state
+            .service
+            .authenticate("root".to_string(), "root-password".to_string())
+            .await
+            .unwrap();
+        let Json(response) = delete_session(State(state.clone()), session_headers(root))
+            .await
+            .unwrap();
+        assert_eq!(response, serde_json::json!({"deleted": true}));
+        assert!(!response.to_string().contains(&root.to_string()));
+        assert!(state.service.validate_session(root).await.is_err());
     }
 
     #[test]
-    fn truncate_query_does_not_panic_on_multibyte_boundary() {
-        // Long Korean query: each '한' is 3 bytes, so byte offset 100 lands inside
-        // a character — `&query[..100]` used to panic here (dogfooding: nexprice
-        // product INSERT with long Korean prod_name → server reset).
-        let q = format!(
-            "INSERT VERTEX product() VALUES 1:(\"{}\")",
-            "한".repeat(200)
-        );
-        let t = truncate_query(&q); // must not panic
-        assert!(q.starts_with(t), "truncation is a prefix");
-        assert!(t.chars().count() <= 100, "at most 100 chars");
-        assert!(q.is_char_boundary(t.len()), "ends on a char boundary");
-    }
-
-    #[test]
-    fn truncate_query_keeps_first_100_chars() {
-        let q = "a".repeat(250);
-        assert_eq!(truncate_query(&q).len(), 100);
+    fn shared_protocol_servers_reference_the_same_service() {
+        let service = Arc::new(GraphService::with_auth(
+            Arc::new(MemoryKVStore::new()),
+            AuthManager::with_config("root-password", Duration::from_secs(3600)),
+        ));
+        let grpc = GraphServer::with_service("127.0.0.1:9669".parse().unwrap(), service.clone());
+        let http = HttpServer::with_service("127.0.0.1:19669".parse().unwrap(), service.clone());
+        assert!(Arc::ptr_eq(&grpc.service, &http.service));
     }
 }

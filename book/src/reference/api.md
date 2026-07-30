@@ -10,13 +10,17 @@ ByoriDB는 gRPC와 HTTP API를 제공합니다.
 |---------|-----------|-----------|
 | Graph | 9669 | 19669 |
 | Meta | 9559 | - |
-| Storage | 9779 | - |
+| Storage | standalone에서는 별도 listener 없음 | - |
+
+Meta listener는 `cluster.peers`를 설정한 launcher 경로에서만 열립니다. standalone의
+StorageServer는 같은 프로세스에서 redb를 열어 Graph service와 공유하며 9779 gRPC
+listener를 시작하지 않습니다.
 
 ### 인증
 
-ByoriDB는 시작 시 `root` 슈퍼유저를 생성합니다. 재시작 후에도 비밀번호를 동일하게
-유지하려면 서버를 시작하기 전에 `BYORIDB_ROOT_PASSWORD`를 설정하세요. 이 변수가
-없으면 서버가 무작위 비밀번호를 생성하고 한 번 로그에 출력합니다.
+ByoriDB는 시작 시 `root` 슈퍼유저를 생성합니다. network server는 시작 전에
+`BYORIDB_ROOT_PASSWORD`가 반드시 설정돼 있어야 하며, 없거나 빈 값이면 fail-fast합니다.
+credential은 로그에 출력되지 않습니다.
 
 ## gRPC API
 
@@ -24,19 +28,23 @@ ByoriDB는 시작 시 `root` 슈퍼유저를 생성합니다. 재시작 후에�
 
 ```protobuf
 service GraphService {
+    rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
+    rpc SignOut(SignOutRequest) returns (SignOutResponse);
     rpc Execute(ExecuteRequest) returns (ExecuteResponse);
-    rpc ExecuteJson(ExecuteJsonRequest) returns (ExecuteJsonResponse);
+    rpc ExecuteJson(ExecuteRequest) returns (ExecuteJsonResponse);
 }
 
 message ExecuteRequest {
-    bytes session_id = 1;
+    int64 session_id = 1;
     string statement = 2;
 }
 
 message ExecuteResponse {
-    ErrorCode error_code = 1;
+    int32 error_code = 1;
     string error_msg = 2;
-    DataSet data = 3;
+    int64 latency_us = 3;
+    bytes data = 4 [deprecated = true];
+    DataSet result = 5;
 }
 ```
 
@@ -68,9 +76,10 @@ let result = client.execute("SHOW SPACES").await?;
 | `/health` | GET | 헬스 체크 |
 | `/metrics` | GET | Prometheus 지표 |
 | `/api/v1/session` | POST | 인증된 세션 생성 |
-| `/api/v1/session/{id}` | DELETE | 세션 종료 |
+| `/api/v1/session` | DELETE | header의 현재 세션 종료 |
 | `/api/v1/query` | POST | 쿼리 실행 |
 | `/api/v1/query/json` | POST | 쿼리를 실행하고 JSON 반환 |
+| `/api/v1/diagnostics/queries` | GET | GOD/ADMIN용 실행 중 쿼리 metadata |
 
 ### 세션 생성
 
@@ -83,13 +92,36 @@ curl -X POST http://localhost:19669/api/v1/session \
   }'
 ```
 
+HTTP 응답의 `session_id`는 JavaScript 정밀도 손실을 피하기 위해 decimal string으로
+직렬화됩니다. 쿼리 body에도 문자열 그대로 전달하세요.
+
+### 세션 종료
+
+세션 ID는 bearer credential이므로 URL에 넣지 않고 header로 전달합니다.
+
+```bash
+curl -X DELETE http://localhost:19669/api/v1/session \
+  -H "x-byoridb-session-id: <SESSION_ID>"
+# {"deleted":true}
+```
+
+### 실행 중 쿼리 진단
+
+```bash
+curl http://localhost:19669/api/v1/diagnostics/queries \
+  -H "x-byoridb-session-id: <GOD_OR_ADMIN_SESSION_ID>"
+```
+
+응답은 `id`, `query_type`, `query_length_bytes`, `space`, `started_at_ms`만 포함합니다.
+raw query와 bearer session ID는 반환하지 않습니다.
+
 ### 쿼리 실행
 
 ```bash
 curl -X POST http://localhost:19669/api/v1/query \
   -H "Content-Type: application/json" \
   -d '{
-    "session_id": 1,
+    "session_id": "<SESSION_ID>",
     "query": "SHOW SPACES"
   }'
 ```
@@ -98,8 +130,10 @@ curl -X POST http://localhost:19669/api/v1/query \
 
 ```json
 {
-  "columns": ["Name"],
-  "rows": [["my_space"], ["test_space"]]
+  "results": [{"Name": "my_space"}, {"Name": "test_space"}],
+  "latency_ms": 1,
+  "row_count": 2,
+  "column_names": ["Name"]
 }
 ```
 
@@ -118,32 +152,28 @@ OK
 curl http://localhost:19669/metrics
 
 # Response (Prometheus format)
-# HELP byoridb_query_total Total queries
+# HELP byoridb_query_total Total number of queries executed
 # TYPE byoridb_query_total counter
-byoridb_query_total{type="read"} 1234
-byoridb_query_total{type="write"} 567
+byoridb_query_total{space="default",type="show"} 12
 ```
 
 ## 에러 코드
 
-| 코드 | 이름 | 설명 |
-|------|------|-------------|
-| 0 | SUCCEEDED | 작업 성공 |
-| -1 | E_DISCONNECTED | 클라이언트 연결 끊김 |
-| -2 | E_FAIL_TO_CONNECT | 연결 실패 |
-| -3 | E_RPC_FAILURE | RPC 오류 |
-| -4 | E_SESSION_INVALID | 유효하지 않은 세션 |
-| -5 | E_SESSION_TIMEOUT | 세션 만료 |
-| -6 | E_SYNTAX_ERROR | 쿼리 구문 오류 |
-| -7 | E_SEMANTIC_ERROR | 쿼리 의미 오류 |
-| -8 | E_EXECUTION_ERROR | 쿼리 실행 실패 |
-| -9 | E_SPACE_NOT_FOUND | Space를 찾을 수 없음 |
-| -10 | E_TAG_NOT_FOUND | Tag를 찾을 수 없음 |
-| -11 | E_EDGE_NOT_FOUND | Edge 타입을 찾을 수 없음 |
-| -12 | E_VERTEX_NOT_FOUND | Vertex를 찾을 수 없음 |
-| -13 | E_INDEX_NOT_FOUND | Index를 찾을 수 없음 |
-| -14 | E_USER_NOT_FOUND | 사용자를 찾을 수 없음 |
-| -15 | E_BAD_USERNAME_PASSWORD | 인증 실패 |
+현재 Graph gRPC 응답의 `error_code`는 작은 transport-level 집합입니다.
+
+| RPC | 코드 | 설명 |
+|-----|------|------|
+| Authenticate | 0 | 성공 |
+| Authenticate | 1 | 인증 실패 (`Invalid credentials`) |
+| Execute / ExecuteJson | 0 | 성공 |
+| Execute / ExecuteJson | 1 | parse/planning/execution 등 query 오류 |
+| Execute / ExecuteJson | 2 | session이 없거나 만료됨 |
+
+HTTP API는 상태 코드와 문자열 `code`를 함께 반환합니다. 인증/인가 경로의 주요 값은
+`AUTH_FAILED`, `AUTH_REQUIRED`, `FORBIDDEN`, `SESSION_EXPIRED`이고, query 길이 제한은
+`/api/v1/query`에서 `QUERY_TOO_LARGE`, 그 밖의 query 실패는 `QUERY_ERROR`입니다.
+`/api/v1/query/json`의 길이 제한 응답은 현재 structured `code` 없이 plain string입니다.
+NebulaGraph의 음수 error code 전체를 구현한 것으로 가정하면 안 됩니다.
 
 ## 데이터 타입
 
@@ -152,35 +182,18 @@ byoridb_query_total{type="write"} 567
 ```protobuf
 message Value {
     oneof value {
-        bool bool_val = 1;
-        int64 int_val = 2;
-        double float_val = 3;
-        string str_val = 4;
-        Date date_val = 5;
-        Time time_val = 6;
-        DateTime datetime_val = 7;
-        Vertex vertex_val = 8;
-        Edge edge_val = 9;
-        Path path_val = 10;
-        List list_val = 11;
-        Map map_val = 12;
+        NullValue null_value = 1;
+        bool bool_value = 2;
+        int64 int_value = 3;
+        double float_value = 4;
+        string string_value = 5;
+        string json_value = 6;
     }
 }
-
-message Vertex {
-    int64 vid = 1;
-    repeated Tag tags = 2;
-}
-
-message Edge {
-    int64 src = 1;
-    int64 dst = 2;
-    int32 type = 3;
-    string name = 4;
-    int64 ranking = 5;
-    map<string, Value> props = 6;
-}
 ```
+
+gRPC는 null/bool/int/float/string만 oneof에 직접 담고 Vertex, Edge, Path, collection,
+date/time 계열 같은 복합 값은 현재 `json_value` 문자열로 fallback합니다.
 
 ### JSON 타입
 
@@ -190,28 +203,15 @@ message Edge {
 | INT8/16/32/64 | number |
 | FLOAT/DOUBLE | number |
 | STRING | string |
-| DATE | string (ISO 8601) |
-| DATETIME | string (ISO 8601) |
 | LIST | array |
 | MAP | object |
+| VERTEX / EDGE / PATH | object |
+| 그 밖의 복합/시간 타입 | 현재 Debug 문자열 fallback(안정된 wire schema 아님) |
 
 ## 속도 제한(Rate Limiting)
 
-기본 제한값:
-
-| 제한 항목 | 값 |
-|-------|-------|
-| IP당 최대 연결 수 | 100 |
-| 초당 최대 쿼리 수 | 1000 |
-| 최대 쿼리 크기 | 4 MB |
-| 쿼리 타임아웃 | 300초 |
-
-제한값 설정:
-
-```toml
-[limits]
-max_connections_per_ip = 100
-max_queries_per_second = 1000
-max_query_size_bytes = 4194304
-query_timeout_secs = 300
-```
+내장 IP별 연결 제한이나 초당 query rate limiter는 아직 없습니다. 필요하면 ingress/API
+gateway에서 적용하세요. HTTP query body의 `query` 문자열에는 코드에 고정된 1 MiB 제한이
+있지만 이를 변경하는 `[limits]` TOML 설정은 구현돼 있지 않습니다. executor config에
+timeout 필드는 존재하나 현재 query 실행을 취소하는 timeout enforcement로 연결되지
+않았으므로 운영 timeout/SLO로 간주하면 안 됩니다.

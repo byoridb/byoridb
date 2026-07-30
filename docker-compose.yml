@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   byoridb-server-1:
     build: .
@@ -10,6 +8,7 @@ services:
       - "19669:19669"
     environment:
       - RUST_LOG=info
+      - BYORIDB_ROOT_PASSWORD=${BYORIDB_ROOT_PASSWORD:?set BYORIDB_ROOT_PASSWORD before running docker compose}
       - BYORIDB__SERVER__GRAPH_ADDR=0.0.0.0:9669
       - BYORIDB__SERVER__HTTP_ADDR=0.0.0.0:19669
       - BYORIDB__STORAGE__DATA_PATHS=/app/data
@@ -24,6 +23,7 @@ services:
       - "19670:19669"
     environment:
       - RUST_LOG=info
+      - BYORIDB_ROOT_PASSWORD=${BYORIDB_ROOT_PASSWORD:?set BYORIDB_ROOT_PASSWORD before running docker compose}
       - BYORIDB__SERVER__GRAPH_ADDR=0.0.0.0:9669
       - BYORIDB__SERVER__HTTP_ADDR=0.0.0.0:19669
       - BYORIDB__STORAGE__DATA_PATHS=/app/data
@@ -38,6 +38,7 @@ services:
       - "19671:19669"
     environment:
       - RUST_LOG=info
+      - BYORIDB_ROOT_PASSWORD=${BYORIDB_ROOT_PASSWORD:?set BYORIDB_ROOT_PASSWORD before running docker compose}
       - BYORIDB__SERVER__GRAPH_ADDR=0.0.0.0:9669
       - BYORIDB__SERVER__HTTP_ADDR=0.0.0.0:19669
       - BYORIDB__STORAGE__DATA_PATHS=/app/data

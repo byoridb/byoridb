@@ -16,7 +16,7 @@
 ```bash
 git clone https://github.com/byoridb/byoridb.git
 cd byoridb
-cargo build --release
+cargo build --locked --release
 ```
 
 독립 실행형 서버(embedded storage + Graph gRPC/HTTP)를 시작합니다. Meta gRPC 서버는
@@ -24,7 +24,7 @@ cluster peers를 설정한 경우에만 함께 시작합니다:
 
 ```bash
 export BYORIDB_ROOT_PASSWORD='change-me-before-production'
-cargo run --release --bin byoridb-server
+cargo run --locked --release --bin byoridb-server
 ```
 
 기본 포트:
@@ -37,12 +37,12 @@ cargo run --release --bin byoridb-server
 # 새 터미널에서
 export BYORIDB_USER=root
 export BYORIDB_PASSWORD='change-me-before-production'
-cargo run -p byoridb-client --bin byoridb-cli
+cargo run --locked -p byoridb-client --bin byoridb-cli
 ```
 
-ByoriDB는 항상 `root` 사용자를 생성합니다. root 비밀번호는
-`BYORIDB_ROOT_PASSWORD`에서 가져오며, 설정되지 않은 경우 서버가 무작위
-비밀번호를 생성하여 시작 시 한 번 로그에 기록합니다.
+ByoriDB는 항상 `root` 사용자를 생성합니다. network server는
+`BYORIDB_ROOT_PASSWORD`가 없거나 빈 값이면 시작을 거부하며 비밀번호를 로그에
+출력하지 않습니다. 배포 환경의 secret manager에서 값을 주입하세요.
 
 ## 3. 기본 쿼리 (CLI)
 
@@ -163,7 +163,7 @@ data_paths = ["data/storage"]
 설정과 함께 실행합니다:
 
 ```bash
-cargo run --release --bin byoridb-server
+BYORIDB_ROOT_PASSWORD='<root-password>' cargo run --locked --release --bin byoridb-server
 ```
 
 ## 6. 백업 및 복원
@@ -171,7 +171,7 @@ cargo run --release --bin byoridb-server
 ### 백업 생성
 
 ```bash
-cargo run --release --bin byoridb-backup -- create \
+cargo run --locked --release --bin byoridb-backup -- create \
   --db data/storage \
   --backup-dir /path/to/backups \
   --label "daily"
@@ -180,11 +180,14 @@ cargo run --release --bin byoridb-backup -- create \
 ### 백업 복원
 
 ```bash
-cargo run --release --bin byoridb-backup -- restore \
+cargo run --locked --release --bin byoridb-backup -- restore \
   --backup-dir /path/to/backups \
-  -i backup_20240101_120000 \
+  --backup-id backup_20240101_120000 \
   --target /path/to/restore
 ```
+
+현재 CLI는 current view와 bitemporal history를 함께 복사하는 전체 snapshot만
+지원합니다. space 단위/증분 백업, WAL 기반 point-in-time recovery는 지원하지 않습니다.
 
 ## 다음 단계
 

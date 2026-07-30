@@ -19,8 +19,8 @@ nGQL 쿼리, write-time ontology 추론, 추론 근거(`WHY`) 설명, bitemporal
   equivalent property, 2-link property chain
 - **Provenance**: 추론 edge의 rule/premise 근거를 `WHY`로 설명, `DELETE EDGE` 시
   provenance 기반 incremental retraction, 명시적 `sameAs` canonical merge
-- **Bitemporal history (v1)**: asserted vertex/edge history 기록과
-  vertex `FETCH ... AS OF <epoch-ms>` 조회
+- **Bitemporal history (v1.1)**: asserted vertex/edge의 current view와 history를
+  원자적으로 기록하고 vertex/edge `FETCH ... AS OF <epoch-ms>` 조회
 - **Similarity**: 구조(Jaccard)·embedding·hybrid recommendation
 - **운영**: HTTP/gRPC API, CLI, backup/restore, Prometheus metrics
 - **스토리지**: 순수 Rust(redb) — C++ 툴체인 불필요
@@ -30,14 +30,15 @@ nGQL 쿼리, write-time ontology 추론, 추론 근거(`WHY`) 설명, bitemporal
 
 ## 아키텍처
 
-storage-compute 분리 구조의 세 서비스로 구성됩니다.
+코드는 storage-compute 분리를 염두에 둔 세 컴포넌트로 구성됩니다.
 
-- **Graph Service** (`byoridb-graph`): stateless 쿼리 엔진 — nGQL 파싱, 실행 조정
-- **Meta Service** (`byoridb-meta`): space/schema/user/auth 메타데이터
+- **Graph Service** (`byoridb-graph`): nGQL 파싱·실행 조정, 인증과 세션을 담당하는 API 계층
+- **Meta Service** (`byoridb-meta`): space/schema/partition 메타데이터
 - **Storage Service** (`byoridb-storage`): vertex/edge 저장, partitioning
 
-로컬 standalone(단일 프로세스에 세 서비스)이 주 사용 경로입니다. 분산 컴포넌트는
-코드베이스에 있지만 multi-node 운영 wiring은 완성되지 않았습니다.
+로컬 standalone이 주 사용 경로이며 한 프로세스 안에서 Storage lifecycle을 시작하고
+Graph HTTP/gRPC를 엽니다. Meta gRPC는 cluster peers가 설정된 경우에만 시작합니다.
+분산 컴포넌트는 코드베이스에 있지만 multi-node 운영 wiring은 완성되지 않았습니다.
 
 ## 빠른 시작
 
@@ -45,6 +46,9 @@ storage-compute 분리 구조의 세 서비스로 구성됩니다.
 
 [Releases](https://github.com/byoridb/byoridb/releases)에서 macOS(Apple Silicon/Intel),
 Linux x86_64용 `byoridb-server` / `byoridb-cli`를 받을 수 있습니다.
+
+현재 `main`의 temporal v1.1 및 edge `AS OF`는 `v0.3.3` 태그 이후에 병합됐습니다.
+이 기능이 필요하면 아래 소스 빌드 경로를 사용하세요.
 
 ```bash
 export BYORIDB_ROOT_PASSWORD='change-me'
@@ -58,14 +62,14 @@ Rust 1.90(`rust-toolchain.toml` 고정)과 `protobuf-compiler`가 필요합니�
 Linux/macOS를 지원합니다.
 
 ```bash
-cargo build --release
-BYORIDB_ROOT_PASSWORD='<password>' cargo run --release --bin byoridb-server
+cargo build --locked --release
+BYORIDB_ROOT_PASSWORD='<password>' cargo run --locked --release --bin byoridb-server
 BYORIDB_USER=root BYORIDB_PASSWORD='<password>' \
-  cargo run -p byoridb-client --bin byoridb-cli
+  cargo run --locked -p byoridb-client --bin byoridb-cli
 
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features -- --test-threads=1
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features -- --test-threads=1
 ```
 
 HTTP API 세션·쿼리 예시는 [QUICKSTART.md](QUICKSTART.md)를 참고하세요.

@@ -122,12 +122,58 @@ pub fn init_logging(config: &LogConfig) {
     }
 }
 
-/// Log a query execution
+/// Return a bounded statement category without retaining or reproducing query
+/// text. Unknown/malformed input is deliberately collapsed to `unknown`.
+pub fn safe_statement_type(query: &str) -> &'static str {
+    let first = query.split_ascii_whitespace().next().unwrap_or_default();
+    if first.eq_ignore_ascii_case("SHOW") {
+        "show"
+    } else if first.eq_ignore_ascii_case("USE") {
+        "use"
+    } else if first.eq_ignore_ascii_case("CREATE") {
+        "create"
+    } else if first.eq_ignore_ascii_case("ALTER") {
+        "alter"
+    } else if first.eq_ignore_ascii_case("DROP") {
+        "drop"
+    } else if first.eq_ignore_ascii_case("INSERT") {
+        "insert"
+    } else if first.eq_ignore_ascii_case("UPDATE") {
+        "update"
+    } else if first.eq_ignore_ascii_case("DELETE") {
+        "delete"
+    } else if first.eq_ignore_ascii_case("FETCH") {
+        "fetch"
+    } else if first.eq_ignore_ascii_case("GO") {
+        "go"
+    } else if first.eq_ignore_ascii_case("MATCH") {
+        "match"
+    } else if first.eq_ignore_ascii_case("LOOKUP") {
+        "lookup"
+    } else if first.eq_ignore_ascii_case("FIND") {
+        "find"
+    } else if first.eq_ignore_ascii_case("RECOMMEND") {
+        "recommend"
+    } else if first.eq_ignore_ascii_case("GRANT") {
+        "grant"
+    } else if first.eq_ignore_ascii_case("REVOKE") {
+        "revoke"
+    } else if first.eq_ignore_ascii_case("EXPLAIN") {
+        "explain"
+    } else if first.eq_ignore_ascii_case("PROFILE") {
+        "profile"
+    } else {
+        "unknown"
+    }
+}
+
+/// Log a query execution using metadata only.
 #[macro_export]
 macro_rules! log_query {
     ($query:expr, $space:expr, $latency_ms:expr) => {
         tracing::info!(
-            query = $query,
+            query_type = $crate::logging::safe_statement_type($query),
+            query_length_bytes = $query.len(),
             space = $space,
             latency_ms = $latency_ms,
             "Query executed"
@@ -135,12 +181,13 @@ macro_rules! log_query {
     };
 }
 
-/// Log a slow query
+/// Log a slow query using metadata only.
 #[macro_export]
 macro_rules! log_slow_query {
     ($query:expr, $space:expr, $latency_ms:expr, $threshold_ms:expr) => {
         tracing::warn!(
-            query = $query,
+            query_type = $crate::logging::safe_statement_type($query),
+            query_length_bytes = $query.len(),
             space = $space,
             latency_ms = $latency_ms,
             threshold_ms = $threshold_ms,
@@ -153,17 +200,14 @@ macro_rules! log_slow_query {
 #[macro_export]
 macro_rules! log_error {
     ($error:expr, $context:expr) => {
-        tracing::error!(
-            error = %$error,
-            context = $context,
-            "Error occurred"
-        );
+        tracing::error!("Error occurred");
     };
 }
 
 /// Query logger that tracks execution and logs appropriately
 pub struct QueryLogger {
-    query: String,
+    query_type: &'static str,
+    query_length_bytes: usize,
     space: String,
     start: std::time::Instant,
     slow_threshold_ms: u64,
@@ -172,10 +216,18 @@ pub struct QueryLogger {
 impl QueryLogger {
     /// Create a new query logger
     pub fn new(query: &str, space: &str, slow_threshold_ms: u64) -> Self {
-        tracing::debug!(query = query, space = space, "Query started");
+        let query_type = safe_statement_type(query);
+        let query_length_bytes = query.len();
+        tracing::debug!(
+            query_type = query_type,
+            query_length_bytes = query_length_bytes,
+            space = space,
+            "Query started"
+        );
 
         Self {
-            query: query.to_string(),
+            query_type,
+            query_length_bytes,
             space: space.to_string(),
             start: std::time::Instant::now(),
             slow_threshold_ms,
@@ -188,7 +240,8 @@ impl QueryLogger {
 
         if latency_ms > self.slow_threshold_ms {
             tracing::warn!(
-                query = %self.query,
+                query_type = self.query_type,
+                query_length_bytes = self.query_length_bytes,
                 space = %self.space,
                 latency_ms = latency_ms,
                 threshold_ms = self.slow_threshold_ms,
@@ -196,7 +249,8 @@ impl QueryLogger {
             );
         } else {
             tracing::info!(
-                query = %self.query,
+                query_type = self.query_type,
+                query_length_bytes = self.query_length_bytes,
                 space = %self.space,
                 latency_ms = latency_ms,
                 "Query completed"
@@ -205,14 +259,14 @@ impl QueryLogger {
     }
 
     /// Log error completion
-    pub fn error(self, err: &dyn std::error::Error) {
+    pub fn error(self, _err: &dyn std::error::Error) {
         let latency_ms = self.start.elapsed().as_millis() as u64;
 
         tracing::error!(
-            query = %self.query,
+            query_type = self.query_type,
+            query_length_bytes = self.query_length_bytes,
             space = %self.space,
             latency_ms = latency_ms,
-            error = %err,
             "Query failed"
         );
     }
@@ -222,7 +276,11 @@ impl QueryLogger {
 #[derive(Debug, serde::Serialize)]
 pub struct QueryLogEntry {
     pub timestamp: String,
+    /// Retained for source/serialization compatibility. This field is always a
+    /// constant marker and never contains the submitted statement.
     pub query: String,
+    pub query_type: &'static str,
+    pub query_length_bytes: usize,
     pub space: String,
     pub latency_ms: u64,
     pub status: QueryStatus,
@@ -242,7 +300,9 @@ impl QueryLogEntry {
     pub fn success(query: &str, space: &str, latency_ms: u64, rows: Option<u64>) -> Self {
         Self {
             timestamp: chrono_timestamp(),
-            query: query.to_string(),
+            query: "<redacted>".to_string(),
+            query_type: safe_statement_type(query),
+            query_length_bytes: query.len(),
             space: space.to_string(),
             latency_ms,
             status: QueryStatus::Success,
@@ -252,14 +312,16 @@ impl QueryLogEntry {
     }
 
     /// Create an error entry
-    pub fn error(query: &str, space: &str, latency_ms: u64, error: &str) -> Self {
+    pub fn error(query: &str, space: &str, latency_ms: u64, _error: &str) -> Self {
         Self {
             timestamp: chrono_timestamp(),
-            query: query.to_string(),
+            query: "<redacted>".to_string(),
+            query_type: safe_statement_type(query),
+            query_length_bytes: query.len(),
             space: space.to_string(),
             latency_ms,
             status: QueryStatus::Error,
-            error: Some(error.to_string()),
+            error: Some("query_error".to_string()),
             rows_affected: None,
         }
     }
@@ -268,7 +330,9 @@ impl QueryLogEntry {
     pub fn slow(query: &str, space: &str, latency_ms: u64, rows: Option<u64>) -> Self {
         Self {
             timestamp: chrono_timestamp(),
-            query: query.to_string(),
+            query: "<redacted>".to_string(),
+            query_type: safe_statement_type(query),
+            query_length_bytes: query.len(),
             space: space.to_string(),
             latency_ms,
             status: QueryStatus::Slow,
@@ -282,7 +346,8 @@ impl QueryLogEntry {
         match self.status {
             QueryStatus::Success => {
                 tracing::info!(
-                    query = %self.query,
+                    query_type = self.query_type,
+                    query_length_bytes = self.query_length_bytes,
                     space = %self.space,
                     latency_ms = self.latency_ms,
                     rows = ?self.rows_affected,
@@ -291,7 +356,8 @@ impl QueryLogEntry {
             }
             QueryStatus::Error => {
                 tracing::error!(
-                    query = %self.query,
+                    query_type = self.query_type,
+                    query_length_bytes = self.query_length_bytes,
                     space = %self.space,
                     latency_ms = self.latency_ms,
                     error = ?self.error,
@@ -300,7 +366,8 @@ impl QueryLogEntry {
             }
             QueryStatus::Slow => {
                 tracing::warn!(
-                    query = %self.query,
+                    query_type = self.query_type,
+                    query_length_bytes = self.query_length_bytes,
                     space = %self.space,
                     latency_ms = self.latency_ms,
                     rows = ?self.rows_affected,
@@ -352,9 +419,22 @@ mod tests {
 
     #[test]
     fn test_query_log_entry() {
-        let entry = QueryLogEntry::success("SHOW SPACES", "default", 50, Some(5));
+        let query = "CREATE USER private@example.com WITH PASSWORD \"secret-value\"";
+        let entry = QueryLogEntry::success(query, "default", 50, Some(5));
         assert_eq!(entry.space, "default");
+        assert_eq!(entry.query, "<redacted>");
+        assert_eq!(entry.query_type, "create");
+        assert_eq!(entry.query_length_bytes, query.len());
         assert_eq!(entry.latency_ms, 50);
         assert!(matches!(entry.status, QueryStatus::Success));
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("private@example.com"));
+        assert!(!json.contains("secret-value"));
+    }
+
+    #[test]
+    fn safe_statement_type_is_bounded() {
+        assert_eq!(safe_statement_type("INSERT VERTEX person"), "insert");
+        assert_eq!(safe_statement_type("private@example.com secret"), "unknown");
     }
 }

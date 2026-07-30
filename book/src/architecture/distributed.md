@@ -1,6 +1,8 @@
 # 분산 시스템
 
-ByoriDB는 고가용성을 갖춘 분산 배포를 위해 설계되었습니다.
+ByoriDB는 고가용성 분산 배포를 고려해 Raft/partition 구성요소를 구현했지만, 현재
+`byoridb-server`의 Storage/Raft bootstrap과 배포 wiring은 완성되지 않았습니다. 이
+페이지의 토폴로지는 라이브러리 설계 설명이며 현재 사용 가능한 운영 절차가 아닙니다.
 
 ## Raft 합의
 
@@ -23,7 +25,10 @@ ByoriDB는 고가용성을 갖춘 분산 배포를 위해 설계되었습니다.
      └────────────────────────────────────────────────────┘
 ```
 
-### 설정
+### 설정 모델
+
+다음 값은 Raft 라이브러리의 개념을 설명하기 위한 예시이며 현재 `byoridb.toml`에서
+지원되는 server 설정이 아닙니다.
 
 ```toml
 [raft]
@@ -119,28 +124,10 @@ CREATE SPACE my_space(
 
 ## 클러스터 관리
 
-### 노드 추가
-
-```bash
-# Start new storage node
-byoridb-storage --join cluster-addr:port
-```
-
-클러스터는 자동으로 다음을 수행합니다.
-1. 새 노드에 파티션 할당
-2. 데이터 리밸런싱
-3. 파티션 맵 갱신
-
-### 노드 제거
-
-```bash
-# Graceful removal
-byoridb-admin node remove <node-id>
-```
-
-1. 다른 노드로 파티션 마이그레이션
-2. 복제 완료를 대기
-3. 클러스터에서 제거
+노드 join/remove용 운영 CLI는 아직 없습니다. `BALANCE LEADER/DATA/STATUS/STOP/RESET`도
+문법은 파싱하지만 balance-job control RPC가 연결되지 않아 명시적 unsupported 오류를
+반환합니다. launcher/bootstrap, migration RPC와 상태 추적이 구현되기 전에는 아래
+Raft/partition metric도 실제 multi-node 운영 신호로 간주하면 안 됩니다.
 
 ### 모니터링
 

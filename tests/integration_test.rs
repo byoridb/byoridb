@@ -1568,7 +1568,6 @@ async fn test_crud_user_management() {
 
 /// Test that newly created users can authenticate
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires AuthManager KVStore sync (PLAN.md S-3 follow-up)"]
 async fn test_new_user_authentication() {
     let (service, _temp_dir) = create_test_service();
 
