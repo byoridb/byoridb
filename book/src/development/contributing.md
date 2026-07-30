@@ -21,26 +21,24 @@ cd byoridb
 ./scripts/setup-hooks.sh
 
 # Build
-cargo build
+cargo build --locked
 
 # Run tests
-cargo test
+cargo test --locked
 ```
 
 ## 개발 워크플로
 
 ### 브랜치 전략
 
-- `main` - 안정 릴리스
-- `develop` - 개발 브랜치
-- `feature/*` - 기능 브랜치
-- `fix/*` - 버그 수정 브랜치
+- `main` - 통합 및 릴리스 기준 브랜치
+- `feature/*`, `fix/*`, `docs/*` - 작업 브랜치
 
 ### 기능 브랜치 생성
 
 ```bash
-git checkout develop
-git pull origin develop
+git checkout main
+git pull origin main
 git checkout -b feature/my-feature
 ```
 
@@ -55,10 +53,10 @@ git checkout -b feature/my-feature
 cargo fmt --all
 
 # Run linter
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 
 # Run tests
-cargo test
+cargo test --locked
 ```
 
 ### 사전 커밋(Pre-commit) 훅
@@ -115,7 +113,7 @@ docs(readme): update installation instructions
 git push origin feature/my-feature
 ```
 
-2. `develop`을 대상으로 PR을 생성합니다
+2. `main`을 대상으로 PR을 생성합니다
 3. PR 템플릿을 작성합니다
 4. CI 검사를 기다립니다
 5. 리뷰 코멘트를 반영합니다
@@ -208,13 +206,13 @@ async fn test_full_workflow() {
 
 ```bash
 # All tests
-cargo test
+cargo test --locked
 
 # Specific package
-cargo test --package byoridb-parser
+cargo test --locked --package byoridb-parser
 
 # Specific test
-cargo test --package byoridb-parser test_parse_alter
+cargo test --locked --package byoridb-parser test_parse_alter
 ```
 
 ## 아키텍처 결정

@@ -1,6 +1,9 @@
 # 아키텍처 개요
 
-ByoriDB는 세 개의 주요 서비스로 구성된 스토리지-컴퓨팅 분리 아키텍처를 사용합니다.
+ByoriDB 코드는 세 개의 주요 컴포넌트로 스토리지-컴퓨팅 분리를 지향합니다. 다만 아래
+분산 토폴로지는 목표 구조입니다. 현재 지원되는 standalone 경로는 한 프로세스에서
+Storage lifecycle/redb를 열고 Graph HTTP/gRPC가 같은 KVStore를 직접 사용하는 단일
+노드이며, Meta gRPC는 cluster peers가 설정된 경우에만 시작합니다.
 
 ## 시스템 아키텍처
 
@@ -24,7 +27,7 @@ ByoriDB는 세 개의 주요 서비스로 구성된 스토리지-컴퓨팅 분�
 │  ┌───────────────┐  │      │  ┌───────────┐  ┌───────────┐  │
 │  │ Schema Cache  │  │      │  │  Part 1   │  │  Part 2   │  │
 │  │ Space Config  │  │      │  │  (Raft)   │  │  (Raft)   │  │
-│  │ User Auth     │  │      │  └───────────┘  └───────────┘  │
+│  │ Partition Map │  │      │  └───────────┘  └───────────┘  │
 │  └───────────────┘  │      └─────────────────────────────────┘
 └─────────────────────┘                    │
            │                               ▼
@@ -39,7 +42,7 @@ ByoriDB는 세 개의 주요 서비스로 구성된 스토리지-컴퓨팅 분�
 
 ### Graph Service
 
-다음을 담당하는 무상태(stateless) 쿼리 엔진입니다.
+쿼리 실행과 인증·세션을 담당하는 API 계층입니다.
 
 - **쿼리 파싱**: `byoridb-parser`를 사용해 nGQL → AST 변환
 - **쿼리 계획**: AST → 실행 계획(Execution Plan)
@@ -47,7 +50,7 @@ ByoriDB는 세 개의 주요 서비스로 구성된 스토리지-컴퓨팅 분�
 - **결과 집계**: 여러 파티션의 결과를 결합
 
 주요 특성:
-- 수평 확장 가능 (무상태)
+- 쿼리 계획/실행 상태는 요청 단위지만 인증 세션은 프로세스에 유지
 - gRPC 및 HTTP 엔드포인트 제공
 - 하위 서비스에 대한 커넥션 풀링
 
@@ -58,7 +61,6 @@ ByoriDB는 세 개의 주요 서비스로 구성된 스토리지-컴퓨팅 분�
 - **Spaces**: 논리적 데이터베이스
 - **Schemas**: Tag, Edge, Index
 - **Partitions**: 데이터 분산 매핑
-- **Users**: 인증 및 권한 부여
 - **Schema Versions**: 온라인 스키마 변경용
 
 주요 특성:
@@ -86,12 +88,16 @@ ByoriDB는 세 개의 주요 서비스로 구성된 스토리지-컴퓨팅 분�
 
 - **redb**: 순수 Rust로 구현된 임베디드 B-tree 스토리지
 - **Raft**: 분산 합의 프로토콜
-- **Snapshots**: 특정 시점(point-in-time) 백업
-- **Compaction**: 백그라운드 최적화
+- **Snapshots**: current view와 bitemporal history를 함께 보존하는 백업
+- **Space reclamation**: redb free page 재사용(LSM식 background compaction 없음)
 
 ## 데이터 흐름
 
-### 쓰기 경로(Write Path)
+현재 standalone의 실제 경로는
+`Client → Graph HTTP/gRPC → in-process Planner/Executor → embedded KVStore(redb)`입니다.
+아래 흐름은 Storage/Raft bootstrap과 배포 wiring이 완료된 뒤의 분산 목표 경로입니다.
+
+### 분산 목표 쓰기 경로(Write Path)
 
 ```
 1. Client → Graph Service (INSERT VERTEX)
@@ -102,7 +108,7 @@ ByoriDB는 세 개의 주요 서비스로 구성된 스토리지-컴퓨팅 분�
 6. Ack back to client
 ```
 
-### 읽기 경로(Read Path)
+### 분산 목표 읽기 경로(Read Path)
 
 ```
 1. Client → Graph Service (FETCH PROP)

@@ -1,6 +1,7 @@
 # 사용자 관리
 
 ByoriDB는 사용자와 권한을 관리하기 위한 역할 기반 접근 제어(RBAC)를 제공합니다.
+사용자 생성·변경·삭제와 역할 부여/회수는 GOD 또는 ADMIN 세션에서만 실행할 수 있습니다.
 
 ## 사용자
 
@@ -57,7 +58,15 @@ DROP USER IF EXISTS bob;
 
 > **참고:** `root` 사용자는 삭제할 수 없습니다.
 
-> **참고:** SHOW USERS는 아직 구현되지 않았습니다.
+### SHOW USERS
+
+GOD 또는 ADMIN 사용자는 built-in `root`와 KVStore에 영속된 사용자를 조회할 수 있습니다.
+결과는 사용자 이름순이며, 여러 역할은 쉼표로 구분됩니다. 역할이 없는 사용자는 Role
+열이 빈 문자열입니다.
+
+```sql
+SHOW USERS;
+```
 
 ## 역할
 
@@ -70,6 +79,9 @@ ByoriDB에는 서로 다른 권한 수준을 가진 다섯 가지 기본 제공 
 | DBA     | Read, Write, Create, Alter               | 데이터베이스 관리자   |
 | USER    | Read, Write                              | 표준 사용자           |
 | GUEST   | Read                                     | 읽기 전용 접근        |
+
+`GOD`는 process bootstrap identity인 `root`에만 부여됩니다. `CREATE USER ... ROLE GOD`와
+`GRANT ROLE GOD`는 거부되며, 애플리케이션 관리자에게는 `ADMIN`을 사용하세요.
 
 ### 권한 종류
 
@@ -110,25 +122,39 @@ REVOKE ROLE ADMIN FROM alice;
 REVOKE ROLE USER FROM bob;
 ```
 
-> **참고:** SHOW ROLES는 아직 구현되지 않았습니다.
+`SHOW ROLES`는 현재 `SHOW USERS`의 별칭으로 같은 사용자/역할 목록을 반환합니다. 역할
+정의 자체를 별도 행으로 열거하는 명령은 아직 없습니다.
+
+## 활성 세션
+
+Graph 서비스에 연결된 GOD 또는 ADMIN 사용자는 live session manager의 세션을 조회할
+수 있습니다. 결과는 `User`, `Space`만 포함하며 bearer credential인 SessionID는 노출하지
+않습니다.
+
+```sql
+SHOW SESSIONS;
+```
+
+executor를 Graph 서비스 없이 직접 임베드한 경로에는 세션 원본이 없으므로 이 명령은
+빈 목록 대신 명시적 unsupported 오류를 반환합니다.
 
 ## 기본 사용자
 
 ByoriDB는 첫 시작 시 기본 슈퍼유저를 생성합니다:
 
 - **사용자 이름:** `root`
-- **비밀번호:** `BYORIDB_ROOT_PASSWORD`의 값, 또는 시작 시 한 번 로그에 기록되는 생성된 비밀번호
+- **비밀번호:** network server 시작 전에 주입한 `BYORIDB_ROOT_PASSWORD` 값
 - **역할:** `GOD`
 
-> **보안 경고:** 프로덕션 시작 전에 시크릿 매니저나 보호된 환경에서 `BYORIDB_ROOT_PASSWORD`를 설정하세요.
+network server는 `BYORIDB_ROOT_PASSWORD`가 없거나 빈 값이면 시작하지 않으며 credential을
+로그에 출력하지 않습니다. 시크릿 매니저에서 주입하고 변경 시 서버를 재시작하세요.
 
-```sql
-ALTER USER root WITH PASSWORD 'your_secure_password';
-```
+`root`는 process bootstrap 계정이라 `CREATE USER root`로 다시 만들 수 없고, 현재
+`ALTER USER root`의 KV 사용자 변경 경로 대상도 아닙니다.
 
 ## 모범 사례
 
-1. **root 비밀번호를 명시적으로 설정** - 시작 전에 `BYORIDB_ROOT_PASSWORD`를 제공하세요
+1. **root 비밀번호를 안전하게 주입** - 시작 전에 `BYORIDB_ROOT_PASSWORD`를 제공하세요
 2. **최소 권한 원칙** - 사용자에게 필요한 최소한의 권한만 부여하세요
 3. **ADMIN은 아껴서 사용** - ADMIN 역할은 데이터베이스 관리자에게만 부여하세요
 4. **읽기 전용 접근에는 GUEST 사용** - 리포팅 및 분석 사용자에게 적합합니다

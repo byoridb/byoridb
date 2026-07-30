@@ -11,7 +11,9 @@ pub enum GraphError {
     #[error("Authentication failed: {0}")]
     AuthFailed(String),
 
-    #[error("Session not found: {0}")]
+    // The inner value is retained for source compatibility and matching, but
+    // never formatted: session IDs are bearer credentials.
+    #[error("Session not found")]
     SessionNotFound(i64),
 
     #[error("Parse error: {0}")]

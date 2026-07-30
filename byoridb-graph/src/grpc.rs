@@ -82,10 +82,12 @@ impl GraphService for GrpcService {
                 error_code: 0,
                 error_msg: "".to_string(),
             })),
-            Err(e) => Ok(Response::new(AuthenticateResponse {
+            Err(_) => Ok(Response::new(AuthenticateResponse {
                 session_id: 0,
                 error_code: 1,
-                error_msg: e.to_string(),
+                // Authentication failures are intentionally indistinguishable
+                // to remote callers (unknown/disabled/locked/wrong password).
+                error_msg: "Invalid credentials".to_string(),
             })),
         }
     }
@@ -206,6 +208,8 @@ fn elapsed_us(start: std::time::Instant) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthManager;
+    use byoridb_kvstore::MemoryKVStore;
     use std::time::Duration;
 
     #[test]
@@ -221,6 +225,59 @@ mod tests {
             "elapsed suspiciously large: {}",
             elapsed
         );
+    }
+
+    async fn failed_grpc_auth(
+        service: &GrpcService,
+        username: &str,
+        password: &str,
+    ) -> AuthenticateResponse {
+        GraphService::authenticate(
+            service,
+            Request::new(AuthenticateRequest {
+                username: username.to_string(),
+                password: password.to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+    }
+
+    #[tokio::test]
+    async fn authentication_failures_do_not_enumerate_accounts() {
+        let auth = AuthManager::with_config("root-password", Duration::from_secs(3600));
+        auth.create_user(
+            "disabled-user",
+            "disabled-password",
+            vec!["USER".to_string()],
+        )
+        .await
+        .unwrap();
+        auth.set_user_enabled("disabled-user", false).await.unwrap();
+        auth.create_user("locked-user", "locked-password", vec!["USER".to_string()])
+            .await
+            .unwrap();
+        for _ in 0..crate::auth::MAX_FAILED_ATTEMPTS {
+            let _ = auth.authenticate("locked-user", "wrong-password").await;
+        }
+        let internal = Arc::new(InternalGraphService::with_auth(
+            Arc::new(MemoryKVStore::new()),
+            auth,
+        ));
+        let service = GrpcService::new(internal);
+
+        for (username, password) in [
+            ("missing-user", "wrong-password"),
+            ("root", "wrong-password"),
+            ("disabled-user", "disabled-password"),
+            ("locked-user", "locked-password"),
+        ] {
+            let response = failed_grpc_auth(&service, username, password).await;
+            assert_eq!(response.session_id, 0);
+            assert_eq!(response.error_code, 1);
+            assert_eq!(response.error_msg, "Invalid credentials");
+        }
     }
 
     #[test]

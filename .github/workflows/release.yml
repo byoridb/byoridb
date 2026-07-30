@@ -23,11 +23,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.90"
           components: rustfmt
       - name: Format check
         run: cargo fmt --all --check
       - name: Workspace tests (serial)
-        run: cargo test --workspace --all-features -- --test-threads=1
+        run: cargo test --locked --workspace --all-features -- --test-threads=1
 
   build:
     name: Build ${{ matrix.target }}
@@ -63,6 +64,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.90"
           targets: ${{ matrix.target }}
 
       - name: Add cross-compile target (macOS x86_64 on ARM runner)
@@ -70,7 +72,7 @@ jobs:
         run: rustup target add x86_64-apple-darwin
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -81,17 +83,17 @@ jobs:
             ${{ runner.os }}-${{ matrix.target }}-cargo-release-
 
       - name: Build release binary
-        run: cargo build --release --workspace --target ${{ matrix.target }}
+        run: cargo build --locked --release --workspace --target ${{ matrix.target }}
 
       - name: Package (Linux/macOS)
         run: |
           cd target/${{ matrix.target }}/release
-          BINS="byoridb-server byoridb-cli"
-          [ -f byoridb-backup ] && BINS="$BINS byoridb-backup"
-          tar -czvf ../../../byoridb-${{ github.ref_name }}-${{ matrix.target }}.tar.gz $BINS
+          BINS=(byoridb-server byoridb-cli)
+          [ -f byoridb-backup ] && BINS+=(byoridb-backup)
+          tar -czvf ../../../byoridb-${{ github.ref_name }}-${{ matrix.target }}.tar.gz "${BINS[@]}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: byoridb-${{ matrix.target }}
           path: byoridb-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
@@ -106,7 +108,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -114,7 +116,7 @@ jobs:
         run: find artifacts -type f
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}

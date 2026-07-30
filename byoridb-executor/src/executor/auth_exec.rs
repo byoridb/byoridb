@@ -33,7 +33,7 @@ impl Executor {
         let mut user_json: serde_json::Value = serde_json::from_slice(&user_data)?;
 
         // Validate and normalize role
-        let normalized_role = validate_and_normalize_role(&plan.role)?;
+        let normalized_role = validate_and_normalize_assignable_role(&plan.role)?;
 
         // Add role if not already present - ensure roles field exists
         let roles = user_json
@@ -92,7 +92,7 @@ impl Executor {
         let mut user_json: serde_json::Value = serde_json::from_slice(&user_data)?;
 
         // Validate and normalize role
-        let normalized_role = validate_and_normalize_role(&plan.role)?;
+        let normalized_role = validate_and_normalize_revocable_role(&plan.role)?;
 
         // Remove role - ensure roles field exists
         let roles = user_json
@@ -127,94 +127,18 @@ impl Executor {
         &self,
         plan: crate::plan::BalancePlan,
     ) -> Result<ExecutorResult> {
-        match plan {
-            crate::plan::BalancePlan::Leader => {
-                // Trigger leader rebalance
-                #[cfg(feature = "distributed")]
-                if let Some(client) = &self.ctx.meta_client {
-                    let space = self.ctx.space.as_ref().ok_or_else(|| {
-                        ExecutionError::InvalidOperation("No space selected".to_string())
-                    })?;
-                    match client.get_space(space).await {
-                        Ok(space_info) => {
-                            // Trigger rebalance via meta service
-                            tracing::info!(
-                                "Triggering leader rebalance for space {}",
-                                space_info.id
-                            );
-                            // Note: Full implementation would call client.balance_leader()
-                            return Ok(ExecutorResult::success_message(
-                                "Leader balance job submitted".to_string(),
-                            ));
-                        }
-                        Err(e) => {
-                            return Err(ExecutionError::InvalidOperation(format!(
-                                "Failed to get space info: {}",
-                                e
-                            )));
-                        }
-                    }
-                }
-                Ok(ExecutorResult::success_message(
-                    "Leader balance job submitted (standalone mode)".to_string(),
-                ))
-            }
-            crate::plan::BalancePlan::Data => {
-                // Trigger data rebalance
-                #[cfg(feature = "distributed")]
-                if let Some(client) = &self.ctx.meta_client {
-                    let space = self.ctx.space.as_ref().ok_or_else(|| {
-                        ExecutionError::InvalidOperation("No space selected".to_string())
-                    })?;
-                    match client.get_space(space).await {
-                        Ok(space_info) => {
-                            tracing::info!("Triggering data rebalance for space {}", space_info.id);
-                            // Note: Full implementation would call client.balance_data()
-                            return Ok(ExecutorResult::success_message(
-                                "Data balance job submitted".to_string(),
-                            ));
-                        }
-                        Err(e) => {
-                            return Err(ExecutionError::InvalidOperation(format!(
-                                "Failed to get space info: {}",
-                                e
-                            )));
-                        }
-                    }
-                }
-                Ok(ExecutorResult::success_message(
-                    "Data balance job submitted (standalone mode)".to_string(),
-                ))
-            }
-            crate::plan::BalancePlan::Status => {
-                // Show balance status
-                Ok(ExecutorResult {
-                    columns: vec![
-                        "Job ID".to_string(),
-                        "Status".to_string(),
-                        "Progress".to_string(),
-                    ],
-                    rows: vec![vec![
-                        byoridb_common::Value::Int(0),
-                        byoridb_common::Value::String("IDLE".to_string()),
-                        byoridb_common::Value::String("N/A".to_string()),
-                    ]],
-                    latency_ms: 0,
-                })
-            }
-            crate::plan::BalancePlan::Stop => {
-                // Stop ongoing balance
-                Ok(ExecutorResult::success_message(
-                    "Balance job stopped".to_string(),
-                ))
-            }
-            crate::plan::BalancePlan::Reset => {
-                // Reset balance plan
-                Ok(ExecutorResult::success_message(
-                    "Balance plan reset".to_string(),
-                ))
-            }
-        }
+        let operation = match plan {
+            crate::plan::BalancePlan::Leader => "LEADER",
+            crate::plan::BalancePlan::Data => "DATA",
+            crate::plan::BalancePlan::Status => "STATUS",
+            crate::plan::BalancePlan::Stop => "STOP",
+            crate::plan::BalancePlan::Reset => "RESET",
+        };
+
+        Err(ExecutionError::InvalidOperation(format!(
+            "BALANCE {} is not supported: no balance-job control RPC is wired to the executor",
+            operation
+        )))
     }
 
     /// Handle CREATE USER
@@ -228,6 +152,12 @@ impl Executor {
         if !self.ctx.is_admin() {
             return Err(ExecutionError::InvalidOperation(
                 "CREATE USER requires GOD or ADMIN role".to_string(),
+            ));
+        }
+
+        if username.eq_ignore_ascii_case("root") {
+            return Err(ExecutionError::InvalidOperation(
+                "Username 'root' is reserved for the built-in superuser".to_string(),
             ));
         }
 
@@ -246,7 +176,7 @@ impl Executor {
 
         // Validate and normalize role if provided
         let normalized_role = match role {
-            Some(r) => Some(validate_and_normalize_role(&r)?),
+            Some(r) => Some(validate_and_normalize_assignable_role(&r)?),
             None => None,
         };
 
@@ -282,10 +212,16 @@ impl Executor {
         username: String,
         if_exists: bool,
     ) -> Result<ExecutorResult> {
+        if !self.ctx.is_admin() {
+            return Err(ExecutionError::InvalidOperation(
+                "DROP USER requires GOD or ADMIN role".to_string(),
+            ));
+        }
+
         let user_key = format!("{}{}", USER_KEY_PREFIX, username);
 
         // Prevent deletion of root user
-        if username == "root" {
+        if username.eq_ignore_ascii_case("root") {
             return Err(ExecutionError::InvalidOperation(
                 "Cannot delete the root user".to_string(),
             ));
@@ -320,6 +256,18 @@ impl Executor {
         username: &str,
         new_password: Option<String>,
     ) -> Result<ExecutorResult> {
+        if !self.ctx.is_admin() {
+            return Err(ExecutionError::InvalidOperation(
+                "ALTER USER requires GOD or ADMIN role".to_string(),
+            ));
+        }
+
+        if username.eq_ignore_ascii_case("root") {
+            return Err(ExecutionError::InvalidOperation(
+                "Root password is managed by process configuration".to_string(),
+            ));
+        }
+
         let user_key = format!("{}{}", USER_KEY_PREFIX, username);
 
         // Get existing user data
@@ -364,17 +312,197 @@ fn hash_password(password: &str) -> Result<String> {
         .map_err(|e| ExecutionError::InvalidOperation(format!("Password hashing failed: {}", e)))
 }
 
-/// Valid roles for user management
-const VALID_ROLES: &[&str] = &["GOD", "ADMIN", "DBA", "USER", "GUEST"];
+/// Roles that may be assigned to persisted users. GOD is reserved for the
+/// process-owned root identity and must never be persisted on another user.
+const ASSIGNABLE_ROLES: &[&str] = &["ADMIN", "DBA", "USER", "GUEST"];
+const REVOCABLE_ROLES: &[&str] = &["GOD", "ADMIN", "DBA", "USER", "GUEST"];
 
-/// Validate and normalize a role to uppercase
-fn validate_and_normalize_role(role: &str) -> Result<String> {
+/// Validate and normalize a role that is being assigned.
+fn validate_and_normalize_assignable_role(role: &str) -> Result<String> {
     let normalized = role.to_uppercase();
-    if !VALID_ROLES.contains(&normalized.as_str()) {
-        return Err(ExecutionError::InvalidOperation(format!(
-            "Invalid role '{}'. Valid roles are: {:?}",
-            role, VALID_ROLES
-        )));
+    if !ASSIGNABLE_ROLES.contains(&normalized.as_str()) {
+        return Err(ExecutionError::InvalidOperation(
+            "Role cannot be assigned; valid roles are ADMIN, DBA, USER, and GUEST".to_string(),
+        ));
     }
     Ok(normalized)
+}
+
+/// GOD remains revocable so operators can repair legacy records that predate
+/// the root-only policy, but it cannot be created or granted.
+fn validate_and_normalize_revocable_role(role: &str) -> Result<String> {
+    let normalized = role.to_uppercase();
+    if !REVOCABLE_ROLES.contains(&normalized.as_str()) {
+        return Err(ExecutionError::InvalidOperation(
+            "Role cannot be revoked; valid roles are GOD, ADMIN, DBA, USER, and GUEST".to_string(),
+        ));
+    }
+    Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::ExecutionContext;
+    use crate::plan::{BalancePlan, ExecutionPlan, GrantPlan, RevokePlan};
+    use byoridb_kvstore::store::MemoryKVStore;
+    use std::sync::Arc;
+
+    fn admin_executor() -> Executor {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let ctx = Arc::new(
+            ExecutionContext::new(kvstore)
+                .with_space("default".to_string())
+                .with_caller_roles(vec!["GOD".to_string()]),
+        );
+        Executor::new(ctx)
+    }
+
+    #[tokio::test]
+    async fn every_balance_variant_returns_explicit_unsupported_error() {
+        let executor = admin_executor();
+
+        for plan in [
+            BalancePlan::Leader,
+            BalancePlan::Data,
+            BalancePlan::Status,
+            BalancePlan::Stop,
+            BalancePlan::Reset,
+        ] {
+            let err = executor
+                .execute(ExecutionPlan::Balance(plan))
+                .await
+                .expect_err("BALANCE must not report success until the control RPC exists");
+            match err {
+                ExecutionError::InvalidOperation(message) => {
+                    assert!(message.contains("not supported"), "message was: {message}");
+                    assert!(message.contains("balance-job control RPC"));
+                }
+                other => panic!("expected InvalidOperation, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_reserved_root_without_persisting_it() {
+        let executor = admin_executor();
+
+        let err = executor
+            .handle_create_user(
+                "root".to_string(),
+                false,
+                "not-the-root-password".to_string(),
+                Some("GOD".to_string()),
+            )
+            .await
+            .expect_err("the built-in root account must not be recreated in KV");
+
+        match err {
+            ExecutionError::InvalidOperation(message) => {
+                assert!(message.contains("reserved"), "message was: {message}");
+            }
+            other => panic!("expected InvalidOperation, got {other:?}"),
+        }
+        assert!(executor
+            .ctx
+            .kvstore
+            .get(format!("{USER_KEY_PREFIX}root").as_bytes())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn create_and_grant_reject_god_without_mutating_user_records() {
+        let executor = admin_executor();
+
+        let create_error = executor
+            .handle_create_user(
+                "alice".to_string(),
+                false,
+                "alice-password".to_string(),
+                Some("gOd".to_string()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(create_error, ExecutionError::InvalidOperation(_)));
+
+        let user_key = format!("{USER_KEY_PREFIX}alice");
+        assert!(executor
+            .ctx
+            .kvstore
+            .get(user_key.as_bytes())
+            .await
+            .unwrap()
+            .is_none());
+
+        executor
+            .handle_create_user(
+                "alice".to_string(),
+                false,
+                "alice-password".to_string(),
+                Some("USER".to_string()),
+            )
+            .await
+            .unwrap();
+        let before = executor
+            .ctx
+            .kvstore
+            .get(user_key.as_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        let grant_error = executor
+            .execute_grant(GrantPlan {
+                role: "god".to_string(),
+                username: "alice".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(grant_error, ExecutionError::InvalidOperation(_)));
+        let after = executor
+            .ctx
+            .kvstore
+            .get(user_key.as_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, before);
+
+        // Revocation remains available to clean records written by older
+        // versions, even though new GOD assignments are rejected.
+        executor
+            .execute_revoke(RevokePlan {
+                role: "GOD".to_string(),
+                username: "alice".to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn drop_and_alter_user_require_admin_role() {
+        let executor = Executor::new(Arc::new(
+            ExecutionContext::new(Arc::new(MemoryKVStore::new()))
+                .with_caller_roles(vec!["USER".to_string()]),
+        ));
+
+        for err in [
+            executor
+                .handle_drop_user("alice".to_string(), false)
+                .await
+                .unwrap_err(),
+            executor
+                .execute_alter_user("alice", Some("new-password".to_string()))
+                .await
+                .unwrap_err(),
+        ] {
+            match err {
+                ExecutionError::InvalidOperation(message) => {
+                    assert!(message.contains("GOD or ADMIN"), "message was: {message}");
+                }
+                other => panic!("expected InvalidOperation, got {other:?}"),
+            }
+        }
+    }
 }

@@ -1,16 +1,23 @@
 name: Build & Deploy
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
     branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
+    types: [completed]
   workflow_dispatch:
     inputs:
       image_tag:
         description: 'Image tag override (default: git sha)'
         required: false
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
 
 env:
   ACR_REGISTRY: byoridbacr23236.azurecr.io
@@ -24,22 +31,62 @@ jobs:
   build-and-deploy:
     name: Build Docker image & deploy to AKS
     runs-on: ubuntu-latest
+    environment:
+      name: production
+    if: >-
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # workflow_run's GITHUB_SHA points at the default branch, which may
+          # already have advanced. Build the exact commit that passed CI.
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       - name: Set image tag
         id: tag
+        env:
+          DEPLOY_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          IMAGE_TAG_OVERRIDE: ${{ inputs.image_tag }}
         run: |
-          TAG="${{ github.event.inputs.image_tag }}"
+          TAG="$IMAGE_TAG_OVERRIDE"
           if [ -z "$TAG" ]; then
-            TAG="sha-$(git rev-parse --short HEAD)"
+            TAG="sha-${DEPLOY_SHA:0:7}"
+          fi
+          if [[ ! "$TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "Invalid Docker image tag: $TAG" >&2
+            exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$DEPLOY_SHA" >> "$GITHUB_OUTPUT"
           echo "Image tag: $TAG"
+          echo "Deploy commit: $DEPLOY_SHA"
+
+      - name: Verify manual deploy commit passed CI
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ steps.tag.outputs.sha }}
+        run: |
+          SUCCESSFUL_RUNS="$(gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f head_sha="$DEPLOY_SHA" \
+            -f branch=main \
+            -f status=success \
+            -f event=push \
+            -f per_page=100 \
+            --jq '.total_count')"
+          if [ "$SUCCESSFUL_RUNS" -lt 1 ]; then
+            echo "Refusing manual deploy: $DEPLOY_SHA has no successful push CI run" >&2
+            exit 1
+          fi
 
       - name: Azure login
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
@@ -57,7 +104,7 @@ jobs:
           toolchain: "1.90"
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -70,7 +117,7 @@ jobs:
       - name: Build release binaries (server + bulk loader + CLI)
         # `-p` is required: the bins live in different workspace packages, so
         # `--bin X --bin Y` alone fails ("no bin target in default-run packages").
-        run: cargo build --release -p byoridb --bin byoridb-server -p byoridb-bulkloader --bin byoridb-bulkloader -p byoridb-client --bin byoridb-cli
+        run: cargo build --locked --release -p byoridb --bin byoridb-server -p byoridb-bulkloader --bin byoridb-bulkloader -p byoridb-client --bin byoridb-cli
 
       - name: Build & push Docker image
         run: |
@@ -89,8 +136,8 @@ jobs:
       - name: Get AKS credentials
         run: |
           az aks get-credentials \
-            --resource-group $AKS_RESOURCE_GROUP \
-            --name $AKS_CLUSTER \
+            --resource-group "$AKS_RESOURCE_GROUP" \
+            --name "$AKS_CLUSTER" \
             --overwrite-existing
 
       - name: Deploy to AKS
@@ -102,7 +149,7 @@ jobs:
           # bootstrap default. Save the live value before apply so the
           # manifest's baked CIDR cannot clobber it (observed incident,
           # 2026-06-12 — every deploy locked the operator out).
-          LIVE_LB_RANGES=$(kubectl get svc byoridb-public -n $K8S_NAMESPACE \
+          LIVE_LB_RANGES=$(kubectl get svc byoridb-public -n "$K8S_NAMESPACE" \
             -o jsonpath='{.spec.loadBalancerSourceRanges}' 2>/dev/null || true)
           # Apply manifests with the freshly built image substituted in, so
           # probe/resource changes roll out together with the code as ONE
@@ -115,7 +162,7 @@ jobs:
               | kubectl apply -f -
           done
           if [ -n "$LIVE_LB_RANGES" ]; then
-            kubectl patch svc byoridb-public -n $K8S_NAMESPACE \
+            kubectl patch svc byoridb-public -n "$K8S_NAMESPACE" \
               -p "{\"spec\":{\"loadBalancerSourceRanges\":$LIVE_LB_RANGES}}"
           fi
           # Timeout must exceed the startupProbe budget (failureThreshold 360 ×
@@ -123,5 +170,5 @@ jobs:
           # dataset (unclean shutdown → 3 full scans, ~20min+) completes before
           # the rollout gives up. 3600s is the kubectl max for --timeout here.
           kubectl rollout status statefulset/byoridb-server \
-            -n $K8S_NAMESPACE \
+            -n "$K8S_NAMESPACE" \
             --timeout=3600s

@@ -70,13 +70,13 @@ cd byoridb
 ### 디버그 빌드
 
 ```bash
-cargo build
+cargo build --locked
 ```
 
 ### 릴리스 빌드 (권장)
 
 ```bash
-cargo build --release
+cargo build --locked --release
 ```
 
 릴리스 빌드는 더 나은 성능을 위해 LTO(Link-Time Optimization)를 활성화합니다.
@@ -94,13 +94,13 @@ cargo build --release
 
 ```bash
 # Run tests
-cargo test
+cargo test --locked
 
 # Start server
-./target/release/byoridb-server
+BYORIDB_ROOT_PASSWORD='<root-password>' ./target/release/byoridb-server
 
 # In another terminal, connect with CLI
-./target/release/byoridb-cli
+BYORIDB_USER=root BYORIDB_PASSWORD='<root-password>' ./target/release/byoridb-cli
 ```
 
 ## 문제 해결
@@ -128,5 +128,5 @@ export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 
 ```bash
 # Limit parallel jobs
-cargo build --release -j 2
+cargo build --locked --release -j 2
 ```

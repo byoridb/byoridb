@@ -4,10 +4,11 @@
 
 ## FETCH PROP
 
-특정 버텍스의 속성을 조회합니다:
+특정 버텍스 또는 엣지의 속성을 조회합니다:
 
 ```sql
-FETCH PROP ON <tag_name> <vid> [, <vid>, ...];
+FETCH PROP ON <tag_name|*> <vid> [, <vid>, ...] [AS OF <epoch-ms>];
+FETCH PROP ON <edge_name|*> <src_vid>-><dst_vid> [AS OF <epoch-ms>];
 ```
 
 **예시:**
@@ -21,7 +22,18 @@ FETCH PROP ON person 1, 2, 3;
 
 -- All tags on a vertex
 FETCH PROP ON * 1;
+
+-- Vertex state at a point in time
+FETCH PROP ON person 1 AS OF 1785110400000;
+
+-- Edge state at a point in time (also finds an edge deleted after that time)
+FETCH PROP ON follow 1->2 AS OF 1785110400000;
 ```
+
+`AS OF`는 asserted vertex/edge의 history를 조회합니다. 현재 표면에서는 하나의 epoch-ms를
+valid time과 transaction time 양쪽에 적용하며, 쓰기 시 두 시간도 동일한 시각으로
+기록합니다. `VALID FROM/TO`, `BETWEEN`, temporal `MATCH`/`GO`, 과거 시점의 추론 사실은
+아직 지원하지 않습니다.
 
 ## GO (그래프 순회)
 

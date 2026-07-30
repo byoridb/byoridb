@@ -12,15 +12,16 @@
 ```bash
 git clone https://github.com/byoridb/byoridb.git
 cd byoridb
-cargo build --release
+cargo build --locked --release
 ```
 
 ## 서버 시작
 
-독립 실행형 서버(Meta + Storage + Graph 서비스 통합)를 실행합니다:
+embedded Storage와 Graph gRPC/HTTP를 한 프로세스에서 실행합니다. Meta gRPC는
+`cluster.peers`를 설정한 경우에만 함께 시작됩니다:
 
 ```bash
-cargo run --bin byoridb-server --release
+BYORIDB_ROOT_PASSWORD='<root-password>' cargo run --locked --bin byoridb-server --release
 ```
 
 서버는 다음에서 시작됩니다:
@@ -32,7 +33,8 @@ cargo run --bin byoridb-server --release
 새 터미널에서:
 
 ```bash
-cargo run -p byoridb-client --bin byoridb-cli
+BYORIDB_USER=root BYORIDB_PASSWORD='<root-password>' \
+  cargo run --locked -p byoridb-client --bin byoridb-cli
 ```
 
 ## 첫 번째 그래프

@@ -4,7 +4,7 @@
 
 use super::{Executor, ExecutorResult};
 use crate::error::{ExecutionError, Result};
-use crate::key::SchemaKey;
+use crate::key::{SchemaKey, USER_KEY_PREFIX};
 
 impl Executor {
     pub(super) async fn execute_show(&self, plan: crate::plan::ShowPlan) -> Result<ExecutorResult> {
@@ -439,22 +439,101 @@ impl Executor {
         Ok(rows)
     }
 
-    /// Execute SHOW USERS.
+    /// Execute SHOW USERS from the persisted user records.
     ///
-    /// Users are currently managed by the in-process `AuthManager` (see
-    /// `byoridb-graph`), not by the meta service. Until user metadata is persisted
-    /// in meta, this returns the built-in root user and logs a warning.
+    /// The built-in root account is owned by the graph authentication layer and
+    /// intentionally has no KV record, so it is always included explicitly.
+    /// Persisted users and their roles are sorted to make the result stable.
     pub(super) async fn execute_show_users(&self) -> Result<ExecutorResult> {
-        tracing::warn!(
-            "SHOW USERS: user metadata is not yet persisted in meta; \
-            returning built-in root only"
-        );
+        if !self.ctx.is_admin() {
+            return Err(ExecutionError::InvalidOperation(
+                "SHOW USERS requires GOD or ADMIN role".to_string(),
+            ));
+        }
+
+        let entries = self
+            .ctx
+            .kvstore
+            .scan_prefix(USER_KEY_PREFIX.as_bytes())
+            .await?;
+        let mut users = vec![("root".to_string(), vec!["GOD".to_string()])];
+
+        for (key, value) in entries {
+            let key = std::str::from_utf8(&key).map_err(|_| {
+                ExecutionError::InvalidOperation(
+                    "Stored user metadata contains a non-UTF-8 key".to_string(),
+                )
+            })?;
+            let username = key.strip_prefix(USER_KEY_PREFIX).ok_or_else(|| {
+                ExecutionError::InvalidOperation(format!(
+                    "Stored user metadata has an invalid key: {key}"
+                ))
+            })?;
+            if username.is_empty() {
+                return Err(ExecutionError::InvalidOperation(
+                    "Stored user metadata has an empty username".to_string(),
+                ));
+            }
+
+            // Legacy versions could persist a root record. The graph layer's
+            // built-in root account remains authoritative, so never duplicate
+            // or override its GOD role in this listing.
+            if username.eq_ignore_ascii_case("root") {
+                continue;
+            }
+
+            let metadata: serde_json::Value = serde_json::from_slice(&value)?;
+            let stored_username = metadata
+                .get("username")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    ExecutionError::InvalidOperation(format!(
+                        "Stored user metadata for {username} is missing username"
+                    ))
+                })?;
+            if stored_username != username {
+                return Err(ExecutionError::InvalidOperation(format!(
+                    "Stored user metadata key {username} does not match username {stored_username}"
+                )));
+            }
+
+            let role_values = metadata
+                .get("roles")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    ExecutionError::InvalidOperation(format!(
+                        "Stored user metadata for {username} has no roles array"
+                    ))
+                })?;
+            let mut roles = role_values
+                .iter()
+                .map(|role| {
+                    role.as_str().map(ToString::to_string).ok_or_else(|| {
+                        ExecutionError::InvalidOperation(format!(
+                            "Stored user metadata for {username} contains a non-string role"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            roles.sort();
+            roles.dedup();
+            users.push((username.to_string(), roles));
+        }
+
+        users.sort_by(|a, b| a.0.cmp(&b.0));
+        let rows = users
+            .into_iter()
+            .map(|(username, roles)| {
+                vec![
+                    byoridb_common::Value::String(username),
+                    byoridb_common::Value::String(roles.join(", ")),
+                ]
+            })
+            .collect();
+
         Ok(ExecutorResult {
             columns: vec!["Name".to_string(), "Role".to_string()],
-            rows: vec![vec![
-                byoridb_common::Value::String("root".to_string()),
-                byoridb_common::Value::String("GOD".to_string()),
-            ]],
+            rows,
             latency_ms: 0,
         })
     }
@@ -1047,18 +1126,19 @@ impl Executor {
     // ===== SHOW SESSIONS =====
 
     pub(super) async fn execute_show_sessions(&self) -> Result<ExecutorResult> {
-        // Session information is managed by the graph layer (byoridb-graph),
-        // not the executor. Return a placeholder indicating the feature needs
-        // the graph service's session manager.
-        Ok(ExecutorResult {
-            columns: vec![
-                "SessionID".to_string(),
-                "User".to_string(),
-                "Space".to_string(),
-            ],
-            rows: vec![],
-            latency_ms: 0,
-        })
+        if !self.ctx.is_admin() {
+            return Err(ExecutionError::InvalidOperation(
+                "SHOW SESSIONS requires GOD or ADMIN role".to_string(),
+            ));
+        }
+
+        // The Graph service intercepts SHOW SESSIONS and supplies its live
+        // SessionManager. Reaching this executor-only path means no truthful
+        // session source exists, so fail instead of returning a fake empty set.
+        Err(ExecutionError::InvalidOperation(
+            "SHOW SESSIONS requires the Graph service session manager and is unavailable in an executor-only context"
+                .to_string(),
+        ))
     }
 
     // ===== SHOW CREATE TAG / SHOW CREATE EDGE =====
@@ -1217,4 +1297,109 @@ fn schema_json_to_create_ddl(name: &str, kind: &str, data: &[u8]) -> String {
         .unwrap_or_default();
 
     format!("CREATE {} {} ({})", kind, name, fields.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::ExecutionContext;
+    use byoridb_kvstore::store::MemoryKVStore;
+    use byoridb_kvstore::KVStore as _;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn show_users_lists_root_and_persisted_users_in_stable_order() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        for (username, roles) in [("zoe", vec!["USER", "ADMIN", "USER"]), ("alice", vec![])] {
+            let metadata = serde_json::json!({
+                "username": username,
+                "password_hash": "test-only",
+                "roles": roles,
+                "enabled": true
+            });
+            kvstore
+                .put(
+                    format!("{USER_KEY_PREFIX}{username}").as_bytes(),
+                    &serde_json::to_vec(&metadata).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // A legacy root record must neither duplicate nor override built-in root.
+        kvstore
+            .put(
+                format!("{USER_KEY_PREFIX}RoOt").as_bytes(),
+                &serde_json::to_vec(&serde_json::json!({
+                    "username": "RoOt",
+                    "password_hash": "legacy",
+                    "roles": ["GUEST"],
+                    "enabled": true
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let executor = Executor::new(Arc::new(
+            ExecutionContext::new(kvstore).with_caller_roles(vec!["GOD".to_string()]),
+        ));
+        let result = executor.execute_show_users().await.unwrap();
+
+        assert_eq!(result.columns, vec!["Name", "Role"]);
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    byoridb_common::Value::String("alice".to_string()),
+                    byoridb_common::Value::String(String::new()),
+                ],
+                vec![
+                    byoridb_common::Value::String("root".to_string()),
+                    byoridb_common::Value::String("GOD".to_string()),
+                ],
+                vec![
+                    byoridb_common::Value::String("zoe".to_string()),
+                    byoridb_common::Value::String("ADMIN, USER".to_string()),
+                ],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn show_sessions_errors_without_graph_session_manager() {
+        let executor = Executor::new(Arc::new(
+            ExecutionContext::new(Arc::new(MemoryKVStore::new()))
+                .with_caller_roles(vec!["ADMIN".to_string()]),
+        ));
+
+        let err = executor.execute_show_sessions().await.unwrap_err();
+        match err {
+            ExecutionError::InvalidOperation(message) => {
+                assert!(message.contains("Graph service session manager"));
+                assert!(message.contains("executor-only"));
+            }
+            other => panic!("expected InvalidOperation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_and_session_listings_require_admin_role() {
+        let executor = Executor::new(Arc::new(
+            ExecutionContext::new(Arc::new(MemoryKVStore::new()))
+                .with_caller_roles(vec!["USER".to_string()]),
+        ));
+
+        for err in [
+            executor.execute_show_users().await.unwrap_err(),
+            executor.execute_show_sessions().await.unwrap_err(),
+        ] {
+            match err {
+                ExecutionError::InvalidOperation(message) => {
+                    assert!(message.contains("GOD or ADMIN"), "message was: {message}");
+                }
+                other => panic!("expected InvalidOperation, got {other:?}"),
+            }
+        }
+    }
 }

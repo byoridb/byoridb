@@ -307,6 +307,7 @@ impl Parser {
             Token::Space => "space",
             Token::Spaces => "spaces",
             Token::User => "user",
+            Token::Users => "users",
             Token::Values => "values",
             Token::Set => "set",
             Token::All => "all",
@@ -347,6 +348,7 @@ impl Parser {
             Token::Dba => "DBA",
             Token::Guest => "GUEST",
             Token::Role => "role",
+            Token::Roles => "roles",
             _ => return None,
         };
         Some(s.to_string())

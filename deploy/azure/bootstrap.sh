@@ -127,7 +127,6 @@ until [[ "$(az aks show -g "$RG" -n "$AKS" --query provisioningState -o tsv)" ==
 done
 
 # Attach ACR — must NOT be inlined into `aks create` if we want `--no-wait`.
-ATTACHED_ACR_ID="$(az aks show -g "$RG" -n "$AKS" --query "servicePrincipalProfile.clientId" -o tsv 2>/dev/null || true)"
 if ! az aks check-acr -g "$RG" -n "$AKS" --acr "$ACR" >/dev/null 2>&1; then
   note "attaching ACR (separate step, blocking)"
   az aks update -g "$RG" -n "$AKS" --attach-acr "$ACR" -o none
@@ -158,7 +157,9 @@ if ! kubectl -n byoridb get secret byoridb-root >/dev/null 2>&1; then
   PW="$(openssl rand -base64 24)"
   kubectl -n byoridb create secret generic byoridb-root \
     --from-literal=BYORIDB_ROOT_PASSWORD="$PW" >/dev/null
-  printf '   - root password (store this!): %s\n' "$PW"
+  unset PW
+  note "created Kubernetes secret byoridb-root (credential value is not printed)"
+  note "retrieve it explicitly with: kubectl -n byoridb get secret byoridb-root -o jsonpath='{.data.BYORIDB_ROOT_PASSWORD}' | base64 --decode"
 else
   note "byoridb-root secret already present — not regenerating"
 fi
@@ -183,8 +184,8 @@ kubectl apply -f "$tmpdir/01-configmap.yaml"
 kubectl apply -f "$tmpdir/03-statefulset.yaml"
 kubectl apply -f "$tmpdir/04-services.yaml"
 
-note "waiting for Pod readiness (up to 3 min)"
-kubectl -n byoridb rollout status statefulset/byoridb-server --timeout=180s
+note "waiting for Pod readiness (up to 60 min; startup recovery may scan a large database)"
+kubectl -n byoridb rollout status statefulset/byoridb-server --timeout=3600s
 
 EXTERNAL_IP="$(kubectl -n byoridb get svc byoridb-public -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
 printf '\n\033[1;32mByoriDB deployed.\033[0m\n'

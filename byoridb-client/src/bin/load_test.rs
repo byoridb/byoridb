@@ -46,9 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Concurrency: {}", args.concurrency);
     println!("Duration: {}s", args.duration);
     if !args.setup.is_empty() {
-        println!("Setup: \"{}\"", args.setup);
+        println!("Setup query: configured ({} bytes)", args.setup.len());
     }
-    println!("Query: \"{}\"", args.query);
+    println!("Query length: {} bytes", args.query.len());
     println!("---------------------------------------------------");
 
     // Shared metrics

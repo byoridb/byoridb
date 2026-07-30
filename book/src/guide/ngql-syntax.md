@@ -16,7 +16,7 @@ nGQL은 세 가지 범주의 문을 지원합니다:
 
 ```
 Username: root
-Password: value of BYORIDB_ROOT_PASSWORD, or the generated password logged at startup
+Password: value injected through BYORIDB_ROOT_PASSWORD before server startup
 ```
 
 ## 빠른 참조

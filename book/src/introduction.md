@@ -1,6 +1,8 @@
 # ByoriDB
 
-nGQL 호환 쿼리 언어와 온톨로지 추론(RDFS-Plus) 레이어를 갖춘, Rust로 작성된 그래프 데이터베이스입니다. 분산은 설계에 반영되어 있으나 다중 노드 배포는 아직 로드맵 단계이며, 현재 프로덕션은 단일 노드입니다.
+nGQL 호환 쿼리 언어, 온톨로지 추론(RDFS-Plus)과 bitemporal history를 갖춘 Rust
+그래프 데이터베이스입니다. 분산은 설계와 라이브러리에 반영되어 있으나 다중 노드
+launcher는 아직 로드맵 단계이며, 운영 경로는 단일 노드입니다.
 
 ## 개요
 
@@ -38,7 +40,8 @@ ByoriDB는 다음과 같은 특징을 갖춘 독립적인 그래프 데이터베
 - `SHOW SPACES` / `SHOW TAGS` / `SHOW EDGES`
 
 **DML (데이터 조작 언어)**
-- `INSERT VERTEX` / `UPDATE VERTEX` / `DELETE VERTEX`
+- `INSERT` / `UPDATE` / `DELETE VERTEX`
+- `INSERT` / `UPDATE` / `DELETE EDGE`
 
 **DQL (데이터 조회 언어)**
 - `FETCH PROP` - 정점 속성 조회
@@ -47,6 +50,7 @@ ByoriDB는 다음과 같은 특징을 갖춘 독립적인 그래프 데이터베
 - `LOOKUP` - 인덱스 기반 쿼리
 - `FIND PATH` - 최단 경로 쿼리
 - `RECOMMEND` - 유사 버텍스 추천 (구조적 / 임베딩 코사인 + WHERE 필터)
+- `FETCH ... AS OF <epoch-ms>` - asserted vertex/edge 시점 조회
 
 **온톨로지 / 시맨틱**
 - `CREATE CLASS … SUBCLASS OF … [DISJOINT WITH …]` - 클래스 계층 (TBox)
@@ -65,12 +69,11 @@ ByoriDB는 다음과 같은 특징을 갖춘 독립적인 그래프 데이터베
 - **복제 팩터(Replica Factor)**: 다중 노드 복제 (설계)
 
 ### 성능 최적화
-- **Bloom filter**: 약 1%의 거짓 양성률(false positive rate)
-- **Block Cache**: 256MB LRU 캐시
-- **배치 연산**: 다중 키 조회
-- **Arena 할당**: malloc 대비 16배 개선
-- **Predicate Pushdown**: 스토리지 계층에서의 필터링
-- **RPC 압축**: gzip/zstd 지원
+- **Copy-on-write B-tree**: redb의 ACID/MVCC와 prefix range scan
+- **보조 인덱스**: tag VID와 reverse-edge 인덱스로 전체 스캔 회피
+- **벡터 검색**: 데이터 규모에 따라 exact cosine에서 persisted HNSW로 전환
+- **배치 연산**: current view와 history를 한 트랜잭션으로 적용
+- **Targeted RPC**: source VID 기반 분산 GO 조회 경로
 
 ## 빠른 예제
 

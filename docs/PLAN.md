@@ -1,20 +1,19 @@
 # ByoriDB 플랜
 
-마지막 업데이트: 2026-07-10 (**T-1~T-4 main 병합, AKS 현재 장애/rollout 대기**
-— PR#22가 `origin/main`의 `025ecc8`로 병합됐고 PR 품질 게이트(Check/Format/Clippy/Test/
-Build Release)는 모두 통과했다. 별도 redb `HISTORY_TABLE`에 vertex/edge 변경 이력을 append하고
-현재 뷰는 기존 `KV_TABLE`에 유지한다. 사용자 표면은 vertex `FETCH ... AS OF <epoch-ms>`까지이며,
-v1은 valid time과 transaction time을 같은 현재 시각으로 기록한다. 명시적 `VALID FROM/TO`,
-temporal MATCH/GO, edge AS OF, BETWEEN은 v2다. 22:03 KST 기준 AKS는 public/headless
-endpoint가 비어 있고 pod `Ready 0/1`, restart 44회다. pod는 기존 `sha-d5ff4e6`에서 redb open
-단계에 머물다 약 65분 후 startup probe로 exit 137 재시작하며, StatefulSet spec만
-`sha-025ecc8`로 바뀐 채 Build & Deploy run #29093255676이 rollout 대기 중이다.
-운영 변경은 수행하지 않았고 T v1 HTTP 스모크도 미착수다.
-로컬 작업트리의 workspace CI 승격/Clippy 정리는 아직 미커밋이며 `origin/main`에는 없다.
-현재 로컬 검증은 fmt/check/clippy와 전체 직렬 테스트(809 passed / 0 failed / 9 ignored),
-분산 E2E(18/18)가 통과했다. 이전 2026-07-06: **O-12/O-13/G-11 AKS HTTP 프로덕션
-스모크 완료**(`sha-0bcab1c`, health/ready OK, pod restart=0). 프로덕션은 semver 릴리스가
-아니라 커밋 SHA 태그 `sha-<short>`로 연속 배포한다(Cargo 0.2.4 / 최신 태그 v0.2.1).
+마지막 업데이트: 2026-07-27 (**temporal v1.1 상태 정리 + 인증/운영 감사 후속**).
+`origin/main`의 `76e7a79`에는 current/history 원자적 dual-write, 같은 millisecond 버전
+충돌 방지, seek 기반 point-in-time 조회와 vertex/edge
+`FETCH ... AS OF <epoch-ms>`가 포함돼 있다. 명시적 `VALID FROM/TO`, temporal MATCH/GO,
+`BETWEEN`, 이력 열람 API와 리텐션/GC는 아직 미구현이다. 이 커밋을 기준으로 한 현재
+작업 트리에는 인증 상태 공유·영속 사용자 hydration/sync·중첩 RBAC·credential 비노출과
+CI/CD gate 보강이 추가됐다. 로컬 감사에서 workspace fmt/check/clippy/test, release build,
+mdBook build가 통과했으며 RustSec 취약점은 0건이다. 변동이 잦은 전체 테스트 개수는
+고정 수치로 문서화하지 않는다. 태그 `v0.3.3`은 이 시점의 `main`보다 10커밋 뒤에 있는
+스냅샷이다. 2026-07-10 AKS 장애 기록은 아래에 역사적 관찰로 남기되 2026-07-27의
+실시간 운영 상태로 재검증하지 않았다.
+
+이전 2026-07-06: **O-12/O-13/G-11 AKS HTTP 프로덕션
+스모크 완료**(`sha-0bcab1c`, health/ready OK, pod restart=0).
 이전: 방향성 재정의 — **core vs Studio 책임 경계** 확정.
 ByoriDB core = 추론 능력을 가진 semantic graph DB core(Palantir clone 아님),
 Studio = Ontology Workbench + Operational Modeling UX. core 로드맵은 Studio가
@@ -97,8 +96,9 @@ change-feed / constraint hooks / shape validation 이 운영 레이어를 떠받
 
 ## 현재 상태
 
-ByoriDB의 운영 토폴로지는 단일 노드이며, **2026-07-10 22:03 KST 현재 AKS endpoint가
-없는 장애 상태**다(G-11 현재 인시던트 참조). Raft/파티셔닝/분산 조회 구성 요소는
+ByoriDB의 운영 토폴로지는 단일 노드다. **마지막으로 기록된 AKS 관찰은 2026-07-10
+22:03 KST의 endpoint 부재 장애이며, 현재 상태는 재검증하지 않았다**(G-11 역사적
+인시던트 참조). Raft/파티셔닝/분산 조회 구성 요소는
 라이브러리와 테스트 수준으로 존재한다. 다중 노드 운영 배포는 `byoridb-server`
 launcher와 K8s/compose wiring이 아직 남아 있어 G-2 후속으로 관리한다. 과거 운영 배포
 로드맵 Phase 1–10이 모두 완료되었고, mock/hardcoded 청산(PR 1–10) 및 그래프
@@ -108,7 +108,7 @@ launcher와 K8s/compose wiring이 아직 남아 있어 G-2 후속으로 관리�
 
 - 단일 노드: redb ACID(`Durability::Immediate` 기본), graceful shutdown,
   인증(root/role-based), WHERE 절,
-  edge CRUD, Prometheus 메트릭, 구조화 JSON 로그
+  edge CRUD, query 계열 Prometheus 메트릭, metadata field를 포함한 stdout text 로그
 - 분산 구성 요소: Raft 합의(커스텀 구현, openraft 호환성 이슈 우회),
   Consistent Hash Ring, Replica Factor, FailureDetector, 파티션 재분배, 핫스팟 감지
   구현/테스트 보유. 운영용 다중 노드 launcher는 G-2 후속.
@@ -117,19 +117,19 @@ launcher와 K8s/compose wiring이 아직 남아 있어 G-2 후속으로 관리�
   (tag/edge, multi-field, prefix-cover 매처), 분산 LOOKUP, 분산 GO
   (source-VID targeted RPC, O(degree)), compound statement
   (`$var = stmt; stmt2`)
-- 시간축 v1: asserted vertex/edge 변경 이력을 별도 `HISTORY_TABLE`에 append하고,
-  vertex `FETCH PROP ON <tag> <vid> AS OF <epoch-ms>` 시점 읽기를 제공. 현재 뷰와
-  추론 materialization은 기존 경로를 유지하며 과거 파생 사실 조회는 지원하지 않음.
+- 시간축 v1.1: asserted vertex/edge 변경 이력을 별도 `HISTORY_TABLE`에 원자적으로
+  append하고, vertex와 edge `FETCH PROP ... AS OF <epoch-ms>` 시점 읽기를 제공.
+  추론 materialization은 current view만 유지하며 과거 파생 사실 조회는 지원하지 않음.
 - 운영: 백업/복구(`byoridb-backup`), 부하 테스트(`load_test` — 31K QPS @ 50동시,
   12.5K QPS @ 100동시, 0% 에러), redb immediate durability와 graceful checkpoint
 
-**검증 상태(2026-07-10, 로컬 `feat/temporal-storage` 작업트리)**:
-`cargo fmt --all -- --check`, `cargo check --workspace --all-targets --all-features`,
-`cargo clippy --workspace --all-targets --all-features -- -D warnings`,
-`cargo test --workspace --all-features -- --test-threads=1` 통과. 테스트 결과는
-809 passed / 0 failed / 9 ignored. `tests/distributed_e2e_test.rs`도 18/18 통과.
-`cargo build --workspace --release`의 마지막 확인은 2026-07-02이며, PR#22의 GitHub
-Build Release 게이트는 2026-07-10 통과했다.
+**검증 상태(2026-07-27, `origin/main` 76e7a79 기반 현재 작업 트리 로컬 감사)**:
+`cargo fmt --all -- --check`,
+`cargo check --locked --workspace --all-targets --all-features`,
+`cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`,
+`cargo test --locked --workspace --all-features -- --test-threads=1`,
+`cargo build --locked --workspace --release`, `mdbook build book` 통과. 전체 테스트 개수는
+기능 추가 때마다 바뀌므로 명령과 실패 0 여부를 기준으로 관리한다.
 
 **운영 스모크(2026-07-06, AKS `sha-0bcab1c`)**:
 HTTP `/health`=`OK`, `/ready`=`READY`. 일회용 space `smoke_20260706183325`에서
@@ -139,7 +139,8 @@ equivalentClass(`employee` ↔ `human` `is_a`)와 equivalentProperty(`likes` ↔
 `BYORIDB_MAX_MEMORY_MB=8192`, `BYORIDB_CACHE_SIZE_MB=32768`, pod restart 0, Ready=true를
 확인했다. 해당 smoke space는 종료 시 `DROP SPACE IF EXISTS`로 정리했다.
 
-**현재 운영 장애(2026-07-10 22:03 KST)**: `byoridb-public`/`byoridb-headless` endpoint가
+**역사적 운영 장애 기록(2026-07-10 22:03 KST, 현재 상태 미재검증)**:
+`byoridb-public`/`byoridb-headless` endpoint가
 없고 `byoridb-server-0`은 `Ready 0/1`, restart 44회다. 현재/이전 컨테이너 로그가 모두
 `Opening redb KVStore at "/app/data"`에서 멈추며, 직전 실행은 약 65분 후 startup probe로
 exit 137 종료됐다. StatefulSet desired image는 `sha-025ecc8`지만 pod는 `sha-d5ff4e6`이고,
@@ -159,12 +160,20 @@ pod 삭제/rollout restart 등 상태 변경은 수행하지 않았다.
 
 ## 알려진 제약
 
-- **Temporal v1은 실험 단계**: main에 병합됐지만 프로덕션 스모크 전이다. 공개 표면은
-  vertex `FETCH ... AS OF`만 지원하고, current/history dual-write가 비원자적이며 같은
-  millisecond 이력 키 충돌과 O(versions/entity) 조회 비용이 있다. 상세는 T 섹션.
+- **Temporal 기능 표면은 아직 제한적**: vertex/edge `FETCH ... AS OF`와 원자적
+  current/history 기록은 구현됐다. 사용자가 valid time을 직접 지정하는 `VALID FROM/TO`,
+  temporal MATCH/GO, `BETWEEN`, 이력 열람 API, 리텐션/GC, temporal 집계와 과거 파생 사실은
+  미구현이다. 상세는 T 섹션.
+- **클러스터 제어 명령**: `BALANCE LEADER/DATA/STATUS/STOP/RESET`은 파싱되지만 실제
+  balance-job RPC가 연결되지 않았다. executor는 성공/IDLE placeholder 대신 명시적
+  unsupported 오류를 반환한다.
+- **관리 조회 경계**: `SHOW USERS`는 GOD/ADMIN에 한해 built-in root와 KV에 영속된
+  사용자를 반환한다. `SHOW SESSIONS`는 Graph 서비스의 live session manager 경로에서만
+  제공되며 executor-only 사용은 명시적 오류다.
 - **Geography 디코딩**: 인코딩만 구현. WKB/WKT 파싱은 미구현(`byoridb-codec/src/row.rs`). 외부 요구 발생 시 진행.
 - **모니터링 대시보드**: Prometheus 메트릭은 `/metrics`로 노출되지만 Grafana 템플릿/알람 규칙이 없음.
-- **로그 수집 파이프라인**: JSON 로그는 출력되지만 Filebeat/Fluentd 같은 중앙 집중 파이프라인 연동 설정이 없음.
+- **로그 형식/수집 파이프라인**: standalone launcher는 stdout text formatter만 연결돼
+  있고 JSON format 전환과 Filebeat/Fluentd 같은 중앙 집중 파이프라인 설정은 없음.
 - **트랜잭션**: 분산 그래프 DB의 2PC 비용이 크다고 판단해 의도적으로 미지원.
 - **MATCH pattern reorder**: 가장 selective한 노드부터 시작하도록 자동 reorder가 없음.
 - **label-only MATCH tag-vid 인덱스** ✅ 적용 완료 (2026-05-29): INSERT VERTEX 시 `{space}:tagvid:{tag_name}:{vid}` 보조 인덱스 작성. label-only MATCH 패턴 (`MATCH (p:product)`) 에서 전체 vertex 스캔 대신 tag-vid prefix scan 사용. 기존 데이터(인덱스 기록 전 삽입)는 빈 scan → 풀스캔 폴백 보장. NebulaGraph 벤치마크 대비 MATCH 157배 지연 원인이었음.
@@ -180,6 +189,10 @@ pod 삭제/rollout restart 등 상태 변경은 수행하지 않았다.
 - **workspace dependency 규율 부채** (감사 2026-07-10): member `Cargo.toml`에
   root `[workspace.dependencies]`를 우회한 직접 버전 지정이 28개 남아 있다. 신규 의존성은
   이 패턴을 늘리지 말고, 기존 항목 정리는 별도 manifest-only 변경으로 진행한다.
+- **직렬화 의존성 부채** (감사 2026-07-27): `cargo audit`의 알려진 취약점은 0건이지만
+  `bincode 1.3.3`은 RUSTSEC-2025-0141(unmaintained) 경고 대상이다. 안전한 drop-in upgrade가
+  없고 KV/벡터 인덱스/Raft 영속 형식에 사용되므로, 교체는 기존 데이터 호환·마이그레이션
+  설계를 포함한 별도 작업으로 진행한다.
 - **nGQL 문자열 escape** ✅ 해소 (2026-06-22): lexer 정규식 `"[^"]*"`/`'[^']*'`가 escape·내부 따옴표·백슬래시를 못 받아, 값에 `"`나 `\`가 있으면 토큰이 끊겨 "Unexpected end of input"으로 실패했음(예: `Chef's`는 OK지만 `6\" pan`, `C:\dir`은 깨짐). `"([^"\\]|\\.)*"`로 확장 + `parser::unquote`가 `\"`/`\\`/`\n`/`\t` 등 해석(흩어진 5개 호출처 통합). **nexprice 도그푸딩으로 발견** — LDBC(INT64·따옴표 없는 VID)만 검증해 와 드러나지 않았던 갭.
 - **INSERT 실행기 문자열 VID 미지원** (미해결): `CREATE SPACE ... vid_type=FIXED_STRING`은 파서·메타가 받지만, `plan.rs`가 INSERT VERTEX/EDGE의 VID를 `Literal::Int`(i64)로 강제(`"Vertex ID must be an integer literal"`)해 문자열 VID 스페이스엔 한 건도 못 넣는다. 우회: 애플리케이션이 문자열 id를 결정적 해시(blake2b 63bit 양수) INT64로 매핑하고 원본 id는 속성으로 보존. 근본 수정은 VID 타입(i64|String) 전파 필요(plan/executor/codec/key 전반, blast radius 큼). nexprice 도그푸딩으로 발견.
 - **MATCH edge accessor projection 제한** (관찰 2026-07-06): `MATCH (a)-[e:edge]->(b) RETURN src(e), dst(e)`가
@@ -805,8 +818,8 @@ ClickHouse식 granule 병렬 스캔 + partial aggregation 병합을 그래프 �
 **주요 리스크**: 범위 균등 분할(redb는 중앙값 키를 싸게 안 줌 — 순차 vid 가정 시작),
 IO-bound 천장(cold cache 디스크 대역폭 상한), `max_memory_mb`(G-11) 피크 N배, fan-out
 캡(코어 수), 작은 스캔 역효과. **상세 설계·미결 결정(D1~D6)·검증 계획**은
-`aidlc-docs/construction/parallel-execution/design.md` (내부). 착수 전 D1~D6 확정 +
-`/cah:construction`. 운영 부하가 실제 병목으로 확인되면 P-1만 우선 승격.
+설계 결정은 구현에 들어갈 때 P-1 전용 문서로 저장한다. 착수 전 D1~D6 확정 +
+Construction gate를 거친다. 운영 부하가 실제 병목으로 확인되면 P-1만 우선 승격.
 
 ### T. bitemporal 시간축 (P2 — 제품 방향 핵심, 2026-07-10 신설)
 
@@ -816,9 +829,9 @@ IO-bound 천장(cold cache 디스크 대역폭 상한), `max_memory_mb`(G-11) �
 bitemporal을 억지로 얹는 것을 네이티브로 제공하는 게 목표. (GBrain은 마크다운+Postgres로 진짜
 추론/시간 아예 포기 — moat를 검색·MCP·배포에 둠. 범용 메모리 정면 경쟁은 비추.)
 
-각 TAG/엣지의 상태가 시간에 따라 어떻게 변했는지를 1급으로 다룬다. v1은 asserted
-vertex/edge 변경 이력을 저장하고 vertex point lookup의 시점 읽기까지 구현했다. 전체 그래프
-시점 질의와 사용자가 valid time을 지정하는 표면은 아직 없다.
+각 TAG/엣지의 상태가 시간에 따라 어떻게 변했는지를 1급으로 다룬다. v1.1은 asserted
+vertex/edge 변경 이력을 원자적으로 저장하고 vertex/edge point lookup의 시점 읽기까지
+구현했다. 전체 그래프 시점 질의와 사용자가 valid time을 지정하는 표면은 아직 없다.
 
 **확정 스코프**:
 - **bitemporal**: valid time(현실 유효기간) + transaction time(기록 시점) 둘 다 1급.
@@ -842,21 +855,20 @@ redb `HISTORY_TABLE`로 물리 분리**(current view는 기존 `KV_TABLE` 그대
 
 **D1~D7 결정과 v1 구현 범위**: valid_to 명시 저장, temporal 집계는 현재 카운트만,
 리텐션/GC 없이 full 보관, 시간은 i64 epoch millis다. KV API는 valid/tx 두 축을 분리하지만
-nGQL v1은 `FETCH ... AS OF <ts>` 하나를 두 축에 같이 적용하고, 쓰기도 valid=tx=now로 기록한다.
-명시적 `VALID FROM/TO`와 lazy migration 표면은 v2로 이월했다. 상세는
-`aidlc-docs/construction/temporal/design.md`.
+nGQL v1.1은 `FETCH ... AS OF <ts>` 하나를 두 축에 같이 적용하고, 쓰기도
+valid=tx=now로 기록한다. 명시적 `VALID FROM/TO`와 lazy migration 표면은 후속으로
+이월했다. 구현 계약은 `byoridb-kvstore/src/store.rs`,
+`byoridb-executor/src/executor/temporal.rs`와 이 섹션을 기준으로 한다.
 
 **미래 최적화(자리만)**: 숫자-핫 속성 valid-time 값축에 Gorilla 무손실 압축 opt-in. 정확/범주형·tx축엔
 부적합. 저장증가 측정 후에만. 구간(계단함수)이 이미 무손실 신호 뼈대 → 압축은 그 위.
-
-**상세 설계·결정(D1~D7)·검증 결과**는 `aidlc-docs/construction/temporal/design.md` (내부).
 
 **✅ v1 구현·main 병합 완료 (2026-07-10, PR#22 `025ecc8`; 프로덕션 스모크 대기):**
 - T-1: kvstore `HISTORY_TABLE` + `put_version`/`scan_history`/`get_as_of`/`batch_put_version`.
 - T-2/T-3/T-4: 쓰기경로(DML INSERT/UPDATE/DELETE VERTEX·EDGE가 current view + 이력 append,
   DELETE=tombstone) / 읽기표면(vertex `FETCH … AS OF <ts>`) / parser·executor·kvstore 회귀.
 - current view(KV_TABLE) 무회귀, 이력 별도 테이블, 추론(B) 비접촉 유지.
-- **v2 남김**: `VALID FROM/TO`, `BETWEEN`, temporal MATCH/GO, edge AS OF 읽기,
+- **후속으로 남김**: `VALID FROM/TO`, `BETWEEN`, temporal MATCH/GO,
   이력 열람 API, 리텐션/GC, temporal 집계, 과거 파생 사실, 신호 압축.
 
 **✅ v1.1 안정성 완료 (2026-07-13; 코드 감사 2026-07-10의 4개 항목 해소):**
@@ -950,8 +962,8 @@ G-11)가 운영 메모리 방어선이다.
 - `byoridb-codec/src/row.rs` — Geography bounds check
 
 **S-15 [High, M] Brute-force 방어** ✅ 완료 (2026-05-13)
-로그인 실패 횟수 제한 없음. IP/username 기반 rate limiting.
-- `byoridb-graph/src/auth.rs` — 5회 실패 시 5분 잠금, 성공 시 카운터 초기화
+수정 전에는 로그인 실패 횟수 제한이 없었다. 현재 username별 5회 실패 시 5분 잠금과
+성공 시 카운터 초기화가 구현돼 있다. IP/QPS rate limiter는 아직 별도 제공하지 않는다.
 
 **S-16 [High, S] Heartbeat 스푸핑 방어** ✅ 완료 (2026-05-13)
 Meta gRPC heartbeat에 인증 없음. 가짜 노드 클러스터 등록 가능.
@@ -961,10 +973,22 @@ Meta gRPC heartbeat에 인증 없음. 가짜 노드 클러스터 등록 가능.
 **S-17 [Medium, S] 세션 sliding window** ✅ 완료 (2026-05-13)
 `last_accessed` 필드 있으나 `expires_at` 미갱신. 장시간 작업 중 세션 끊김.
 - `byoridb-graph/src/session.rs` — get_session 호출 시 expires_at 연장
+- `byoridb-graph/src/auth.rs` — auth bearer TTL도 같은 access에서 연장해 양 session store 정렬
 
 **S-18 [Medium, S] HTTP 쿼리 문자열 길이 제한** ✅ 완료 (2026-05-13)
 HTTP API에 쿼리 크기 제한 없음 (gRPC는 64MB 제한 있음).
 - `byoridb-graph/src/server.rs` — MAX_QUERY_LEN=1MiB, 초과 시 413 반환
+
+**S-19 [Critical~Medium, L] 인증 경계 재감사** ✅ 완료 (2026-07-27)
+- standalone launcher는 비어 있지 않은 `BYORIDB_ROOT_PASSWORD` 없이는 listener/storage를
+  시작하지 않고, HTTP/gRPC가 하나의 `GraphService`와 bearer/session 상태를 공유한다.
+- KV 사용자는 시작 시 hydration되고 CREATE/ALTER/DROP/GRANT/REVOKE 직후 live auth cache와
+  수렴한다. credential/role 변경은 기존 bearer를 폐기하되 동시 새 로그인은 보존한다.
+- compound 및 PROFILE 내부까지 RBAC를 재귀 검사하고, GOD는 built-in root 전용이다.
+  사용자·role·session 열람과 diagnostics는 GOD/ADMIN에 한정하며 session ID/쿼리 원문을
+  노출하지 않는다.
+- unknown/wrong/disabled/locked 로그인은 transport에서 같은 응답을 반환하고 Argon2 dummy
+  verify로 계산량을 맞춘다. auth/graph sliding TTL과 만료·고아 세션 정리도 함께 수렴한다.
 
 ### A. 운영 도구 연동 (P1, 운영 시작 전 필수)
 
@@ -1194,7 +1218,8 @@ Azure AKS에 실제로 배포해보며 발견된 마찰 포인트.
 - **Phase 1 데이터 안정성**: WAL, graceful shutdown
 - **Phase 2 인증/보안**: 사용자/role-based 권한
 - **Phase 3 쿼리 완성도**: WHERE 절, edge CRUD
-- **Phase 4 모니터링**: Prometheus 메트릭, JSON 구조화 로그
+- **Phase 4 모니터링**: Prometheus metric helper와 구조화 log field 구현. 현재 standalone
+  launcher는 stdout text formatter만 사용하며 일부 storage/session/partition metric helper는 미연결.
 - **Phase 5 분산 시스템**: 파티셔닝, Raft 복제, 인덱스
 - **Phase 6 운영 보강**: 부하 테스트(31K QPS), 장애 복구, 백업/복구
 - **Phase 7 분산 핵심**: Raft 네트워크/스토리지/스냅샷/멤버십, Meta Client/Server
@@ -1274,9 +1299,9 @@ Phase 0–7 모두 ✅, 커밋 `1d90124`. 핵심 임팩트:
 
 ## 측정 환경
 
-- 워크스페이스 빌드: `cargo build --workspace`
-- 워크스페이스 테스트: `cargo test --workspace --all-features -- --test-threads=1`
-- KVStore temporal 프로토타입: `cargo run -p byoridb-kvstore --release --example temporal_readbench`
+- 워크스페이스 빌드: `cargo build --locked --workspace`
+- 워크스페이스 테스트: `cargo test --locked --workspace --all-features -- --test-threads=1`
+- KVStore temporal 프로토타입: `cargo run --locked -p byoridb-kvstore --release --example temporal_readbench`
 - 그래프 알고리즘 벤치: `cargo bench -p byoridb-executor --bench graph_traversal`
 - CRAP 측정: `scripts/crap_check.sh` + `scripts/crap_analyze.py`
 
@@ -1306,10 +1331,16 @@ Phase 0–7 모두 ✅, 커밋 `1d90124`. 핵심 임팩트:
 - pre-commit 훅이 `cargo fmt` 검사 — 커밋 전 `cargo fmt --all` 선실행.
 - 커밋 메시지: `<type>(<scope>): <subject>`. type은 feat/fix/refactor/chore/docs.
 - `.claude/`는 로컬 전용. 절대 커밋 금지.
-- `deploy.yml`에 `paths-ignore: ['docs/**', '*.md']` — **문서/`.md`만 바뀐 커밋은 배포 스킵**(이미지 무변경). 코드 파일(`*.rs`, `Cargo.toml` 등)이 하나라도 바뀌면 배포 트리거. 문서-only 정정이면 재배포 부담 0.
+- `deploy.yml`은 `main` push의 CI `workflow_run`이 성공한 경우에만 그 CI의 정확한
+  `head_sha`를 빌드·배포한다. 현재 path filter가 없으므로 docs-only push도 CI가 성공하면
+  배포된다. 수동 `workflow_dispatch`는 운영자가 의도적으로 실행하는 별도 경로다.
 
-**버전 / 릴리스 정책 (2026-07-01 확정 — 방안 A)**
+**버전 / 릴리스 상태 (2026-07-27 정정)**
 
-- **배포·버전의 유일한 진실 = 커밋 SHA.** `deploy.yml`이 `sha-$(git rev-parse --short HEAD)`(+`latest`)로 `main` HEAD를 연속 배포(CD). PLAN.md의 각 항목이 인용하는 `sha-<short>`가 배포 지표다.
-- **semver 릴리스는 운영하지 않는다.** `Cargo.toml`의 `version`(현 `0.2.4`)과 기존 git 태그 `v0.x`(v0.1.0/v0.2.0/v0.2.1)는 **릴리스 라인이 아니라 초기 스냅샷/개발값**이다. 셋을 동기화하지 않으며, 프로덕션이 "특정 semver를 추적"하지 않는다.
-- **규칙: 문서(README/book/PLAN 등)에 새 semver 숫자를 박지 말 것.** 기능 상태는 이 PLAN.md와 README 기능표·로드맵으로 표현한다(과거 README 본문의 `v0.2.15` 같은 실체 없는 버전이 이렇게 생겼다). 외부 소비자용 안정 릴리스가 생기면 그때 방안 B(마일스톤 태그 + Cargo bump + CHANGELOG)로 승격.
+- 운영 배포 이미지는 커밋 SHA(`sha-<short>`)로 식별한다. 배포 상태를 확인할 때는
+  문서의 과거 서술보다 실제 workload image SHA와 CI 결과를 우선한다.
+- 소스 배포용 semver 태그와 Cargo 버전도 존재하며 현재 최신 태그/Cargo 버전은
+  `v0.3.3`/`0.3.3`이다. 다만 temporal v1.1과 edge `AS OF`는 그 태그 이후 main에
+  병합됐으므로 해당 기능의 배포 단위는 아직 `76e7a79` 계열 SHA다.
+- 새 기능 상태는 README와 이 문서에 기록하고, 새 릴리스가 실제로 만들어질 때만
+  Cargo 버전·태그·릴리스 산출물을 함께 갱신한다.

@@ -58,9 +58,13 @@ impl Parser {
                 self.advance();
                 ShowStatement::Classes
             }
-            Token::User => {
+            Token::User | Token::Users => {
                 self.advance();
                 ShowStatement::Users
+            }
+            Token::Role | Token::Roles => {
+                self.advance();
+                ShowStatement::Roles
             }
             Token::Parts => {
                 self.advance();

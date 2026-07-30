@@ -93,12 +93,20 @@ impl Executor for ByoriDBExecutorAdapter {
             &self.stmt,
             Statement::Show(byoridb_parser::ast::ShowStatement::Sessions)
         ) {
+            if !self
+                .caller_roles
+                .iter()
+                .any(|role| role == "GOD" || role == "ADMIN")
+            {
+                return Err(crate::error::GraphError::AuthFailed(
+                    "SHOW SESSIONS requires GOD or ADMIN role".to_string(),
+                ));
+            }
             let rows = if let Some(ref sm) = self.session_manager {
                 sm.list_sessions()
                     .into_iter()
-                    .map(|(sid, user, space)| {
+                    .map(|(_sid, user, space)| {
                         vec![
-                            byoridb_common::Value::Int(sid),
                             byoridb_common::Value::String(user),
                             byoridb_common::Value::String(space.unwrap_or_else(|| "-".to_string())),
                         ]
@@ -108,11 +116,7 @@ impl Executor for ByoriDBExecutorAdapter {
                 vec![]
             };
             let dataset = byoridb_common::DataSet::with_rows(
-                vec![
-                    "SessionID".to_string(),
-                    "User".to_string(),
-                    "Space".to_string(),
-                ],
+                vec!["User".to_string(), "Space".to_string()],
                 rows,
             );
             return Ok(dataset);

@@ -273,10 +273,14 @@ pub enum Token {
     // User management
     #[token("USER", ignore(case))]
     User,
+    #[token("USERS", ignore(case))]
+    Users,
     #[token("PASSWORD", ignore(case))]
     Password,
     #[token("ROLE", ignore(case))]
     Role,
+    #[token("ROLES", ignore(case))]
+    Roles,
     #[token("GOD", ignore(case))]
     God,
     #[token("ADMIN", ignore(case))]

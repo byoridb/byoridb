@@ -6,28 +6,25 @@
 
 ### 단독(Standalone) 모드
 
-모든 서비스가 단일 프로세스에서 실행됩니다 — 개발 및 테스트에 적합합니다:
+모든 서비스가 단일 프로세스에서 실행됩니다. 현재 지원되는 운영 경로입니다:
 
 ```bash
-byoridb-server --data-dir /var/lib/byoridb
+BYORIDB_ROOT_PASSWORD='<secret>' \
+BYORIDB__STORAGE__DATA_PATHS=/var/lib/byoridb \
+  byoridb-server
 ```
 
 ### 분산(Distributed) 모드
 
-프로덕션 확장성을 위해 서비스를 분리합니다:
-
-```bash
-# Meta Service (1-3 nodes for HA)
-byoridb-meta --config /etc/byoridb/meta.toml
-
-# Storage Service (3+ nodes)
-byoridb-storage --config /etc/byoridb/storage.toml
-
-# Graph Service (2+ nodes, stateless)
-byoridb --config /etc/byoridb/graph.toml
-```
+Raft, partition allocator와 분산 조회 구성요소는 있지만 Storage/Raft bootstrap을 포함한
+multi-node launcher와 배포 wiring은 완성되지 않았습니다. 별도 `byoridb-meta`,
+`byoridb-storage`, `byoridb` 실행 파일로 클러스터를 구성하는 명령은 제공하지 않습니다.
 
 ## 하드웨어 권장 사양
+
+아래 수치는 초기 capacity-planning 예시이며 검증된 SLO나 multi-node 권장 구성은
+아닙니다. standalone에서는 세 역할의 합산 메모리와 실제 dataset working set을 기준으로
+부하 테스트하세요.
 
 ### Meta Service
 
@@ -55,143 +52,55 @@ byoridb --config /etc/byoridb/graph.toml
 
 ## Docker 배포
 
-### Docker Compose
-
-```yaml
-version: '3.8'
-
-services:
-  meta:
-    image: byoridb/meta:latest
-    ports:
-      - "9559:9559"
-    volumes:
-      - meta-data:/data
-
-  storage:
-    image: byoridb/storage:latest
-    ports:
-      - "9779:9779"
-    volumes:
-      - storage-data:/data
-    depends_on:
-      - meta
-
-  graph:
-    image: byoridb/graph:latest
-    ports:
-      - "9669:9669"
-      - "19669:19669"
-    depends_on:
-      - meta
-      - storage
-
-volumes:
-  meta-data:
-  storage-data:
-```
-
-다음 명령으로 시작합니다:
+### 단일 컨테이너
 
 ```bash
-docker-compose up -d
+docker build -t byoridb-server:local .
+docker run --name byoridb-server \
+  -p 9669:9669 -p 19669:19669 \
+  -e BYORIDB_ROOT_PASSWORD='<secret>' \
+  -e BYORIDB__STORAGE__DATA_PATHS=/app/data \
+  -v byoridb-data:/app/data \
+  byoridb-server:local
+```
+
+저장소의 현재 `docker-compose.yml`은 서로 복제하지 않는 독립 standalone 인스턴스 3개를
+띄우는 개발용 파일입니다. 클러스터나 고가용성 구성으로 해석하면 안 됩니다.
+root 비밀번호의 checked-in 기본값은 두지 않습니다. 실행 전에 secret을 환경변수로
+주입해야 하며, 누락하거나 빈 값이면 Compose가 시작을 거부합니다.
+
+```bash
+export BYORIDB_ROOT_PASSWORD='<secret>'
+docker compose up --build
 ```
 
 ## Kubernetes 배포
 
-### 기본 StatefulSet
-
-```yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: byoridb-storage
-spec:
-  serviceName: byoridb-storage
-  replicas: 3
-  selector:
-    matchLabels:
-      app: byoridb-storage
-  template:
-    metadata:
-      labels:
-        app: byoridb-storage
-    spec:
-      containers:
-      - name: storage
-        image: byoridb/storage:latest
-        ports:
-        - containerPort: 9779
-        volumeMounts:
-        - name: data
-          mountPath: /data
-  volumeClaimTemplates:
-  - metadata:
-      name: data
-    spec:
-      accessModes: ["ReadWriteOnce"]
-      resources:
-        requests:
-          storage: 100Gi
-```
+`deploy/azure/k8s`의 manifest는 `replicas: 1`인 standalone StatefulSet과 PVC를
+배포합니다. image tag는 CI-gated deploy workflow가 성공한 commit SHA로 치환하므로 raw
+StatefulSet 파일만 직접 apply하지 마세요. `byoridb-root` Secret에 비어 있지 않은
+`BYORIDB_ROOT_PASSWORD`가 필요합니다.
 
 ## 프로덕션 설정
 
-### Meta Service
+지원되는 standalone 설정 예시입니다.
 
 ```toml
 [server]
-bind_addr = "0.0.0.0:9559"
-data_dir = "/var/lib/byoridb/meta"
-
-[cluster]
-peers = ["meta1:9559", "meta2:9559", "meta3:9559"]
-
-[raft]
-election_timeout_ms = 2000
-heartbeat_interval_ms = 200
-```
-
-### Storage Service
-
-```toml
-[server]
-bind_addr = "0.0.0.0:9779"
-data_dir = "/var/lib/byoridb/storage"
-
-[meta]
-addrs = ["meta1:9559", "meta2:9559", "meta3:9559"]
-
-[storage]
-block_cache_size = "4GB"
-write_buffer_size = "128MB"
-```
-
-### Graph Service
-
-```toml
-[server]
-grpc_addr = "0.0.0.0:9669"
+graph_addr = "0.0.0.0:9669"
 http_addr = "0.0.0.0:19669"
 
-[meta]
-addrs = ["meta1:9559", "meta2:9559", "meta3:9559"]
-
 [storage]
-addrs = ["storage1:9779", "storage2:9779", "storage3:9779"]
+data_paths = ["/var/lib/byoridb"]
 ```
 
 ## 보안
 
-### TLS 설정
+### TLS 경계
 
-```toml
-[tls]
-enabled = true
-cert_file = "/etc/byoridb/server.crt"
-key_file = "/etc/byoridb/server.key"
-ca_file = "/etc/byoridb/ca.crt"
-```
+ByoriDB server에는 아직 native TLS 설정이 없습니다. 외부에 노출할 때는 ingress/reverse
+proxy나 service mesh에서 TLS를 종료하고, server port는 private network와 방화벽으로
+제한하세요. native TLS가 있는 것으로 가정한 `byoridb.toml` 설정은 동작하지 않습니다.
 
 ### 인증
 
@@ -211,8 +120,5 @@ export BYORIDB_ROOT_PASSWORD='strong-password'
 curl http://localhost:19669/health
 ```
 
-### gRPC 헬스 체크
-
-```bash
-grpc_health_probe -addr=localhost:9669
-```
+tonic 표준 gRPC health service는 아직 등록돼 있지 않으므로 `grpc_health_probe`는 사용할
+수 없습니다. liveness/readiness에는 HTTP `/health`와 `/ready`를 사용하세요.
