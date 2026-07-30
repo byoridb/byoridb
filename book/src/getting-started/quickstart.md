@@ -1,71 +1,75 @@
-# 빠른 시작
+[한국어](../ko/getting-started/quickstart.html)
 
-5분 안에 ByoriDB를 실행해 봅니다.
+# Quickstart
 
-## 사전 요구사항
+This walkthrough starts a local standalone server, connects with the simple CLI
+REPL, and creates a small graph.
 
-- Rust 1.90+ ([rustup](https://rustup.rs/)을 통해 설치)
-- protobuf-compiler (gRPC 코드 생성용)
+## Prerequisites
 
-## 소스에서 빌드
+- Rust 1.90 through [rustup](https://rustup.rs/)
+- `protoc` (`protobuf-compiler`)
+- A cloned ByoriDB repository
 
-```bash
-git clone https://github.com/byoridb/byoridb.git
-cd byoridb
-cargo build --locked --release
-```
+See [Installation](./installation.md) for platform-specific setup.
 
-## 서버 시작
-
-embedded Storage와 Graph gRPC/HTTP를 한 프로세스에서 실행합니다. Meta gRPC는
-`cluster.peers`를 설정한 경우에만 함께 시작됩니다:
+## Build and start the server
 
 ```bash
-BYORIDB_ROOT_PASSWORD='<root-password>' cargo run --locked --bin byoridb-server --release
+cargo build --locked --workspace --release
+export BYORIDB_ROOT_PASSWORD='replace-with-a-long-random-secret'
+cargo run --locked --release -p byoridb --bin byoridb-server
 ```
 
-서버는 다음에서 시작됩니다:
-- gRPC: `localhost:9669`
-- HTTP: `localhost:19669`
+The standalone launcher combines the storage and graph layers in one process.
+Its current defaults are:
 
-## CLI로 연결
+| Interface | Default listener |
+| --- | --- |
+| gRPC | `0.0.0.0:9669` |
+| HTTP | `0.0.0.0:19669` |
 
-새 터미널에서:
+Both listeners are plaintext. Keep them on a trusted network, or bind to
+loopback as shown in [Configuration](./configuration.md). The server requires a
+non-empty `BYORIDB_ROOT_PASSWORD`; the value is not printed to logs.
+
+## Connect with the CLI
+
+Open another terminal in the repository:
 
 ```bash
-BYORIDB_USER=root BYORIDB_PASSWORD='<root-password>' \
-  cargo run --locked -p byoridb-client --bin byoridb-cli
+export BYORIDB_USER=root
+export BYORIDB_PASSWORD='same-secret-used-to-start-the-server'
+cargo run --locked --release -p byoridb-client --bin byoridb-cli
 ```
 
-## 첫 번째 그래프
+The prompt is `byoridb>`. Enter one logical query per line.
+
+## Create and query a graph
+
+Run these statements in order:
 
 ```sql
--- Create a space
-CREATE SPACE social(vid_type=INT64);
+CREATE SPACE social (vid_type = INT64);
 USE social;
 
--- Define schema
 CREATE TAG person(name STRING, age INT64);
 CREATE EDGE knows(since INT64);
 
--- Insert vertices
-INSERT VERTEX person(name, age) VALUES 1:('Alice', 30);
-INSERT VERTEX person(name, age) VALUES 2:('Bob', 25);
-INSERT VERTEX person(name, age) VALUES 3:('Carol', 28);
+INSERT VERTEX person(name, age) VALUES 1:("Alice", 30), 2:("Bob", 25), 3:("Carol", 28);
+INSERT EDGE knows(since) VALUES 1->2:(2020), 2->3:(2021);
 
--- Insert edges
-INSERT EDGE knows(since) VALUES 1->2:(2020);
-INSERT EDGE knows(since) VALUES 2->3:(2021);
-
--- Query: Who does Alice know?
-GO FROM 1 OVER knows YIELD $$.person.name;
-
--- Query: Find path from Alice to Carol
+FETCH PROP ON person 1, 2, 3;
+GO FROM 1 OVER knows YIELD knows._dst AS friend_id;
+MATCH (p:person) WHERE p.person.age >= 28 RETURN p.person.name AS name, p.person.age AS age;
 FIND SHORTEST PATH FROM 1 TO 3 OVER knows;
 ```
 
-## 다음 단계
+Type `quit` or `exit` to close the CLI.
 
-- [설치](./installation.md) - 자세한 설치 안내
-- [설정](./configuration.md) - 필요에 맞게 ByoriDB 구성하기
-- [nGQL 문법](../guide/ngql-syntax.md) - 쿼리 언어 배우기
+## Next steps
+
+- [Configuration](./configuration.md)
+- [CLI](../guide/cli.md)
+- [nGQL syntax](../guide/ngql-syntax.md)
+- [Users and roles](../guide/ngql/users.md)

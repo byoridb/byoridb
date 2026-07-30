@@ -1,34 +1,132 @@
-# 로드맵
+# Roadmap
 
-ByoriDB의 현재 상태를 요약합니다. 우선순위와 완료 근거의 단일 진실원은
-[docs/PLAN.md](https://github.com/byoridb/byoridb/blob/main/docs/PLAN.md)입니다.
+[한국어](../ko/development/roadmap.html)
 
-## 구현된 핵심
+This page summarizes the direction visible in the current source tree. It is
+not a release schedule or a compatibility promise. `docs/PLAN.md` is the
+detailed engineering source of truth; historical incident notes in that file
+should not be interpreted as a statement about a live environment today.
 
-- nGQL DDL/DML과 `MATCH`, `GO`, `FETCH`, `LOOKUP`, `FIND PATH`
-- redb 기반 current view와 원자적 bitemporal history 기록
-- asserted vertex/edge `FETCH ... AS OF <epoch-ms>`
-- class hierarchy, RDFS-Plus/선택적 OWL 2 RL materialization, `WHY`, DRed, shape 검사
-- 구조·embedding(HNSW)·hybrid recommendation
-- HTTP/gRPC/CLI, Prometheus metrics, full snapshot backup/restore
-- Raft, partition allocator, failure detector 등 분산 라이브러리 구성요소
+This summary was last checked against `main` at `8209f28` on 2026-07-30.
 
-## 우선 남은 기능
+## Available on the current main line
 
-- temporal `MATCH`/`GO`, `VALID FROM/TO`, `BETWEEN`, history API, retention/GC와
-  과거 추론 사실
-- Storage/Raft bootstrap을 포함한 실제 multi-node launcher와 배포 wiring
-- `FIXED_STRING` VID 실행 경로, edge `LOOKUP`, FIND `WHERE/YIELD`, MATCH edge accessor
-- 실제 balance-job 제어 RPC (`BALANCE`는 현재 명시적 unsupported 오류)
-- TLS, Grafana/알람 규칙과 중앙 로그 수집
+### Graph and query core
 
-이미 완료된 기능을 오래된 버전 번호로 다시 분류하지 않습니다. 릴리스 상태는 Git 태그와
-README의 release 주의를 함께 확인하세요.
+- spaces, tags, edge types, vertices, edges, and tag/edge indexes;
+- vertex `INSERT`, `UPDATE`, and `DELETE`, plus edge `INSERT` and `DELETE`;
+- `FETCH`, `GO`, `MATCH`, `LOOKUP`, and path finding;
+- variable-length MATCH paths, reverse-edge traversal, grouping and common
+  aggregates;
+- `EXPLAIN` access-path reporting and runtime `PROFILE` observations;
+- multi-row batched DML and resource guards for scans, traversal, and result
+  materialization.
 
-## 기여하기
+### Ontology and recommendations
 
-기능 개발에 기여하고 싶으신가요? [기여 가이드](./contributing.md)를 확인하세요.
+- class hierarchies, disjointness, equivalent classes and properties;
+- transitive, symmetric, inverse, subproperty, domain/range, and two-link
+  property-chain semantics;
+- current-view forward materialization, inference provenance, `WHY`, and
+  incremental edge retraction support;
+- `owl:sameAs` canonical merging with documented irreversible behavior;
+- shape declarations, write-time checks, and consistency queries;
+- structural, embedding, and blended recommendations, including persisted HNSW
+  indexes for larger vector sets.
 
-## 기능 요청
+### Storage and temporal state
 
-아이디어가 있으신가요? `enhancement` 라벨을 붙여 이슈를 열어 주세요.
+- pure-Rust redb current-view storage with protobuf vertex/edge payloads;
+- a physically separate asserted-fact history table;
+- atomic redb application of the current entity mutation and matching history
+  version on the executor's temporal DML path;
+- monotonic transaction timestamps that avoid same-millisecond history-key
+  collisions;
+- vertex and edge `FETCH PROP ... AS OF <epoch-ms>`, including tombstones;
+- snapshot backup and restore that preserve current and history tables.
+
+### Service and operations
+
+- authenticated gRPC and HTTP query services sharing one service instance;
+- durable non-root users, built-in roles, recursive statement authorization,
+  session invalidation after security-state changes, and admin-only query
+  diagnostics;
+- Prometheus query metrics, health/readiness endpoints, and graceful draining;
+- an interactive Rust CLI, offline CSV bulk loader, Docker assets, and a
+  single-replica Azure AKS deployment definition.
+
+## Current product boundaries
+
+The following limitations are part of the current status, not completed
+features:
+
+- **Multi-node operation:** partition, RPC, Meta, migration, and custom Raft
+  components exist, but the launcher does not wire a complete Storage/Raft
+  cluster or route normal Graph queries through it.
+- **Temporal semantics:** valid time is not user-specified; one epoch-ms value
+  is used for valid and transaction time. Temporal `MATCH`/`GO`, intervals, and
+  historical inferred facts are absent.
+- **Sessions:** session and active-auth state is in process, is cleared on
+  restart, and is not shared across replicas.
+- **Transport security:** the server has no native TLS. Deployments need trusted
+  TLS termination, network restrictions, and external traffic controls.
+- **Transactions:** redb operations are transactional, but the query language
+  has no general multi-statement transaction or compound rollback.
+- **Edge updates:** `UPDATE EDGE` is accepted by the parser, but the current
+  plan/executor path only implements vertex updates.
+- **API maturity:** gRPC complex values use a JSON fallback in the structured
+  response; the older JSON byte field remains for compatibility.
+- **Operational packaging:** there is no supported Kubernetes operator, Helm
+  chart, or automated multi-node upgrade procedure.
+
+## Active engineering directions
+
+### Complete the distributed runtime
+
+The largest architecture gap is to connect and validate what is already present:
+
+- Storage RPC and per-partition Raft startup;
+- peer discovery, bootstrap, membership changes, and leader routing;
+- distributed Graph execution parity across query types;
+- replication/recovery/failover tests in real multi-process deployments;
+- a session and authorization design for multiple Graph replicas;
+- upgrade, snapshot, migration, and observability runbooks.
+
+This work must close before documentation can recommend replicas greater than
+one for shared data.
+
+### Expand bitemporal queries
+
+Likely next temporal increments include explicit valid-time intervals,
+independent transaction-time selection, interval queries, temporal graph
+traversal/pattern matching, and a defined policy for inferred history. Any
+extension must preserve current-view performance and backup compatibility.
+
+### Improve execution scalability
+
+Parallel execution and better cost-based planning remain measurement-driven
+work. Priorities include bounding memory, avoiding accidental full scans,
+improving large aggregation paths, and publishing reproducible benchmarks
+instead of fixed marketing QPS numbers.
+
+### Harden operations and security
+
+Further work includes native or formally documented TLS integration, external
+rate limiting, more complete space-scoped authorization administration,
+cluster-wide session revocation, backup automation, restore drills, and
+metrics whose declared storage/session/partition series are fed by runtime
+state.
+
+### Mature client and wire formats
+
+The Rust client is the implemented client surface. Rich first-class protobuf
+representations for complex values and additional language clients should
+follow an explicit compatibility policy rather than ad-hoc wire changes.
+
+## How to help
+
+Choose an issue or a concrete item in `docs/PLAN.md`, keep the change scoped,
+and follow the [contribution guide](contributing.html). For distributed, Raft,
+temporal, authentication, and storage changes, include the specialized
+regression tests and document the remaining boundary as carefully as the new
+capability.

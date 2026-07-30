@@ -1,0 +1,31 @@
+[book]
+title = "ByoriDB 문서"
+authors = ["ByoriDB Contributors"]
+description = "Rust로 작성한 ontology graph database 문서"
+language = "ko"
+multilingual = false
+src = "../src.ko"
+
+[rust]
+edition = "2021"
+
+[build]
+build-dir = "../book/ko"
+create-missing = false
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "coal"
+git-repository-url = "https://github.com/byoridb/byoridb"
+edit-url-template = "https://github.com/byoridb/byoridb/edit/main/book/ko/{path}"
+site-url = "/byoridb/ko/"
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 30
+use-hierarchical-tree = true
+expand = true

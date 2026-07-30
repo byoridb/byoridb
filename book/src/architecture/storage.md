@@ -1,157 +1,127 @@
-# 스토리지 엔진
+# Storage engine
 
-ByoriDB는 순수 Rust로 구현된 임베디드 키-값 저장소인 **redb**를 기반
-스토리지 엔진으로 사용합니다. C++ 툴체인 의존성이 없습니다.
+[한국어](../ko/architecture/storage.html)
 
-## redb 아키텍처
+ByoriDB uses [redb](https://www.redb.org/) as its production embedded key-value
+engine. redb is a pure-Rust, copy-on-write B-tree with ACID transactions and
+MVCC reads; it is not an LSM tree and ByoriDB does not expose RocksDB-style WAL,
+memtable, Bloom-filter, compression, or compaction settings.
 
-redb는 단일 파일 기반의 copy-on-write **B-tree** 저장소로, 완전한 ACID
-트랜잭션과 MVCC를 지원합니다. LSM 트리가 아닙니다.
+## Files and tables
 
-```
-┌─────────────────────────────────────────────┐
-│              Write Path                      │
-│  begin_write → insert/remove → commit        │
-│   (single writer, serialized; fsync on commit)│
-└─────────────────────────────────────────────┘
-                        ↓
-┌─────────────────────────────────────────────┐
-│            Copy-on-write B-tree              │
-│  Pages are versioned; readers see a stable   │
-│  MVCC snapshot while a writer commits.        │
-│  Free pages are reclaimed automatically.      │
-└─────────────────────────────────────────────┘
-```
-
-현재 상태는 원시 바이트 키를 쓰는 redb `kv` 테이블에 저장되며, bitemporal 버전은
-별도 `history` 테이블에 저장됩니다. prefix scan은 정렬된 키 공간(keyspace)에 대한
-범위 쿼리로 처리됩니다.
-
-## 키 인코딩
-
-### Vertex 키
+A configured data path is a directory. `RedbKVStore` opens or creates:
 
 ```text
-{space}:vertex:{vid}
+<data-path>/data.redb
 ```
 
-### Edge 키
+Only the first configured data path is currently opened. The database contains
+two primary tables:
+
+| Table | Purpose |
+|---|---|
+| `kv` | Current graph state, schemas, indexes, users, and materialized ontology state |
+| `history` | Immutable asserted vertex/edge versions and deletion tombstones |
+
+Keeping history in a separate B-tree prevents ordinary current-view prefix
+scans from sharing their tree pages with a growing history.
+
+## Logical keyspaces
+
+The standalone executor stores byte keys in the flat `kv` table. Important
+logical namespaces include:
 
 ```text
-{space}:edge:{src}:{edge_type}:{dst}:{ranking}
-{space}:in-edge:{dst}:{edge_type}:{src}:{ranking}
+space:<space>                              # space metadata
+space:<space>:tag:<tag>                    # tag schema
+space:<space>:edge:<edge-type>             # edge schema
+<space>:vertex:<vid>                       # current vertex
+<space>:edge:<src>:<type>:<dst>:<rank>     # current outgoing edge
+<space>:in-edge:<dst>:<type>:<src>:<rank>  # reverse-edge index
+<space>:tagvid:<tag>:<vid>                 # tag membership index
+__user_<username>                          # durable non-root user
 ```
 
-### History 키
+Additional namespaces hold secondary indexes, degree counters, vectors,
+ontology materialization, and inference provenance. These are internal formats,
+not a stable public storage API.
+
+New vertex and edge payloads use a magic-prefixed protobuf encoding.
+`VertexCodec` retains a JSON decoding fallback for legacy records. The general
+row codec also contains version-aware row support, but the standalone graph DML
+path stores its vertex and edge payloads through `VertexCodec`; operators should
+not assume an automatic on-read schema migration that is not exercised by that
+path.
+
+## Transaction behavior
+
+redb allows concurrent MVCC readers and serializes writers. With the default
+durability, each ByoriDB write transaction commits with redb
+`Durability::Immediate`.
+
+The executor batches multi-row inserts. Its temporal `batch_apply` operation
+opens both the `kv` and `history` tables in one redb write transaction, so the
+current-view entity changes supplied to that call and their history versions
+commit or fail together. Deletes append an empty-payload tombstone in the same
+operation.
+
+This is not a general transaction layer:
+
+- there is no `BEGIN`/`COMMIT` query syntax;
+- clauses in a compound statement execute sequentially without rollback;
+- some higher-level follow-up work, such as inference or auxiliary maintenance,
+  may run in additional storage operations.
+
+## Temporal model
+
+For asserted vertex and edge DML, ByoriDB preserves the current record and an
+append-only history version:
 
 ```text
-entity_key || 0x00 || desc(valid_from) || desc(transaction_time)
+history key   = entity-key + valid-from(desc) + transaction-time(desc)
+history value = valid-to + encoded entity payload
 ```
 
-값은 `valid_to`와 해당 시점의 binary payload이며, 삭제는 빈 payload tombstone으로
-기록됩니다. current view 변경과 history append는 한 redb write transaction으로
-커밋됩니다.
+The current temporal surface has these boundaries:
 
-### 값 인코딩
+- valid time and transaction time are both assigned from one monotonic
+  epoch-millisecond value;
+- multiple writes in the same wall-clock millisecond receive distinct,
+  increasing transaction values;
+- an insert/update writes an open `[timestamp, infinity)` version;
+- a delete writes an empty tombstone;
+- `FETCH PROP ON <tag> <vid> AS OF <epoch-ms>` reads a historical vertex;
+- `FETCH PROP ON <edge-or-*> <src>-><dst> AS OF <epoch-ms>` reads historical
+  edges, including an edge that has since been deleted;
+- the one `AS OF` value is applied to both valid and transaction time.
 
-```
-[0xCA magic][protobuf VertexData 또는 EdgeData]
-```
+User-provided `VALID FROM`/`VALID TO`, `BETWEEN`, temporal `GO`/`MATCH`, and
+historical inferred-fact reconstruction are not implemented. The history is
+for asserted vertex/edge state; ontology inference continues to use the current
+view.
 
-현재 graph vertex/edge 쓰기 경로는 magic byte가 붙은 Protocol Buffers를 사용하며, 읽기는
-이전 JSON record도 fallback으로 디코딩합니다. `byoridb-codec`에는 별도의
-schema-versioned row codec도 있지만 위 current-view graph record 형식과는 구분됩니다.
+## Durability and cache
 
-## 성능 튜닝
+The server exposes two storage-specific environment variables outside the
+structured `BYORIDB__...` configuration tree:
 
-redb는 노출하는 설정 표면이 작습니다. 주요 조정 항목은 page cache 크기입니다.
+| Variable | Default | Meaning |
+|---|---:|---|
+| `BYORIDB_CACHE_SIZE_MB` | `256` | redb page-cache size in MiB; non-positive or invalid values fall back to the default |
+| `BYORIDB_DURABILITY` | immediate | `none`, `relaxed`, or `eventual` enables relaxed bulk-load durability |
 
-```bash
-export BYORIDB_CACHE_SIZE_MB=256  # redb page cache; increase for read-heavy workloads
-```
+Relaxed durability skips per-commit fsync for most commits and periodically
+forces a checkpoint. A crash can lose recent commits. Use it only for data that
+can be reloaded, not normal serving.
 
-내구성(Durability)은 기본값이 `Immediate`로, 모든 commit이 fsync되고 체크섬으로
-검증되어 별도의 write-ahead log 없이도 크래시 안전성을 제공합니다. (redb에는 LSM의
-memtable/bloom-filter/compression 조정 항목이 없습니다. 그것들은 RocksDB 고유의
-기능이었습니다.)
+On graceful shutdown the server performs an Immediate empty commit to leave
+redb's allocator state clean. Give the process enough termination time to drain
+queries and complete that checkpoint.
 
-## 데이터 레이아웃
+## Backup implications
 
-### Vertex 저장
-
-```
-Tag Data:
-┌─────────────────────────────────────────────┐
-│  Key: {space}:vertex:{vid}                  │
-│  Value: 0xCA + protobuf VertexData          │
-└─────────────────────────────────────────────┘
-```
-
-### Edge 저장
-
-효율적인 탐색(traversal)을 위해 Edge는 양방향으로 저장됩니다.
-
-```
-Out-Edge:
-┌─────────────────────────────────────────────┐
-│  Key: {space}:edge:{src}:{type}:{dst}:{rank}│
-│  Value: 0xCA + protobuf EdgeData            │
-└─────────────────────────────────────────────┘
-
-In-Edge (for reverse traversal):
-┌─────────────────────────────────────────────┐
-│  Key: {space}:in-edge:{dst}:{type}:{src}:{rank}│
-│  Value: same denormalized EdgeData           │
-└─────────────────────────────────────────────┘
-```
-
-### Index 저장
-
-```
-┌─────────────────────────────────────────────┐
-│  Key: space|index_id|property_value|vid     │
-│  Value: (empty or additional data)          │
-└─────────────────────────────────────────────┘
-```
-
-## 스키마 버전 row codec
-
-`byoridb-codec`의 row codec은 schema version을 읽어 이전 row를 현재 schema로 변환하는
-기능을 제공합니다.
-
-```
-Read Path:
-1. Read row from the KV store
-2. Extract schema_version from row
-3. If version < current:
-   - Decode with old schema
-   - Transform to current schema
-   - Return transformed data
-4. If version == current:
-   - Decode directly
-   - Return data
-```
-
-이는 codec 수준의 기능입니다. 현재 graph vertex/edge current-view record는 위의
-Protocol Buffers 형식을 사용하므로 모든 record가 이 row 경로를 거치거나 자동으로
-재작성된다고 가정하면 안 됩니다.
-
-## 공간 회수(Space Reclamation)
-
-redb에는 LSM compaction이 없습니다. copy-on-write B-tree이므로 free page를 추적하고
-이후 쓰기 시 자동으로 재사용하므로, 삭제된 키의 공간은 별도의 백그라운드 compaction
-프로세스 없이 회수됩니다.
-
-## 스냅샷
-
-`byoridb-backup`은 source redb에 MVCC read snapshot을 열고 current view와 history
-테이블을 새 redb 파일로 복사합니다.
-
-```bash
-byoridb-backup create --db /var/lib/byoridb --backup-dir /backup/byoridb
-byoridb-backup list --backup-dir /backup/byoridb
-byoridb-backup restore --backup-dir /backup/byoridb \
-  --backup-id <backup_id> --target /var/lib/byoridb-restored
-```
-
-space 단위 백업, 증분 백업과 WAL 기반 point-in-time recovery는 지원하지 않습니다.
+The backup implementation copies both `kv` and `history` from a read
+transaction into a new redb file. Copying only `data.redb` while it is changing,
+or preserving only the current table, is not a supported substitute. Follow
+the [Backup and restore](../operations/backup.html) procedure and test restores
+regularly.

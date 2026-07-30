@@ -1,125 +1,206 @@
-# 성능
+# Performance
 
-성능 특성 및 튜닝 가이드라인입니다.
+[한국어](../ko/reference/performance.html)
 
-## 벤치마크
+ByoriDB does not publish a stable QPS or latency table. Results depend on the
+dataset, query shape, redb file, durability, cache warmth, filesystem, and
+hardware. Any number used for capacity planning should come from a reproducible
+run against the intended build and workload.
 
-환경과 dataset이 없는 고정 latency/QPS 표는 제거했습니다. 재현 가능한 최신 명령과
-측정값은 [docs/PLAN.md](https://github.com/byoridb/byoridb/blob/main/docs/PLAN.md)의
-측정 환경/벤치 기반선을 기준으로 합니다.
-multi-node launcher가 완성되지 않았으므로 3노드 처리량을 검증된 수치로 제시하지 않습니다.
+## Benchmark tools in the repository
 
-## 튜닝 가이드라인
+### Criterion microbenchmarks
 
-### 메모리 튜닝
+`benches/benchmark.rs` measures object creation, parsing, plan building,
+serialization, filters, and arena allocation:
 
-#### redb page cache와 쿼리 메모리
-
-읽기 중심 워크로드에서는 노드 메모리 범위 안에서 `BYORIDB_CACHE_SIZE_MB`를 조정합니다.
-대형 결과의 OOM을 막는 `BYORIDB_MAX_MEMORY_MB`와 scan cap인
-`BYORIDB_MAX_SCAN_LIMIT`도 함께 고려하세요.
-
-### 쿼리 튜닝
-
-#### 인덱스 사용
-
-```sql
--- Without index: full scan
-LOOKUP ON person WHERE person.name == 'Alice';
-
--- With index: fast lookup
-CREATE TAG INDEX name_idx ON person(name);
-LOOKUP ON person WHERE person.name == 'Alice';
+```bash
+cargo bench --locked -p byoridb --bench benchmark
 ```
 
-#### 결과 제한
+### In-process end-to-end benchmarks
 
-```sql
--- Avoid unbounded queries
-MATCH (n:person) RETURN n;          -- May return millions
+`benches/e2e_benchmark.rs` creates temporary redb databases and exercises batch
+inserts, `FETCH`, `GO`, `LOOKUP`, and complete query-service calls:
 
--- Use LIMIT
-MATCH (n:person) RETURN n LIMIT 100;
+```bash
+cargo bench --locked -p byoridb --bench e2e_benchmark
 ```
 
-#### 알려진 VID에는 FETCH 사용
+These runs do not include network latency or a persistent production-sized
+database. Preserve Criterion output, commit SHA, Rust version, operating system,
+CPU, memory, filesystem, redb file size, cache settings, and durability with any
+reported result.
 
-```sql
--- If you know the vertex ID, use FETCH
-FETCH PROP ON person 1;
+### gRPC load generator
 
--- Instead of
-MATCH (n:person) WHERE id(n) == 1 RETURN n;
+The client package contains a simple concurrent load generator:
+
+```bash
+export BYORIDB_USER=root
+export BYORIDB_PASSWORD='same-secret-used-to-start-the-server'
+
+cargo run --locked --release -p byoridb-client --bin load_test -- \
+  --address http://127.0.0.1:9669 \
+  --concurrency 20 \
+  --duration 30 \
+  --setup 'USE example' \
+  --query 'FETCH PROP ON person 1'
 ```
 
-### 스토리지 튜닝
+It reports request count, errors, and average/per-second QPS. It is not a
+latency-distribution benchmark and does not provision test data for you.
 
-redb는 copy-on-write B-tree라 RocksDB식 compression, write-buffer, background
-compaction 설정을 제공하지 않습니다. 기본 durability는 commit마다 fsync하는
-`immediate`입니다. `BYORIDB_DURABILITY=relaxed`는 최근 commit 손실을 감수할 수 있는
-재적재 가능한 bulk import에서만 사용하세요.
+## Inspect a query before tuning
 
-### 배치 쓰기
-
-```sql
--- Instead of individual inserts
-INSERT VERTEX person VALUES 1:('Alice', 30);
-INSERT VERTEX person VALUES 2:('Bob', 25);
-
--- Use batch insert
-INSERT VERTEX person VALUES
-    1:('Alice', 30),
-    2:('Bob', 25),
-    3:('Carol', 28);
-```
-
-## 프로파일링
-
-### 쿼리 프로파일링
+`EXPLAIN` derives a logical operator tree and reports the selected access path
+without executing the statement:
 
 ```sql
-PROFILE GO FROM 1 OVER follow YIELD $$.person.name;
+EXPLAIN MATCH (p:person) WHERE p.name == "Alice" RETURN p;
 ```
 
-출력 컬럼은 `id`, `operator`, `rows`, `time(us)`, `access`, `detail`입니다.
+The `access` column distinguishes named indexes, the tag-VID index, point
+lookups, edge-prefix/reverse-edge access, and a full scan.
 
-### 실행 계획 설명(Explain Plan)
+`PROFILE` executes the query and overlays observations at instrumented points:
 
 ```sql
-EXPLAIN MATCH (a:person)-[e:follow]->(b:person)
-WHERE a.name == 'Alice'
-RETURN b.name;
+PROFILE GO FROM 1 OVER knows YIELD dst(edge);
+PROFILE MATCH (p:person) RETURN count(p);
 ```
 
-## 성능 모니터링
+Its columns are `id`, `operator`, `rows`, `time(us)`, `access`, and `detail`.
+The executor is imperative rather than a Volcano iterator tree, so not every
+operator has independently attributable timing. Treat missing timing as
+unmeasured, not zero.
 
-주시해야 할 주요 지표:
+## Query practices
 
-- `byoridb_query_latency_seconds` - 쿼리 지연 시간
-- `byoridb_query_errors_total` - query 오류 수
-- `byoridb_slow_queries_total` - slow threshold 초과 수
-- `byoridb_inflight_queries` - 현재 실행 중인 query 수
-- `byoridb_rows_written_total` - operation별 기록 행 수
+### Prefer point access when the VID is known
 
-`byoridb_storage_bytes`와 partition metric 갱신 함수는 아직 standalone 경로에 연결되지
-않았습니다. 디스크 사용량과 container resource는 외부 exporter로 수집하세요.
+```sql
+FETCH PROP ON person 42;
+```
 
-## 자주 발생하는 문제
+`FETCH` builds exact current-view keys and uses a batch get for multiple VIDs.
+A general `MATCH` has more planning and scan/expansion work. Batches containing
+hundreds of IDs and their response-size/performance bounds still need the
+LDBC-scale regression coverage tracked in
+[issue #10](https://github.com/byoridb/byoridb/issues/10).
 
-### 높은 지연 시간
+### Create and use secondary indexes
 
-1. working set 대비 redb page cache 크기 확인
-2. full scan 여부 확인 (EXPLAIN 사용)
-3. 쿼리 패턴에 맞는 인덱스가 존재하는지 검증
+```sql
+CREATE TAG INDEX person_name_idx ON person(name);
+LOOKUP ON person WHERE person.name == "Alice";
+```
 
-### 낮은 처리량
+Use `EXPLAIN` to confirm the access path. Label-only MATCH can use the
+automatically maintained tag-VID index; older data created before that index
+entry existed may fall back to a full scan until backfilled/reloaded.
 
-1. CPU 사용률 확인
-2. full scan과 결과 materialization 크기 확인
-3. 배치 작업 사용
+Only equality `LOOKUP` predicates currently route through a tag secondary
+index. Range predicates (`>`, `>=`, `<`, `<=`) use a bounded full scan even when
+an index exists; range index scans remain open in
+[issue #1](https://github.com/byoridb/byoridb/issues/1).
 
-### 높은 디스크 사용량
+### Bound result sets
 
-1. `history` 보존량과 불필요한 데이터 확인
-2. 별도 backup 디렉터리 보존 정책 확인
-3. 리텐션/GC가 아직 미구현임을 용량 계획에 반영
+```sql
+MATCH (p:person) RETURN p LIMIT 100;
+```
+
+Avoid returning full vertex payloads when only an aggregate or a few
+properties are needed. Result materialization is memory-bound and the
+application guard is an estimate, not a substitute for a bounded query.
+
+### Batch writes
+
+```sql
+INSERT VERTEX person(name, age) VALUES
+  1:("Alice", 30),
+  2:("Bob", 25),
+  3:("Carol", 28);
+```
+
+One multi-row statement lets the executor commit a redb batch instead of one
+transaction per statement. The current entity writes and matching temporal
+history versions passed to `batch_apply` are committed together.
+
+### Use the correct traversal direction
+
+Outgoing traversal scans an edge prefix bounded by source VID. Incoming and
+undirected traversal use the maintained reverse-edge index rather than a full
+edge scan. Large degrees and variable-length paths can still expand rapidly;
+use narrow edge types, bounded step ranges, filters, and limits.
+
+## Runtime guards
+
+The default execution context applies:
+
+| Guard | Default | Configuration |
+|---|---:|---|
+| Estimated result-memory budget | 1024 MiB | `BYORIDB_MAX_MEMORY_MB`; `0` disables |
+| Rows returned by guarded prefix scans | 100,000 | `BYORIDB_MAX_SCAN_LIMIT`; `0` disables |
+| Traversal/materialization visited nodes | 100,000 | internal execution default |
+| Maximum GO/MATCH path steps | 20 | internal execution default |
+| Maximum enumerated shortest paths | 1,024 | internal execution default |
+
+Some traversal algorithms warn and return partial/truncated results at a cap,
+while excessive step ranges return an error. Raising or disabling a guard can
+turn an incomplete analytical query into an out-of-memory process failure;
+change one at a time and observe process/PVC metrics.
+
+The `timeout_ms` field in `ExecutionConfig` is not currently enforced as a
+general server-side query timeout. Apply an external timeout with care: an HTTP
+client timing out does not necessarily cancel work already running on the
+server. Use the authenticated active-query diagnostic to inspect it.
+
+## redb tuning
+
+### Page cache
+
+```bash
+export BYORIDB_CACHE_SIZE_MB=4096
+```
+
+The default is 256 MiB. Increase it only when the process has headroom for the
+cache plus query materialization, indexes, and the operating system. Measure
+cold and warm runs separately.
+
+### Durability
+
+Normal serving uses Immediate durability with fsync per write transaction.
+`BYORIDB_DURABILITY=none`, `relaxed`, or `eventual` enables a faster bulk-load
+mode in which recent commits can be lost on a crash. Use that only for an
+idempotent, reloadable import and return to the default afterward.
+
+There are no supported `block_cache_size`, `write_buffer_size`, compression, or
+compaction configuration keys. Those are LSM/RocksDB concepts, not ByoriDB's
+redb tuning surface.
+
+## Temporal-read costs
+
+- Current reads stay in the `kv` table and do not scan history.
+- A vertex `AS OF` read uses the ordered history key to seek near the requested
+  `(valid_at, transaction_at)` point, then checks qualifying versions.
+- An edge `AS OF` read first enumerates historical entity keys under the source
+  and edge-type prefix, then resolves each candidate. Its cost grows with the
+  number of historical edge identities under that prefix.
+- History is asserted-fact-only. Inference and ordinary traversals use the
+  current view.
+
+Test retention growth and historical edge workloads explicitly; no automatic
+history pruning policy is currently implemented.
+
+## Other boundaries
+
+- redb serializes write transactions, so adding client concurrency does not
+  create parallel disk writers.
+- gRPC gzip/zstd support reduces some network payloads but is not storage
+  compression.
+- Persisted HNSW is used only above the executor's vector-count threshold;
+  smaller sets use exact flat cosine search.
+- The checked-in multi-node-looking Compose configuration is not a distributed
+  performance topology. Benchmark it only as independent databases.

@@ -7,7 +7,7 @@ on:
       - 'book/**'
       - '.github/workflows/docs.yml'
   pull_request:
-    branches: [main, develop]
+    branches: [main]
     paths:
       - 'book/**'
       - '.github/workflows/docs.yml'
@@ -48,8 +48,22 @@ jobs:
       - name: Add mdBook to PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Build book
+      - name: Check English and Korean page parity
+        run: |
+          find book/src -type f -name '*.md' | sed 's#^book/src/##' | sort > /tmp/book-en-pages
+          find book/src.ko -type f -name '*.md' | sed 's#^book/src.ko/##' | sort > /tmp/book-ko-pages
+          diff -u /tmp/book-en-pages /tmp/book-ko-pages
+
+      - name: Build English book
         run: mdbook build book
+
+      - name: Build Korean book
+        run: mdbook build book/ko
+
+      - name: Verify rendered books
+        run: |
+          test -f book/book/index.html
+          test -f book/book/ko/index.html
 
       - name: Setup Pages
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
