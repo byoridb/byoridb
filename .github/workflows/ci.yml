@@ -126,6 +126,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
       # RustSec fails the check for vulnerabilities in the committed
       # Cargo.lock while still surfacing informational advisories (for
       # example, unmaintained crates) without blocking unrelated changes.
