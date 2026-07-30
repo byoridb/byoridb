@@ -79,6 +79,7 @@ HTTP API 세션·쿼리 예시는 [QUICKSTART.md](QUICKSTART.md)를 참고하세
 - [빠른 시작](QUICKSTART.md)
 - [상세 제약, 로드맵, 이력](docs/PLAN.md)
 - [기여 가이드](CONTRIBUTING.md)
+- [보안 정책](SECURITY.ko.md) ([English](SECURITY.md))
 - [Agent memory 제품 (byori)](https://github.com/byoridb/byori)
 
 ## 라이선스

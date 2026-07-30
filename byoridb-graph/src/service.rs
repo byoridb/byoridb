@@ -910,6 +910,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn role_changes_take_effect_immediately_and_revoke_old_sessions() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        let root = root_session(&service).await;
+        service
+            .execute(
+                root,
+                "CREATE USER role_target WITH PASSWORD \"role-password\" ROLE USER".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let before_grant = service
+            .authenticate("role_target".to_string(), "role-password".to_string())
+            .await
+            .unwrap();
+        service
+            .execute(root, "GRANT ROLE ADMIN TO role_target".to_string())
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .execute(before_grant, "SHOW SPACES".to_string())
+                .await,
+            Err(GraphError::SessionNotFound(_))
+        ));
+
+        let after_grant = service
+            .authenticate("role_target".to_string(), "role-password".to_string())
+            .await
+            .unwrap();
+        service
+            .execute(after_grant, "CREATE SPACE role_change_probe".to_string())
+            .await
+            .unwrap();
+
+        service
+            .execute(root, "REVOKE ROLE ADMIN FROM role_target".to_string())
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .execute(after_grant, "SHOW SPACES".to_string())
+                .await,
+            Err(GraphError::SessionNotFound(_))
+        ));
+
+        let after_revoke = service
+            .authenticate("role_target".to_string(), "role-password".to_string())
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .execute(after_revoke, "DROP SPACE role_change_probe".to_string())
+                .await,
+            Err(GraphError::AuthFailed(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn auth_sync_orphan_cleanup_preserves_concurrent_new_login() {
         let service = test_service(Arc::new(MemoryKVStore::new()));
         let root = root_session(&service).await;
