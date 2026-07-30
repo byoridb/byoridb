@@ -41,7 +41,7 @@ jobs:
        github.event.workflow_run.head_branch == 'main')
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # workflow_run's GITHUB_SHA points at the default branch, which may
           # already have advanced. Build the exact commit that passed CI.
