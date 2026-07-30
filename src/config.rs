@@ -151,6 +151,34 @@ mod tests {
     }
 
     #[test]
+    fn environment_keys_remain_case_insensitive_for_scalars_and_lists() {
+        // config 0.15 restored case-sensitive config paths, while its
+        // Environment source still normalizes environment keys to lowercase.
+        // Guard both a scalar and an explicitly list-parsed key because our
+        // deployment convention uses uppercase BYORIDB__SECTION__KEY names.
+        with_env(
+            &[
+                ("bYoRiDb__SeRvEr__HtTp_AdDr", "127.0.0.1:29669"),
+                (
+                    "bYoRiDb__ClUsTeR__pEeRs",
+                    "node2.example:9559,node3.example:9559",
+                ),
+            ],
+            || {
+                let cfg = AppConfig::load().expect("mixed-case environment keys must parse");
+                assert_eq!(cfg.server.http_addr.to_string(), "127.0.0.1:29669");
+                assert_eq!(
+                    cfg.cluster.peers,
+                    vec![
+                        "node2.example:9559".to_string(),
+                        "node3.example:9559".to_string(),
+                    ]
+                );
+            },
+        );
+    }
+
+    #[test]
     fn k8s_auto_injected_service_envs_are_ignored() {
         // Simulate K8s' enableServiceLinks behavior: prefix is BYORIDB_ (single
         // underscore), which must NOT collide with BYORIDB__SECTION__KEY.
