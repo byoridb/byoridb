@@ -1,139 +1,121 @@
-# 분산 시스템
+# Distributed systems
 
-ByoriDB는 고가용성 분산 배포를 고려해 Raft/partition 구성요소를 구현했지만, 현재
-`byoridb-server`의 Storage/Raft bootstrap과 배포 wiring은 완성되지 않았습니다. 이
-페이지의 토폴로지는 라이브러리 설계 설명이며 현재 사용 가능한 운영 절차가 아닙니다.
+[한국어](../ko/architecture/distributed.html)
 
-## Raft 합의
+> **Status: component implementation, not a supported cluster deployment.**
+> Run ByoriDB as a single server unless you are developing and validating the
+> unfinished distributed path itself.
 
-각 파티션은 다음을 위해 Raft 프로토콜을 사용합니다.
+ByoriDB contains substantial distributed-system building blocks, but the
+presence of those modules does not mean the `byoridb-server` binary currently
+forms a replicated cluster.
 
-- **Leader Election**: 리더 장애 시 자동 페일오버(failover)
-- **Log Replication**: 모든 쓰기는 리더를 거쳐 팔로워로 복제됨
-- **Consistency**: 각 파티션 내에서 강한 일관성(strong consistency) 보장
+## Components in the repository
 
-### Raft 상태
+### Partition routing
 
-```
-┌─────────┐  timeout   ┌───────────┐  majority vote  ┌────────┐
-│Follower │──────────→ │ Candidate │───────────────→ │ Leader │
-└─────────┘            └───────────┘                 └────────┘
-     ↑                       │                            │
-     │        split vote     │                            │
-     └───────────────────────┘                            │
-     │                                     heartbeat      │
-     └────────────────────────────────────────────────────┘
-```
+Spaces can carry `partition_num` and `replica_factor` metadata. The common hash
+function maps a VID to a one-based partition, and the distributed executor can
+group vertex and edge requests by partition. Edge requests are partitioned by
+source VID.
 
-### 설정 모델
+Meta components maintain space, host, and partition-allocation records. The
+distributed query executor can consult a `MetaClient`, select a Storage host,
+issue parallel RPCs, and aggregate selected `FETCH`, edge, scan, and index
+operations.
 
-다음 값은 Raft 라이브러리의 개념을 설명하기 위한 예시이며 현재 `byoridb.toml`에서
-지원되는 server 설정이 아닙니다.
+### Storage RPC
 
-```toml
-[raft]
-election_timeout_ms = 1000     # Time before new election
-heartbeat_interval_ms = 100    # Leader heartbeat frequency
-snapshot_interval = 10000      # Entries before snapshot
-max_log_entries = 100000       # Max log entries to keep
-```
+`byoridb-storage` defines protobuf services for vertex/edge access, scans,
+indexes, partition migration, and Raft transport. `byoridb-meta` also contains
+migration and rebalance helpers.
 
-## 파티셔닝
+These services and clients are library components. The default launcher does
+not start and connect a complete set of remote Storage services.
 
-데이터는 VID 기반 해싱을 사용해 여러 파티션에 분산됩니다.
+### Custom Raft
 
-```
-partition_id = hash(vid) % num_partitions
-```
+`byoridb-storage/src/raft/` implements a custom Raft state machine and transport
+with:
 
-### 파티션 설정
+- follower, candidate, and leader states;
+- request-vote and append-entries handling;
+- persistent term/vote/log state;
+- chunked snapshot installation;
+- per-`(space_id, part_id)` group management;
+- configuration-change commands and a gRPC network driver.
 
-```sql
-CREATE SPACE my_space(
-    vid_type = INT64,
-    partition_num = 10,
-    replica_factor = 3
-);
-```
+The code has unit and component tests, but it has not been externally validated
+as a production consensus implementation. It must not be used to claim data
+replication or failover from the current server deployment.
 
-| 파라미터 | 설명 | 권장값 |
-|-----------|-------------|----------------|
-| `partition_num` | 파티션 개수 | 머신당 10-100 |
-| `replica_factor` | 각 파티션의 복제본 수 | 프로덕션에서는 3 |
+## What the launcher currently does
 
-### 파티션 분포
+`byoridb-server` reads the following cluster settings:
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                    Storage Cluster                        │
-│                                                          │
-│  Node 1          Node 2          Node 3                  │
-│  ┌────┐          ┌────┐          ┌────┐                 │
-│  │P1-L│          │P1-F│          │P1-F│   Partition 1   │
-│  ├────┤          ├────┤          ├────┤                 │
-│  │P2-F│          │P2-L│          │P2-F│   Partition 2   │
-│  ├────┤          ├────┤          ├────┤                 │
-│  │P3-F│          │P3-F│          │P3-L│   Partition 3   │
-│  └────┘          └────┘          └────┘                 │
-│                                                          │
-│  L = Leader, F = Follower                               │
-└──────────────────────────────────────────────────────────┘
+```text
+BYORIDB__CLUSTER__NODE_ID
+BYORIDB__CLUSTER__PEERS
+BYORIDB__CLUSTER__ADVERTISE_ADDR
+BYORIDB__CLUSTER__BOOTSTRAP
+BYORIDB__CLUSTER__META_ADDR
 ```
 
-## 복제(Replication)
+When `BYORIDB__CLUSTER__PEERS` is empty, the server runs the normal standalone
+path. When it is non-empty, the launcher additionally starts a Meta gRPC
+server. It does **not** currently:
 
-### 쓰기 복제
+- bootstrap Storage/Raft peers from that list;
+- start the Storage query/Raft RPC topology required by all partitions;
+- construct the Graph execution context with remote Meta and Storage clients;
+- route normal Graph queries through the distributed executor;
+- implement a complete membership/bootstrap lifecycle;
+- make authentication sessions shared or restart-durable.
 
-1. 클라이언트가 Graph Service로 쓰기 요청을 보냄
-2. Graph Service가 파티션 리더로 라우팅
-3. 리더가 Raft log에 추가(append)
-4. 리더가 팔로워로 복제
-5. 과반수(majority)가 확인하면 commit
-6. redb에 적용하고 응답
+`BYORIDB__CLUSTER__BOOTSTRAP` is parsed but is not yet connected to a complete
+bootstrap sequence.
 
-### 읽기 옵션
+## Deployment files are standalone
 
-| 모드 | 일관성 | 성능 |
-|------|-------------|-------------|
-| Leader | 강함(Strong) | 낮음 |
-| Follower | 최종적(Eventual) | 높음 |
+The checked-in deployment assets deliberately do not establish a cluster:
 
-## 장애 처리
+- `docker-compose.yml` starts three independent `byoridb-server` processes,
+  each with its own volume and no cluster environment. Writes are not
+  replicated between them.
+- `deploy/azure/k8s/03-statefulset.yaml` declares one replica and one
+  ReadWriteOnce PVC.
 
-### 리더 장애
+Changing either replica count without completing distributed storage and
+session routing can produce isolated databases and inconsistent client
+behavior. Do not place independent replicas behind one load balancer as though
+they shared data.
 
-1. 팔로워가 heartbeat 누락을 감지
-2. election timeout이 새 선거를 트리거
-3. 새 리더 선출 (과반수 필요)
-4. 새 리더와 함께 서비스 재개
+Repository manifests describe desired configuration only. This page makes no
+claim about the current state of a live Kubernetes or Azure environment.
 
-**복구 시간:** election timeout의 약 2-3배
+## Session and authorization constraint
 
-### 팔로워 장애
+Non-root user records are persisted in redb and loaded into an in-process auth
+cache. Session IDs, selected spaces, role snapshots, and active-query state are
+process-local. A future multi-Graph deployment therefore also needs a defined
+session-affinity or shared-session design and cluster-wide revocation behavior.
 
-1. 리더가 팔로워의 다운을 감지
-2. 남은 복제본으로 계속 서비스
-3. 팔로워가 복구되면 log를 통해 따라잡음(catch up)
-4. 너무 많이 뒤처진 경우 snapshot 전송
+## Work required for a supported cluster
 
-### 네트워크 분할(Network Partition)
+A production-ready distributed mode requires at least:
 
-- 과반수를 가진 파티션은 계속 서비스
-- 소수(minority) 파티션은 읽기 전용(read-only)이 됨
-- 네트워크가 복구되면 자동으로 복구
+1. launcher wiring for Storage RPC, Raft drivers, peer discovery, and group
+   bootstrap;
+2. Graph contexts connected to Meta/Storage clients for every supported query
+   path, with explicit local/distributed parity;
+3. tested membership changes, leader redirects, recovery, snapshots, and data
+   migration;
+4. authentication/session behavior across Graph replicas;
+5. Docker/Kubernetes topology and end-to-end multi-process tests that verify
+   replication and failover rather than only component routing;
+6. operational runbooks, upgrade compatibility, observability, and fault
+   injection testing.
 
-## 클러스터 관리
-
-노드 join/remove용 운영 CLI는 아직 없습니다. `BALANCE LEADER/DATA/STATUS/STOP/RESET`도
-문법은 파싱하지만 balance-job control RPC가 연결되지 않아 명시적 unsupported 오류를
-반환합니다. launcher/bootstrap, migration RPC와 상태 추적이 구현되기 전에는 아래
-Raft/partition metric도 실제 multi-node 운영 신호로 간주하면 안 됩니다.
-
-### 모니터링
-
-모니터링해야 할 주요 지표:
-
-- `raft_leader_changes` - 리더십 변경
-- `raft_log_entries` - 로그 크기
-- `partition_status` - 파티션별 상태
-- `replication_lag` - 팔로워 지연
+Until those gates close, `partition_num` and `replica_factor` should be treated
+as schema/component metadata, not evidence that the standalone server has
+created physical replicas.
