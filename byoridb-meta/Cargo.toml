@@ -13,7 +13,7 @@ server = ["dep:axum", "distributed"]
 # Enables the gRPC layer (proto + MetaClient/StorageClient/rpc/service). Pulls
 # in tonic (→ axum/hyper/mio), not wasm-compatible. The pure metadata *types*
 # (schema, hotspot, key, error) stay available to the embedded build.
-distributed = ["dep:tonic", "dep:prost"]
+distributed = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
 
 [dependencies]
 byoridb-common = { path = "../byoridb-common" }
@@ -29,6 +29,7 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 tokio-stream = "0.1"
 axum = { workspace = true, optional = true }
@@ -37,7 +38,7 @@ axum = { workspace = true, optional = true }
 tempfile = "3"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14"
 
 [lints]
 workspace = true
