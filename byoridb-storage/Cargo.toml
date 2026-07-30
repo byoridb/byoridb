@@ -5,7 +5,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14"
 
 [features]
 default = []
@@ -13,7 +13,7 @@ default = []
 # Pulls in tonic (→ axum/hyper/mio/socket2) which cannot compile to wasm32. Off
 # for embedded; StorageEnv and the storage *types* (index, key, codec, errors,
 # raft) are pure-Rust and always available (redb-backed, no C++ toolchain).
-distributed = ["dep:tonic", "dep:prost"]
+distributed = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
 
 [dependencies]
 byoridb-common = { path = "../byoridb-common" }
@@ -29,6 +29,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 tokio-stream = "0.1"
 bincode.workspace = true

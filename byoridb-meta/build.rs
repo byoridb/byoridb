@@ -4,16 +4,16 @@
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // proto/gRPC code is only generated for the `distributed` feature; the
-    // embedded (wasm-capable) build skips tonic-build entirely.
+    // embedded (wasm-capable) build skips gRPC code generation entirely.
     if std::env::var_os("CARGO_FEATURE_DISTRIBUTED").is_none() {
         return Ok(());
     }
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
         .compile_protos(&["proto/meta.proto"], &["proto"])?;
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(false)
         .build_client(true)
         .compile_protos(&["proto/storage.proto"], &["proto"])?;
