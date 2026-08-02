@@ -390,11 +390,15 @@ mod h6_multipattern_tests {
     }
 
     fn eblob(src: i64, dst: i64, etype: &str) -> Vec<u8> {
+        eblob_with_rank(src, dst, etype, 0)
+    }
+
+    fn eblob_with_rank(src: i64, dst: i64, etype: &str, ranking: i64) -> Vec<u8> {
         VertexCodec::encode_edge(&EdgeData {
             src_vid: src,
             dst_vid: dst,
             edge_type: etype.to_string(),
-            ranking: 0,
+            ranking,
             properties: Default::default(),
         })
         .unwrap()
@@ -519,10 +523,20 @@ mod h6_multipattern_tests {
     /// entry, mirroring what INSERT EDGE writes. Needed for Incoming and
     /// Undirected traversal tests.
     async fn put_edge_both_ways(ctx: &Arc<ExecutionContext>, src: i64, dst: i64, etype: &str) {
-        let blob = eblob(src, dst, etype);
-        let fwd = format!("default:edge:{}:{}:{}:0", src, etype, dst);
+        put_edge_both_ways_with_rank(ctx, src, dst, etype, 0).await;
+    }
+
+    async fn put_edge_both_ways_with_rank(
+        ctx: &Arc<ExecutionContext>,
+        src: i64,
+        dst: i64,
+        etype: &str,
+        ranking: i64,
+    ) {
+        let blob = eblob_with_rank(src, dst, etype, ranking);
+        let fwd = format!("default:edge:{}:{}:{}:{}", src, etype, dst, ranking);
         ctx.kvstore.put(fwd.as_bytes(), &blob).await.unwrap();
-        let rev = crate::key::SchemaKey::in_edge_data("default", dst, etype, src, 0);
+        let rev = crate::key::SchemaKey::in_edge_data("default", dst, etype, src, ranking);
         ctx.kvstore.put(&rev, &blob).await.unwrap();
     }
 
@@ -665,6 +679,102 @@ mod h6_multipattern_tests {
         let plan = match_plan("MATCH (a)-[:knows]-(b) WHERE id(a)==1 RETURN id(b) AS vid");
         let res = exec.execute_match(plan).await.unwrap();
         assert_eq!(returned_vids(&res), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn directed_match_projects_all_edge_accessors() {
+        let ctx = make_context();
+        let exec = MatchExecutor::new(ctx.clone());
+        for vid in 1..=2 {
+            ctx.kvstore
+                .put(
+                    format!("default:vertex:{}", vid).as_bytes(),
+                    &vblob("person", &format!("P{}", vid)),
+                )
+                .await
+                .unwrap();
+        }
+        put_edge_both_ways_with_rank(&ctx, 1, 2, "knows", 42).await;
+
+        let plan = match_plan(
+            "MATCH (a)-[e:knows]->(b) WHERE id(a)==1 \
+             RETURN src(e), dst(e), type(e), rank(e), ranking(e), properties(e)",
+        );
+        let res = exec.execute_match(plan).await.unwrap();
+
+        assert_eq!(
+            res.rows,
+            vec![vec![
+                byoridb_common::Value::Int(1),
+                byoridb_common::Value::Int(2),
+                byoridb_common::Value::String("knows".to_string()),
+                byoridb_common::Value::Int(42),
+                byoridb_common::Value::Int(42),
+                byoridb_common::Value::Map(byoridb_common::datatypes::map::Map {
+                    data: Default::default(),
+                }),
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn reverse_and_undirected_match_keep_stored_edge_orientation() {
+        let ctx = make_context();
+        let exec = MatchExecutor::new(ctx.clone());
+        for vid in 1..=2 {
+            ctx.kvstore
+                .put(
+                    format!("default:vertex:{}", vid).as_bytes(),
+                    &vblob("person", &format!("P{}", vid)),
+                )
+                .await
+                .unwrap();
+        }
+        put_edge_both_ways_with_rank(&ctx, 2, 1, "knows", 7).await;
+
+        for query in [
+            "MATCH (a)<-[e:knows]-(b) WHERE id(a)==1 RETURN src(e), dst(e), rank(e)",
+            "MATCH (a)-[e:knows]-(b) WHERE id(a)==1 RETURN src(e), dst(e), rank(e)",
+        ] {
+            let res = exec.execute_match(match_plan(query)).await.unwrap();
+            assert_eq!(
+                res.rows,
+                vec![vec![
+                    byoridb_common::Value::Int(2),
+                    byoridb_common::Value::Int(1),
+                    byoridb_common::Value::Int(7),
+                ]],
+                "query: {query}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn edge_accessors_return_typed_errors_for_invalid_variables() {
+        let ctx = make_context();
+        let exec = MatchExecutor::new(ctx.clone());
+        for vid in 1..=2 {
+            ctx.kvstore
+                .put(
+                    format!("default:vertex:{}", vid).as_bytes(),
+                    &vblob("person", &format!("P{}", vid)),
+                )
+                .await
+                .unwrap();
+        }
+        put_edge_both_ways(&ctx, 1, 2, "knows").await;
+
+        let plan =
+            match_plan("MATCH (a)-[e:knows]->(b) WHERE id(a)==1 RETURN src(a), src(missing)");
+        let res = exec.execute_match(plan).await.unwrap();
+
+        assert_eq!(
+            res.rows,
+            vec![vec![
+                byoridb_common::Value::Null(byoridb_common::NullType::BadType),
+                byoridb_common::Value::Null(byoridb_common::NullType::UnknownProp),
+            ]]
+        );
     }
 
     #[tokio::test]
