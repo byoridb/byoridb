@@ -189,6 +189,47 @@ impl Executor {
     }
 }
 
+/// Convert a LOOKUP range literal to the indexed field's physical key type.
+/// Returning `None` deliberately routes unsupported or ambiguous comparisons
+/// through the full predicate evaluator, preserving cross-type correctness.
+pub(crate) async fn range_index_boundary(
+    ctx: &ExecutionContext,
+    space: &str,
+    tag: &str,
+    field: &str,
+    value: &byoridb_common::Value,
+) -> Option<byoridb_storage::key::IndexValue> {
+    use byoridb_common::Value;
+    use byoridb_storage::key::IndexValue;
+
+    let schema = ctx
+        .kvstore
+        .get(&crate::key::SchemaKey::tag(space, tag))
+        .await
+        .ok()??;
+    let schema: serde_json::Value = serde_json::from_slice(&schema).ok()?;
+    let data_type = schema
+        .get("properties")?
+        .as_array()?
+        .iter()
+        .find(|property| property.get("name").and_then(|name| name.as_str()) == Some(field))?
+        .get("data_type")?
+        .as_str()?;
+
+    match (data_type, value) {
+        ("Bool", Value::Bool(value)) => Some(IndexValue::Bool(*value)),
+        ("Int8" | "Int16" | "Int32" | "Int64", Value::Int(value)) => Some(IndexValue::Int(*value)),
+        ("Float" | "Double", Value::Float(value)) if !value.is_nan() && *value != 0.0 => {
+            Some(IndexValue::Float(*value))
+        }
+        ("Float" | "Double", Value::Int(value)) => {
+            let value = *value as f64;
+            (value != 0.0).then_some(IndexValue::Float(value))
+        }
+        _ => None,
+    }
+}
+
 mod auth_exec;
 mod class_ddl;
 mod consistency;
@@ -226,6 +267,7 @@ mod tests {
     use byoridb_kvstore::KVStore as _;
     use byoridb_parser::ast::DataType;
     use byoridb_parser::ast::{Expression, Literal};
+    use byoridb_storage::key::IndexValue;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1198,6 +1240,89 @@ mod tests {
         let result = executor.execute_lookup(plan).await.unwrap();
         // Should find at least the 3 vertices we created
         assert!(result.rows.len() >= 3);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_uses_single_field_range_index() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let ctx = Arc::new(
+            ExecutionContext::new(kvstore.clone())
+                .with_space("default".to_string())
+                .with_space_id(1),
+        );
+        kvstore
+            .put(
+                &SchemaKey::tag("default", "person"),
+                &serde_json::to_vec(&serde_json::json!({
+                    "name": "person",
+                    "properties": [{"name": "age", "data_type": "Int64"}]
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let index_manager = ctx.index_manager.as_ref().unwrap();
+        let index_id = index_manager
+            .create_tag_index(
+                1,
+                "person_age_idx".to_string(),
+                10,
+                "person".to_string(),
+                vec!["age".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+
+        for (vid, age) in [(1i64, 10i64), (2, 30), (3, 31), (4, 50)] {
+            let vertex = CodecVertexData {
+                vid,
+                tags: vec![CodecTagData {
+                    name: "person".to_string(),
+                    properties: HashMap::from([(
+                        "age".to_string(),
+                        byoridb_common::Value::Int(age),
+                    )]),
+                }],
+            };
+            kvstore
+                .put(
+                    format!("default:vertex:{vid}").as_bytes(),
+                    &VertexCodec::encode_vertex(&vertex).unwrap(),
+                )
+                .await
+                .unwrap();
+            index_manager
+                .insert_tag_index(1, index_id, &[IndexValue::Int(age)], vid)
+                .await
+                .unwrap();
+        }
+
+        let executor = Executor::new(ctx);
+        for (predicate, expected) in [
+            ("person.age > 30", vec![3, 4]),
+            ("person.age >= 30", vec![2, 3, 4]),
+            ("person.age < 30", vec![1]),
+            ("person.age <= 30", vec![1, 2]),
+            ("30 < person.age", vec![3, 4]),
+            // Cross-type numeric comparison remains correct by using the
+            // predicate fallback rather than probing the wrong key type.
+            ("person.age > 30.5", vec![3, 4]),
+        ] {
+            let statement =
+                byoridb_parser::parse(&format!("LOOKUP ON person WHERE {predicate}")).unwrap();
+            let plan = ExecutionPlanBuilder::build(statement).unwrap();
+            let result = executor.execute(plan).await.unwrap();
+            let vids: Vec<i64> = result
+                .rows
+                .iter()
+                .filter_map(|row| match row.first() {
+                    Some(byoridb_common::Value::Int(vid)) => Some(*vid),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(vids, expected, "predicate: {predicate}");
+        }
     }
 
     #[tokio::test]

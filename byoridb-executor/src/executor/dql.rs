@@ -9,6 +9,7 @@ use byoridb_codec::EdgeData as CodecEdgeData;
 use byoridb_codec::{VertexCodec, VertexData as CodecVertexData};
 use byoridb_common::FilterExpr;
 use byoridb_parser::ast::{BinaryOperator, Expression, Literal};
+use byoridb_storage::index::RangeOperator;
 use byoridb_storage::key::IndexValue;
 #[cfg(feature = "distributed")]
 use byoridb_storage::proto::storage::IndexValue as ProtoIndexValue;
@@ -988,6 +989,20 @@ impl Executor {
         // Try index-based lookup first
         if let Some(ref index_manager) = self.ctx.index_manager {
             if let Some(ref where_expr) = plan.where_clause {
+                if let Some(result) = self
+                    .try_execute_range_index_lookup(
+                        index_manager,
+                        where_expr,
+                        space.as_str(),
+                        &tag_or_edge_name,
+                        &result_columns,
+                        lookup_limit,
+                    )
+                    .await?
+                {
+                    return Ok(result);
+                }
+
                 // Try to extract indexable condition
                 if let Some((field, value)) = self.extract_eq_condition(where_expr) {
                     // Find applicable index
@@ -1539,6 +1554,169 @@ impl Executor {
             }
             _ => None,
         }
+    }
+
+    /// Extract a simple ordered range predicate and normalize it so the field
+    /// is always on the left. For example, `30 < person.age` becomes
+    /// `person.age > 30`.
+    pub(super) fn extract_range_condition(
+        &self,
+        expr: &Expression,
+    ) -> Option<(String, byoridb_common::Value, RangeOperator)> {
+        let Expression::BinaryOp { op, left, right } = expr else {
+            return None;
+        };
+
+        let direct = match op {
+            BinaryOperator::Gt => RangeOperator::GreaterThan,
+            BinaryOperator::Gte => RangeOperator::GreaterThanOrEqual,
+            BinaryOperator::Lt => RangeOperator::LessThan,
+            BinaryOperator::Lte => RangeOperator::LessThanOrEqual,
+            _ => return None,
+        };
+        if let Some((field, value)) = self.field_value_pair(left, right) {
+            return Some((field, value, direct));
+        }
+
+        let reversed = match direct {
+            RangeOperator::GreaterThan => RangeOperator::LessThan,
+            RangeOperator::GreaterThanOrEqual => RangeOperator::LessThanOrEqual,
+            RangeOperator::LessThan => RangeOperator::GreaterThan,
+            RangeOperator::LessThanOrEqual => RangeOperator::GreaterThanOrEqual,
+        };
+        self.field_value_pair(right, left)
+            .map(|(field, value)| (field, value, reversed))
+    }
+
+    async fn try_execute_range_index_lookup(
+        &self,
+        index_manager: &byoridb_storage::IndexManager,
+        where_expr: &Expression,
+        space: &str,
+        tag: &str,
+        result_columns: &[String],
+        lookup_limit: Option<usize>,
+    ) -> Result<Option<ExecutorResult>> {
+        // String index encoding is length-prefixed and therefore not globally
+        // lexical. Unsupported or cross-type boundaries return None and keep
+        // the correctness-preserving predicate-pushdown fallback.
+        let Some((field, value, operator)) = self.extract_range_condition(where_expr) else {
+            return Ok(None);
+        };
+        let space_id = self.ctx.resolve_space_id().await;
+        let indexes = index_manager.list_tag_indexes(space_id).await;
+        let Some(index_def) = indexes
+            .iter()
+            .find(|index| index.fields.len() == 1 && index.fields[0] == field)
+        else {
+            return Ok(None);
+        };
+        let Some(index_value) =
+            super::range_index_boundary(&self.ctx, space, tag, &field, &value).await
+        else {
+            return Ok(None);
+        };
+
+        let partition_num = self.resolve_local_partition_num(space).await;
+        let profiling = self.ctx.profiling();
+        let start = std::time::Instant::now();
+        let mut vids = Vec::new();
+        let mut last_error = None;
+        for part_id in 1..=partition_num {
+            match index_manager
+                .lookup_tag_range(
+                    part_id,
+                    index_def,
+                    index_value.clone(),
+                    operator,
+                    lookup_limit.unwrap_or(usize::MAX),
+                )
+                .await
+            {
+                Ok(part_vids) => vids.extend(part_vids),
+                Err(error) => {
+                    tracing::warn!(
+                        "Local range index lookup on part {} failed: {}",
+                        part_id,
+                        error
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        if vids.is_empty() && last_error.is_some() {
+            return Ok(None);
+        }
+
+        if profiling {
+            self.ctx.record_profile(
+                ProfileOp::IndexScan,
+                format!("range index '{}'", index_def.index_name),
+                vids.len() as u64,
+                start.elapsed().as_micros() as u64,
+                false,
+            );
+        }
+        self.build_local_tag_index_result(space, result_columns.to_vec(), vids, lookup_limit)
+            .await
+            .map(Some)
+    }
+
+    async fn build_local_tag_index_result(
+        &self,
+        space: &str,
+        result_columns: Vec<String>,
+        mut vids: Vec<i64>,
+        limit: Option<usize>,
+    ) -> Result<ExecutorResult> {
+        if let Some(limit) = limit {
+            vids.truncate(limit);
+        }
+        if vids.is_empty() {
+            return Ok(ExecutorResult {
+                columns: result_columns,
+                rows: vec![],
+                latency_ms: 0,
+            });
+        }
+
+        let keys: Vec<Vec<u8>> = vids
+            .iter()
+            .map(|vid| format!("{}:vertex:{}", space, vid).into_bytes())
+            .collect();
+        let results = self.ctx.kvstore.batch_get(&keys).await?;
+        let mut rows = Vec::new();
+        for (vid, data) in vids.iter().zip(results.iter()) {
+            let Some(data) = data else {
+                continue;
+            };
+            let vertex_data = if VertexCodec::is_proto_format(data) {
+                match VertexCodec::decode_vertex(data) {
+                    Ok(vertex) => VertexCodec::vertex_to_json(&vertex),
+                    Err(error) => {
+                        tracing::warn!(
+                            "Skipping undecodable vertex {} in range index lookup: {}",
+                            vid,
+                            error
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                serde_json::from_slice(data)?
+            };
+            let mut row = vec![byoridb_common::Value::Int(*vid)];
+            if let Some(tags) = vertex_data.get("tags") {
+                row.push(byoridb_common::Value::String(tags.to_string()));
+            }
+            rows.push(row);
+        }
+
+        Ok(ExecutorResult {
+            columns: result_columns,
+            rows,
+            latency_ms: 0,
+        })
     }
 
     /// Convert Expression to byoridb_common::Value
