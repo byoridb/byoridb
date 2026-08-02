@@ -3,10 +3,11 @@
 # Installation
 
 Tagged [GitHub releases](https://github.com/byoridb/byoridb/releases) publish
-prebuilt archives for Linux x86_64 and macOS x86_64/arm64. A tagged
-release can lag the current `main` branch; the instructions below build the
-exact checkout. The repository pins Rust 1.90, so a `rustup` installation will
-select the expected compiler automatically.
+prebuilt archives for Linux x86_64/arm64 and macOS x86_64/arm64. Releases made
+before the arm64 workflow landed do not retroactively gain that artifact. A
+tagged release can lag the current `main` branch; the instructions below build
+the exact checkout. The repository pins Rust 1.90, so a `rustup` installation
+will select the expected compiler automatically.
 
 ## Supported systems
 
@@ -16,12 +17,24 @@ select the expected compiler automatically.
 Windows is not currently supported. ByoriDB uses the pure-Rust `redb` storage
 engine, so RocksDB and a C++ RocksDB toolchain are not required.
 
-The release workflow does not currently publish an ARM Linux archive. Its macOS
-archives are neither code-signed nor notarized, so Gatekeeper may warn or refuse
-to launch them. The project does not document an officially supported
-Gatekeeper bypass; build the desired tag from source instead. These notes do not
-supply the missing ARM Linux artifact or macOS signing; both remain unresolved
-release work.
+The release workflow builds Linux arm64 natively on GitHub's arm64 runner. It
+also refuses a tagged macOS release unless all Developer ID signing and App
+Store Connect notarization credentials listed below are configured. Existing
+v0.3.3 and older macOS archives predate that gate and remain unsigned; build
+those tags from source instead of bypassing Gatekeeper.
+
+Release maintainers must configure these repository secrets before creating a
+new tag:
+
+- `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`, and
+  `MACOS_SIGNING_IDENTITY` for a Developer ID Application certificate.
+- `APPLE_API_KEY_P8_BASE64`, `APPLE_API_KEY_ID`, and `APPLE_API_ISSUER_ID` for
+  `xcrun notarytool`.
+
+The workflow signs every macOS executable with the hardened runtime and secure
+timestamp, verifies each signature, and waits for Apple notarization to succeed
+before packaging. Missing credentials fail the macOS build rather than silently
+publishing another unsigned archive.
 
 Current release archives also contain binaries only and omit `LICENSE` and
 `NOTICES.md`; packaging those files remains open in

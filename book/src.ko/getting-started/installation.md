@@ -2,8 +2,10 @@
 
 # 설치
 
-ByoriDB는 현재 소스에서 빌드합니다. 저장소가 Rust 1.90을 고정하므로 `rustup`을
-사용하면 알맞은 컴파일러가 자동으로 선택됩니다.
+태그된 [GitHub release](https://github.com/byoridb/byoridb/releases)는 Linux
+x86_64/arm64와 macOS x86_64/arm64 archive를 제공합니다. arm64 workflow 도입 전
+release에는 artifact가 소급 추가되지 않습니다. 저장소가 Rust 1.90을 고정하므로
+`rustup`을 사용하면 알맞은 컴파일러가 자동으로 선택됩니다.
 
 ## 지원 운영체제
 
@@ -12,6 +14,22 @@ ByoriDB는 현재 소스에서 빌드합니다. 저장소가 Rust 1.90을 고정
 
 Windows는 현재 지원하지 않습니다. ByoriDB의 저장소 엔진은 순수 Rust 기반
 `redb`이므로 RocksDB나 RocksDB용 C++ 툴체인은 필요하지 않습니다.
+
+Release workflow는 GitHub arm64 runner에서 Linux arm64를 native build합니다. 또한
+Developer ID 서명 및 App Store Connect notarization credential이 모두 없으면 새 macOS
+tag release를 실패시킵니다. v0.3.3 이하 macOS archive는 이 gate보다 오래되어 여전히
+unsigned 상태이므로 Gatekeeper를 우회하지 말고 해당 tag를 source에서 build하세요.
+
+Release maintainer는 tag 생성 전에 다음 repository secret을 설정해야 합니다.
+
+- Developer ID Application certificate용 `MACOS_CERTIFICATE_P12_BASE64`,
+  `MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGNING_IDENTITY`
+- `xcrun notarytool`용 `APPLE_API_KEY_P8_BASE64`, `APPLE_API_KEY_ID`,
+  `APPLE_API_ISSUER_ID`
+
+Workflow는 모든 macOS executable을 hardened runtime과 secure timestamp로 서명하고
+signature를 검증하며 Apple notarization 성공을 기다린 뒤 package합니다. Credential이
+없으면 unsigned archive를 조용히 배포하지 않고 macOS build를 실패시킵니다.
 
 현재 release archive에는 binary만 포함되고 `LICENSE`와 `NOTICES.md`는 누락되어
 있습니다. 이 packaging 작업은

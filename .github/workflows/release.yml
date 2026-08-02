@@ -40,6 +40,11 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            # Build natively: avoids a cross-linker/sysroot dependency and
+            # exercises the artifact on the architecture that will run it.
+            os: ubuntu-24.04-arm
+            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
@@ -49,6 +54,35 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+
+      # Never publish another unsigned macOS archive. These secrets require an
+      # Apple Developer Program membership and are deliberately validated before
+      # the expensive build starts. See book/src/getting-started/installation.md.
+      - name: Validate macOS signing credentials
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          missing=()
+          for name in \
+            MACOS_CERTIFICATE_P12_BASE64 \
+            MACOS_CERTIFICATE_PASSWORD \
+            MACOS_SIGNING_IDENTITY \
+            APPLE_API_KEY_P8_BASE64 \
+            APPLE_API_KEY_ID \
+            APPLE_API_ISSUER_ID
+          do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "Missing required macOS release secrets: ${missing[*]}" >&2
+            exit 1
+          fi
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
@@ -84,6 +118,66 @@ jobs:
 
       - name: Build release binary
         run: cargo build --locked --release --workspace --target ${{ matrix.target }}
+
+      - name: Verify release binaries
+        run: |
+          RELEASE_DIR="target/${{ matrix.target }}/release"
+          test -x "$RELEASE_DIR/byoridb-server"
+          test -x "$RELEASE_DIR/byoridb-cli"
+          file "$RELEASE_DIR/byoridb-server"
+          file "$RELEASE_DIR/byoridb-cli"
+
+      - name: Sign and notarize macOS binaries
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/byoridb-developer-id.p12"
+          API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          KEYCHAIN_PATH="$RUNNER_TEMP/byoridb-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          RELEASE_DIR="target/${{ matrix.target }}/release"
+
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 -D > "$CERTIFICATE_PATH"
+          printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 -D > "$API_KEY_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+
+          BINS=(byoridb-server byoridb-cli)
+          [ -f "$RELEASE_DIR/byoridb-backup" ] && BINS+=(byoridb-backup)
+          for bin in "${BINS[@]}"; do
+            codesign --force --options runtime --timestamp \
+              --keychain "$KEYCHAIN_PATH" \
+              --sign "$MACOS_SIGNING_IDENTITY" "$RELEASE_DIR/$bin"
+            codesign --verify --strict --verbose=2 "$RELEASE_DIR/$bin"
+          done
+
+          NOTARY_STAGE="$RUNNER_TEMP/byoridb-${{ matrix.target }}"
+          mkdir -p "$NOTARY_STAGE"
+          for bin in "${BINS[@]}"; do
+            cp "$RELEASE_DIR/$bin" "$NOTARY_STAGE/$bin"
+          done
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$NOTARY_STAGE" "$RUNNER_TEMP/byoridb-notarization.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/byoridb-notarization.zip" \
+            --key "$API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait
 
       - name: Package (Linux/macOS)
         run: |
