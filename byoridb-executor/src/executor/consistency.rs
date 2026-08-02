@@ -66,6 +66,8 @@ impl Executor {
             });
         }
 
+        let vid_type = crate::vid::space_vid_type(&self.ctx, &space).await?;
+
         // Scan every vertex; report disjoint-pair memberships.
         let mut rows = Vec::new();
         for (key, _value) in self
@@ -97,7 +99,7 @@ impl Executor {
                     };
                     if reported.insert(pair.clone()) {
                         rows.push(vec![
-                            Value::Int(vid),
+                            crate::vid::display_vid(&self.ctx, &space, vid_type, vid).await?,
                             Value::String(pair.0),
                             Value::String(pair.1),
                         ]);

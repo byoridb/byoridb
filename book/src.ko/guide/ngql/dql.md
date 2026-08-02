@@ -6,12 +6,13 @@ query statement는 인증 session에서 `USE`로 선택한 space를 사용합니
 
 ## FETCH PROP
 
-정수 VID로 vertex를 조회합니다.
+space에 선택한 VID type으로 vertex를 조회합니다.
 
 ```sql
 FETCH PROP ON person 1;
 FETCH PROP ON person 1, 2, 3;
 FETCH PROP ON * 1;
+FETCH PROP ON person "alice";
 ```
 
 여러 VID를 한 문장에 넣으면 내부적으로 한 번의 `batch_get`을 사용합니다. 다만 수백
@@ -25,6 +26,7 @@ endpoint pair로 edge를 조회합니다.
 ```sql
 FETCH PROP ON knows 1->2;
 FETCH PROP ON * 1->2;
+FETCH PROP ON knows "alice"->"bob";
 ```
 
 현재 temporal read는 vertex와 edge 모두 epoch-millisecond timestamp를 받습니다.

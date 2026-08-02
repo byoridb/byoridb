@@ -7,11 +7,12 @@ A space is a logical namespace for graph schema and data. Select a space with
 
 ## Create a space
 
-The reliable standalone form uses integer VIDs:
+Spaces support either integer or fixed-length string VIDs:
 
 ```sql
 CREATE SPACE social;
 CREATE SPACE IF NOT EXISTS social (vid_type = INT64);
+CREATE SPACE accounts (vid_type = FIXED_STRING(32));
 ```
 
 The current defaults are `partition_num = 100`, `replica_factor = 1`,
@@ -30,9 +31,27 @@ The parser also accepts `PARTITION BY MODULO` and
 `PARTITION BY RANGE(100, 200, 300)`. In standalone mode these fields are stored
 as metadata; they do not turn one process into a multi-node cluster.
 
-Although `FIXED_STRING(N)` is accepted as a space VID-type option, current DML
-planning requires integer literal VIDs. Use `INT64` until string-VID execution is
-implemented.
+`FIXED_STRING(N)` accepts quoted UTF-8 identifiers whose encoded length is at
+most `N` bytes. A space uses one VID type consistently, so integer literals are
+rejected in a `FIXED_STRING` space and string literals are rejected in an
+`INT64` space:
+
+```sql
+USE accounts;
+CREATE TAG account(name STRING);
+INSERT VERTEX account(name) VALUES "acct-001":("Primary");
+FETCH PROP ON account "acct-001";
+```
+
+Internally, a `FIXED_STRING` space stores a persistent bidirectional mapping
+between each UTF-8 VID and a stable positive `i64` surrogate. Existing vertex,
+edge, tag-to-VID, index, partition, codec, storage, and RPC formats continue to
+use that surrogate; graph query inputs and results translate at the executor
+boundary. The mapping records use `{space}:vid-map:{hex-utf8}` for string to
+surrogate and `{space}:vid-rev:{surrogate}` for the reverse direction. They are
+not recycled when graph data is deleted and are removed with the space's normal
+key prefix when `DROP SPACE` runs. This preserves the existing integer storage
+and protobuf wire contract while returning the original string to clients.
 
 ## Select a space
 

@@ -254,7 +254,7 @@ mod tests {
     fn fetch_as_of_plan(vid: i64, as_of: Option<i64>) -> ExecutionPlan {
         ExecutionPlan::Fetch(FetchPlan {
             space: "default".to_string(),
-            vids: vec![vid],
+            vids: vec![vid.into()],
             tags: vec!["person".to_string()],
             yield_clause: None,
             edge_refs: vec![],
@@ -606,7 +606,7 @@ mod tests {
         let plan = InsertPlan::Vertex {
             space: "default".to_string(),
             vertices: vec![VertexInsert {
-                vid: 100,
+                vid: 100.into(),
                 tags: vec![TagData {
                     name: "player".to_string(),
                     props: [(
@@ -656,7 +656,7 @@ mod tests {
         // Delete the vertex
         let plan = DeletePlan {
             space: "default".to_string(),
-            vids: vec![200],
+            vids: vec![200.into()],
             conditions: None,
         };
 
@@ -675,7 +675,7 @@ mod tests {
         // Try to delete a vertex that doesn't exist
         let plan = DeletePlan {
             space: "default".to_string(),
-            vids: vec![999],
+            vids: vec![999.into()],
             conditions: None,
         };
 
@@ -708,7 +708,7 @@ mod tests {
         // Fetch the vertex
         let plan = FetchPlan {
             space: "default".to_string(),
-            vids: vec![300],
+            vids: vec![300.into()],
             tags: vec!["player".to_string()],
             yield_clause: None,
             edge_refs: vec![],
@@ -744,7 +744,7 @@ mod tests {
         // Fetch multiple vertices
         let plan = FetchPlan {
             space: "default".to_string(),
-            vids: vec![301, 302, 303],
+            vids: vec![301.into(), 302.into(), 303.into()],
             tags: vec!["player".to_string()],
             yield_clause: None,
             edge_refs: vec![],
@@ -764,7 +764,7 @@ mod tests {
         // Fetch a vertex that doesn't exist
         let plan = FetchPlan {
             space: "default".to_string(),
-            vids: vec![888],
+            vids: vec![888.into()],
             tags: vec!["player".to_string()],
             yield_clause: None,
             edge_refs: vec![],
@@ -802,7 +802,7 @@ mod tests {
         // GO from 400 over follow
         let plan = GoPlan {
             from_clause: FromClause {
-                vids: vec![400],
+                vids: vec![400.into()],
                 src: None,
             },
             over_edges: vec!["follow".to_string()],
@@ -838,7 +838,7 @@ mod tests {
 
         let plan = GoPlan {
             from_clause: FromClause {
-                vids: vec![430],
+                vids: vec![430.into()],
                 src: None,
             },
             over_edges: vec!["follow".to_string()],
@@ -885,7 +885,7 @@ mod tests {
 
         let plan = GoPlan {
             from_clause: FromClause {
-                vids: vec![410],
+                vids: vec![410.into()],
                 src: None,
             },
             over_edges: vec!["follow".to_string()],
@@ -919,7 +919,7 @@ mod tests {
 
         let plan = GoPlan {
             from_clause: FromClause {
-                vids: vec![420],
+                vids: vec![420.into()],
                 src: None,
             },
             over_edges: vec!["follow".to_string()],
@@ -1715,7 +1715,7 @@ mod tests {
                 vids: vec![],
                 tags: vec!["follows".to_string()],
                 yield_clause: None,
-                edge_refs: vec![(1, 2)],
+                edge_refs: vec![(1.into(), 2.into())],
                 is_edge_fetch: true,
                 src_var: None,
                 as_of: None,
@@ -1879,7 +1879,7 @@ mod tests {
         let result = executor
             .execute(ExecutionPlan::Go(GoPlan {
                 from_clause: FromClause {
-                    vids: vec![1],
+                    vids: vec![1.into()],
                     src: None,
                 },
                 over_edges: vec!["follows".to_string()],
@@ -1959,8 +1959,8 @@ mod tests {
             space: "default".to_string(),
             edges: vec![
                 crate::plan::EdgeInsert {
-                    src: 1,
-                    dst: 2,
+                    src: 1.into(),
+                    dst: 2.into(),
                     edge_type: "follows".to_string(),
                     ranking: 0,
                     props: std::collections::HashMap::from([(
@@ -1969,8 +1969,8 @@ mod tests {
                     )]),
                 },
                 crate::plan::EdgeInsert {
-                    src: 1,
-                    dst: 3,
+                    src: 1.into(),
+                    dst: 3.into(),
                     edge_type: "follows".to_string(),
                     ranking: 0,
                     props: std::collections::HashMap::from([(
@@ -1979,8 +1979,8 @@ mod tests {
                     )]),
                 },
                 crate::plan::EdgeInsert {
-                    src: 1,
-                    dst: 10,
+                    src: 1.into(),
+                    dst: 10.into(),
                     edge_type: "follows".to_string(),
                     ranking: 0,
                     props: std::collections::HashMap::from([(

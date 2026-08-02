@@ -639,6 +639,191 @@ async fn test_crud_vertex_insert_and_fetch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_fixed_string_vid_crud_traversal_and_type_contract() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(
+        &service,
+        session_id,
+        "CREATE SPACE string_vid_test (vid_type=FIXED_STRING(32))",
+    )
+    .await;
+    execute(&service, session_id, "USE string_vid_test").await;
+    execute(&service, session_id, "CREATE TAG person(name STRING)").await;
+    execute(&service, session_id, "CREATE EDGE knows(since INT64)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX person(name) VALUES "alice":("Alice"), "bob":("Bob")"#,
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT EDGE knows(since) VALUES "alice"->"bob":(2024)"#,
+    )
+    .await;
+
+    let fetched = execute(
+        &service,
+        session_id,
+        r#"FETCH PROP ON person "alice", "missing", "bob""#,
+    )
+    .await;
+    assert_eq!(fetched.row_count(), 2);
+    assert_eq!(fetched.rows[0][0], Value::String("alice".to_string()));
+    assert_eq!(fetched.rows[1][0], Value::String("bob".to_string()));
+
+    let edge_fetch = execute(
+        &service,
+        session_id,
+        r#"FETCH PROP ON knows "alice"->"bob""#,
+    )
+    .await;
+    assert_eq!(edge_fetch.row_count(), 1);
+    assert_eq!(edge_fetch.rows[0][0], Value::String("alice".to_string()));
+    assert_eq!(edge_fetch.rows[0][1], Value::String("bob".to_string()));
+    assert!(matches!(&edge_fetch.rows[0][2], Value::String(json)
+        if json.contains(r#""src":"alice""#) && json.contains(r#""dst":"bob""#)));
+
+    let lookup = execute(&service, session_id, "LOOKUP ON person YIELD person.name").await;
+    assert_eq!(lookup.row_count(), 2);
+    assert!(lookup
+        .rows
+        .iter()
+        .all(|row| matches!(row.first(), Some(Value::String(_)))));
+
+    let go_default = execute(&service, session_id, r#"GO FROM "alice" OVER knows"#).await;
+    assert_eq!(
+        go_default.rows,
+        vec![vec![
+            Value::String("alice".to_string()),
+            Value::String("bob".to_string()),
+        ]]
+    );
+
+    let go = execute(
+        &service,
+        session_id,
+        r#"GO FROM "alice" OVER knows YIELD knows._src AS src, knows._dst AS dst"#,
+    )
+    .await;
+    assert_eq!(
+        go.rows,
+        vec![vec![
+            Value::String("alice".to_string()),
+            Value::String("bob".to_string()),
+        ]]
+    );
+
+    let matched = execute(
+        &service,
+        session_id,
+        r#"MATCH (n:person) WHERE id(n) == "alice" RETURN id(n) AS vid"#,
+    )
+    .await;
+    assert_eq!(matched.rows, vec![vec![Value::String("alice".to_string())]]);
+    let matched_vertex = execute(
+        &service,
+        session_id,
+        r#"MATCH (n:person) WHERE id(n) == "alice" RETURN n"#,
+    )
+    .await;
+    assert!(matches!(
+        &matched_vertex.rows[0][0],
+        Value::Vertex(vertex) if vertex.vid == Value::String("alice".to_string())
+    ));
+
+    let found = execute(
+        &service,
+        session_id,
+        r#"FIND SHORTEST PATH FROM "alice" TO "bob" OVER knows"#,
+    )
+    .await;
+    assert_eq!(found.row_count(), 1);
+    assert!(matches!(
+        &found.rows[0][0],
+        Value::List(path)
+            if path.values == vec![
+                Value::String("alice".to_string()),
+                Value::String("bob".to_string())
+            ]
+    ));
+
+    execute(
+        &service,
+        session_id,
+        r#"UPDATE VERTEX ON person "alice" SET name = "Alice Updated""#,
+    )
+    .await;
+    let updated = execute(&service, session_id, r#"FETCH PROP ON person "alice""#).await;
+    assert!(matches!(&updated.rows[0][1], Value::String(json) if json.contains("Alice Updated")));
+
+    execute(&service, session_id, r#"DELETE EDGE knows "alice"->"bob""#).await;
+    let after_edge_delete = execute(
+        &service,
+        session_id,
+        r#"GO FROM "alice" OVER knows YIELD knows._dst"#,
+    )
+    .await;
+    assert_eq!(after_edge_delete.row_count(), 0);
+
+    execute(&service, session_id, r#"DELETE VERTEX "bob""#).await;
+    let after_vertex_delete = execute(&service, session_id, r#"FETCH PROP ON person "bob""#).await;
+    assert_eq!(after_vertex_delete.row_count(), 0);
+
+    let wrong_fixed_type = service
+        .execute(
+            session_id,
+            r#"INSERT VERTEX person(name) VALUES 7:("wrong")"#.to_string(),
+        )
+        .await;
+    assert!(
+        wrong_fixed_type
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("uses FIXED_STRING VIDs")),
+        "integer VID in FIXED_STRING space should fail clearly: {wrong_fixed_type:?}"
+    );
+
+    let too_long = service
+        .execute(
+            session_id,
+            r#"INSERT VERTEX person(name) VALUES "123456789012345678901234567890123":("too long")"#
+                .to_string(),
+        )
+        .await;
+    assert!(
+        too_long.as_ref().is_err_and(|error| {
+            let message = error.to_string();
+            message.contains("33 bytes") && message.contains("FIXED_STRING(32)")
+        }),
+        "FIXED_STRING length should be enforced in UTF-8 bytes: {too_long:?}"
+    );
+
+    execute(&service, session_id, "CREATE SPACE int_vid_test").await;
+    execute(&service, session_id, "USE int_vid_test").await;
+    execute(&service, session_id, "CREATE TAG person(name STRING)").await;
+    let wrong_int_type = service
+        .execute(
+            session_id,
+            r#"INSERT VERTEX person(name) VALUES "alice":("wrong")"#.to_string(),
+        )
+        .await;
+    assert!(
+        wrong_int_type
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("uses INT64 VIDs")),
+        "string VID in INT64 space should fail clearly: {wrong_int_type:?}"
+    );
+
+    service.sign_out(session_id, session_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_insert_preserves_semicolon_inside_string_literal() {
     let (service, _temp_dir) = create_test_service();
 

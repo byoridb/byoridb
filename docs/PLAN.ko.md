@@ -220,7 +220,7 @@ pod 삭제/rollout restart 등 상태 변경은 수행하지 않았다.
   없고 KV/벡터 인덱스/Raft 영속 형식에 사용되므로, 교체는 기존 데이터 호환·마이그레이션
   설계를 포함한 별도 작업으로 진행한다.
 - **nGQL 문자열 escape** ✅ 해소 (2026-06-22): lexer 정규식 `"[^"]*"`/`'[^']*'`가 escape·내부 따옴표·백슬래시를 못 받아, 값에 `"`나 `\`가 있으면 토큰이 끊겨 "Unexpected end of input"으로 실패했음(예: `Chef's`는 OK지만 `6\" pan`, `C:\dir`은 깨짐). `"([^"\\]|\\.)*"`로 확장 + `parser::unquote`가 `\"`/`\\`/`\n`/`\t` 등 해석(흩어진 5개 호출처 통합). **nexprice 도그푸딩으로 발견** — LDBC(INT64·따옴표 없는 VID)만 검증해 와 드러나지 않았던 갭.
-- **INSERT 실행기 문자열 VID 미지원** (미해결): `CREATE SPACE ... vid_type=FIXED_STRING`은 파서·메타가 받지만, `plan.rs`가 INSERT VERTEX/EDGE의 VID를 `Literal::Int`(i64)로 강제(`"Vertex ID must be an integer literal"`)해 문자열 VID 스페이스엔 한 건도 못 넣는다. 우회: 애플리케이션이 문자열 id를 결정적 해시(blake2b 63bit 양수) INT64로 매핑하고 원본 id는 속성으로 보존. 근본 수정은 VID 타입(i64|String) 전파 필요(plan/executor/codec/key 전반, blast radius 큼). nexprice 도그푸딩으로 발견.
+- **FIXED_STRING 문자열 VID** ✅ 해소 (2026-08-02): VID 표현을 `Int|String`으로 확장해 vertex/edge CRUD와 FETCH/GO/FIND/LOOKUP/MATCH endpoint에 전파했다. Space별 UTF-8 문자열↔양수 `i64` mapping을 영속 저장하고 기존 codec/key/partition/storage RPC에는 surrogate를 전달하므로 protobuf와 정수 저장 계약은 바뀌지 않는다. 입력·결과는 executor 경계에서 원래 문자열로 변환하며 VID type 불일치는 명확히 거부한다. nexprice 도그푸딩으로 발견.
 - **MATCH edge accessor projection 제한** (관찰 2026-07-06): `MATCH (a)-[e:edge]->(b) RETURN src(e), dst(e)`가
   row는 반환하지만 `src(e)`/`dst(e)` 값은 null로 평가된다. `MATCH ... RETURN id(a), id(b)`는 정상이고,
   GO/FETCH 계열 edge accessor 회귀와는 별개다. nGQL 호환성을 넓힐 때 `MATCH` projection의 edge

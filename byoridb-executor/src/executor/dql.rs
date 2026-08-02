@@ -29,6 +29,14 @@ fn json_to_value(val: &serde_json::Value) -> Option<byoridb_common::Value> {
     }
 }
 
+fn vid_value_to_json(value: byoridb_common::Value) -> serde_json::Value {
+    match value {
+        byoridb_common::Value::Int(value) => serde_json::Value::from(value),
+        byoridb_common::Value::String(value) => serde_json::Value::from(value),
+        _ => serde_json::Value::Null,
+    }
+}
+
 impl Executor {
     pub(super) async fn execute_fetch(
         &self,
@@ -83,13 +91,22 @@ impl Executor {
 
         let profiling = self.ctx.profiling();
         let fetch_start = std::time::Instant::now();
+        let vid_type = crate::vid::space_vid_type(&self.ctx, effective_space).await?;
+        let mut resolved_vids = Vec::with_capacity(plan.vids.len());
+        for vid in &plan.vids {
+            if let Some(internal) =
+                crate::vid::resolve_vid(&self.ctx, effective_space, vid_type, vid, false).await?
+            {
+                resolved_vids.push(internal);
+            }
+        }
 
         // Execute distributed fetch
         let vertices = distributed
             .execute_fetch(
                 space_id,
                 partition_num,
-                plan.vids.clone(),
+                resolved_vids,
                 plan.tags.clone(),
                 vec![], // All properties
             )
@@ -124,7 +141,9 @@ impl Executor {
             }
 
             let mut row = Vec::new();
-            row.push(byoridb_common::Value::Int(vertex.vid));
+            row.push(
+                crate::vid::display_vid(&self.ctx, effective_space, vid_type, vertex.vid).await?,
+            );
 
             // Extract tags and their properties
             for tag_data in &vertex.tags {
@@ -169,8 +188,10 @@ impl Executor {
             return self.execute_fetch_edges_local(plan, effective_space).await;
         }
 
-        // Resolve VIDs: either literal list or $var.col from context
-        let resolved_vids: Vec<i64> = if let Some(ref var_ref) = plan.src_var {
+        let vid_type = crate::vid::space_vid_type(&self.ctx, effective_space).await?;
+
+        // Resolve VIDs: either literal list or $var.col from context.
+        let external_vids: Vec<crate::plan::Vid> = if let Some(ref var_ref) = plan.src_var {
             let (var_name, col_name) = if let Some(dot) = var_ref.find('.') {
                 (&var_ref[..dot], Some(&var_ref[dot + 1..]))
             } else {
@@ -185,20 +206,29 @@ impl Executor {
             bound
                 .rows
                 .iter()
-                .filter_map(|row| {
-                    row.get(col_idx).and_then(|v| match v {
-                        byoridb_common::Value::Int(i) => Some(*i),
-                        _ => None,
-                    })
+                .filter_map(|row| match row.get(col_idx) {
+                    Some(byoridb_common::Value::Int(i)) => Some(crate::plan::Vid::Int(*i)),
+                    Some(byoridb_common::Value::String(s)) => {
+                        Some(crate::plan::Vid::String(s.clone()))
+                    }
+                    _ => None,
                 })
                 .collect()
         } else {
             plan.vids.clone()
         };
 
+        let mut resolved_vids = Vec::with_capacity(external_vids.len());
+        for vid in &external_vids {
+            if let Some(internal) =
+                crate::vid::resolve_vid(&self.ctx, effective_space, vid_type, vid, false).await?
+            {
+                resolved_vids.push(internal);
+            }
+        }
+
         // O-8 D5: normalize to sameAs representatives so a fetch of a merged-away
         // vid returns the surviving node that holds the facts.
-        let mut resolved_vids = resolved_vids;
         for vid in resolved_vids.iter_mut() {
             *vid = crate::ontology::representative_of(&self.ctx, effective_space, *vid).await?;
         }
@@ -243,7 +273,9 @@ impl Executor {
                     }
 
                     let mut row = Vec::new();
-                    row.push(byoridb_common::Value::Int(*vid));
+                    row.push(
+                        crate::vid::display_vid(&self.ctx, effective_space, vid_type, *vid).await?,
+                    );
 
                     for tag in &vertex_data.tags {
                         if !plan.tags.is_empty() && !plan.tags.iter().any(|req| req == &tag.name) {
@@ -301,8 +333,21 @@ impl Executor {
         let mut result_bytes = 0usize; // OOM guard: bound accumulated result memory
         let profiling = self.ctx.profiling();
         let fetch_start = std::time::Instant::now();
+        let vid_type = crate::vid::space_vid_type(&self.ctx, effective_space).await?;
 
-        for (src, dst) in &plan.edge_refs {
+        for (external_src, external_dst) in &plan.edge_refs {
+            let Some(src) =
+                crate::vid::resolve_vid(&self.ctx, effective_space, vid_type, external_src, false)
+                    .await?
+            else {
+                continue;
+            };
+            let Some(dst) =
+                crate::vid::resolve_vid(&self.ctx, effective_space, vid_type, external_dst, false)
+                    .await?
+            else {
+                continue;
+            };
             // Scan all edges from `src` with the given edge type (ranking = 0 default)
             let prefix = if edge_type == "*" {
                 format!("{}:edge:{}:", effective_space, src)
@@ -340,11 +385,27 @@ impl Executor {
 
             for value in values {
                 match VertexCodec::decode_edge(&value) {
-                    Ok(edge) if edge.dst_vid == *dst => {
-                        let edge_json = VertexCodec::edge_to_json(&edge);
+                    Ok(edge) if edge.dst_vid == dst => {
+                        let src_value = crate::vid::display_vid(
+                            &self.ctx,
+                            effective_space,
+                            vid_type,
+                            edge.src_vid,
+                        )
+                        .await?;
+                        let dst_value = crate::vid::display_vid(
+                            &self.ctx,
+                            effective_space,
+                            vid_type,
+                            edge.dst_vid,
+                        )
+                        .await?;
+                        let mut edge_json = VertexCodec::edge_to_json(&edge);
+                        edge_json["src"] = vid_value_to_json(src_value.clone());
+                        edge_json["dst"] = vid_value_to_json(dst_value.clone());
                         let row = vec![
-                            byoridb_common::Value::Int(edge.src_vid),
-                            byoridb_common::Value::Int(edge.dst_vid),
+                            src_value,
+                            dst_value,
                             byoridb_common::Value::String(edge_json.to_string()),
                         ];
                         result_bytes += crate::context::estimate_row_bytes(&row);
@@ -382,6 +443,12 @@ impl Executor {
 
     /// Execute GO statement (graph traversal)
     pub(super) async fn execute_go(&self, plan: crate::plan::GoPlan) -> Result<ExecutorResult> {
+        let space = self
+            .ctx
+            .space
+            .as_ref()
+            .ok_or_else(|| ExecutionError::InvalidOperation("No space selected".to_string()))?;
+        let vid_type = crate::vid::space_vid_type(&self.ctx, space).await?;
         let from_vids = if plan.from_clause.vids.is_empty() {
             if let Some(ref var_ref) = plan.from_clause.src {
                 // Resolve $var.column reference from context variables.
@@ -417,10 +484,29 @@ impl Executor {
                 for row in &bound.rows {
                     if let Some(val) = row.get(col_idx) {
                         match val {
-                            byoridb_common::Value::Int(i) => vids.push(*i),
+                            byoridb_common::Value::Int(i) => {
+                                let external = crate::plan::Vid::Int(*i);
+                                if let Some(internal) = crate::vid::resolve_vid(
+                                    &self.ctx, space, vid_type, &external, false,
+                                )
+                                .await?
+                                {
+                                    vids.push(internal);
+                                }
+                            }
+                            byoridb_common::Value::String(s) => {
+                                let external = crate::plan::Vid::String(s.clone());
+                                if let Some(internal) = crate::vid::resolve_vid(
+                                    &self.ctx, space, vid_type, &external, false,
+                                )
+                                .await?
+                                {
+                                    vids.push(internal);
+                                }
+                            }
                             other => {
                                 return Err(ExecutionError::InvalidOperation(format!(
-                                    "Variable column value is not a VID (integer): {:?}",
+                                    "Variable column value is not an integer or string VID: {:?}",
                                     other
                                 )))
                             }
@@ -434,7 +520,15 @@ impl Executor {
                 ));
             }
         } else {
-            plan.from_clause.vids.clone()
+            let mut vids = Vec::with_capacity(plan.from_clause.vids.len());
+            for external in &plan.from_clause.vids {
+                if let Some(internal) =
+                    crate::vid::resolve_vid(&self.ctx, space, vid_type, external, false).await?
+                {
+                    vids.push(internal);
+                }
+            }
+            vids
         };
 
         // Check if distributed mode is enabled
@@ -509,12 +603,18 @@ impl Executor {
         }
 
         // Convert EdgeData to rows
+        let space = self
+            .ctx
+            .space
+            .as_ref()
+            .ok_or_else(|| ExecutionError::InvalidOperation("No space selected".to_string()))?;
+        let vid_type = crate::vid::space_vid_type(&self.ctx, space).await?;
         let mut rows = Vec::new();
         for edge in edges {
             if let Some(ref key) = edge.key {
                 let row = vec![
-                    byoridb_common::Value::Int(key.src_vid),
-                    byoridb_common::Value::Int(key.dst_vid),
+                    crate::vid::display_vid(&self.ctx, space, vid_type, key.src_vid).await?,
+                    crate::vid::display_vid(&self.ctx, space, vid_type, key.dst_vid).await?,
                 ];
                 rows.push(row);
             }
@@ -550,6 +650,7 @@ impl Executor {
             .space
             .as_ref()
             .ok_or_else(|| ExecutionError::InvalidOperation("No space selected".to_string()))?;
+        let vid_type = crate::vid::space_vid_type(&self.ctx, space).await?;
 
         // O-8 D5: normalize source vids to their owl:sameAs representatives so the
         // traversal starts from the node that actually holds the merged facts.
@@ -689,15 +790,13 @@ impl Executor {
         // If no explicit YIELD columns, return ["src", "dst"] for backward
         // compatibility and compound-statement variable resolution.
         if plan.yield_clause.columns.is_empty() {
-            let rows: Vec<Vec<byoridb_common::Value>> = traversal
-                .into_iter()
-                .map(|(src, dst, _)| {
-                    vec![
-                        byoridb_common::Value::Int(src),
-                        byoridb_common::Value::Int(dst),
-                    ]
-                })
-                .collect();
+            let mut rows = Vec::with_capacity(traversal.len());
+            for (src, dst, _) in traversal {
+                rows.push(vec![
+                    crate::vid::display_vid(&self.ctx, space, vid_type, src).await?,
+                    crate::vid::display_vid(&self.ctx, space, vid_type, dst).await?,
+                ]);
+            }
             if profiling {
                 self.ctx.record_profile(
                     ProfileOp::Project,
@@ -747,9 +846,10 @@ impl Executor {
                         src_vid,
                         dst_vid,
                         last_edge.as_ref(),
+                        vid_type,
                         &col.expression,
                     )
-                    .await;
+                    .await?;
                 row.push(val);
             }
             result_bytes += crate::context::estimate_row_bytes(&row);
@@ -835,19 +935,29 @@ impl Executor {
         src_vid: i64,
         dst_vid: i64,
         last_edge: Option<&CodecEdgeData>,
+        vid_type: crate::vid::SpaceVidType,
         expr: &Expression,
-    ) -> byoridb_common::Value {
-        match expr {
+    ) -> Result<byoridb_common::Value> {
+        let value = match expr {
             Expression::Identifier(name) => match name.as_str() {
-                "src" | "_src_vid" => byoridb_common::Value::Int(src_vid),
-                "dst" | "_dst_vid" => byoridb_common::Value::Int(dst_vid),
+                "src" | "_src_vid" => {
+                    crate::vid::display_vid(&self.ctx, space, vid_type, src_vid).await?
+                }
+                "dst" | "_dst_vid" => {
+                    crate::vid::display_vid(&self.ctx, space, vid_type, dst_vid).await?
+                }
                 "vertex" => {
                     let key = format!("{}:vertex:{}", space, dst_vid);
                     match self.ctx.kvstore.get(key.as_bytes()).await {
                         Ok(Some(blob)) => match VertexCodec::decode_vertex(&blob) {
-                            Ok(v) => byoridb_common::Value::String(
-                                VertexCodec::vertex_to_json(&v).to_string(),
-                            ),
+                            Ok(v) => {
+                                let mut json = VertexCodec::vertex_to_json(&v);
+                                json["vid"] = vid_value_to_json(
+                                    crate::vid::display_vid(&self.ctx, space, vid_type, dst_vid)
+                                        .await?,
+                                );
+                                byoridb_common::Value::String(json.to_string())
+                            }
                             Err(_) => byoridb_common::Value::Null(byoridb_common::NullType::Null),
                         },
                         _ => byoridb_common::Value::Null(byoridb_common::NullType::Null),
@@ -857,15 +967,21 @@ impl Executor {
                 // `OVER *` where a typed prefix like `has_brand._dst` isn't usable
                 // (the edge type varies per row). Serialised as JSON like `vertex`.
                 "edge" => match last_edge {
-                    Some(e) => byoridb_common::Value::String(
-                        serde_json::json!({
-                            "src": e.src_vid,
-                            "dst": e.dst_vid,
-                            "type": e.edge_type,
-                            "rank": e.ranking,
-                        })
-                        .to_string(),
-                    ),
+                    Some(e) => {
+                        let src =
+                            crate::vid::display_vid(&self.ctx, space, vid_type, e.src_vid).await?;
+                        let dst =
+                            crate::vid::display_vid(&self.ctx, space, vid_type, e.dst_vid).await?;
+                        byoridb_common::Value::String(
+                            serde_json::json!({
+                                "src": vid_value_to_json(src),
+                                "dst": vid_value_to_json(dst),
+                                "type": e.edge_type,
+                                "rank": e.ranking,
+                            })
+                            .to_string(),
+                        )
+                    }
                     None => byoridb_common::Value::Null(byoridb_common::NullType::Null),
                 },
                 _ => byoridb_common::Value::Null(byoridb_common::NullType::Null),
@@ -873,8 +989,14 @@ impl Executor {
             Expression::PropRef { object: _, prop } => {
                 if let Some(edge) = last_edge {
                     match prop.as_str() {
-                        "_dst" | "dst_id" => byoridb_common::Value::Int(edge.dst_vid),
-                        "_src" | "src_id" => byoridb_common::Value::Int(edge.src_vid),
+                        "_dst" | "dst_id" => {
+                            crate::vid::display_vid(&self.ctx, space, vid_type, edge.dst_vid)
+                                .await?
+                        }
+                        "_src" | "src_id" => {
+                            crate::vid::display_vid(&self.ctx, space, vid_type, edge.src_vid)
+                                .await?
+                        }
                         "_type" => byoridb_common::Value::String(edge.edge_type.clone()),
                         "_rank" => byoridb_common::Value::Int(edge.ranking),
                         _ => {
@@ -892,11 +1014,13 @@ impl Executor {
                 let key = format!("{}:vertex:{}", space, dst_vid);
                 let blob = match self.ctx.kvstore.get(key.as_bytes()).await {
                     Ok(Some(b)) => b,
-                    _ => return byoridb_common::Value::Null(byoridb_common::NullType::Null),
+                    _ => return Ok(byoridb_common::Value::Null(byoridb_common::NullType::Null)),
                 };
                 let vertex = match VertexCodec::decode_vertex(&blob) {
                     Ok(v) => v,
-                    Err(_) => return byoridb_common::Value::Null(byoridb_common::NullType::Null),
+                    Err(_) => {
+                        return Ok(byoridb_common::Value::Null(byoridb_common::NullType::Null))
+                    }
                 };
                 vertex
                     .tags
@@ -921,14 +1045,19 @@ impl Executor {
             Expression::FunctionCall { name, .. } => {
                 match (name.to_lowercase().as_str(), last_edge) {
                     ("type", Some(e)) => byoridb_common::Value::String(e.edge_type.clone()),
-                    ("dst", Some(e)) => byoridb_common::Value::Int(e.dst_vid),
-                    ("src", Some(e)) => byoridb_common::Value::Int(e.src_vid),
+                    ("dst", Some(e)) => {
+                        crate::vid::display_vid(&self.ctx, space, vid_type, e.dst_vid).await?
+                    }
+                    ("src", Some(e)) => {
+                        crate::vid::display_vid(&self.ctx, space, vid_type, e.src_vid).await?
+                    }
                     ("rank" | "ranking", Some(e)) => byoridb_common::Value::Int(e.ranking),
                     _ => byoridb_common::Value::Null(byoridb_common::NullType::Null),
                 }
             }
             _ => byoridb_common::Value::Null(byoridb_common::NullType::Null),
-        }
+        };
+        Ok(value)
     }
 
     /// Execute LOOKUP statement (index-based query)
@@ -941,6 +1070,7 @@ impl Executor {
             .space
             .as_ref()
             .ok_or_else(|| ExecutionError::InvalidOperation("No space selected".to_string()))?;
+        let vid_type = crate::vid::space_vid_type(&self.ctx, space).await?;
 
         let (tag_or_edge_name, result_columns) = match &plan.lookup_type {
             crate::plan::LookupType::Tag(tag) => (
@@ -1070,9 +1200,12 @@ impl Executor {
                                                 let mut rows = Vec::new();
                                                 for vertex in vertices {
                                                     let mut row = Vec::new();
-                                                    row.push(byoridb_common::Value::Int(
-                                                        vertex.vid,
-                                                    ));
+                                                    row.push(
+                                                        crate::vid::display_vid(
+                                                            &self.ctx, space, vid_type, vertex.vid,
+                                                        )
+                                                        .await?,
+                                                    );
                                                     // Format tags as string
                                                     let tags_str = vertex
                                                         .tags
@@ -1203,7 +1336,10 @@ impl Executor {
                                             serde_json::from_slice(data)?
                                         };
                                     let mut row = Vec::new();
-                                    row.push(byoridb_common::Value::Int(*vid));
+                                    row.push(
+                                        crate::vid::display_vid(&self.ctx, space, vid_type, *vid)
+                                            .await?,
+                                    );
                                     if let Some(tags) = vertex_data.get("tags") {
                                         row.push(byoridb_common::Value::String(tags.to_string()));
                                     }
@@ -1232,6 +1368,29 @@ impl Executor {
             }
         }
 
+        self.execute_lookup_scan(
+            &plan,
+            space,
+            vid_type,
+            tag_or_edge_name,
+            result_columns,
+            lookup_limit,
+        )
+        .await
+    }
+
+    /// LOOKUP fallback when no usable local or distributed index produced a
+    /// result. Keeping scan decoding and result shaping here also keeps the
+    /// index-selection path small enough to audit independently.
+    async fn execute_lookup_scan(
+        &self,
+        plan: &crate::plan::LookupPlan,
+        space: &str,
+        vid_type: crate::vid::SpaceVidType,
+        tag_or_edge_name: String,
+        result_columns: Vec<String>,
+        lookup_limit: Option<usize>,
+    ) -> Result<ExecutorResult> {
         // Fallback: Scan with predicate pushdown
         tracing::debug!("Using scan with predicate pushdown for LOOKUP (no suitable index found)");
         self.ctx.mark_full_scan();
@@ -1359,7 +1518,7 @@ impl Executor {
             };
 
             let mut row = Vec::new();
-            row.push(byoridb_common::Value::Int(vid));
+            row.push(crate::vid::display_vid(&self.ctx, space, vid_type, vid).await?);
             if !tag_str.is_empty() {
                 row.push(byoridb_common::Value::String(tag_str));
             }
@@ -1618,23 +1777,49 @@ impl Executor {
 
     /// Execute FIND statement (path finding)
     pub(super) async fn execute_find(&self, plan: crate::plan::FindPlan) -> Result<ExecutorResult> {
-        // Resolve parameters
-        let from_vid = match Self::expr_to_value(&plan.from_vid) {
-            Some(byoridb_common::Value::Int(i)) => i,
+        let space = self
+            .ctx
+            .space
+            .as_ref()
+            .ok_or_else(|| ExecutionError::InvalidOperation("No space selected".to_string()))?;
+        let vid_type = crate::vid::space_vid_type(&self.ctx, space).await?;
+
+        // Resolve integer or string parameters through the selected space's VID contract.
+        let from_external = match Self::expr_to_value(&plan.from_vid) {
+            Some(byoridb_common::Value::Int(i)) => crate::plan::Vid::Int(i),
+            Some(byoridb_common::Value::String(s)) => crate::plan::Vid::String(s),
             _ => {
                 return Err(ExecutionError::InvalidOperation(
-                    "Invalid FROM VID (must be integer)".to_string(),
+                    "Invalid FROM VID (must be an integer or string literal)".to_string(),
                 ))
             }
         };
-
-        let to_vid = match Self::expr_to_value(&plan.to_vid) {
-            Some(byoridb_common::Value::Int(i)) => i,
+        let to_external = match Self::expr_to_value(&plan.to_vid) {
+            Some(byoridb_common::Value::Int(i)) => crate::plan::Vid::Int(i),
+            Some(byoridb_common::Value::String(s)) => crate::plan::Vid::String(s),
             _ => {
                 return Err(ExecutionError::InvalidOperation(
-                    "Invalid TO VID (must be integer)".to_string(),
+                    "Invalid TO VID (must be an integer or string literal)".to_string(),
                 ))
             }
+        };
+        let Some(from_vid) =
+            crate::vid::resolve_vid(&self.ctx, space, vid_type, &from_external, false).await?
+        else {
+            return Ok(ExecutorResult {
+                columns: vec!["path".to_string()],
+                rows: Vec::new(),
+                latency_ms: 0,
+            });
+        };
+        let Some(to_vid) =
+            crate::vid::resolve_vid(&self.ctx, space, vid_type, &to_external, false).await?
+        else {
+            return Ok(ExecutorResult {
+                columns: vec!["path".to_string()],
+                rows: Vec::new(),
+                latency_ms: 0,
+            });
         };
 
         // "*" means all edge types → pass empty slice (get_neighbors treats empty as wildcard)
@@ -1758,16 +1943,16 @@ impl Executor {
         let columns = vec!["path".to_string()];
         // One row per path; the path is a list of vids so clients can read
         // hop count and intermediate vertices without string parsing.
-        let rows: Vec<Vec<byoridb_common::Value>> = paths
-            .into_iter()
-            .map(|path| {
-                vec![byoridb_common::Value::List(
-                    byoridb_common::datatypes::list::List::with_values(
-                        path.into_iter().map(byoridb_common::Value::Int).collect(),
-                    ),
-                )]
-            })
-            .collect();
+        let mut rows = Vec::with_capacity(paths.len());
+        for path in paths {
+            let mut displayed = Vec::with_capacity(path.len());
+            for vid in path {
+                displayed.push(crate::vid::display_vid(&self.ctx, space, vid_type, vid).await?);
+            }
+            rows.push(vec![byoridb_common::Value::List(
+                byoridb_common::datatypes::list::List::with_values(displayed),
+            )]);
+        }
 
         Ok(ExecutorResult {
             columns,

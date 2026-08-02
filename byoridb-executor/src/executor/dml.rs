@@ -29,6 +29,7 @@ impl Executor {
                 } else {
                     space
                 };
+                let vid_type = crate::vid::space_vid_type(&self.ctx, &effective_space).await?;
                 // Fetch the tag-index list once (not per row), then collect every
                 // KV write into a single batch so the whole multi-row INSERT
                 // commits in one redb transaction (one fsync) instead of one per
@@ -71,10 +72,22 @@ impl Executor {
                         self.validate_write_shapes(&effective_space, &tag_names, &sprops)
                             .await?;
                     }
-                    let key = format!("{}:vertex:{}", effective_space, vertex.vid);
+                    // Materialize a string mapping only after schema/shape
+                    // validation succeeds, so rejected writes do not leave
+                    // behind unused VID metadata.
+                    let internal_vid = crate::vid::resolve_vid(
+                        &self.ctx,
+                        &effective_space,
+                        vid_type,
+                        &vertex.vid,
+                        true,
+                    )
+                    .await?
+                    .expect("creating a string VID mapping always resolves");
+                    let key = format!("{}:vertex:{}", effective_space, internal_vid);
                     // Convert plan TagData to codec TagData and use Proto encoding
                     let codec_vertex = CodecVertexData {
-                        vid: vertex.vid,
+                        vid: internal_vid,
                         tags: vertex
                             .tags
                             .iter()
@@ -106,7 +119,7 @@ impl Executor {
                                 let vkey = crate::key::SchemaKey::vec_data(
                                     &effective_space,
                                     prop,
-                                    vertex.vid,
+                                    internal_vid,
                                 );
                                 batch.push((vkey, bytes));
                                 dirty_vec_props.insert(prop.clone());
@@ -131,7 +144,10 @@ impl Executor {
                                 })
                                 .collect::<Vec<_>>();
                             let idx_key = byoridb_storage::KeyUtils::tag_index_key(
-                                1, index.id, &values, vertex.vid,
+                                1,
+                                index.id,
+                                &values,
+                                internal_vid,
                             );
                             batch.push((idx_key, Vec::new()));
                         }
@@ -168,6 +184,7 @@ impl Executor {
                 } else {
                     space
                 };
+                let vid_type = crate::vid::space_vid_type(&self.ctx, &effective_space).await?;
                 // Collect all KV writes into one batch → single redb commit
                 // (one fsync) per multi-row INSERT, applied atomically.
                 let space_id = self.ctx.resolve_space_id().await;
@@ -192,18 +209,37 @@ impl Executor {
                 let mut seen_edges: std::collections::HashSet<Vec<u8>> =
                     std::collections::HashSet::new();
                 for edge in edges {
-                    // Schema validation: verify edge type and its fields exist
+                    // Schema validation precedes mapping creation so an invalid
+                    // edge row cannot materialize otherwise-unused VID records.
                     let edge_type_name = edge.edge_type.clone();
                     self.validate_edge_props(&effective_space, &edge_type_name, &edge.props)
                         .await?;
+                    let src = crate::vid::resolve_vid(
+                        &self.ctx,
+                        &effective_space,
+                        vid_type,
+                        &edge.src,
+                        true,
+                    )
+                    .await?
+                    .expect("creating a string VID mapping always resolves");
+                    let dst = crate::vid::resolve_vid(
+                        &self.ctx,
+                        &effective_space,
+                        vid_type,
+                        &edge.dst,
+                        true,
+                    )
+                    .await?
+                    .expect("creating a string VID mapping always resolves");
                     let key = format!(
                         "{}:edge:{}:{}:{}:{}",
-                        effective_space, edge.src, edge_type_name, edge.dst, edge.ranking
+                        effective_space, src, edge_type_name, dst, edge.ranking
                     );
                     // Use Proto encoding for edge data
                     let codec_edge = CodecEdgeData {
-                        src_vid: edge.src,
-                        dst_vid: edge.dst,
+                        src_vid: src,
+                        dst_vid: dst,
                         edge_type: edge_type_name.clone(),
                         ranking: edge.ranking,
                         properties: edge.props.clone(),
@@ -226,9 +262,9 @@ impl Executor {
                     // is an O(in-degree) prefix scan (see algo::get_incoming_neighbors).
                     let in_edge_key = SchemaKey::in_edge_data(
                         &effective_space,
-                        edge.dst,
+                        dst,
                         &edge_type_name,
-                        edge.src,
+                        src,
                         edge.ranking,
                     );
                     batch.push((in_edge_key, data));
@@ -258,14 +294,10 @@ impl Executor {
                         );
                         batch.push((idx_key, Vec::new()));
                     }
-                    new_triples.push((edge.src, edge_type_name.clone(), edge.dst));
+                    new_triples.push((src, edge_type_name.clone(), dst));
                     if edge_is_new {
-                        *deg_in
-                            .entry((edge_type_name.clone(), edge.dst))
-                            .or_insert(0) += 1;
-                        *deg_out
-                            .entry((edge_type_name.clone(), edge.src))
-                            .or_insert(0) += 1;
+                        *deg_in.entry((edge_type_name.clone(), dst)).or_insert(0) += 1;
+                        *deg_out.entry((edge_type_name.clone(), src)).or_insert(0) += 1;
                     }
                     inserted += 1;
                 }
@@ -445,7 +477,10 @@ impl Executor {
             plan.space.clone()
         };
 
-        let vid = plan.vid;
+        let vid_type = crate::vid::space_vid_type(&self.ctx, &effective_space).await?;
+        let vid = crate::vid::resolve_vid(&self.ctx, &effective_space, vid_type, &plan.vid, true)
+            .await?
+            .expect("UPDATE upsert always resolves a VID");
         let tag_name = plan.tag_name.as_ref().ok_or_else(|| {
             ExecutionError::InvalidOperation("Tag name required for UPDATE".to_string())
         })?;
@@ -652,11 +687,21 @@ impl Executor {
             plan.space.clone()
         };
 
+        let vid_type = crate::vid::space_vid_type(&self.ctx, &effective_space).await?;
+        let mut resolved_vids = Vec::with_capacity(plan.vids.len());
+        for vid in &plan.vids {
+            if let Some(internal) =
+                crate::vid::resolve_vid(&self.ctx, &effective_space, vid_type, vid, false).await?
+            {
+                resolved_vids.push(internal);
+            }
+        }
+
         // O-8 D7: owl:sameAs merges are irreversible (insertion-only), so refuse
         // to delete a vertex entangled in one — either a non-representative
         // member (its facts moved elsewhere) or a representative that absorbed
         // others. Allowing it would orphan or lose the merged class.
-        for vid in &plan.vids {
+        for vid in &resolved_vids {
             let rep = crate::ontology::representative_of(&self.ctx, &effective_space, *vid).await?;
             if rep != *vid {
                 return Err(ExecutionError::InvalidOperation(format!(
@@ -678,8 +723,7 @@ impl Executor {
         }
 
         // Build all keys at once
-        let keys: Vec<Vec<u8>> = plan
-            .vids
+        let keys: Vec<Vec<u8>> = resolved_vids
             .iter()
             .map(|vid| format!("{}:vertex:{}", effective_space, vid).into_bytes())
             .collect();
@@ -704,7 +748,7 @@ impl Executor {
             Some(im) => im.list_tag_indexes(self.ctx.resolve_space_id().await).await,
             None => Vec::new(),
         };
-        for (vid, (key, exists)) in plan.vids.iter().zip(keys.iter().zip(results.iter())) {
+        for (vid, (key, exists)) in resolved_vids.iter().zip(keys.iter().zip(results.iter())) {
             let Some(data) = exists else { continue };
             let vertex = VertexCodec::decode_vertex(data).ok();
 
@@ -807,6 +851,7 @@ impl Executor {
         } else {
             plan.space.clone()
         };
+        let vid_type = crate::vid::space_vid_type(&self.ctx, &effective_space).await?;
 
         // O-8 D7: a sameAs edge is what triggered an irreversible merge — deleting
         // it cannot un-merge the equivalence class, so reject rather than mislead.
@@ -833,7 +878,19 @@ impl Executor {
         // 삭제가 트랜잭션 끝으로 지연되므로, 같은 edge ref 가 중복 나열되면 두 번
         // 세지 않도록 배치 내 중복을 걸러낸다 (기존 즉시-삭제 시절의 동작 유지).
         let mut seen_refs: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-        for (src, dst, ranking) in &plan.edge_refs {
+        for (external_src, external_dst, ranking) in &plan.edge_refs {
+            let Some(src) =
+                crate::vid::resolve_vid(&self.ctx, &effective_space, vid_type, external_src, false)
+                    .await?
+            else {
+                continue;
+            };
+            let Some(dst) =
+                crate::vid::resolve_vid(&self.ctx, &effective_space, vid_type, external_dst, false)
+                    .await?
+            else {
+                continue;
+            };
             // Key format: {space}:edge:{src}:{edge_type}:{dst}:{ranking}
             let key = format!(
                 "{}:edge:{}:{}:{}:{}",
@@ -845,18 +902,13 @@ impl Executor {
                 del_keys.push(key.as_bytes().to_vec());
                 tombstones.push(key.as_bytes().to_vec());
                 // Keep the reverse-edge index in sync (written by INSERT EDGE).
-                let in_edge_key = SchemaKey::in_edge_data(
-                    &effective_space,
-                    *dst,
-                    &plan.edge_name,
-                    *src,
-                    *ranking,
-                );
+                let in_edge_key =
+                    SchemaKey::in_edge_data(&effective_space, dst, &plan.edge_name, src, *ranking);
                 del_keys.push(in_edge_key);
-                *deg_in.entry((plan.edge_name.clone(), *dst)).or_insert(0) -= 1;
-                *deg_out.entry((plan.edge_name.clone(), *src)).or_insert(0) -= 1;
+                *deg_in.entry((plan.edge_name.clone(), dst)).or_insert(0) -= 1;
+                *deg_out.entry((plan.edge_name.clone(), src)).or_insert(0) -= 1;
                 deleted += 1;
-                deleted_edges.push((*src, plan.edge_name.clone(), *dst));
+                deleted_edges.push((src, plan.edge_name.clone(), dst));
             }
         }
         // T-트랙 v1.1: 현재뷰 삭제 + tombstone append 단일 트랜잭션.

@@ -152,19 +152,19 @@ impl Parser {
             }));
         }
 
-        // Detect edge fetch: peek for `int ->` pattern
+        // Detect edge fetch: peek for `<integer|string> ->` pattern.
         let is_edge = self.peek_is_edge_ref();
 
         let (fetch_type, vids) = if is_edge {
             // Parse `src->dst [, src->dst ...]`
             let mut edge_exprs: Vec<Expression> = Vec::new();
             loop {
-                let src = self.consume_signed_integer()?;
+                let src = self.parse_expression()?;
                 self.consume_token(Token::Arrow)?;
-                let dst = self.consume_signed_integer()?;
-                // Encode as two consecutive integer literals; plan builder pairs them up
-                edge_exprs.push(Expression::Literal(Literal::Int(src)));
-                edge_exprs.push(Expression::Literal(Literal::Int(dst)));
+                let dst = self.parse_expression()?;
+                // Encode as two consecutive VID expressions; the plan builder pairs them.
+                edge_exprs.push(src);
+                edge_exprs.push(dst);
                 if !self.match_token(Token::Comma) {
                     break;
                 }
@@ -203,7 +203,8 @@ impl Parser {
         }
     }
 
-    /// Return true when the upcoming tokens look like `[-]<int> ->` (edge ref).
+    /// Return true when the upcoming tokens look like `[-]<int> ->` or
+    /// `<string> ->` (edge ref).
     /// Negative VIDs lex as `Minus Integer`, so the arrow may sit one token later.
     fn peek_is_edge_ref(&self) -> bool {
         let int_pos = if matches!(
@@ -214,25 +215,15 @@ impl Parser {
         } else {
             self.pos
         };
-        let is_int = matches!(
+        let is_vid = matches!(
             self.tokens.get(int_pos).map(|t| &t.token),
-            Some(Token::Integer(_))
+            Some(Token::Integer(_) | Token::StringLiteral(_) | Token::SingleQuotedString(_))
         );
         let is_arrow = matches!(
             self.tokens.get(int_pos + 1).map(|t| &t.token),
             Some(Token::Arrow)
         );
-        is_int && is_arrow
-    }
-
-    /// Consume an integer with an optional leading minus (negative VIDs in
-    /// edge refs — `FETCH PROP ON rel -5->7`).
-    fn consume_signed_integer(&mut self) -> Result<i64> {
-        if self.match_token(Token::Minus) {
-            Ok(-self.consume_integer()?)
-        } else {
-            self.consume_integer()
-        }
+        is_vid && is_arrow
     }
 
     // ===== FIND statement =====

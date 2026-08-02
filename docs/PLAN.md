@@ -199,8 +199,9 @@ This is still **partial**, not a supported multi-node deployment:
 
 ### Query and data model
 
-- `FIXED_STRING` is accepted in space DDL, but DML execution still requires
-  integer VIDs. Until the type is implemented end to end, use `INT64`.
+- `FIXED_STRING(N)` VIDs are supported across graph CRUD, FETCH, GO, FIND,
+  LOOKUP, and MATCH. They use a durable per-space string-to-`i64` mapping so
+  existing codec, key, storage, partition, and RPC contracts remain unchanged.
 - `SHOW USER`/`SHOW USERS` and `SHOW ROLE`/`SHOW ROLES` list the built-in root
   and persisted users with their roles. `SHOW SESSIONS` lists active users and
   selected spaces without bearer session IDs.
@@ -237,7 +238,7 @@ This is still **partial**, not a supported multi-node deployment:
 
 | ID | Work | Exit criteria |
 |---|---|---|
-| COR-1 | Resolve the `FIXED_STRING` VID mismatch | Either complete string-VID support across parser/plan/codec/keys or reject it at DDL |
+| COR-1 | ✅ Resolve the `FIXED_STRING` VID mismatch | String VIDs round-trip across graph CRUD and traversal while the existing `i64` storage/RPC contract remains compatible |
 | COR-2 | Complete identity metadata surfaces | Supported user, role, and session listing syntax reports durable, authorized state without secrets |
 | COR-3 | Release/archive completeness | Binary archives include `LICENSE` and `NOTICES` and supported platforms are explicit |
 | OPS-1 | Recovery validation | Automated restore test includes both current and history tables and records recovery time |

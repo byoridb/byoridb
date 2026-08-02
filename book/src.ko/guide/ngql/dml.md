@@ -3,12 +3,20 @@
 [English](../../../guide/ngql/dml.html) | **한국어**
 
 그래프 데이터를 변경하기 전에 space를 선택하고 사용할 tag 또는 edge schema를
-만드세요. 현재 실행 경로는 정수 VID를 요구합니다.
+만드세요. `INT64` space에서는 정수 literal을, `FIXED_STRING(N)` space에서는
+따옴표 문자열 literal을 사용합니다.
 
 ## Vertex 삽입
 
 ```sql
 INSERT VERTEX person(name, age) VALUES 1:("Alice", 30);
+```
+
+문자열 VID space에서는 같은 mutation의 endpoint를 따옴표로 감쌉니다.
+
+```sql
+INSERT VERTEX person(name, age) VALUES "alice":("Alice", 30);
+INSERT EDGE knows(since) VALUES "alice"->"bob":(2020);
 ```
 
 한 문장에 여러 vertex를 넣으면 current view와 history가 하나의 storage transaction에

@@ -46,6 +46,7 @@ impl MatchExecutor {
             .space
             .clone()
             .ok_or_else(|| ExecutionError::InvalidOperation("No space selected".to_string()))?;
+        let vid_type = crate::vid::space_vid_type(&self.ctx, &space).await?;
 
         let flat = flatten_pattern(&plan.pattern)?;
         let matcher = PatternMatcher::new(self.ctx.clone());
@@ -109,11 +110,19 @@ impl MatchExecutor {
         // Instead of scanning all start-node candidates and traversing forward,
         // we call get_incoming_neighbors(X) once — an O(in-degree) reverse-edge
         // index lookup vs N forward prefix scans (N = candidate count, 100K+).
-        let mut id_bindings = plan
+        let external_id_bindings = plan
             .where_clause
             .as_ref()
             .map(extract_id_eq_bindings)
             .unwrap_or_default();
+        let mut id_bindings = HashMap::with_capacity(external_id_bindings.len());
+        for (variable, external_vid) in external_id_bindings {
+            if let Some(internal) =
+                crate::vid::resolve_vid(&self.ctx, &space, vid_type, &external_vid, false).await?
+            {
+                id_bindings.insert(variable, internal);
+            }
+        }
 
         // O-8 D5: normalize `id(n) == X` constraints to the owl:sameAs
         // representative so a match on a merged-away vid resolves to the
@@ -1055,7 +1064,7 @@ impl MatchExecutor {
                             .keys()
                             .any(|k| k.starts_with(&format!("{}.", name)));
                         if is_edge {
-                            self.build_edge_value(*vid, name, bindings).await
+                            self.build_edge_value(*vid, name, bindings, space).await
                         } else {
                             self.build_vertex_value(*vid, space).await
                         }
@@ -1082,7 +1091,20 @@ impl MatchExecutor {
             Expression::FunctionCall { name, args } if name.to_lowercase() == "id" => {
                 if let Some(Expression::Identifier(var)) = args.first() {
                     match bindings.get(var) {
-                        Some(byoridb_common::Value::Int(v)) => byoridb_common::Value::Int(*v),
+                        Some(byoridb_common::Value::Int(v)) => {
+                            match crate::vid::space_vid_type(&self.ctx, space).await {
+                                Ok(vid_type) => {
+                                    crate::vid::display_vid(&self.ctx, space, vid_type, *v)
+                                        .await
+                                        .unwrap_or(byoridb_common::Value::Null(
+                                            byoridb_common::NullType::Null,
+                                        ))
+                                }
+                                Err(_) => {
+                                    byoridb_common::Value::Null(byoridb_common::NullType::Null)
+                                }
+                            }
+                        }
                         Some(other) => other.clone(),
                         None => byoridb_common::Value::Null(byoridb_common::NullType::Null),
                     }
@@ -1170,13 +1192,19 @@ impl MatchExecutor {
 
     /// Build a full `Value::Vertex` object from a VID by fetching from KV.
     async fn build_vertex_value(&self, vid: i64, space: &str) -> byoridb_common::Value {
+        let displayed_vid = match crate::vid::space_vid_type(&self.ctx, space).await {
+            Ok(vid_type) => crate::vid::display_vid(&self.ctx, space, vid_type, vid)
+                .await
+                .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null)),
+            Err(_) => byoridb_common::Value::Null(byoridb_common::NullType::Null),
+        };
         let key = format!("{}:vertex:{}", space, vid);
         let blob = match self.ctx.kvstore.get(key.as_bytes()).await {
             Ok(Some(b)) => b,
             _ => {
                 // No vertex data → return bare VID as Vertex
                 return byoridb_common::Value::Vertex(Box::new(byoridb_common::Vertex {
-                    vid: byoridb_common::Value::Int(vid),
+                    vid: displayed_vid,
                     tags: vec![],
                 }));
             }
@@ -1185,7 +1213,7 @@ impl MatchExecutor {
             Ok(v) => v,
             Err(_) => {
                 return byoridb_common::Value::Vertex(Box::new(byoridb_common::Vertex {
-                    vid: byoridb_common::Value::Int(vid),
+                    vid: displayed_vid,
                     tags: vec![],
                 }))
             }
@@ -1205,7 +1233,7 @@ impl MatchExecutor {
             .collect();
 
         byoridb_common::Value::Vertex(Box::new(byoridb_common::Vertex {
-            vid: byoridb_common::Value::Int(vid),
+            vid: displayed_vid,
             tags,
         }))
     }
@@ -1216,6 +1244,7 @@ impl MatchExecutor {
         dst_vid: i64,
         var: &str,
         bindings: &HashMap<String, byoridb_common::Value>,
+        space: &str,
     ) -> byoridb_common::Value {
         // Edge properties are stored as "var.propname" in bindings
         let prefix = format!("{}.", var);
@@ -1239,12 +1268,23 @@ impl MatchExecutor {
             }
         }
 
+        let (src, dst) = match crate::vid::space_vid_type(&self.ctx, space).await {
+            Ok(vid_type) => (
+                crate::vid::display_vid(&self.ctx, space, vid_type, src_vid)
+                    .await
+                    .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null)),
+                crate::vid::display_vid(&self.ctx, space, vid_type, dst_vid)
+                    .await
+                    .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null)),
+            ),
+            Err(_) => (
+                byoridb_common::Value::Null(byoridb_common::NullType::Null),
+                byoridb_common::Value::Null(byoridb_common::NullType::Null),
+            ),
+        };
         byoridb_common::Value::Edge(Box::new(byoridb_common::Edge::with_props(
-            byoridb_common::Value::Int(src_vid),
-            byoridb_common::Value::Int(dst_vid),
-            0, // edge_type numeric (unused for display)
-            edge_type,
-            0, // ranking
+            src, dst, 0, // edge_type numeric (unused for display)
+            edge_type, 0, // ranking
             props,
         )))
     }
@@ -2321,9 +2361,9 @@ fn compare_values(
     }
 }
 
-/// Extract `id(var) == literal_int` (or reversed) bindings from a WHERE expression.
+/// Extract `id(var) == literal_vid` (or reversed) bindings from a WHERE expression.
 /// Handles AND chains. Returns map from variable name → VID.
-pub(crate) fn extract_id_eq_bindings(expr: &Expression) -> HashMap<String, i64> {
+pub(crate) fn extract_id_eq_bindings(expr: &Expression) -> HashMap<String, crate::plan::Vid> {
     match expr {
         Expression::BinaryOp {
             op: BinaryOperator::And,
@@ -2339,15 +2379,18 @@ pub(crate) fn extract_id_eq_bindings(expr: &Expression) -> HashMap<String, i64> 
             left,
             right,
         } => {
-            let try_extract = |func: &Expression, val: &Expression| -> Option<(String, i64)> {
-                if let (
-                    Expression::FunctionCall { name, args },
-                    Expression::Literal(Literal::Int(v)),
-                ) = (func, val)
-                {
+            let try_extract = |func: &Expression,
+                               val: &Expression|
+             -> Option<(String, crate::plan::Vid)> {
+                let vid = match val {
+                    Expression::Literal(Literal::Int(v)) => crate::plan::Vid::Int(*v),
+                    Expression::Literal(Literal::String(v)) => crate::plan::Vid::String(v.clone()),
+                    _ => return None,
+                };
+                if let Expression::FunctionCall { name, args } = func {
                     if name.to_lowercase() == "id" {
                         if let Some(Expression::Identifier(var)) = args.first() {
-                            return Some((var.clone(), *v));
+                            return Some((var.clone(), vid));
                         }
                     }
                 }

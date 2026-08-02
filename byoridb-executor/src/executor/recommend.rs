@@ -1010,7 +1010,7 @@ mod tests {
         executor
             .execute_delete(crate::plan::DeletePlan {
                 space: "default".to_string(),
-                vids: vec![1],
+                vids: vec![1.into()],
                 conditions: None,
             })
             .await
@@ -1129,7 +1129,7 @@ mod tests {
 
         let update = |vec: Vec<f64>| crate::plan::UpdatePlan {
             space: "default".to_string(),
-            vid: 1,
+            vid: 1.into(),
             tag_name: Some("product".to_string()),
             updates: std::collections::HashMap::from([(
                 "emb".to_string(),

@@ -3,12 +3,20 @@
 # Data mutation
 
 Select a space and create the referenced tag or edge schema before mutating
-graph data. Current execution requires integer vertex IDs.
+graph data. Use integer literals in `INT64` spaces and quoted string literals in
+`FIXED_STRING(N)` spaces.
 
 ## Insert vertices
 
 ```sql
 INSERT VERTEX person(name, age) VALUES 1:("Alice", 30);
+```
+
+For a string-VID space, the same mutation uses quoted endpoints:
+
+```sql
+INSERT VERTEX person(name, age) VALUES "alice":("Alice", 30);
+INSERT EDGE knows(since) VALUES "alice"->"bob":(2020);
 ```
 
 A statement can batch several vertices into one current-view/history

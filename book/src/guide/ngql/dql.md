@@ -6,12 +6,13 @@ Query statements use the space selected by the authenticated session.
 
 ## FETCH PROP
 
-Fetch vertices by integer VID:
+Fetch vertices by the VID type selected for the space:
 
 ```sql
 FETCH PROP ON person 1;
 FETCH PROP ON person 1, 2, 3;
 FETCH PROP ON * 1;
+FETCH PROP ON person "alice";
 ```
 
 The multi-VID form uses one internal `batch_get`, but the repository does not
@@ -25,6 +26,7 @@ Fetch edges by endpoint pair:
 ```sql
 FETCH PROP ON knows 1->2;
 FETCH PROP ON * 1->2;
+FETCH PROP ON knows "alice"->"bob";
 ```
 
 The current temporal read surface accepts an epoch-millisecond timestamp for
