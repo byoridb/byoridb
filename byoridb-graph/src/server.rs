@@ -334,7 +334,33 @@ async fn delete_session(
                 }),
             )
         })?;
-    state.service.sign_out(session_id, session_id).await;
+    state
+        .service
+        .sign_out(session_id, session_id)
+        .await
+        .map_err(|error| match error {
+            crate::error::GraphError::SessionNotFound(_) => (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "Invalid or expired session".to_string(),
+                    code: "SESSION_EXPIRED".to_string(),
+                }),
+            ),
+            crate::error::GraphError::InvalidOperation(_) => (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    error: "Sign out is not allowed".to_string(),
+                    code: "FORBIDDEN".to_string(),
+                }),
+            ),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Sign out failed".to_string(),
+                    code: "INTERNAL_ERROR".to_string(),
+                }),
+            ),
+        })?;
     info!("Session deleted");
     Ok(Json(serde_json::json!({"deleted": true})))
 }
@@ -764,6 +790,13 @@ mod tests {
         assert_eq!(response, serde_json::json!({"deleted": true}));
         assert!(!response.to_string().contains(&root.to_string()));
         assert!(state.service.validate_session(root).await.is_err());
+
+        let (status, Json(error)) = delete_session(State(state), session_headers(root))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code, "AUTH_REQUIRED");
+        assert!(!error.error.contains(&root.to_string()));
     }
 
     #[test]

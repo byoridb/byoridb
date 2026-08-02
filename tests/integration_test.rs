@@ -535,7 +535,7 @@ async fn test_crud_space_operations() {
     // DROP SPACE
     let _result = execute(&service, session_id, "DROP SPACE crud_test").await;
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -566,7 +566,7 @@ async fn test_crud_tag_operations() {
     // DROP TAG
     let _result = execute(&service, session_id, "DROP TAG person").await;
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -597,7 +597,7 @@ async fn test_crud_edge_operations() {
     // DROP EDGE
     let _result = execute(&service, session_id, "DROP EDGE follows").await;
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -635,7 +635,7 @@ async fn test_crud_vertex_insert_and_fetch() {
     let result = execute(&service, session_id, "FETCH PROP ON player 1, 2, 3").await;
     assert!(result.row_count() >= 3, "Should fetch 3 vertices");
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -672,7 +672,7 @@ async fn test_insert_preserves_semicolon_inside_string_literal() {
         "stored payload should preserve semicolon, got {stored}"
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -723,7 +723,7 @@ async fn test_crud_edge_insert_and_go() {
     )
     .await;
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 /// Reverse traversal (`GO ... REVERSELY`) must find in-neighbors via the
@@ -788,7 +788,7 @@ async fn test_go_reversely_uses_reverse_edge_index() {
         "after deleting Alice->Bob, only Charlie remains incoming to Bob"
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 /// Index definitions must survive across queries (each GraphService query
@@ -866,7 +866,7 @@ async fn test_index_definitions_survive_across_queries() {
         found.rows
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 /// Regression: two spaces with the same tag + same index name + same VID must
@@ -944,7 +944,7 @@ async fn test_cross_space_index_isolation() {
         b_sees_a.rows
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 /// Regression: `GO ... WHERE <cond>` must filter on edge/vertex properties.
@@ -1003,7 +1003,7 @@ async fn test_go_where_filters_edges() {
         filtered.rows
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 /// Regression: UPDATE and DELETE must keep tag secondary indexes consistent.
@@ -1079,7 +1079,7 @@ async fn test_update_delete_maintain_tag_index() {
         "after DELETE, no index entry may survive"
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 /// Regression: UPDATE `WHEN` and DELETE `WHERE` safety predicates must gate the
@@ -1141,7 +1141,7 @@ async fn test_update_delete_respect_conditions() {
     execute(&service, session_id, "DELETE VERTEX 1 WHERE t.n == 42").await;
     assert_eq!(count(42).await, 0, "WHERE true must delete");
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 /// Regression: INSERT must reject a value whose type does not match the declared
@@ -1186,7 +1186,7 @@ async fn test_insert_rejects_type_mismatch() {
         "correctly-typed INSERT should persist"
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 /// Regression: an indexed MATCH must not silently truncate candidates at a
@@ -1237,7 +1237,7 @@ async fn test_indexed_match_not_truncated_at_1000() {
         "indexed MATCH must return all 1001 matches, not a truncated 1000"
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 /// Regression: a LOOKUP predicate the pushdown can't express must NOT silently
@@ -1283,7 +1283,7 @@ async fn test_lookup_unsupported_predicate_not_fail_open() {
         bad.map(|d| d.row_count())
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 /// Regression: DROP INDEX must delete the index *data*, not only its definition.
@@ -1332,7 +1332,7 @@ async fn test_drop_index_removes_stale_entries() {
         leak.rows
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 /// Regression: `LOOKUP ON <edge-type>` must fail clearly rather than silently
@@ -1367,7 +1367,7 @@ async fn test_edge_lookup_errors_clearly() {
     let tag_lookup = execute(&service, session_id, "LOOKUP ON t WHERE t.n == 1").await;
     assert_eq!(tag_lookup.row_count(), 1, "tag LOOKUP must still work");
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 /// Graceful shutdown: once readiness is flipped off, new queries must be
@@ -1400,7 +1400,7 @@ async fn test_shutdown_rejects_new_queries() {
         "rejection must clearly say the server is shutting down: {err}"
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1446,7 +1446,7 @@ async fn test_crud_lookup() {
         "Should find at least 2 employees over 27"
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1490,7 +1490,7 @@ async fn test_crud_update_vertex() {
         "Should still have vertex after update"
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1526,7 +1526,7 @@ async fn test_crud_delete_vertex() {
     let result = execute(&service, session_id, "FETCH PROP ON item 3").await;
     assert!(result.row_count() >= 1, "Vertex 3 should still exist");
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1563,7 +1563,7 @@ async fn test_crud_user_management() {
     // DROP USER
     let _result = execute(&service, session_id, "DROP USER testuser").await;
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 /// Test that newly created users can authenticate
@@ -1585,7 +1585,7 @@ async fn test_new_user_authentication() {
     )
     .await;
 
-    service.sign_out(root_session, root_session).await;
+    service.sign_out(root_session, root_session).await.unwrap();
 
     // AUTH-SYNC (S-3) is implemented: CREATE USER syncs to AuthManager in-memory cache,
     // so the new user can authenticate immediately after creation.
@@ -1593,7 +1593,10 @@ async fn test_new_user_authentication() {
         .authenticate("newuser".to_string(), "newpass".to_string())
         .await;
     let new_session_id = new_session.expect("New user should authenticate after AUTH-SYNC");
-    service.sign_out(new_session_id, new_session_id).await;
+    service
+        .sign_out(new_session_id, new_session_id)
+        .await
+        .unwrap();
 
     // Cleanup: log back in as root to delete the user
     let root_session = service
@@ -1602,7 +1605,7 @@ async fn test_new_user_authentication() {
         .expect("Root re-authentication failed");
 
     execute(&service, root_session, "DROP USER IF EXISTS newuser").await;
-    service.sign_out(root_session, root_session).await;
+    service.sign_out(root_session, root_session).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1687,7 +1690,7 @@ async fn test_benchmark_match_query_patterns() {
     assert_eq!(q5.rows[0][0], Value::Int(3));
     assert_eq!(q5.rows[0][1], Value::Float(50.0));
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1770,7 +1773,7 @@ async fn test_crud_full_workflow() {
     // 9. Cleanup
     execute(&service, session_id, "DROP SPACE social_network").await;
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2096,5 +2099,5 @@ async fn test_sameas_merges_nodes_and_blocks_deletion() {
         "deleting a sameAs edge must be rejected"
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }

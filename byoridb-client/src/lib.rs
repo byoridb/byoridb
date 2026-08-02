@@ -148,7 +148,10 @@ impl Client {
         let request = tonic::Request::new(SignOutRequest {
             session_id: self.session_id,
         });
-        self.client.sign_out(request).await?;
+        let response = self.client.sign_out(request).await?.into_inner();
+        if response.error_code != 0 {
+            return Err(anyhow!("Sign out error: {}", response.error_msg));
+        }
         Ok(())
     }
 }
