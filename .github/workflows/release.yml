@@ -90,7 +90,10 @@ jobs:
           cd target/${{ matrix.target }}/release
           BINS=(byoridb-server byoridb-cli)
           [ -f byoridb-backup ] && BINS+=(byoridb-backup)
-          tar -czvf ../../../byoridb-${{ github.ref_name }}-${{ matrix.target }}.tar.gz "${BINS[@]}"
+          ARCHIVE=../../../byoridb-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          tar -czvf "$ARCHIVE" "${BINS[@]}" -C ../../.. LICENSE NOTICES.md
+          tar -tzf "$ARCHIVE" | grep -Fxq LICENSE
+          tar -tzf "$ARCHIVE" | grep -Fxq NOTICES.md
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

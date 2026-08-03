@@ -23,10 +23,11 @@ Gatekeeper bypass; build the desired tag from source instead. These notes do not
 supply the missing ARM Linux artifact or macOS signing; both remain unresolved
 release work.
 
-Current release archives also contain binaries only and omit `LICENSE` and
-`NOTICES.md`; packaging those files remains open in
-[issue #28](https://github.com/byoridb/byoridb/issues/28). Review the repository
-license and notices before redistributing an archive.
+The release workflow includes `LICENSE` and `NOTICES.md` at the root of every
+new tagged archive and verifies both files before publishing it. Published
+v0.3.3 and older archives predate this check and are not changed retroactively;
+review the repository license and notices before redistributing those legacy
+archives.
 
 ## Build requirements
 
