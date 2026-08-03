@@ -313,6 +313,35 @@ mod tests {
         assert!(!response.error_msg.contains("99999999"));
     }
 
+    #[tokio::test]
+    async fn sign_out_expired_session_returns_session_error() {
+        const ROOT_PASSWORD: &str = "root-password";
+        let internal = Arc::new(InternalGraphService::with_auth(
+            Arc::new(MemoryKVStore::new()),
+            AuthManager::with_config(ROOT_PASSWORD, Duration::from_millis(20)),
+        ));
+        let session = internal
+            .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let service = GrpcService::new(internal);
+
+        let response = GraphService::sign_out(
+            &service,
+            Request::new(SignOutRequest {
+                session_id: session,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.error_code, 2);
+        assert_eq!(response.error_msg, "Session not found");
+        assert!(!response.error_msg.contains(&session.to_string()));
+    }
+
     #[test]
     fn elapsed_us_never_negative() {
         let start = std::time::Instant::now();

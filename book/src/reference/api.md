@@ -73,17 +73,18 @@ message ExecuteResponse {
 The protobuf session ID remains an `int64`; protobuf clients preserve it
 without the JavaScript JSON number precision problem.
 
-For `Execute` and `ExecuteJson`, current application error codes are:
+Current application error codes are:
 
-| Code | Meaning |
-|---:|---|
-| `0` | Success |
-| `1` | Query, parse, authorization, or execution error |
-| `2` | Session missing or expired |
-
-`Authenticate` uses `0` for success and `1` for authentication failure.
-`SignOut` currently returns `0` after attempting to remove the caller's own
-session.
+| RPC | Code | Meaning |
+|---|---:|---|
+| `Authenticate` | `0` | Success |
+| `Authenticate` | `1` | Authentication failure (`Invalid credentials`) |
+| `SignOut` | `0` | Success |
+| `SignOut` | `1` | Other sign-out failure |
+| `SignOut` | `2` | Session missing or expired |
+| `Execute` / `ExecuteJson` | `0` | Success |
+| `Execute` / `ExecuteJson` | `1` | Query, parse, authorization, or execution error |
+| `Execute` / `ExecuteJson` | `2` | Session missing or expired |
 
 ### Result representation
 
@@ -213,9 +214,9 @@ curl -sS -X DELETE \
   -H 'X-ByoriDB-Session-Id: 734817462937615829'
 ```
 
-The endpoint validates and signs out the session identified by the header. A
-missing, malformed, expired, or unknown session returns HTTP 401 with
-`AUTH_REQUIRED`.
+The endpoint validates and signs out the session identified by the header.
+A missing or malformed header returns HTTP 401 with `AUTH_REQUIRED`; a parsed
+session that is expired or unknown returns HTTP 401 with `SESSION_EXPIRED`.
 
 ### Active queries
 

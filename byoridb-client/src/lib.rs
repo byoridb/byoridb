@@ -7,7 +7,7 @@ pub mod graph_proto {
 }
 
 use graph_proto::graph_service_client::GraphServiceClient;
-use graph_proto::{AuthenticateRequest, ExecuteRequest, SignOutRequest};
+use graph_proto::{AuthenticateRequest, ExecuteRequest, SignOutRequest, SignOutResponse};
 
 /// Render a proto `DataSet` to a flat string for the legacy `execute()`
 /// caller. Each row becomes one comma-separated line, columns header on
@@ -38,6 +38,13 @@ fn format_dataset(ds: &graph_proto::DataSet) -> String {
         out.push('\n');
     }
     out
+}
+
+fn ensure_sign_out_succeeded(response: SignOutResponse) -> Result<()> {
+    if response.error_code != 0 {
+        return Err(anyhow!("Sign out error: {}", response.error_msg));
+    }
+    Ok(())
 }
 
 pub struct Client {
@@ -149,10 +156,7 @@ impl Client {
             session_id: self.session_id,
         });
         let response = self.client.sign_out(request).await?.into_inner();
-        if response.error_code != 0 {
-            return Err(anyhow!("Sign out error: {}", response.error_msg));
-        }
-        Ok(())
+        ensure_sign_out_succeeded(response)
     }
 }
 
@@ -217,5 +221,16 @@ mod tests {
             "error should mention password: {}",
             msg
         );
+    }
+
+    #[test]
+    fn close_surfaces_nonzero_sign_out_response() {
+        let error = ensure_sign_out_succeeded(SignOutResponse {
+            error_code: 2,
+            error_msg: "Session not found".to_string(),
+        })
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "Sign out error: Session not found");
     }
 }
