@@ -107,7 +107,7 @@ impl Executor {
                     // Key: {space}:tagvid:{tag_name}:{vid} → empty value.
                     for tag in &codec_vertex.tags {
                         let tagvid_key =
-                            format!("{}:tagvid:{}:{}", effective_space, tag.name, vertex.vid);
+                            format!("{}:tagvid:{}:{}", effective_space, tag.name, internal_vid);
                         batch.push((tagvid_key.into_bytes(), Vec::new()));
                     }
                     // Dense embedding side-store (PLAN.md R-2a): any numeric-list

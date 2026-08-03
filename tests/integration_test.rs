@@ -757,6 +757,24 @@ async fn test_fixed_string_vid_crud_traversal_and_type_contract() {
         Value::Vertex(vertex) if vertex.vid == Value::String("alice".to_string())
     ));
 
+    // Label-only MATCH reads the tag-VID secondary index. Its keys must use
+    // internal surrogates so they remain parseable before result VIDs are
+    // translated back to FIXED_STRING values.
+    let label_only = execute(&service, session_id, "MATCH (n:person) RETURN id(n) AS vid").await;
+    let mut label_only_vids: Vec<String> = label_only
+        .rows
+        .iter()
+        .map(|row| match row.first() {
+            Some(Value::String(vid)) => vid.clone(),
+            other => panic!("expected FIXED_STRING VID from label-only MATCH, got {other:?}"),
+        })
+        .collect();
+    label_only_vids.sort();
+    assert_eq!(
+        label_only_vids,
+        vec!["alice".to_string(), "bob".to_string()]
+    );
+
     let found = execute(
         &service,
         session_id,

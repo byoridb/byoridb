@@ -45,6 +45,16 @@ fn go_expr_needs_dst_vertex(expr: &Expression) -> bool {
     }
 }
 
+#[derive(Clone, Copy)]
+struct GoYieldRow<'a> {
+    space: &'a str,
+    src_vid: i64,
+    dst_vid: i64,
+    last_edge: Option<&'a CodecEdgeData>,
+    dst_vertex: Option<&'a CodecVertexData>,
+    vid_type: crate::vid::SpaceVidType,
+}
+
 impl Executor {
     pub(super) async fn execute_fetch(
         &self,
@@ -895,18 +905,16 @@ impl Executor {
         let mut result_bytes = 0usize; // OOM guard: bound accumulated result memory
         for (src_vid, dst_vid, last_edge) in traversal {
             let mut row = Vec::with_capacity(plan.yield_clause.columns.len());
+            let yield_row = GoYieldRow {
+                space,
+                src_vid,
+                dst_vid,
+                last_edge: last_edge.as_ref(),
+                dst_vertex: dst_vertices.get(&dst_vid),
+                vid_type,
+            };
             for col in &plan.yield_clause.columns {
-                let val = self
-                    .eval_go_yield_expr(
-                        space,
-                        src_vid,
-                        dst_vid,
-                        last_edge.as_ref(),
-                        dst_vertices.get(&dst_vid),
-                        vid_type,
-                        &col.expression,
-                    )
-                    .await?;
+                let val = self.eval_go_yield_expr(yield_row, &col.expression).await?;
                 row.push(val);
             }
             result_bytes += crate::context::estimate_row_bytes(&row);
@@ -988,14 +996,17 @@ impl Executor {
     /// Evaluate a single YIELD expression in the context of a GO traversal row.
     async fn eval_go_yield_expr(
         &self,
-        space: &str,
-        src_vid: i64,
-        dst_vid: i64,
-        last_edge: Option<&CodecEdgeData>,
-        dst_vertex: Option<&CodecVertexData>,
-        vid_type: crate::vid::SpaceVidType,
+        row: GoYieldRow<'_>,
         expr: &Expression,
     ) -> Result<byoridb_common::Value> {
+        let GoYieldRow {
+            space,
+            src_vid,
+            dst_vid,
+            last_edge,
+            dst_vertex,
+            vid_type,
+        } = row;
         let value = match expr {
             Expression::Identifier(name) => match name.as_str() {
                 "src" | "_src_vid" => {
