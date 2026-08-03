@@ -233,6 +233,7 @@ impl FilterExpr {
             (Value::Int(a), Value::Int(b)) => a < b,
             (Value::Float(a), Value::Float(b)) => a < b,
             (Value::String(a), Value::String(b)) => a < b,
+            (Value::Bool(a), Value::Bool(b)) => a < b,
             (Value::Int(a), Value::Float(b)) => (*a as f64) < *b,
             (Value::Float(a), Value::Int(b)) => *a < (*b as f64),
             _ => false,
@@ -245,6 +246,7 @@ impl FilterExpr {
             (Value::Int(a), Value::Int(b)) => a <= b,
             (Value::Float(a), Value::Float(b)) => a <= b,
             (Value::String(a), Value::String(b)) => a <= b,
+            (Value::Bool(a), Value::Bool(b)) => a <= b,
             (Value::Int(a), Value::Float(b)) => (*a as f64) <= *b,
             (Value::Float(a), Value::Int(b)) => *a <= (*b as f64),
             _ => false,
@@ -257,6 +259,7 @@ impl FilterExpr {
             (Value::Int(a), Value::Int(b)) => a > b,
             (Value::Float(a), Value::Float(b)) => a > b,
             (Value::String(a), Value::String(b)) => a > b,
+            (Value::Bool(a), Value::Bool(b)) => a > b,
             (Value::Int(a), Value::Float(b)) => (*a as f64) > *b,
             (Value::Float(a), Value::Int(b)) => *a > (*b as f64),
             _ => false,
@@ -269,6 +272,7 @@ impl FilterExpr {
             (Value::Int(a), Value::Int(b)) => a >= b,
             (Value::Float(a), Value::Float(b)) => a >= b,
             (Value::String(a), Value::String(b)) => a >= b,
+            (Value::Bool(a), Value::Bool(b)) => a >= b,
             (Value::Int(a), Value::Float(b)) => (*a as f64) >= *b,
             (Value::Float(a), Value::Int(b)) => *a >= (*b as f64),
             _ => false,
@@ -312,6 +316,19 @@ mod tests {
         assert!(FilterExpr::lt("age", Value::Int(35)).evaluate(&get_field));
         assert!(FilterExpr::le("age", Value::Int(30)).evaluate(&get_field));
         assert!(!FilterExpr::lt("age", Value::Int(25)).evaluate(&get_field));
+    }
+
+    #[test]
+    fn test_bool_comparison_filters() {
+        let get_field = |field: &str| match field {
+            "enabled" => Some(Value::Bool(true)),
+            _ => None,
+        };
+
+        assert!(FilterExpr::gt("enabled", Value::Bool(false)).evaluate(&get_field));
+        assert!(FilterExpr::ge("enabled", Value::Bool(true)).evaluate(&get_field));
+        assert!(!FilterExpr::lt("enabled", Value::Bool(false)).evaluate(&get_field));
+        assert!(FilterExpr::le("enabled", Value::Bool(true)).evaluate(&get_field));
     }
 
     #[test]

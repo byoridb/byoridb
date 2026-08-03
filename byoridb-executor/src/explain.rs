@@ -42,6 +42,8 @@ pub enum AccessPath {
     PointLookup,
     /// Un-indexed full scan.
     FullScan,
+    /// The executor deliberately rejects this access path in the current mode.
+    Unsupported(String),
     /// No data access (DDL, projection-only, output).
     None,
 }
@@ -55,6 +57,7 @@ impl AccessPath {
             AccessPath::ReverseEdgeIndex => "reverse-edge index".to_string(),
             AccessPath::PointLookup => "point lookup".to_string(),
             AccessPath::FullScan => "⚠ FULL SCAN".to_string(),
+            AccessPath::Unsupported(reason) => format!("UNSUPPORTED: {reason}"),
             AccessPath::None => "-".to_string(),
         }
     }
@@ -213,6 +216,7 @@ async fn build_lookup(ctx: &ExecutionContext, p: &LookupPlan) -> PlanNode {
 
     let (op, scan_op) = match &access {
         AccessPath::Index(_) => ("IndexScan", ProfileOp::IndexScan),
+        AccessPath::Unsupported(_) => ("Unsupported", ProfileOp::FullScan),
         _ => ("TagScan", ProfileOp::FullScan),
     };
     let scan = PlanNode::new(
@@ -223,8 +227,11 @@ async fn build_lookup(ctx: &ExecutionContext, p: &LookupPlan) -> PlanNode {
     .with_profile(scan_op);
 
     let mut node = scan;
+    if let Some(offset) = p.offset {
+        node = PlanNode::new("Offset", offset.to_string(), AccessPath::None).child(node);
+    }
     if let Some(limit) = p.limit {
-        node = PlanNode::new("Limit", format!("{}", limit), AccessPath::None).child(node);
+        node = PlanNode::new("Limit", limit.to_string(), AccessPath::None).child(node);
     }
     let cols = match &p.lookup_type {
         LookupType::Tag(t) => format!("{}.vid", t),
@@ -450,33 +457,63 @@ fn build_fetch(p: &crate::plan::FetchPlan) -> PlanNode {
 // ===== Access-path resolution (static, EXPLAIN) =====
 
 async fn lookup_access(ctx: &ExecutionContext, p: &LookupPlan) -> AccessPath {
+    lookup_access_for_mode(ctx, p, ctx.is_distributed()).await
+}
+
+async fn lookup_access_for_mode(
+    ctx: &ExecutionContext,
+    p: &LookupPlan,
+    distributed: bool,
+) -> AccessPath {
     // Only tag lookups currently have an index path in the executor.
     if let LookupType::Tag(tag) = &p.lookup_type {
+        if let Some(expr) = p.where_clause.as_ref() {
+            if let Some(access) = distributed_lookup_guard(distributed, expr) {
+                return access;
+            }
+        }
         if let (Some(im), Some(expr)) = (ctx.index_manager.as_ref(), p.where_clause.as_ref()) {
             if let Some(field) = lookup_index_field(expr) {
                 if let Some(value) = range_lookup_literal(expr) {
                     let Some(space) = ctx.space.as_deref() else {
-                        return AccessPath::FullScan;
+                        return lookup_full_scan_access(distributed);
                     };
                     if crate::executor::range_index_boundary(ctx, space, tag, &field, &value)
                         .await
                         .is_none()
                     {
-                        return AccessPath::FullScan;
+                        return lookup_full_scan_access(distributed);
                     }
                 }
                 let space_id = ctx.resolve_space_id().await;
                 let indexes = im.list_tag_indexes(space_id).await;
-                if let Some(idx) = indexes
-                    .iter()
-                    .find(|i| i.fields.len() == 1 && i.fields[0] == field)
-                {
+                if let Some(idx) = indexes.iter().find(|i| {
+                    i.schema_name.eq_ignore_ascii_case(tag)
+                        && i.fields.len() == 1
+                        && i.fields[0] == field
+                }) {
                     return AccessPath::Index(idx.index_name.clone());
                 }
             }
         }
     }
-    AccessPath::FullScan
+    lookup_full_scan_access(distributed)
+}
+
+fn lookup_full_scan_access(distributed: bool) -> AccessPath {
+    if distributed {
+        AccessPath::Unsupported(
+            crate::executor::DISTRIBUTED_LOOKUP_FULL_SCAN_UNSUPPORTED.to_string(),
+        )
+    } else {
+        AccessPath::FullScan
+    }
+}
+
+fn distributed_lookup_guard(distributed: bool, expr: &Expression) -> Option<AccessPath> {
+    (distributed && crate::executor::expression_contains_ordered_range(expr)).then(|| {
+        AccessPath::Unsupported(crate::executor::DISTRIBUTED_LOOKUP_RANGE_UNSUPPORTED.to_string())
+    })
 }
 
 fn range_lookup_literal(expr: &Expression) -> Option<Value> {
@@ -905,6 +942,16 @@ mod tests {
         )
         .await
         .unwrap();
+        kv.put(
+            &crate::key::SchemaKey::tag("default", "car"),
+            &serde_json::to_vec(&serde_json::json!({
+                "name": "car",
+                "properties": [{"name": "age", "data_type": "Int64"}]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
         let index_manager = ctx.index_manager.as_ref().unwrap();
         let index_id = index_manager
             .create_tag_index(
@@ -912,6 +959,17 @@ mod tests {
                 "person_age_idx".to_string(),
                 10,
                 "person".to_string(),
+                vec!["age".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        index_manager
+            .create_tag_index(
+                1,
+                "car_age_idx".to_string(),
+                20,
+                "car".to_string(),
                 vec!["age".to_string()],
                 vec![0],
             )
@@ -943,6 +1001,15 @@ mod tests {
         let stmt = byoridb_parser::parse(q).unwrap();
         let plan = ExecutionPlanBuilder::build(stmt).unwrap();
         exec.execute(plan).await.unwrap()
+    }
+
+    fn lookup_plan(q: &str) -> crate::plan::LookupPlan {
+        let statement = byoridb_parser::parse(q).unwrap();
+        let plan = ExecutionPlanBuilder::build(statement).unwrap();
+        let crate::plan::ExecutionPlan::Lookup(plan) = plan else {
+            panic!("expected LOOKUP plan");
+        };
+        plan
     }
 
     #[tokio::test]
@@ -1016,6 +1083,13 @@ mod tests {
             );
         }
 
+        let car = run(&exec, "EXPLAIN LOOKUP ON car WHERE car.age > 30").await;
+        let ai = access_col(&car);
+        assert!(car.rows.iter().any(|row| matches!(
+            &row[ai],
+            byoridb_common::Value::String(access) if access.contains("car_age_idx")
+        )));
+
         let cross_type = run(&exec, "EXPLAIN LOOKUP ON person WHERE person.age > 30.5").await;
         let ai = access_col(&cross_type);
         assert!(
@@ -1025,6 +1099,141 @@ mod tests {
             )),
             "cross-type range must retain the correctness-preserving fallback: {:?}",
             cross_type.rows
+        );
+
+        let reversed = run(
+            &exec,
+            "EXPLAIN LOOKUP ON person WHERE 30.5 < person.age LIMIT 2 OFFSET 1",
+        )
+        .await;
+        let ai = access_col(&reversed);
+        assert!(reversed.rows.iter().any(|row| matches!(
+            &row[ai],
+            byoridb_common::Value::String(access) if access.contains("FULL SCAN")
+        )));
+        let operators = operators(&reversed);
+        assert!(operators.iter().any(|operator| operator == "Offset"));
+        assert!(operators.iter().any(|operator| operator == "Limit"));
+    }
+
+    #[tokio::test]
+    async fn explain_float_schema_range_uses_full_scan_for_mixed_key_domains() {
+        let kv = Arc::new(MemoryKVStore::new());
+        let ctx = Arc::new(
+            ExecutionContext::new(kv.clone())
+                .with_space("default".to_string())
+                .with_space_id(1),
+        );
+        kv.put(
+            &crate::key::SchemaKey::tag("default", "metric"),
+            &serde_json::to_vec(&serde_json::json!({
+                "name": "metric",
+                "properties": [{"name": "score", "data_type": "Double"}]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        ctx.index_manager
+            .as_ref()
+            .unwrap()
+            .create_tag_index(
+                1,
+                "metric_score_idx".to_string(),
+                10,
+                "metric".to_string(),
+                vec!["score".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        let exec = Executor::new(ctx);
+
+        for query in [
+            "EXPLAIN LOOKUP ON metric WHERE metric.score > 1",
+            "EXPLAIN LOOKUP ON metric WHERE metric.score > 1.0",
+        ] {
+            let result = run(&exec, query).await;
+            let ai = access_col(&result);
+            assert!(
+                result.rows.iter().any(|row| matches!(
+                    &row[ai],
+                    byoridb_common::Value::String(access) if access.contains("FULL SCAN")
+                )),
+                "Float/Double range must match the runtime fallback for {query}: {:?}",
+                result.rows
+            );
+            assert!(!result.rows.iter().any(|row| matches!(
+                &row[ai],
+                byoridb_common::Value::String(access) if access.contains("metric_score_idx")
+            )));
+        }
+    }
+
+    #[test]
+    fn distributed_range_explain_reports_unsupported_access() {
+        let statement = byoridb_parser::parse("LOOKUP ON person WHERE person.age > 30").unwrap();
+        let plan = ExecutionPlanBuilder::build(statement).unwrap();
+        let crate::plan::ExecutionPlan::Lookup(plan) = plan else {
+            panic!("expected LOOKUP plan");
+        };
+        let expression = plan.where_clause.as_ref().unwrap();
+        let access = super::distributed_lookup_guard(true, expression).unwrap();
+        assert!(matches!(access, super::AccessPath::Unsupported(_)));
+        assert!(access.display().contains("UNSUPPORTED"));
+
+        for query in [
+            "LOOKUP ON person WHERE person.age > 30 AND person.enabled == true",
+            "LOOKUP ON person WHERE person.enabled == true OR person.age <= 30",
+            "LOOKUP ON person WHERE NOT (person.age > 30)",
+        ] {
+            let statement = byoridb_parser::parse(query).unwrap();
+            let plan = ExecutionPlanBuilder::build(statement).unwrap();
+            let crate::plan::ExecutionPlan::Lookup(plan) = plan else {
+                panic!("expected LOOKUP plan");
+            };
+            let access =
+                super::distributed_lookup_guard(true, plan.where_clause.as_ref().unwrap()).unwrap();
+            assert!(
+                matches!(access, super::AccessPath::Unsupported(_)),
+                "query: {query}"
+            );
+        }
+
+        let equality = byoridb_parser::parse("LOOKUP ON person WHERE person.age == 30").unwrap();
+        let equality = ExecutionPlanBuilder::build(equality).unwrap();
+        let crate::plan::ExecutionPlan::Lookup(equality) = equality else {
+            panic!("expected LOOKUP plan");
+        };
+        assert!(
+            super::distributed_lookup_guard(true, equality.where_clause.as_ref().unwrap())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn distributed_lookup_explain_matches_runtime_full_scan_guard() {
+        let exec = exec_with_age_index().await;
+        for query in [
+            "LOOKUP ON person",
+            "LOOKUP ON person WHERE person.name == \"Alice\"",
+            "LOOKUP ON person WHERE person.age == 30 AND person.age == 40",
+            "LOOKUP ON person WHERE person.age > 30.5",
+        ] {
+            let plan = lookup_plan(query);
+            let access = super::lookup_access_for_mode(exec.ctx(), &plan, true).await;
+            assert!(
+                matches!(access, super::AccessPath::Unsupported(_)),
+                "distributed runtime rejects the full-scan path for {query}: {access:?}"
+            );
+            assert!(access.display().contains("UNSUPPORTED"));
+        }
+
+        let indexed = lookup_plan("LOOKUP ON person WHERE person.age == 40");
+        let access = super::lookup_access_for_mode(exec.ctx(), &indexed, true).await;
+        assert!(
+            matches!(access, super::AccessPath::Index(ref name) if name == "person_age_idx"),
+            "supported distributed equality lookup should retain its index path: {access:?}"
         );
     }
 
