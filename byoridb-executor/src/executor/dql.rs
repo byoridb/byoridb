@@ -30,6 +30,14 @@ fn json_to_value(val: &serde_json::Value) -> Option<byoridb_common::Value> {
     }
 }
 
+fn go_expr_needs_dst_vertex(expr: &Expression) -> bool {
+    match expr {
+        Expression::DstVertexProp { .. } => true,
+        Expression::Identifier(name) => name == "vertex",
+        _ => false,
+    }
+}
+
 impl Executor {
     pub(super) async fn execute_fetch(
         &self,
@@ -737,20 +745,66 @@ impl Executor {
             })
             .collect();
 
+        // Destination projections used to perform one point get per result
+        // row *and* projected column. Resolve every distinct destination once
+        // instead, then evaluate all `$$.tag.prop` / `vertex` expressions from
+        // the decoded batch. This is the hot path for LDBC-style fan-out reads.
+        let needs_dst_vertices = plan
+            .yield_clause
+            .columns
+            .iter()
+            .any(|col| go_expr_needs_dst_vertex(&col.expression));
+        let mut dst_vertices: std::collections::HashMap<i64, CodecVertexData> =
+            std::collections::HashMap::new();
+        if needs_dst_vertices {
+            let batch_start = std::time::Instant::now();
+            let mut seen = std::collections::HashSet::new();
+            let dst_vids: Vec<i64> = traversal
+                .iter()
+                .map(|(_, dst, _)| *dst)
+                .filter(|dst| seen.insert(*dst))
+                .collect();
+            let keys: Vec<Vec<u8>> = dst_vids
+                .iter()
+                .map(|dst| format!("{}:vertex:{}", space, dst).into_bytes())
+                .collect();
+            let blobs = if keys.is_empty() {
+                Vec::new()
+            } else {
+                self.ctx.kvstore.batch_get(&keys).await?
+            };
+            for (dst, blob) in dst_vids.iter().zip(blobs) {
+                if let Some(vertex) = blob.and_then(|data| VertexCodec::decode_vertex(&data).ok()) {
+                    dst_vertices.insert(*dst, vertex);
+                }
+            }
+            if profiling {
+                self.ctx.record_profile(
+                    ProfileOp::GetVertices,
+                    format!(
+                        "batch destination projection: {} unique vid(s), {} found",
+                        dst_vids.len(),
+                        dst_vertices.len()
+                    ),
+                    dst_vertices.len() as u64,
+                    batch_start.elapsed().as_micros() as u64,
+                    false,
+                );
+            }
+        }
+
         let mut rows = Vec::with_capacity(traversal.len());
         let mut result_bytes = 0usize; // OOM guard: bound accumulated result memory
         for (src_vid, dst_vid, last_edge) in traversal {
             let mut row = Vec::with_capacity(plan.yield_clause.columns.len());
             for col in &plan.yield_clause.columns {
-                let val = self
-                    .eval_go_yield_expr(
-                        space,
-                        src_vid,
-                        dst_vid,
-                        last_edge.as_ref(),
-                        &col.expression,
-                    )
-                    .await;
+                let val = self.eval_go_yield_expr(
+                    src_vid,
+                    dst_vid,
+                    last_edge.as_ref(),
+                    dst_vertices.get(&dst_vid),
+                    &col.expression,
+                );
                 row.push(val);
             }
             result_bytes += crate::context::estimate_row_bytes(&row);
@@ -830,30 +884,25 @@ impl Executor {
     }
 
     /// Evaluate a single YIELD expression in the context of a GO traversal row.
-    async fn eval_go_yield_expr(
+    fn eval_go_yield_expr(
         &self,
-        space: &str,
         src_vid: i64,
         dst_vid: i64,
         last_edge: Option<&CodecEdgeData>,
+        dst_vertex: Option<&CodecVertexData>,
         expr: &Expression,
     ) -> byoridb_common::Value {
         match expr {
             Expression::Identifier(name) => match name.as_str() {
                 "src" | "_src_vid" => byoridb_common::Value::Int(src_vid),
                 "dst" | "_dst_vid" => byoridb_common::Value::Int(dst_vid),
-                "vertex" => {
-                    let key = format!("{}:vertex:{}", space, dst_vid);
-                    match self.ctx.kvstore.get(key.as_bytes()).await {
-                        Ok(Some(blob)) => match VertexCodec::decode_vertex(&blob) {
-                            Ok(v) => byoridb_common::Value::String(
-                                VertexCodec::vertex_to_json(&v).to_string(),
-                            ),
-                            Err(_) => byoridb_common::Value::Null(byoridb_common::NullType::Null),
-                        },
-                        _ => byoridb_common::Value::Null(byoridb_common::NullType::Null),
-                    }
-                }
+                "vertex" => dst_vertex
+                    .map(|vertex| {
+                        byoridb_common::Value::String(
+                            VertexCodec::vertex_to_json(vertex).to_string(),
+                        )
+                    })
+                    .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null)),
                 // `edge` refers to the edge currently being traversed. Needed for
                 // `OVER *` where a typed prefix like `has_brand._dst` isn't usable
                 // (the edge type varies per row). Serialised as JSON like `vertex`.
@@ -888,25 +937,13 @@ impl Executor {
                     byoridb_common::Value::Null(byoridb_common::NullType::Null)
                 }
             }
-            Expression::DstVertexProp { tag, prop } => {
-                // Fetch the destination vertex and look up tag.prop.
-                let key = format!("{}:vertex:{}", space, dst_vid);
-                let blob = match self.ctx.kvstore.get(key.as_bytes()).await {
-                    Ok(Some(b)) => b,
-                    _ => return byoridb_common::Value::Null(byoridb_common::NullType::Null),
-                };
-                let vertex = match VertexCodec::decode_vertex(&blob) {
-                    Ok(v) => v,
-                    Err(_) => return byoridb_common::Value::Null(byoridb_common::NullType::Null),
-                };
-                vertex
-                    .tags
-                    .iter()
-                    .find(|t| t.name.eq_ignore_ascii_case(tag))
-                    .and_then(|t| t.properties.get(prop))
-                    .cloned()
-                    .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null))
-            }
+            Expression::DstVertexProp { tag, prop } => dst_vertex
+                .into_iter()
+                .flat_map(|vertex| vertex.tags.iter())
+                .find(|t| t.name.eq_ignore_ascii_case(tag))
+                .and_then(|t| t.properties.get(prop))
+                .cloned()
+                .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null)),
             Expression::Literal(lit) => match lit {
                 Literal::Int(i) => byoridb_common::Value::Int(*i),
                 Literal::Float(f) => byoridb_common::Value::Float(*f),

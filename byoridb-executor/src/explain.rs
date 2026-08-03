@@ -177,10 +177,26 @@ fn build_go(p: &crate::plan::GoPlan) -> PlanNode {
     .with_profile(op)
     .child(start);
 
+    let needs_dst_vertices = p.yield_clause.columns.iter().any(|col| {
+        matches!(&col.expression, Expression::DstVertexProp { .. })
+            || matches!(&col.expression, Expression::Identifier(name) if name == "vertex")
+    });
+    let input = if needs_dst_vertices {
+        PlanNode::new(
+            "GetVertices",
+            "batch destination projection",
+            AccessPath::PointLookup,
+        )
+        .with_profile(ProfileOp::GetVertices)
+        .child(neighbors)
+    } else {
+        neighbors
+    };
+
     let proj_detail = yield_columns(&p.yield_clause);
     PlanNode::new("Project", proj_detail, AccessPath::None)
         .with_profile(ProfileOp::Project)
-        .child(neighbors)
+        .child(input)
 }
 
 async fn build_lookup(ctx: &ExecutionContext, p: &LookupPlan) -> PlanNode {
@@ -1088,6 +1104,23 @@ mod tests {
         let ops = operators(&res);
         assert!(ops.iter().any(|o| o == "GetNeighbors"), "{:?}", ops);
         assert!(ops.iter().any(|o| o == "Project"), "{:?}", ops);
+    }
+
+    #[tokio::test]
+    async fn profile_go_destination_projection_reports_batch_getvertices() {
+        let exec = exec_graph().await;
+        let res = run(
+            &exec,
+            "PROFILE GO FROM 1 OVER belongs_to YIELD $$.category.name",
+        )
+        .await;
+        let ops = operators(&res);
+        assert!(ops.iter().any(|o| o == "GetVertices"), "{:?}", ops);
+        let detail_idx = res.columns.iter().position(|c| c == "detail").unwrap();
+        assert!(res.rows.iter().any(|row| {
+            matches!(&row[detail_idx], byoridb_common::Value::String(detail)
+                if detail.contains("batch destination projection"))
+        }));
     }
 
     #[tokio::test]

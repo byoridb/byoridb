@@ -256,7 +256,7 @@ mod tests {
     use crate::plan::{
         AlterColumnOp, AlterOpType, AlterPlan, CreatePlan, DeletePlan, DropPlan, FetchPlan,
         FindPlan, FindType, FromClause, GoPlan, InsertPlan, LookupPlan, LookupType, PropertyDef,
-        ShowPlan, StepClause, TagData, ToClause, VertexInsert, YieldClause,
+        ShowPlan, StepClause, TagData, ToClause, VertexInsert, YieldClause, YieldColumn,
     };
     use crate::ExecutionPlanBuilder;
     use byoridb_codec::{
@@ -819,6 +819,58 @@ mod tests {
         assert_eq!(result.rows.len(), 0);
     }
 
+    #[tokio::test]
+    async fn test_fetch_thousand_vids_preserves_input_order_and_skips_missing() {
+        let executor = create_executor();
+        let missing = [250i64, 750];
+        let mut pairs = Vec::new();
+        for vid in 1i64..=1000 {
+            if missing.contains(&vid) {
+                continue;
+            }
+            let vertex = CodecVertexData {
+                vid,
+                tags: vec![CodecTagData {
+                    name: "item".to_string(),
+                    properties: HashMap::from([(
+                        "ordinal".to_string(),
+                        byoridb_common::Value::Int(vid),
+                    )]),
+                }],
+            };
+            pairs.push((
+                format!("default:vertex:{vid}").into_bytes(),
+                VertexCodec::encode_vertex(&vertex).unwrap(),
+            ));
+        }
+        executor.ctx.kvstore.batch_put(pairs).await.unwrap();
+
+        let result = executor
+            .execute_fetch(FetchPlan {
+                space: "default".to_string(),
+                vids: (1i64..=1000).collect(),
+                tags: vec!["item".to_string()],
+                yield_clause: None,
+                edge_refs: vec![],
+                is_edge_fetch: false,
+                src_var: None,
+                as_of: None,
+            })
+            .await
+            .unwrap();
+
+        let actual: Vec<i64> = result
+            .rows
+            .iter()
+            .map(|row| match row.first() {
+                Some(byoridb_common::Value::Int(vid)) => *vid,
+                other => panic!("expected VID in first FETCH column, got {other:?}"),
+            })
+            .collect();
+        let expected: Vec<i64> = (1i64..=1000).filter(|vid| !missing.contains(vid)).collect();
+        assert_eq!(actual, expected);
+    }
+
     // ===== GO Tests =====
 
     #[tokio::test]
@@ -868,6 +920,136 @@ mod tests {
             .collect();
         destinations.sort_unstable();
         assert_eq!(destinations, vec![401, 402]);
+    }
+
+    #[tokio::test]
+    async fn test_go_destination_projection_batches_multitag_and_null_values() {
+        let executor = create_executor();
+        let destination_vertices = [
+            CodecVertexData {
+                vid: 2,
+                tags: vec![
+                    CodecTagData {
+                        name: "person".to_string(),
+                        properties: HashMap::from([(
+                            "name".to_string(),
+                            byoridb_common::Value::String("Bob".to_string()),
+                        )]),
+                    },
+                    CodecTagData {
+                        name: "stats".to_string(),
+                        properties: HashMap::from([(
+                            "score".to_string(),
+                            byoridb_common::Value::Int(7),
+                        )]),
+                    },
+                ],
+            },
+            CodecVertexData {
+                vid: 3,
+                tags: vec![CodecTagData {
+                    name: "person".to_string(),
+                    properties: HashMap::from([(
+                        "name".to_string(),
+                        byoridb_common::Value::String("Cara".to_string()),
+                    )]),
+                }],
+            },
+        ];
+        executor
+            .ctx
+            .kvstore
+            .batch_put(
+                destination_vertices
+                    .iter()
+                    .map(|vertex| {
+                        (
+                            format!("default:vertex:{}", vertex.vid).into_bytes(),
+                            VertexCodec::encode_vertex(vertex).unwrap(),
+                        )
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        insert_test_edge(&executor, 1, 2, "follow", 0).await;
+        insert_test_edge(&executor, 1, 3, "follow", 0).await;
+
+        let profile = executor.ctx.enable_profile();
+        let result = executor
+            .execute_go(GoPlan {
+                from_clause: FromClause {
+                    vids: vec![1],
+                    src: None,
+                },
+                over_edges: vec!["follow".to_string()],
+                direction: byoridb_parser::ast::EdgeDirection::Outgoing,
+                to_clause: ToClause {
+                    steps: StepClause::Exactly(1),
+                    variable: "v".to_string(),
+                },
+                where_clause: None,
+                yield_clause: YieldClause {
+                    columns: vec![
+                        YieldColumn {
+                            expression: Expression::PropRef {
+                                object: "follow".to_string(),
+                                prop: "_dst".to_string(),
+                            },
+                            alias: Some("dst".to_string()),
+                        },
+                        YieldColumn {
+                            expression: Expression::DstVertexProp {
+                                tag: "person".to_string(),
+                                prop: "name".to_string(),
+                            },
+                            alias: Some("name".to_string()),
+                        },
+                        YieldColumn {
+                            expression: Expression::DstVertexProp {
+                                tag: "stats".to_string(),
+                                prop: "score".to_string(),
+                            },
+                            alias: Some("score".to_string()),
+                        },
+                        YieldColumn {
+                            expression: Expression::DstVertexProp {
+                                tag: "stats".to_string(),
+                                prop: "missing".to_string(),
+                            },
+                            alias: Some("missing".to_string()),
+                        },
+                    ],
+                },
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    byoridb_common::Value::Int(2),
+                    byoridb_common::Value::String("Bob".to_string()),
+                    byoridb_common::Value::Int(7),
+                    byoridb_common::Value::Null(byoridb_common::NullType::Null),
+                ],
+                vec![
+                    byoridb_common::Value::Int(3),
+                    byoridb_common::Value::String("Cara".to_string()),
+                    byoridb_common::Value::Null(byoridb_common::NullType::Null),
+                    byoridb_common::Value::Null(byoridb_common::NullType::Null),
+                ],
+            ]
+        );
+        let batch_records: Vec<_> = profile
+            .snapshot()
+            .into_iter()
+            .filter(|record| record.op == crate::profile::ProfileOp::GetVertices)
+            .collect();
+        assert_eq!(batch_records.len(), 1);
+        assert!(batch_records[0].detail.contains("2 unique vid(s), 2 found"));
+        executor.ctx.disable_profile();
     }
 
     #[tokio::test]
