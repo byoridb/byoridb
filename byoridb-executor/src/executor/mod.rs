@@ -9,6 +9,11 @@ use crate::error::Result;
 use crate::plan::ExecutionPlan;
 use std::sync::Arc;
 
+pub(crate) const DISTRIBUTED_LOOKUP_FULL_SCAN_UNSUPPORTED: &str =
+    "Distributed LOOKUP full scans are not supported yet";
+pub(crate) const DISTRIBUTED_LOOKUP_RANGE_UNSUPPORTED: &str =
+    "Distributed LOOKUP range predicates are not supported yet";
+
 /// Result of query execution
 #[derive(Debug, Clone)]
 pub struct ExecutorResult {
@@ -189,6 +194,76 @@ impl Executor {
     }
 }
 
+/// Return true when an expression tree contains any ordered comparison.
+/// Distributed LOOKUP range execution is not implemented, so callers must
+/// detect comparisons nested under AND/OR/NOT instead of checking only the
+/// top-level predicate and accidentally falling back to coordinator-local IO.
+pub(crate) fn expression_contains_ordered_range(
+    expression: &byoridb_parser::ast::Expression,
+) -> bool {
+    use byoridb_parser::ast::{BinaryOperator, Expression};
+
+    match expression {
+        Expression::BinaryOp { op, left, right } => {
+            matches!(
+                op,
+                BinaryOperator::Lt | BinaryOperator::Lte | BinaryOperator::Gt | BinaryOperator::Gte
+            ) || expression_contains_ordered_range(left)
+                || expression_contains_ordered_range(right)
+        }
+        Expression::UnaryOp { operand, .. } => expression_contains_ordered_range(operand),
+        Expression::FunctionCall { args, .. } | Expression::List(args) => {
+            args.iter().any(expression_contains_ordered_range)
+        }
+        Expression::Map(values) => values.values().any(expression_contains_ordered_range),
+        Expression::Literal(_)
+        | Expression::Identifier(_)
+        | Expression::PropRef { .. }
+        | Expression::DstVertexProp { .. } => false,
+    }
+}
+
+/// Convert a LOOKUP range literal to the indexed field's physical key type.
+/// Returning `None` deliberately routes unsupported or ambiguous comparisons
+/// through the full predicate evaluator, preserving cross-type correctness.
+pub(crate) async fn range_index_boundary(
+    ctx: &ExecutionContext,
+    space: &str,
+    tag: &str,
+    field: &str,
+    value: &byoridb_common::Value,
+) -> Option<byoridb_storage::key::IndexValue> {
+    use byoridb_common::Value;
+    use byoridb_storage::key::IndexValue;
+
+    let schema = ctx
+        .kvstore
+        .get(&crate::key::SchemaKey::tag(space, tag))
+        .await
+        .ok()??;
+    let schema: serde_json::Value = serde_json::from_slice(&schema).ok()?;
+    let data_type = schema
+        .get("properties")?
+        .as_array()?
+        .iter()
+        .find(|property| property.get("name").and_then(|name| name.as_str()) == Some(field))?
+        .get("data_type")?
+        .as_str()?;
+
+    match (data_type, value) {
+        ("Bool", Value::Bool(value)) => Some(IndexValue::Bool(*value)),
+        ("Int8" | "Int16" | "Int32" | "Int64", Value::Int(value)) => Some(IndexValue::Int(*value)),
+        // Float/Double columns accept both Int and Float Values, while DML
+        // currently indexes the Value's physical variant without canonicalizing
+        // it. Those variants occupy separate key-marker domains, so one ordered
+        // range scan cannot be complete. Keep the predicate-scan path until
+        // writes canonicalize numeric index keys or the executor can merge both
+        // domains safely.
+        ("Float" | "Double", _) => None,
+        _ => None,
+    }
+}
+
 mod auth_exec;
 mod class_ddl;
 mod consistency;
@@ -226,6 +301,7 @@ mod tests {
     use byoridb_kvstore::KVStore as _;
     use byoridb_parser::ast::DataType;
     use byoridb_parser::ast::{Expression, Literal};
+    use byoridb_storage::key::IndexValue;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1349,6 +1425,93 @@ mod tests {
 
     // ===== LOOKUP Tests =====
 
+    async fn lookup_vids(executor: &Executor, query: &str) -> Vec<i64> {
+        let statement = byoridb_parser::parse(query).unwrap();
+        let plan = ExecutionPlanBuilder::build(statement).unwrap();
+        executor
+            .execute(plan)
+            .await
+            .unwrap()
+            .rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(byoridb_common::Value::Int(vid)) => Some(*vid),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn put_lookup_schema(kvstore: &Arc<MemoryKVStore>, tag: &str, fields: &[(&str, &str)]) {
+        let properties: Vec<_> = fields
+            .iter()
+            .map(|(name, data_type)| serde_json::json!({"name": name, "data_type": data_type}))
+            .collect();
+        kvstore
+            .put(
+                &SchemaKey::tag("default", tag),
+                &serde_json::to_vec(&serde_json::json!({
+                    "name": tag,
+                    "properties": properties
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn put_lookup_vertex(
+        kvstore: &Arc<MemoryKVStore>,
+        tag: &str,
+        vid: i64,
+        properties: HashMap<String, byoridb_common::Value>,
+    ) {
+        let vertex = CodecVertexData {
+            vid,
+            tags: vec![CodecTagData {
+                name: tag.to_string(),
+                properties,
+            }],
+        };
+        kvstore
+            .put(
+                format!("default:vertex:{vid}").as_bytes(),
+                &VertexCodec::encode_vertex(&vertex).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn distributed_runtime_range_guard_recurses_through_logical_predicates() {
+        for query in [
+            "LOOKUP ON person WHERE person.age > 30 AND person.enabled == true",
+            "LOOKUP ON person WHERE person.enabled == true OR person.age <= 30",
+            "LOOKUP ON person WHERE NOT (person.age > 30)",
+        ] {
+            let statement = byoridb_parser::parse(query).unwrap();
+            let plan = ExecutionPlanBuilder::build(statement).unwrap();
+            let ExecutionPlan::Lookup(plan) = plan else {
+                panic!("expected LOOKUP plan");
+            };
+            assert!(
+                expression_contains_ordered_range(plan.where_clause.as_ref().unwrap()),
+                "query: {query}"
+            );
+        }
+
+        let statement = byoridb_parser::parse(
+            "LOOKUP ON person WHERE person.age == 30 AND person.enabled == true",
+        )
+        .unwrap();
+        let plan = ExecutionPlanBuilder::build(statement).unwrap();
+        let ExecutionPlan::Lookup(plan) = plan else {
+            panic!("expected LOOKUP plan");
+        };
+        assert!(!expression_contains_ordered_range(
+            plan.where_clause.as_ref().unwrap()
+        ));
+    }
+
     #[tokio::test]
     async fn test_lookup_by_scan() {
         let executor = create_executor();
@@ -1380,6 +1543,482 @@ mod tests {
         let result = executor.execute_lookup(plan).await.unwrap();
         // Should find at least the 3 vertices we created
         assert!(result.rows.len() >= 3);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_uses_single_field_range_index() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let ctx = Arc::new(
+            ExecutionContext::new(kvstore.clone())
+                .with_space("default".to_string())
+                .with_space_id(1),
+        );
+        kvstore
+            .put(
+                &SchemaKey::tag("default", "person"),
+                &serde_json::to_vec(&serde_json::json!({
+                    "name": "person",
+                    "properties": [{"name": "age", "data_type": "Int64"}]
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let index_manager = ctx.index_manager.as_ref().unwrap();
+        let index_id = index_manager
+            .create_tag_index(
+                1,
+                "person_age_idx".to_string(),
+                10,
+                "person".to_string(),
+                vec!["age".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+
+        for (vid, age) in [(1i64, 10i64), (2, 30), (3, 31), (4, 50)] {
+            let vertex = CodecVertexData {
+                vid,
+                tags: vec![CodecTagData {
+                    name: "person".to_string(),
+                    properties: HashMap::from([(
+                        "age".to_string(),
+                        byoridb_common::Value::Int(age),
+                    )]),
+                }],
+            };
+            kvstore
+                .put(
+                    format!("default:vertex:{vid}").as_bytes(),
+                    &VertexCodec::encode_vertex(&vertex).unwrap(),
+                )
+                .await
+                .unwrap();
+            index_manager
+                .insert_tag_index(1, index_id, &[IndexValue::Int(age)], vid)
+                .await
+                .unwrap();
+        }
+
+        let executor = Executor::new(ctx);
+        for (predicate, expected) in [
+            ("person.age > 30", vec![3, 4]),
+            ("person.age >= 30", vec![2, 3, 4]),
+            ("person.age < 30", vec![1]),
+            ("person.age <= 30", vec![1, 2]),
+            ("30 < person.age", vec![3, 4]),
+            // Cross-type numeric comparison remains correct by using the
+            // predicate fallback rather than probing the wrong key type.
+            ("person.age > 30.5", vec![3, 4]),
+            ("30.5 < person.age", vec![3, 4]),
+        ] {
+            let vids = lookup_vids(&executor, &format!("LOOKUP ON person WHERE {predicate}")).await;
+            assert_eq!(vids, expected, "predicate: {predicate}");
+        }
+
+        assert_eq!(
+            lookup_vids(
+                &executor,
+                "LOOKUP ON person WHERE person.age > 0 LIMIT 2 OFFSET 1",
+            )
+            .await,
+            vec![2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn float_schema_range_falls_back_for_mixed_index_key_domains() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let ctx = Arc::new(
+            ExecutionContext::new(kvstore.clone())
+                .with_space("default".to_string())
+                .with_space_id(1),
+        );
+        put_lookup_schema(&kvstore, "metric", &[("score", "Double")]).await;
+        let index_manager = ctx.index_manager.as_ref().unwrap().clone();
+        let index_id = index_manager
+            .create_tag_index(
+                1,
+                "metric_score_idx".to_string(),
+                10,
+                "metric".to_string(),
+                vec!["score".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        let executor = Executor::new(ctx);
+
+        // Double columns accept both literal variants. DML intentionally keeps
+        // their physical Value variants, which produces separate Int and Float
+        // index marker domains until numeric index writes are canonicalized.
+        let statement =
+            byoridb_parser::parse("INSERT VERTEX metric(score) VALUES 1:(2), 2:(2.5)").unwrap();
+        let plan = ExecutionPlanBuilder::build(statement).unwrap();
+        executor.execute(plan).await.unwrap();
+
+        let index = index_manager.get_index_by_id(1, index_id).await.unwrap();
+        assert_eq!(
+            index_manager
+                .lookup_tag(1, &index, &[IndexValue::Int(2)], 10)
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            index_manager
+                .lookup_tag(1, &index, &[IndexValue::Float(2.5)], 10)
+                .await
+                .unwrap(),
+            vec![2]
+        );
+
+        for query in [
+            "LOOKUP ON metric WHERE metric.score > 1",
+            "LOOKUP ON metric WHERE metric.score > 1.0",
+        ] {
+            assert_eq!(lookup_vids(&executor, query).await, vec![1, 2], "{query}");
+        }
+        assert!(executor.ctx().took_full_scan());
+    }
+
+    #[tokio::test]
+    async fn lookup_indexes_are_scoped_to_the_requested_tag() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let ctx = Arc::new(
+            ExecutionContext::new(kvstore.clone())
+                .with_space("default".to_string())
+                .with_space_id(1),
+        );
+        put_lookup_schema(&kvstore, "person", &[("age", "Int64")]).await;
+        put_lookup_schema(&kvstore, "car", &[("age", "Int64")]).await;
+
+        let index_manager = ctx.index_manager.as_ref().unwrap();
+        let person_index = index_manager
+            .create_tag_index(
+                1,
+                "person_age_idx".to_string(),
+                10,
+                "person".to_string(),
+                vec!["age".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        let car_index = index_manager
+            .create_tag_index(
+                1,
+                "car_age_idx".to_string(),
+                20,
+                "car".to_string(),
+                vec!["age".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+
+        for (vid, age) in [(1, 10), (2, 20)] {
+            put_lookup_vertex(
+                &kvstore,
+                "person",
+                vid,
+                HashMap::from([("age".to_string(), byoridb_common::Value::Int(age))]),
+            )
+            .await;
+            index_manager
+                .insert_tag_index(1, person_index, &[IndexValue::Int(age)], vid)
+                .await
+                .unwrap();
+        }
+        // Stale index entries sort before the live rows. Candidate scanning
+        // must not apply the result LIMIT before missing/mismatched vertices
+        // are decoded and filtered, or both range and equality under-return.
+        put_lookup_vertex(
+            &kvstore,
+            "person",
+            0,
+            HashMap::from([("age".to_string(), byoridb_common::Value::Int(-1))]),
+        )
+        .await;
+        index_manager
+            .insert_tag_index(1, person_index, &[IndexValue::Int(1)], 0)
+            .await
+            .unwrap();
+        index_manager
+            .insert_tag_index(1, person_index, &[IndexValue::Int(2)], -1)
+            .await
+            .unwrap();
+        // The same live VID can be reachable through both an old stale key and
+        // its current key. A broad range must return that vertex only once.
+        index_manager
+            .insert_tag_index(1, person_index, &[IndexValue::Int(5)], 1)
+            .await
+            .unwrap();
+        index_manager
+            .insert_tag_index(1, person_index, &[IndexValue::Int(10)], 0)
+            .await
+            .unwrap();
+        for (vid, age) in [(101, 100), (102, 200)] {
+            put_lookup_vertex(
+                &kvstore,
+                "car",
+                vid,
+                HashMap::from([("age".to_string(), byoridb_common::Value::Int(age))]),
+            )
+            .await;
+            index_manager
+                .insert_tag_index(1, car_index, &[IndexValue::Int(age)], vid)
+                .await
+                .unwrap();
+        }
+
+        let executor = Executor::new(ctx);
+        assert_eq!(
+            lookup_vids(&executor, "LOOKUP ON person WHERE person.age > 0 LIMIT 2",).await,
+            vec![1, 2]
+        );
+        assert_eq!(
+            lookup_vids(&executor, "LOOKUP ON car WHERE car.age > 0").await,
+            vec![101, 102]
+        );
+        assert_eq!(
+            lookup_vids(&executor, "LOOKUP ON person WHERE person.age == 10 LIMIT 1",).await,
+            vec![1]
+        );
+        assert_eq!(
+            lookup_vids(&executor, "LOOKUP ON car WHERE car.age == 100").await,
+            vec![101]
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_limit_stops_chunked_vertex_decode_early() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let ctx = Arc::new(
+            ExecutionContext::new(kvstore.clone())
+                .with_space("default".to_string())
+                .with_space_id(1),
+        );
+        put_lookup_schema(
+            &kvstore,
+            "person",
+            &[("age", "Int64"), ("payload", "String")],
+        )
+        .await;
+        let index_manager = ctx.index_manager.as_ref().unwrap();
+        let index_id = index_manager
+            .create_tag_index(
+                1,
+                "person_age_idx".to_string(),
+                10,
+                "person".to_string(),
+                vec!["age".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+
+        put_lookup_vertex(
+            &kvstore,
+            "person",
+            1,
+            HashMap::from([
+                ("age".to_string(), byoridb_common::Value::Int(10)),
+                (
+                    "payload".to_string(),
+                    byoridb_common::Value::String("x".repeat(256 * 1024)),
+                ),
+            ]),
+        )
+        .await;
+        index_manager
+            .insert_tag_index(1, index_id, &[IndexValue::Int(10)], 1)
+            .await
+            .unwrap();
+
+        // More than one fetch chunk of stale candidates follows the first
+        // live row. The malformed row at the end proves LIMIT 1 neither fetches
+        // nor decodes later chunks after the requested row has been collected.
+        for vid in 2..=300 {
+            index_manager
+                .insert_tag_index(1, index_id, &[IndexValue::Int(10)], vid)
+                .await
+                .unwrap();
+        }
+        kvstore
+            .put(b"default:vertex:400", b"not-json")
+            .await
+            .unwrap();
+        index_manager
+            .insert_tag_index(1, index_id, &[IndexValue::Int(10)], 400)
+            .await
+            .unwrap();
+
+        let executor = Executor::new(ctx);
+        assert_eq!(
+            lookup_vids(&executor, "LOOKUP ON person WHERE person.age == 10 LIMIT 1",).await,
+            vec![1]
+        );
+        assert_eq!(
+            lookup_vids(&executor, "LOOKUP ON person WHERE person.age > 0 LIMIT 1",).await,
+            vec![1]
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_window_and_bool_order_match_index_and_scan_paths() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let ctx = Arc::new(
+            ExecutionContext::new(kvstore.clone())
+                .with_space("default".to_string())
+                .with_space_id(1)
+                .with_config(ExecutionConfig {
+                    max_scan_limit: 2,
+                    ..ExecutionConfig::default()
+                }),
+        );
+        for tag in ["indexed_item", "scanned_item"] {
+            put_lookup_schema(&kvstore, tag, &[("score", "Int64"), ("enabled", "Bool")]).await;
+        }
+
+        let index_manager = ctx.index_manager.as_ref().unwrap();
+        let score_index = index_manager
+            .create_tag_index(
+                1,
+                "indexed_item_score_idx".to_string(),
+                10,
+                "indexed_item".to_string(),
+                vec!["score".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        let enabled_index = index_manager
+            .create_tag_index(
+                1,
+                "indexed_item_enabled_idx".to_string(),
+                10,
+                "indexed_item".to_string(),
+                vec!["enabled".to_string()],
+                vec![1],
+            )
+            .await
+            .unwrap();
+
+        for (tag, base_vid) in [("indexed_item", 0), ("scanned_item", 100)] {
+            for score in 1..=4i64 {
+                let vid = base_vid + score;
+                let enabled = score >= 3;
+                put_lookup_vertex(
+                    &kvstore,
+                    tag,
+                    vid,
+                    HashMap::from([
+                        ("score".to_string(), byoridb_common::Value::Int(score)),
+                        ("enabled".to_string(), byoridb_common::Value::Bool(enabled)),
+                    ]),
+                )
+                .await;
+                if tag == "indexed_item" {
+                    index_manager
+                        .insert_tag_index(1, score_index, &[IndexValue::Int(score)], vid)
+                        .await
+                        .unwrap();
+                    index_manager
+                        .insert_tag_index(1, enabled_index, &[IndexValue::Bool(enabled)], vid)
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+
+        let executor = Executor::new(ctx);
+        assert_eq!(
+            lookup_vids(
+                &executor,
+                "LOOKUP ON indexed_item WHERE indexed_item.score > 0 OFFSET 1",
+            )
+            .await,
+            vec![2, 3]
+        );
+        // Unrelated vertices sort before this tag's rows. LIMIT must count
+        // predicate matches, not raw prefix entries.
+        assert_eq!(
+            lookup_vids(
+                &executor,
+                "LOOKUP ON scanned_item WHERE scanned_item.score > 0 LIMIT 2",
+            )
+            .await,
+            vec![101, 102]
+        );
+        assert_eq!(
+            lookup_vids(
+                &executor,
+                "LOOKUP ON scanned_item WHERE scanned_item.score > 0 OFFSET 1",
+            )
+            .await,
+            vec![102, 103]
+        );
+        assert_eq!(
+            lookup_vids(
+                &executor,
+                "LOOKUP ON indexed_item WHERE indexed_item.enabled > false",
+            )
+            .await,
+            vec![3, 4]
+        );
+        assert_eq!(
+            lookup_vids(
+                &executor,
+                "LOOKUP ON scanned_item WHERE scanned_item.enabled > false",
+            )
+            .await,
+            vec![103, 104]
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_range_collects_every_local_partition_before_windowing() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let mut context = ExecutionContext::new(kvstore.clone())
+            .with_space("default".to_string())
+            .with_space_id(1);
+        context.partition_num = Some(2);
+        let ctx = Arc::new(context);
+        put_lookup_schema(&kvstore, "person", &[("age", "Int64")]).await;
+        let index_manager = ctx.index_manager.as_ref().unwrap();
+        let index_id = index_manager
+            .create_tag_index(
+                1,
+                "person_age_idx".to_string(),
+                10,
+                "person".to_string(),
+                vec!["age".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+
+        for (part_id, vid, age) in [(1, 1, 10), (2, 2, 20)] {
+            put_lookup_vertex(
+                &kvstore,
+                "person",
+                vid,
+                HashMap::from([("age".to_string(), byoridb_common::Value::Int(age))]),
+            )
+            .await;
+            index_manager
+                .insert_tag_index(part_id, index_id, &[IndexValue::Int(age)], vid)
+                .await
+                .unwrap();
+        }
+
+        let executor = Executor::new(ctx);
+        assert_eq!(
+            lookup_vids(&executor, "LOOKUP ON person WHERE person.age > 0").await,
+            vec![1, 2]
+        );
     }
 
     #[tokio::test]

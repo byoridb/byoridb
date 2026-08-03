@@ -9,9 +9,53 @@ use byoridb_codec::EdgeData as CodecEdgeData;
 use byoridb_codec::{VertexCodec, VertexData as CodecVertexData};
 use byoridb_common::FilterExpr;
 use byoridb_parser::ast::{BinaryOperator, Expression, Literal};
+use byoridb_storage::index::RangeOperator;
 use byoridb_storage::key::IndexValue;
 #[cfg(feature = "distributed")]
 use byoridb_storage::proto::storage::IndexValue as ProtoIndexValue;
+use std::collections::HashSet;
+
+const INDEX_VERTEX_FETCH_CHUNK_SIZE: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
+struct LookupWindow {
+    offset: usize,
+    limit: Option<usize>,
+    fetch_limit: Option<usize>,
+    index_limit: Option<usize>,
+}
+
+impl LookupWindow {
+    fn is_satisfied(self, decoded_rows: usize) -> bool {
+        self.fetch_limit
+            .is_some_and(|required| decoded_rows >= required)
+    }
+
+    fn apply<T>(self, rows: Vec<T>) -> Vec<T> {
+        let rows = rows.into_iter().skip(self.offset);
+        match self.limit {
+            Some(limit) => rows.take(limit).collect(),
+            None => rows.collect(),
+        }
+    }
+
+    #[cfg(feature = "distributed")]
+    fn index_limit_u32(self) -> Result<u32> {
+        match self.index_limit {
+            Some(limit) => u32::try_from(limit).map_err(|_| {
+                ExecutionError::InvalidOperation(format!(
+                    "LOOKUP OFFSET + LIMIT exceeds the distributed query limit: {limit}"
+                ))
+            }),
+            None => Ok(u32::MAX),
+        }
+    }
+}
+
+fn stable_dedupe_vids(vids: Vec<i64>) -> Vec<i64> {
+    let mut seen = HashSet::with_capacity(vids.len());
+    vids.into_iter().filter(|vid| seen.insert(*vid)).collect()
+}
 
 fn json_to_value(val: &serde_json::Value) -> Option<byoridb_common::Value> {
     match val {
@@ -27,6 +71,59 @@ fn json_to_value(val: &serde_json::Value) -> Option<byoridb_common::Value> {
         serde_json::Value::Null => Some(byoridb_common::Value::null()),
         _ => None,
     }
+}
+
+fn json_vertex_matches_tag(
+    vertex_data: &serde_json::Value,
+    tag_name: &str,
+    filter_expr: &FilterExpr,
+) -> bool {
+    let Some(tag) = vertex_data
+        .get("tags")
+        .and_then(|tags| tags.as_array())
+        .and_then(|tags| {
+            tags.iter()
+                .find(|tag| tag.get("name").and_then(|name| name.as_str()) == Some(tag_name))
+        })
+    else {
+        return false;
+    };
+    let get_field = |field: &str| -> Option<byoridb_common::Value> {
+        let props = tag.get("props")?.as_object()?;
+        props
+            .get(field)
+            .or_else(|| {
+                let qualified = format!("{tag_name}.{field}");
+                props.get(&qualified)
+            })
+            .and_then(json_to_value)
+    };
+    filter_expr.evaluate(&get_field)
+}
+
+#[cfg(feature = "distributed")]
+fn proto_vertex_matches_tag(
+    vertex: &byoridb_storage::proto::storage::VertexData,
+    tag_name: &str,
+    filter_expr: &FilterExpr,
+) -> bool {
+    let Some(tag) = vertex.tags.iter().find(|tag| tag.tag_name == tag_name) else {
+        return false;
+    };
+    let get_field = |field: &str| {
+        tag.properties
+            .get(field)
+            .or_else(|| tag.properties.get(&format!("{tag_name}.{field}")))
+            .and_then(|bytes| bincode::deserialize::<byoridb_common::Value>(bytes).ok())
+    };
+    filter_expr.evaluate(&get_field)
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_lookup_fetch_selection() -> (Vec<String>, Vec<String>) {
+    // Empty selectors request every tag/property. LOOKUP returns `<tag>.*`, so
+    // narrowing this fetch to the indexed field would silently shrink output.
+    (Vec::new(), Vec::new())
 }
 
 fn go_expr_needs_dst_vertex(expr: &Expression) -> bool {
@@ -1018,13 +1115,48 @@ impl Executor {
             }
         }
 
-        let lookup_limit = self.lookup_limit(plan.limit);
+        let lookup_window = self.lookup_window(plan.offset, plan.limit)?;
+        if lookup_window.limit == Some(0) {
+            return Ok(ExecutorResult {
+                columns: result_columns,
+                rows: vec![],
+                latency_ms: 0,
+            });
+        }
+        // scan_with_filter applies this cap after the predicate matches. Index
+        // candidates use the separate safety cap because stale entries may be
+        // discarded while vertex rows are decoded.
+        let filtered_scan_limit = lookup_window.fetch_limit;
         #[cfg(feature = "distributed")]
-        let lookup_limit_u32 = self.lookup_limit_u32(plan.limit);
+        if self.ctx.is_distributed()
+            && plan
+                .where_clause
+                .as_ref()
+                .is_some_and(super::expression_contains_ordered_range)
+        {
+            return Err(ExecutionError::InvalidOperation(
+                super::DISTRIBUTED_LOOKUP_RANGE_UNSUPPORTED.to_string(),
+            ));
+        }
+        #[cfg(feature = "distributed")]
+        let lookup_limit_u32 = lookup_window.index_limit_u32()?;
 
         // Try index-based lookup first
         if let Some(ref index_manager) = self.ctx.index_manager {
             if let Some(ref where_expr) = plan.where_clause {
+                if let Some(result) = self
+                    .try_execute_range_index_lookup(
+                        index_manager,
+                        where_expr,
+                        space.as_str(),
+                        &tag_or_edge_name,
+                        lookup_window,
+                    )
+                    .await?
+                {
+                    return Ok(result);
+                }
+
                 // Try to extract indexable condition
                 if let Some((field, value)) = self.extract_eq_condition(where_expr) {
                     // Find applicable index
@@ -1032,10 +1164,11 @@ impl Executor {
                     let indexes = index_manager.list_tag_indexes(space_id).await;
 
                     // Find an index that covers the field
-                    if let Some(index_def) = indexes
-                        .iter()
-                        .find(|idx| idx.fields.len() == 1 && idx.fields[0] == field)
-                    {
+                    if let Some(index_def) = indexes.iter().find(|idx| {
+                        idx.schema_name.eq_ignore_ascii_case(&tag_or_edge_name)
+                            && idx.fields.len() == 1
+                            && idx.fields[0] == field
+                    }) {
                         tracing::debug!(
                             "Using index '{}' for LOOKUP on field '{}'",
                             index_def.index_name,
@@ -1044,10 +1177,16 @@ impl Executor {
 
                         // Convert value to IndexValue
                         let index_value = self.byoridb_value_to_index_value(&value);
+                        let index_filter = FilterExpr::eq(field.clone(), value.clone());
 
                         // Check if distributed mode is enabled
                         #[cfg(feature = "distributed")]
                         if self.ctx.is_distributed() {
+                            if self.ctx.get_distributed_executor().is_none() {
+                                return Err(ExecutionError::InvalidOperation(
+                                    "Distributed LOOKUP index executor is unavailable".to_string(),
+                                ));
+                            }
                             // Use distributed executor
                             if let Some(distributed_executor) = self.ctx.get_distributed_executor()
                             {
@@ -1067,6 +1206,10 @@ impl Executor {
                                     .await
                                 {
                                     Ok(vids) => {
+                                        let candidate_cap_reached = lookup_window
+                                            .index_limit
+                                            .is_some_and(|limit| vids.len() >= limit);
+                                        let vids = stable_dedupe_vids(vids);
                                         tracing::debug!(
                                             "Distributed index lookup returned {} VIDs",
                                             vids.len()
@@ -1092,60 +1235,74 @@ impl Executor {
                                             });
                                         }
 
-                                        // Use distributed fetch for vertex data
-                                        match distributed_executor
-                                            .execute_fetch(
-                                                space_id,
-                                                partition_num,
-                                                vids.clone(),
-                                                vec![],
-                                                vec![],
-                                            )
-                                            .await
+                                        // Fetch full vertices in bounded chunks. Index candidate
+                                        // scans intentionally overfetch so stale entries cannot
+                                        // under-fill OFFSET/LIMIT, but one small result must not
+                                        // materialize every candidate's full property payload.
+                                        let mut rows = Vec::new();
+                                        'fetch_chunks: for vid_chunk in
+                                            vids.chunks(INDEX_VERTEX_FETCH_CHUNK_SIZE)
                                         {
-                                            Ok(vertices) => {
-                                                let mut rows = Vec::new();
-                                                for vertex in vertices {
-                                                    let mut row = Vec::new();
-                                                    row.push(byoridb_common::Value::Int(
-                                                        vertex.vid,
-                                                    ));
-                                                    // Format tags as string
-                                                    let tags_str = vertex
-                                                        .tags
-                                                        .iter()
-                                                        .map(|t| {
-                                                            format!(
-                                                                "{}:{:?}",
-                                                                t.tag_name, t.properties
-                                                            )
-                                                        })
-                                                        .collect::<Vec<_>>()
-                                                        .join(",");
-                                                    row.push(byoridb_common::Value::String(
-                                                        tags_str,
-                                                    ));
-                                                    rows.push(row);
+                                            // The selectors stay empty because the result projects
+                                            // `<tag>.*`.
+                                            let (tag_names, prop_names) =
+                                                distributed_lookup_fetch_selection();
+                                            let vertices = distributed_executor
+                                                .execute_fetch(
+                                                    space_id,
+                                                    partition_num,
+                                                    vid_chunk.to_vec(),
+                                                    tag_names,
+                                                    prop_names,
+                                                )
+                                                .await
+                                                .map_err(|error| {
+                                                    ExecutionError::InvalidOperation(format!(
+                                                        "Distributed vertex fetch failed: {error}"
+                                                    ))
+                                                })?;
+                                            for vertex in vertices {
+                                                if !proto_vertex_matches_tag(
+                                                    &vertex,
+                                                    &tag_or_edge_name,
+                                                    &index_filter,
+                                                ) {
+                                                    continue;
                                                 }
-                                                return Ok(ExecutorResult {
-                                                    columns: result_columns,
-                                                    rows,
-                                                    latency_ms: 0,
-                                                });
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "Distributed vertex fetch failed: {}",
-                                                    e
-                                                );
+                                                let mut row = Vec::new();
+                                                row.push(byoridb_common::Value::Int(vertex.vid));
+                                                // Format tags as string
+                                                let tags_str = vertex
+                                                    .tags
+                                                    .iter()
+                                                    .map(|t| {
+                                                        format!("{}:{:?}", t.tag_name, t.properties)
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                                    .join(",");
+                                                row.push(byoridb_common::Value::String(tags_str));
+                                                rows.push(row);
+                                                if lookup_window.is_satisfied(rows.len()) {
+                                                    break 'fetch_chunks;
+                                                }
                                             }
                                         }
+                                        self.ensure_index_window_satisfied(
+                                            lookup_window,
+                                            candidate_cap_reached,
+                                            rows.len(),
+                                        )?;
+                                        let rows = lookup_window.apply(rows);
+                                        return Ok(ExecutorResult {
+                                            columns: result_columns,
+                                            rows,
+                                            latency_ms: 0,
+                                        });
                                     }
                                     Err(e) => {
-                                        tracing::warn!(
-                                            "Distributed index lookup failed, falling back to local: {}",
-                                            e
-                                        );
+                                        return Err(ExecutionError::InvalidOperation(format!(
+                                            "Distributed index lookup failed: {e}"
+                                        )));
                                     }
                                 }
                             }
@@ -1160,6 +1317,7 @@ impl Executor {
                         let idx_profiling = self.ctx.profiling();
                         let idx_start = std::time::Instant::now();
                         let mut vids: Vec<i64> = Vec::new();
+                        let mut candidate_cap_reached = false;
                         let mut last_err: Option<byoridb_storage::IndexError> = None;
                         for part_id in 1..=partition_num {
                             match index_manager
@@ -1167,11 +1325,16 @@ impl Executor {
                                     part_id,
                                     index_def,
                                     std::slice::from_ref(&index_value),
-                                    lookup_limit.unwrap_or(usize::MAX),
+                                    lookup_window.index_limit.unwrap_or(usize::MAX),
                                 )
                                 .await
                             {
-                                Ok(part_vids) => vids.extend(part_vids),
+                                Ok(part_vids) => {
+                                    candidate_cap_reached |= lookup_window
+                                        .index_limit
+                                        .is_some_and(|limit| part_vids.len() >= limit);
+                                    vids.extend(part_vids);
+                                }
                                 Err(e) => {
                                     tracing::warn!(
                                         "Local index lookup on part {} failed: {}",
@@ -1183,11 +1346,13 @@ impl Executor {
                             }
                         }
 
-                        if vids.is_empty() && last_err.is_some() {
-                            // Every partition errored: surrender to the scan
-                            // fallback instead of returning an empty result
-                            // that pretends the index succeeded.
+                        if last_err.is_some() {
+                            // A single failed partition makes the accumulated
+                            // VIDs incomplete. Discard them and use the complete
+                            // predicate-scan fallback instead of returning a
+                            // partial result.
                         } else {
+                            let vids = stable_dedupe_vids(vids);
                             if idx_profiling {
                                 self.ctx.record_profile(
                                     ProfileOp::IndexScan,
@@ -1197,72 +1362,21 @@ impl Executor {
                                     false,
                                 );
                             }
-                            if vids.is_empty() {
-                                return Ok(ExecutorResult {
-                                    columns: result_columns,
-                                    rows: vec![],
-                                    latency_ms: 0,
-                                });
-                            }
-
-                            // Batch fetch vertices by VIDs
-                            let keys: Vec<Vec<u8>> = vids
-                                .iter()
-                                .map(|vid| format!("{}:vertex:{}", space, vid).into_bytes())
-                                .collect();
-
-                            let results = self.ctx.kvstore.batch_get(&keys).await?;
-
-                            let mut rows = Vec::new();
-                            for (vid, data_opt) in vids.iter().zip(results.iter()) {
-                                if let Some(data) = data_opt {
-                                    // Vertices are proto-encoded (with a legacy
-                                    // JSON fallback) — same dual-format decode
-                                    // as the scan path below. This branch used
-                                    // to JSON-decode only: it predated the
-                                    // proto codec and was unreachable while
-                                    // index definitions never survived their
-                                    // creating query.
-                                    let vertex_data: serde_json::Value =
-                                        if VertexCodec::is_proto_format(data) {
-                                            match VertexCodec::decode_vertex(data) {
-                                                Ok(v) => VertexCodec::vertex_to_json(&v),
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        "Skipping undecodable vertex {} in index lookup: {}",
-                                                        vid,
-                                                        e
-                                                    );
-                                                    continue;
-                                                }
-                                            }
-                                        } else {
-                                            serde_json::from_slice(data)?
-                                        };
-                                    let mut row = Vec::new();
-                                    row.push(byoridb_common::Value::Int(*vid));
-                                    if let Some(tags) = vertex_data.get("tags") {
-                                        row.push(byoridb_common::Value::String(tags.to_string()));
-                                    }
-                                    rows.push(row);
-                                }
-                            }
-
                             tracing::debug!(
-                                "Index lookup returned {} results across {} partitions (scanned {} keys)",
-                                rows.len(),
-                                partition_num,
-                                vids.len()
+                                "Index lookup returned {} candidates across {} partitions",
+                                vids.len(),
+                                partition_num
                             );
-
-                            if let Some(limit) = plan.limit {
-                                rows.truncate(limit);
-                            }
-                            return Ok(ExecutorResult {
-                                columns: result_columns,
-                                rows,
-                                latency_ms: 0,
-                            });
+                            return self
+                                .build_local_tag_index_result(
+                                    space.as_str(),
+                                    &tag_or_edge_name,
+                                    &index_filter,
+                                    vids,
+                                    lookup_window,
+                                    candidate_cap_reached,
+                                )
+                                .await;
                         }
                     }
                 }
@@ -1270,6 +1384,12 @@ impl Executor {
         }
 
         // Fallback: Scan with predicate pushdown
+        #[cfg(feature = "distributed")]
+        if self.ctx.is_distributed() {
+            return Err(ExecutionError::InvalidOperation(
+                super::DISTRIBUTED_LOOKUP_FULL_SCAN_UNSUPPORTED.to_string(),
+            ));
+        }
         tracing::debug!("Using scan with predicate pushdown for LOOKUP (no suitable index found)");
         self.ctx.mark_full_scan();
         let scan_profiling = self.ctx.profiling();
@@ -1293,7 +1413,6 @@ impl Executor {
         };
 
         let tag_name_filter = tag_or_edge_name.clone();
-        let is_tag_lookup = matches!(plan.lookup_type, crate::plan::LookupType::Tag(_));
 
         // Create a filter closure that evaluates the filter expression.
         // Supports both proto-encoded (0xCA magic byte) and legacy JSON vertices.
@@ -1310,49 +1429,14 @@ impl Executor {
                 }
             };
 
-            // Filter by tag name: only return vertices that have the requested tag
-            if is_tag_lookup {
-                let has_tag = vertex_data
-                    .get("tags")
-                    .and_then(|t| t.as_array())
-                    .map(|tags| {
-                        tags.iter().any(|t| {
-                            t.get("name").and_then(|n| n.as_str()) == Some(tag_name_filter.as_str())
-                        })
-                    })
-                    .unwrap_or(false);
-                if !has_tag {
-                    return false;
-                }
-            }
-
-            // Build field getter from vertex data
-            let get_field = |field: &str| -> Option<byoridb_common::Value> {
-                if let Some(tags) = vertex_data.get("tags").and_then(|t| t.as_array()) {
-                    for tag in tags {
-                        if let Some(props) = tag.get("props").and_then(|p| p.as_object()) {
-                            if let Some(prop_value) = props.get(field) {
-                                return json_to_value(prop_value);
-                            }
-                            let tag_name = tag.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                            let full_key = format!("{}.{}", tag_name, field);
-                            if let Some(prop_value) = props.get(&full_key) {
-                                return json_to_value(prop_value);
-                            }
-                        }
-                    }
-                }
-                None
-            };
-
-            filter_expr.evaluate(&get_field)
+            json_vertex_matches_tag(&vertex_data, &tag_name_filter, &filter_expr)
         });
 
         // Use scan_with_filter for predicate pushdown
         let results = self
             .ctx
             .kvstore
-            .scan_with_filter(vertex_prefix.as_bytes(), filter_fn, lookup_limit)
+            .scan_with_filter(vertex_prefix.as_bytes(), filter_fn, filtered_scan_limit)
             .await?;
 
         if scan_profiling {
@@ -1408,12 +1492,7 @@ impl Executor {
         }
         self.ctx.check_result_budget(result_bytes)?;
 
-        if let Some(offset) = plan.offset {
-            rows = rows.into_iter().skip(offset).collect();
-        }
-        if let Some(limit) = plan.limit {
-            rows.truncate(limit);
-        }
+        let rows = lookup_window.apply(rows);
         Ok(ExecutorResult {
             columns: result_columns,
             rows,
@@ -1463,18 +1542,18 @@ impl Executor {
                 BinaryOperator::Neq => self
                     .field_value_pair(left, right)
                     .map(|(f, v)| FilterExpr::ne(f, v)),
-                BinaryOperator::Lt => self
-                    .field_value_pair(left, right)
-                    .map(|(f, v)| FilterExpr::lt(f, v)),
-                BinaryOperator::Lte => self
-                    .field_value_pair(left, right)
-                    .map(|(f, v)| FilterExpr::le(f, v)),
-                BinaryOperator::Gt => self
-                    .field_value_pair(left, right)
-                    .map(|(f, v)| FilterExpr::gt(f, v)),
-                BinaryOperator::Gte => self
-                    .field_value_pair(left, right)
-                    .map(|(f, v)| FilterExpr::ge(f, v)),
+                BinaryOperator::Lt
+                | BinaryOperator::Lte
+                | BinaryOperator::Gt
+                | BinaryOperator::Gte => {
+                    let (field, value, operator) = self.extract_range_condition(expr)?;
+                    Some(match operator {
+                        RangeOperator::GreaterThan => FilterExpr::gt(field, value),
+                        RangeOperator::GreaterThanOrEqual => FilterExpr::ge(field, value),
+                        RangeOperator::LessThan => FilterExpr::lt(field, value),
+                        RangeOperator::LessThanOrEqual => FilterExpr::le(field, value),
+                    })
+                }
                 BinaryOperator::And => {
                     let left_filter = self.expr_to_filter_expr(left.as_ref())?;
                     let right_filter = self.expr_to_filter_expr(right.as_ref())?;
@@ -1578,6 +1657,201 @@ impl Executor {
         }
     }
 
+    /// Extract a simple ordered range predicate and normalize it so the field
+    /// is always on the left. For example, `30 < person.age` becomes
+    /// `person.age > 30`.
+    pub(super) fn extract_range_condition(
+        &self,
+        expr: &Expression,
+    ) -> Option<(String, byoridb_common::Value, RangeOperator)> {
+        let Expression::BinaryOp { op, left, right } = expr else {
+            return None;
+        };
+
+        let direct = match op {
+            BinaryOperator::Gt => RangeOperator::GreaterThan,
+            BinaryOperator::Gte => RangeOperator::GreaterThanOrEqual,
+            BinaryOperator::Lt => RangeOperator::LessThan,
+            BinaryOperator::Lte => RangeOperator::LessThanOrEqual,
+            _ => return None,
+        };
+        if let Some((field, value)) = self.field_value_pair(left, right) {
+            return Some((field, value, direct));
+        }
+
+        let reversed = match direct {
+            RangeOperator::GreaterThan => RangeOperator::LessThan,
+            RangeOperator::GreaterThanOrEqual => RangeOperator::LessThanOrEqual,
+            RangeOperator::LessThan => RangeOperator::GreaterThan,
+            RangeOperator::LessThanOrEqual => RangeOperator::GreaterThanOrEqual,
+        };
+        self.field_value_pair(right, left)
+            .map(|(field, value)| (field, value, reversed))
+    }
+
+    async fn try_execute_range_index_lookup(
+        &self,
+        index_manager: &byoridb_storage::IndexManager,
+        where_expr: &Expression,
+        space: &str,
+        tag: &str,
+        lookup_window: LookupWindow,
+    ) -> Result<Option<ExecutorResult>> {
+        // String index encoding is length-prefixed and therefore not globally
+        // lexical. Unsupported or cross-type boundaries return None and keep
+        // the correctness-preserving predicate-pushdown fallback.
+        let Some((field, value, operator)) = self.extract_range_condition(where_expr) else {
+            return Ok(None);
+        };
+        let filter_expr = match operator {
+            RangeOperator::GreaterThan => FilterExpr::gt(field.clone(), value.clone()),
+            RangeOperator::GreaterThanOrEqual => FilterExpr::ge(field.clone(), value.clone()),
+            RangeOperator::LessThan => FilterExpr::lt(field.clone(), value.clone()),
+            RangeOperator::LessThanOrEqual => FilterExpr::le(field.clone(), value.clone()),
+        };
+        #[cfg(feature = "distributed")]
+        if self.ctx.is_distributed() {
+            return Err(ExecutionError::InvalidOperation(
+                super::DISTRIBUTED_LOOKUP_RANGE_UNSUPPORTED.to_string(),
+            ));
+        }
+        let space_id = self.ctx.resolve_space_id().await;
+        let indexes = index_manager.list_tag_indexes(space_id).await;
+        let Some(index_def) = indexes.iter().find(|index| {
+            index.schema_name.eq_ignore_ascii_case(tag)
+                && index.fields.len() == 1
+                && index.fields[0] == field
+        }) else {
+            return Ok(None);
+        };
+        let Some(index_value) =
+            super::range_index_boundary(&self.ctx, space, tag, &field, &value).await
+        else {
+            return Ok(None);
+        };
+
+        let partition_num = self.resolve_local_partition_num(space).await;
+        let profiling = self.ctx.profiling();
+        let start = std::time::Instant::now();
+        let mut vids = Vec::new();
+        let mut candidate_cap_reached = false;
+        for part_id in 1..=partition_num {
+            match index_manager
+                .lookup_tag_range(
+                    part_id,
+                    index_def,
+                    index_value.clone(),
+                    operator,
+                    lookup_window.index_limit.unwrap_or(usize::MAX),
+                )
+                .await
+            {
+                Ok(part_vids) => {
+                    candidate_cap_reached |= lookup_window
+                        .index_limit
+                        .is_some_and(|limit| part_vids.len() >= limit);
+                    vids.extend(part_vids);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Local range index lookup on part {} failed; discarding all partial results: {}",
+                        part_id,
+                        error
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+        let vids = stable_dedupe_vids(vids);
+
+        if profiling {
+            self.ctx.record_profile(
+                ProfileOp::IndexScan,
+                format!("range index '{}'", index_def.index_name),
+                vids.len() as u64,
+                start.elapsed().as_micros() as u64,
+                false,
+            );
+        }
+        self.build_local_tag_index_result(
+            space,
+            tag,
+            &filter_expr,
+            vids,
+            lookup_window,
+            candidate_cap_reached,
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn build_local_tag_index_result(
+        &self,
+        space: &str,
+        tag: &str,
+        filter_expr: &FilterExpr,
+        vids: Vec<i64>,
+        lookup_window: LookupWindow,
+        candidate_cap_reached: bool,
+    ) -> Result<ExecutorResult> {
+        let result_columns = vec![format!("{tag}.vid"), format!("{tag}.*")];
+        if vids.is_empty() {
+            return Ok(ExecutorResult {
+                columns: result_columns,
+                rows: vec![],
+                latency_ms: 0,
+            });
+        }
+
+        let mut rows = Vec::new();
+        'fetch_chunks: for vid_chunk in vids.chunks(INDEX_VERTEX_FETCH_CHUNK_SIZE) {
+            let keys: Vec<Vec<u8>> = vid_chunk
+                .iter()
+                .map(|vid| format!("{}:vertex:{}", space, vid).into_bytes())
+                .collect();
+            let results = self.ctx.kvstore.batch_get(&keys).await?;
+            for (vid, data) in vid_chunk.iter().zip(results.iter()) {
+                let Some(data) = data else {
+                    continue;
+                };
+                let vertex_data = if VertexCodec::is_proto_format(data) {
+                    match VertexCodec::decode_vertex(data) {
+                        Ok(vertex) => VertexCodec::vertex_to_json(&vertex),
+                        Err(error) => {
+                            tracing::warn!(
+                                "Skipping undecodable vertex {} in tag index lookup: {}",
+                                vid,
+                                error
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    serde_json::from_slice(data)?
+                };
+                if !json_vertex_matches_tag(&vertex_data, tag, filter_expr) {
+                    continue;
+                }
+                let mut row = vec![byoridb_common::Value::Int(*vid)];
+                if let Some(tags) = vertex_data.get("tags") {
+                    row.push(byoridb_common::Value::String(tags.to_string()));
+                }
+                rows.push(row);
+                if lookup_window.is_satisfied(rows.len()) {
+                    break 'fetch_chunks;
+                }
+            }
+        }
+
+        self.ensure_index_window_satisfied(lookup_window, candidate_cap_reached, rows.len())?;
+        let rows = lookup_window.apply(rows);
+        Ok(ExecutorResult {
+            columns: result_columns,
+            rows,
+            latency_ms: 0,
+        })
+    }
+
     /// Convert Expression to byoridb_common::Value
     pub(super) fn expr_to_value(expr: &Expression) -> Option<byoridb_common::Value> {
         match expr {
@@ -1612,21 +1886,57 @@ impl Executor {
         }
     }
 
-    fn lookup_limit(&self, explicit: Option<usize>) -> Option<usize> {
-        explicit.or_else(|| {
+    fn lookup_window(
+        &self,
+        offset: Option<usize>,
+        explicit: Option<usize>,
+    ) -> Result<LookupWindow> {
+        let offset = offset.unwrap_or(0);
+        let limit = explicit.or_else(|| {
             if self.ctx.config.max_scan_limit > 0 {
                 Some(self.ctx.config.max_scan_limit)
             } else {
                 None
             }
+        });
+        let fetch_limit = limit
+            .map(|limit| {
+                offset.checked_add(limit).ok_or_else(|| {
+                    ExecutionError::InvalidOperation(
+                        "LOOKUP OFFSET + LIMIT exceeds the platform size".to_string(),
+                    )
+                })
+            })
+            .transpose()?;
+        let index_limit = if self.ctx.config.max_scan_limit > 0 {
+            Some(fetch_limit.unwrap_or(0).max(self.ctx.config.max_scan_limit))
+        } else {
+            None
+        };
+        Ok(LookupWindow {
+            offset,
+            limit,
+            fetch_limit,
+            index_limit,
         })
     }
 
-    #[cfg(feature = "distributed")]
-    fn lookup_limit_u32(&self, explicit: Option<usize>) -> u32 {
-        self.lookup_limit(explicit)
-            .and_then(|limit| u32::try_from(limit).ok())
-            .unwrap_or(u32::MAX)
+    fn ensure_index_window_satisfied(
+        &self,
+        lookup_window: LookupWindow,
+        candidate_cap_reached: bool,
+        decoded_rows: usize,
+    ) -> Result<()> {
+        if candidate_cap_reached
+            && lookup_window
+                .fetch_limit
+                .is_some_and(|required| decoded_rows < required)
+        {
+            return Err(ExecutionError::ResourceExhausted(format!(
+                "LOOKUP index candidate scan reached its safety cap after decoding {decoded_rows} rows"
+            )));
+        }
+        Ok(())
     }
 
     /// Convert byoridb_common::Value to proto IndexValue (for distributed queries)
@@ -1811,5 +2121,38 @@ impl Executor {
             rows,
             latency_ms: 0,
         })
+    }
+}
+
+#[cfg(all(test, feature = "distributed"))]
+mod distributed_lookup_tests {
+    use super::*;
+    use byoridb_storage::proto::storage::{TagData, VertexData};
+    use std::collections::HashMap;
+
+    #[test]
+    fn equality_revalidation_keeps_full_vertex_projection() {
+        let age = byoridb_common::Value::Int(30);
+        let name = byoridb_common::Value::String("Alice".to_string());
+        let vertex = VertexData {
+            vid: 1,
+            tags: vec![TagData {
+                tag_name: "person".to_string(),
+                properties: HashMap::from([
+                    ("age".to_string(), bincode::serialize(&age).unwrap()),
+                    ("name".to_string(), bincode::serialize(&name).unwrap()),
+                ]),
+            }],
+        };
+
+        let (tag_names, prop_names) = distributed_lookup_fetch_selection();
+        assert!(tag_names.is_empty());
+        assert!(prop_names.is_empty());
+        assert!(proto_vertex_matches_tag(
+            &vertex,
+            "person",
+            &FilterExpr::eq("age", age)
+        ));
+        assert!(vertex.tags[0].properties.contains_key("name"));
     }
 }
