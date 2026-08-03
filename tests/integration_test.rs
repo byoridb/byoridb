@@ -720,6 +720,25 @@ async fn test_fixed_string_vid_crud_traversal_and_type_contract() {
         ]]
     );
 
+    // Destination projections are batch-loaded. The decoded vertex must still
+    // expose the external FIXED_STRING identifier instead of its internal i64
+    // mapping, while ordinary destination properties come from the same batch.
+    let projected_destination = execute(
+        &service,
+        session_id,
+        r#"GO FROM "alice" OVER knows YIELD vertex AS destination, $$.person.name AS name"#,
+    )
+    .await;
+    assert_eq!(projected_destination.row_count(), 1);
+    assert!(matches!(
+        &projected_destination.rows[0][0],
+        Value::String(json) if json.contains(r#""vid":"bob""#)
+    ));
+    assert_eq!(
+        projected_destination.rows[0][1],
+        Value::String("Bob".to_string())
+    );
+
     let matched = execute(
         &service,
         session_id,

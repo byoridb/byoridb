@@ -806,7 +806,7 @@ mod tests {
         let result = executor
             .execute_fetch(FetchPlan {
                 space: "default".to_string(),
-                vids: (1i64..=1000).collect(),
+                vids: (1i64..=1000).map(Into::into).collect(),
                 tags: vec!["item".to_string()],
                 yield_clause: None,
                 edge_refs: vec![],
@@ -937,7 +937,7 @@ mod tests {
         let result = executor
             .execute_go(GoPlan {
                 from_clause: FromClause {
-                    vids: vec![1],
+                    vids: vec![1.into()],
                     src: None,
                 },
                 over_edges: vec!["follow".to_string()],
