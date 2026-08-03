@@ -765,6 +765,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_query_sessions_return_401_session_expired_on_both_http_surfaces() {
+        const ROOT_PASSWORD: &str = "root-password";
+        let state = test_state(AuthManager::with_config(
+            ROOT_PASSWORD,
+            Duration::from_millis(20),
+        ));
+
+        let json_session = state
+            .service
+            .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (status, Json(error)) = match execute_query(
+            State(state.clone()),
+            Json(QueryRequest {
+                session_id: json_session,
+                query: "SHOW SPACES".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("expired session unexpectedly executed a JSON query"),
+        };
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code, "SESSION_EXPIRED");
+
+        let raw_session = state
+            .service
+            .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (status, body) = execute_query_json(
+            State(state),
+            Json(QueryRequest {
+                session_id: raw_session,
+                query: "SHOW SPACES".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(error["code"], "SESSION_EXPIRED");
+    }
+
+    #[tokio::test]
     async fn logout_uses_header_and_does_not_echo_bearer_token() {
         let state = test_state(AuthManager::with_config(
             "root-password",

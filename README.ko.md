@@ -39,6 +39,19 @@ edge 설명, 과거 시점 조회를 제공합니다.
 - **Pure-Rust storage:** embedded KV layer는 redb를 사용하므로 C++ toolchain이
   필요하지 않습니다.
 
+### Batch read 동작과 제한
+
+`FETCH PROP ON <tag> vid, ...`는 current-view vertex key 전체를 한 번의 storage
+`batch_get`으로 읽습니다. 결과는 입력 VID 순서를 유지하고 존재하지 않는 VID는
+생략합니다. HTTP query text 제한은 1 MiB이므로 일반적인 숫자 VID 500~1,000개 요청은
+transport 제한보다 충분히 작습니다. 응답 크기는 property payload에 따라 달라지며 설정된
+query result-memory 제한을 적용받습니다.
+
+`GO ... YIELD $$.tag.prop`과 `YIELD vertex`는 destination VID를 중복 제거한 뒤
+projection 전에 한 번의 batch로 읽습니다. tag, property 또는 destination vertex가 없으면
+`NULL`을 반환합니다. `EXPLAIN`과 `PROFILE`에는 이 작업이 `batch destination
+projection` detail을 가진 `GetVertices`로 표시됩니다.
+
 ByoriDB는 전체 OWL 2 RL rule set이나 범용 temporal query language를 구현하지
 않습니다. 현재 temporal model에서는 valid time과 transaction time을 서버가 함께
 생성하며 temporal `MATCH`, `GO`, `BETWEEN`, 사용자가 지정하는 `VALID FROM/TO`는
