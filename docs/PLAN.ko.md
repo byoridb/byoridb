@@ -21,7 +21,7 @@ GitHub에서 모두 열려 있다.
 | [#24](https://github.com/byoridb/byoridb/issues/24) | 부분 해결 | Windows 미지원과 unsigned/notarized macOS의 Gatekeeper 위험 및 source-build 권장은 문서화됨; ARM Linux 바이너리와 실제 macOS 서명/notarization은 미완료 |
 | [#28](https://github.com/byoridb/byoridb/issues/28) | 코드 해결; PR #51 머지 시 닫힘 | Release workflow가 새 tag archive의 root에 `LICENSE`와 `NOTICES.md`를 포함하고 검증함; 이미 게시된 v0.3.3 이하 archive는 소급 변경되지 않음 |
 | [#1](https://github.com/byoridb/byoridb/issues/1) | 미해결 | range 술어가 index range scan 대신 full scan으로 폴백함 |
-| [#10](https://github.com/byoridb/byoridb/issues/10) | 미해결 | 대규모 batch-read 검증·최적화·PROFILE과 LDBC 수용 기준이 남음 |
+| [#10](https://github.com/byoridb/byoridb/issues/10) | 엔진 범위 코드 해결·하네스 수용 검증 대기 | 1,000 VID `FETCH` 회귀 검증, destination projection 단일 deduplicated `batch_get`, `EXPLAIN`/`PROFILE`의 `GetVertices` 노출을 반영했으며 별도 LDBC 하네스의 Q9 전환과 `<10s` 측정은 남음 |
 
 코드 해결 항목은 구현·검증 근거를 이슈에 남긴 뒤 닫고, 부분 해결/미해결 항목은
 남은 수용 기준이 통과할 때까지 유지한다.
