@@ -19,7 +19,7 @@ GitHub에서 모두 열려 있다.
 | [#25](https://github.com/byoridb/byoridb/issues/25) | `byori`에서 해결·이슈 열림 | 책임 저장소가 [byoridb/byori](https://github.com/byoridb/byori)로 이동했고 typed-wiki schema bootstrap/version migration [3ce7730](https://github.com/byoridb/byori/commit/3ce7730e19f04bd980b10829c9c6e34b9ecf86d4)과 guarded structured-memory 도구 [18d605f](https://github.com/byoridb/byori/commit/18d605f214a8fb8ce6476b9eccdc9efc9162b714)가 반영됨 |
 | [#23](https://github.com/byoridb/byoridb/issues/23) | 부분 해결 | 서버의 만료/누락 세션은 [PR #35](https://github.com/byoridb/byoridb/pull/35)에서 `401 SESSION_EXPIRED`가 됐지만, 태그 릴리스와 `byori` 클라이언트/MCP 통합 테스트가 남음 |
 | [#24](https://github.com/byoridb/byoridb/issues/24) | 부분 해결 | Windows 미지원과 unsigned/notarized macOS의 Gatekeeper 위험 및 source-build 권장은 문서화됨; ARM Linux 바이너리와 실제 macOS 서명/notarization은 미완료 |
-| [#28](https://github.com/byoridb/byoridb/issues/28) | 미해결 | 바이너리 아카이브가 실행 파일만 담고 `LICENSE`/`NOTICES.md`를 누락함; installer 책임은 `byori`로 이동함 |
+| [#28](https://github.com/byoridb/byoridb/issues/28) | 코드 해결; PR #51 머지 시 닫힘 | Release workflow가 새 tag archive의 root에 `LICENSE`와 `NOTICES.md`를 포함하고 검증함; 이미 게시된 v0.3.3 이하 archive는 소급 변경되지 않음 |
 | [#1](https://github.com/byoridb/byoridb/issues/1) | 미해결 | range 술어가 index range scan 대신 full scan으로 폴백함 |
 | [#10](https://github.com/byoridb/byoridb/issues/10) | 엔진 범위 코드 해결·하네스 수용 검증 대기 | 1,000 VID `FETCH` 회귀 검증, destination projection 단일 deduplicated `batch_get`, `EXPLAIN`/`PROFILE`의 `GetVertices` 노출을 반영했으며 별도 LDBC 하네스의 Q9 전환과 `<10s` 측정은 남음 |
 
