@@ -533,10 +533,33 @@ mod h6_multipattern_tests {
         etype: &str,
         ranking: i64,
     ) {
-        let blob = eblob_with_rank(src, dst, etype, ranking);
-        let fwd = format!("default:edge:{}:{}:{}:{}", src, etype, dst, ranking);
+        put_edge_data_both_ways(
+            ctx,
+            &EdgeData {
+                src_vid: src,
+                dst_vid: dst,
+                edge_type: etype.to_string(),
+                ranking,
+                properties: Default::default(),
+            },
+        )
+        .await;
+    }
+
+    async fn put_edge_data_both_ways(ctx: &Arc<ExecutionContext>, edge: &EdgeData) {
+        let blob = VertexCodec::encode_edge(edge).unwrap();
+        let fwd = format!(
+            "default:edge:{}:{}:{}:{}",
+            edge.src_vid, edge.edge_type, edge.dst_vid, edge.ranking
+        );
         ctx.kvstore.put(fwd.as_bytes(), &blob).await.unwrap();
-        let rev = crate::key::SchemaKey::in_edge_data("default", dst, etype, src, ranking);
+        let rev = crate::key::SchemaKey::in_edge_data(
+            "default",
+            edge.dst_vid,
+            &edge.edge_type,
+            edge.src_vid,
+            edge.ranking,
+        );
         ctx.kvstore.put(&rev, &blob).await.unwrap();
     }
 
@@ -715,6 +738,110 @@ mod h6_multipattern_tests {
                 }),
             ]]
         );
+    }
+
+    #[tokio::test]
+    async fn edge_identity_does_not_collide_with_user_properties() {
+        let ctx = make_context();
+        let exec = MatchExecutor::new(ctx.clone());
+        for vid in 1..=2 {
+            ctx.kvstore
+                .put(
+                    format!("default:vertex:{}", vid).as_bytes(),
+                    &vblob("person", &format!("P{}", vid)),
+                )
+                .await
+                .unwrap();
+        }
+
+        let properties = std::collections::HashMap::from([
+            ("__src__".to_string(), byoridb_common::Value::Int(101)),
+            ("__dst__".to_string(), byoridb_common::Value::Int(202)),
+            (
+                "__type__".to_string(),
+                byoridb_common::Value::String("property-type".to_string()),
+            ),
+            ("__rank__".to_string(), byoridb_common::Value::Int(303)),
+            (
+                "note".to_string(),
+                byoridb_common::Value::String("kept".to_string()),
+            ),
+        ]);
+        put_edge_data_both_ways(
+            &ctx,
+            &EdgeData {
+                src_vid: 1,
+                dst_vid: 2,
+                edge_type: "knows".to_string(),
+                ranking: 42,
+                properties: properties.clone(),
+            },
+        )
+        .await;
+
+        let plan = match_plan(
+            "MATCH (a)-[e:knows]->(b) WHERE id(a)==1 \
+             RETURN src(e), dst(e), type(e), rank(e), properties(e), \
+                    e.__src__, e.__dst__, e.__type__, e.__rank__, e",
+        );
+        let res = exec.execute_match(plan).await.unwrap();
+
+        assert_eq!(
+            res.rows,
+            vec![vec![
+                byoridb_common::Value::Int(1),
+                byoridb_common::Value::Int(2),
+                byoridb_common::Value::String("knows".to_string()),
+                byoridb_common::Value::Int(42),
+                byoridb_common::Value::Map(byoridb_common::datatypes::map::Map {
+                    data: properties.clone(),
+                }),
+                byoridb_common::Value::Int(101),
+                byoridb_common::Value::Int(202),
+                byoridb_common::Value::String("property-type".to_string()),
+                byoridb_common::Value::Int(303),
+                byoridb_common::Value::Edge(Box::new(byoridb_common::Edge::with_props(
+                    byoridb_common::Value::Int(1),
+                    byoridb_common::Value::Int(2),
+                    0,
+                    "knows",
+                    42,
+                    properties,
+                ))),
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_identity_survives_required_and_optional_joins() {
+        let ctx = make_context();
+        seed(&ctx).await;
+        let exec = MatchExecutor::new(ctx.clone());
+
+        for query in [
+            "MATCH (p:product)-[e1:belongs_to]->(c:category), \
+                   (p)-[e2:has_tag]->(t:itemtag) \
+             WHERE id(p)==1 \
+             RETURN src(e1), dst(e1), type(e1), src(e2), dst(e2), type(e2)",
+            "MATCH (p:product)-[e1:belongs_to]->(c:category) \
+             OPTIONAL MATCH (p)-[e2:has_tag]->(t:itemtag) \
+             WHERE id(p)==1 \
+             RETURN src(e1), dst(e1), type(e1), src(e2), dst(e2), type(e2)",
+        ] {
+            let res = exec.execute_match(match_plan(query)).await.unwrap();
+            assert_eq!(
+                res.rows,
+                vec![vec![
+                    byoridb_common::Value::Int(1),
+                    byoridb_common::Value::Int(100),
+                    byoridb_common::Value::String("belongs_to".to_string()),
+                    byoridb_common::Value::Int(1),
+                    byoridb_common::Value::Int(200),
+                    byoridb_common::Value::String("has_tag".to_string()),
+                ]],
+                "query: {query}"
+            );
+        }
     }
 
     #[tokio::test]
