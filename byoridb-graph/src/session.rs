@@ -94,9 +94,9 @@ impl SessionManager {
         self.sessions.insert(id, session);
     }
 
-    /// Remove a session by ID
-    pub async fn remove_session(&self, session_id: i64) {
-        self.sessions.remove(&session_id);
+    /// Remove a session by ID. Returns true when a session existed.
+    pub async fn remove_session(&self, session_id: i64) -> bool {
+        self.sessions.remove(&session_id).is_some()
     }
 
     /// Check if a session exists and is not expired.
@@ -251,8 +251,9 @@ mod tests {
         let id = manager.create_session("user".to_string()).await;
 
         assert!(manager.has_session(id).await);
-        manager.remove_session(id).await;
+        assert!(manager.remove_session(id).await);
         assert!(!manager.has_session(id).await);
+        assert!(!manager.remove_session(id).await);
     }
 
     #[tokio::test]
