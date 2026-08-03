@@ -30,6 +30,7 @@ pub mod profile;
 #[cfg(feature = "distributed")]
 pub mod storage_client;
 pub mod transaction;
+pub(crate) mod vid;
 
 pub use arena::{ArenaPool, QueryArena};
 pub use context::{ExecutionConfig, ExecutionContext};

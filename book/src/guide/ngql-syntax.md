@@ -68,15 +68,21 @@ execution paths are complete.
 
 ## Vertex IDs
 
-Current DML and query planning requires integer vertex IDs. Use the default
-`INT64` VID type:
+Choose one VID type per space. `INT64` uses integer literals and
+`FIXED_STRING(N)` uses quoted UTF-8 strings of at most `N` bytes:
 
 ```sql
 CREATE SPACE demo (vid_type = INT64);
+CREATE SPACE accounts (vid_type = FIXED_STRING(32));
 ```
 
-`FIXED_STRING(N)` can be parsed as space metadata, but current INSERT/FETCH/GO
-planning still rejects string VIDs. It is not an operational string-VID mode.
+String VIDs are supported in standalone graph CRUD, FETCH, GO, FIND, LOOKUP,
+and MATCH. Mapping-backed `FIXED_STRING` is not supported in distributed or
+multi-coordinator execution, and `RECOMMEND` remains INT64-only. Except for the
+read/delete-only live legacy bridge described in the
+[space guide](./ngql/spaces.md#legacy-integer-bridge), mixing an integer literal
+into a `FIXED_STRING` space, or a string literal into an `INT64` space, is
+rejected.
 
 ## Expressions
 

@@ -132,6 +132,37 @@ fn test_parse_fetch() {
 }
 
 #[test]
+fn test_parse_fetch_string_vids_and_edge_ref() {
+    match parse(r#"FETCH PROP ON player "alice", 'bob'"#).unwrap() {
+        Statement::Fetch(stmt) => {
+            assert_eq!(stmt.fetch_type, FetchType::Vertex);
+            assert_eq!(
+                stmt.vids,
+                vec![
+                    Expression::Literal(Literal::String("alice".to_string())),
+                    Expression::Literal(Literal::String("bob".to_string())),
+                ]
+            );
+        }
+        other => panic!("Expected vertex Fetch, got {other:?}"),
+    }
+
+    match parse(r#"FETCH PROP ON knows "alice"->'bob'"#).unwrap() {
+        Statement::Fetch(stmt) => {
+            assert_eq!(stmt.fetch_type, FetchType::EdgeProp);
+            assert_eq!(
+                stmt.vids,
+                vec![
+                    Expression::Literal(Literal::String("alice".to_string())),
+                    Expression::Literal(Literal::String("bob".to_string())),
+                ]
+            );
+        }
+        other => panic!("Expected edge Fetch, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_parse_go() {
     let result = parse("GO FROM 1 OVER follow");
     assert!(result.is_ok());

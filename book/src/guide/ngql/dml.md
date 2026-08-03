@@ -3,12 +3,20 @@
 # Data mutation
 
 Select a space and create the referenced tag or edge schema before mutating
-graph data. Current execution requires integer vertex IDs.
+graph data. Use integer literals in `INT64` spaces and quoted string literals in
+`FIXED_STRING(N)` spaces.
 
 ## Insert vertices
 
 ```sql
 INSERT VERTEX person(name, age) VALUES 1:("Alice", 30);
+```
+
+For a string-VID space, the same mutation uses quoted endpoints:
+
+```sql
+INSERT VERTEX person(name, age) VALUES "alice":("Alice", 30);
+INSERT EDGE knows(since) VALUES "alice"->"bob":(2020);
 ```
 
 A statement can batch several vertices into one current-view/history
@@ -20,6 +28,12 @@ INSERT VERTEX person(name, age) VALUES
     2:("Bob", 25),
     3:("Carol", 28);
 ```
+
+If a VID already exists, INSERT replaces that vertex's current tag set. If the
+same VID appears more than once in one statement, the last row is the current
+view. Tag-to-VID entries removed by the overwrite, including tags from earlier
+duplicate rows, are deleted in the same graph-data transaction; label-only
+MATCH and COUNT therefore do not retain those old labels.
 
 Only named properties are supplied. Unknown property names and plainly
 incompatible scalar types are rejected. The current INSERT path does not fill
@@ -111,7 +125,16 @@ unmerging canonical vertices is not implemented.
 ## Atomicity and history
 
 - A multi-row vertex or edge INSERT applies its current-view records and
-  history versions in one storage transaction.
+  history versions in one storage transaction. Vertex overwrites include their
+  tag-to-VID additions and removals in that transaction.
+- For `FIXED_STRING`, every deterministic schema, shape, VID-length, endpoint,
+  and `WHEN` validation completes before a new mapping is claimed. Mapping
+  uniqueness uses a separate atomic reverse-key claim before the graph-data
+  transaction. Therefore a storage failure after that claim can leave an
+  unused mapping record even though no graph row committed; mappings are not
+  recycled. The all-or-nothing statement guarantee applies to graph current
+  view, tag-to-VID state, and history, not to cleanup of such unused mapping
+  metadata after an I/O failure.
 - Current UPDATE and DELETE paths also write the current view and temporal
   history together.
 - Separate nGQL requests are not part of a cross-statement transaction.

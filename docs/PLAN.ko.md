@@ -2,26 +2,28 @@
 
 > [English](PLAN.md) | **한국어**
 >
-> **현재 코드 기준선:** 2026-07-30, `origin/main`의 `8209f28`. 아래 장문의 날짜별
+> **현재 코드 기준선:** 2026-08-03, `origin/main`의 `3f5f1a5`와 PR #57의
+> 통합 결과. 아래 장문의 날짜별
 > 기록은 역사적 맥락으로 보존하며, 현재 상태 판단에는 이 기준선과 구현/테스트를
 > 우선한다.
 
-## GitHub 이슈 감사 상태 (2026-07-30)
+## GitHub 이슈 감사 상태 (2026-08-03)
 
-구현 상태와 GitHub 이슈 상태는 별개다. 아래 이슈는 코드가 반영된 경우에도 현재
-GitHub에서 모두 열려 있다.
+구현 상태와 GitHub 이슈 상태는 별개다. 아래 상태는 2026-08-03에 확인했으며,
+코드가 완료된 브랜치가 있다고 해서 이슈가 자동으로 닫힌 것은 아니다.
 
 | 이슈 | 현재 판정 | 근거 또는 남은 작업 |
 |---|---|---|
-| [#26](https://github.com/byoridb/byoridb/issues/26) | 코드 해결·이슈 열림 | 원자적 dual-write, 단조 transaction timestamp, seek 기반 `AS OF`, E2E가 [PR #32](https://github.com/byoridb/byoridb/pull/32)에 반영됨 |
-| [#27](https://github.com/byoridb/byoridb/issues/27) | 코드 해결·이슈 열림 | workspace Clippy `-D warnings` CI gate가 [PR #30](https://github.com/byoridb/byoridb/pull/30)에 반영됨 |
-| [#29](https://github.com/byoridb/byoridb/issues/29) | 코드 해결·이슈 열림 | Dependabot의 `main` 대상 수정과 후속 PR 생성을 [PR #35](https://github.com/byoridb/byoridb/pull/35) 이후 확인함 |
-| [#25](https://github.com/byoridb/byoridb/issues/25) | `byori`에서 해결·이슈 열림 | 책임 저장소가 [byoridb/byori](https://github.com/byoridb/byori)로 이동했고 typed-wiki schema bootstrap/version migration [3ce7730](https://github.com/byoridb/byori/commit/3ce7730e19f04bd980b10829c9c6e34b9ecf86d4)과 guarded structured-memory 도구 [18d605f](https://github.com/byoridb/byori/commit/18d605f214a8fb8ce6476b9eccdc9efc9162b714)가 반영됨 |
-| [#23](https://github.com/byoridb/byoridb/issues/23) | 부분 해결 | 서버의 만료/누락 세션은 [PR #35](https://github.com/byoridb/byoridb/pull/35)에서 `401 SESSION_EXPIRED`가 됐지만, 태그 릴리스와 `byori` 클라이언트/MCP 통합 테스트가 남음 |
-| [#24](https://github.com/byoridb/byoridb/issues/24) | 부분 해결 | Windows 미지원과 unsigned/notarized macOS의 Gatekeeper 위험 및 source-build 권장은 문서화됨; ARM Linux 바이너리와 실제 macOS 서명/notarization은 미완료 |
-| [#28](https://github.com/byoridb/byoridb/issues/28) | 코드 해결; PR #51 머지 시 닫힘 | Release workflow가 새 tag archive의 root에 `LICENSE`와 `NOTICES.md`를 포함하고 검증함; 이미 게시된 v0.3.3 이하 archive는 소급 변경되지 않음 |
-| [#1](https://github.com/byoridb/byoridb/issues/1) | 미해결 | range 술어가 index range scan 대신 full scan으로 폴백함 |
-| [#10](https://github.com/byoridb/byoridb/issues/10) | 엔진 범위 코드 해결·하네스 수용 검증 대기 | 1,000 VID `FETCH` 회귀 검증, destination projection 단일 deduplicated `batch_get`, `EXPLAIN`/`PROFILE`의 `GetVertices` 노출을 반영했으며 별도 LDBC 하네스의 Q9 전환과 `<10s` 측정은 남음 |
+| [#26](https://github.com/byoridb/byoridb/issues/26) | PR #32로 해결·이슈 닫힘 | 원자적 dual-write, 단조 transaction timestamp, seek 기반 `AS OF`, E2E가 [PR #32](https://github.com/byoridb/byoridb/pull/32)에 반영됨 |
+| [#27](https://github.com/byoridb/byoridb/issues/27) | PR #30으로 해결·이슈 닫힘 | workspace Clippy `-D warnings` CI gate가 [PR #30](https://github.com/byoridb/byoridb/pull/30)에 반영됨 |
+| [#29](https://github.com/byoridb/byoridb/issues/29) | PR #35로 해결·이슈 닫힘 | Dependabot의 `main` 대상 수정과 후속 PR 생성을 [PR #35](https://github.com/byoridb/byoridb/pull/35) 이후 확인함 |
+| [#25](https://github.com/byoridb/byoridb/issues/25) | `byori`에서 해결·tracking 이슈 닫힘 | 책임 저장소가 [byoridb/byori](https://github.com/byoridb/byori)로 이동했고 typed-wiki schema bootstrap/version migration [3ce7730](https://github.com/byoridb/byori/commit/3ce7730e19f04bd980b10829c9c6e34b9ecf86d4)과 guarded structured-memory 도구 [18d605f](https://github.com/byoridb/byori/commit/18d605f214a8fb8ce6476b9eccdc9efc9162b714)가 반영됨 |
+| [#23](https://github.com/byoridb/byoridb/issues/23) | 부분 해결·이슈 열림 | 서버의 만료/누락 세션은 [PR #35](https://github.com/byoridb/byoridb/pull/35)에서 `401 SESSION_EXPIRED`가 됐지만, 태그 릴리스와 `byori` 클라이언트/MCP 통합 테스트가 남음 |
+| [#24](https://github.com/byoridb/byoridb/issues/24) | 부분 해결·이슈 열림 | 새 tag release가 Linux x86_64/arm64와 macOS x86_64/arm64 archive를 빌드함. Windows는 미지원이고 macOS artifact는 아직 서명/notarization되지 않았으며, 과거 release에는 artifact가 소급 추가되지 않음 |
+| [#28](https://github.com/byoridb/byoridb/issues/28) | PR #51로 해결·이슈 닫힘 | Release workflow가 새 tag archive의 root에 `LICENSE`와 `NOTICES.md`를 포함하고 검증함; 이미 게시된 v0.3.3 이하 archive는 소급 변경되지 않음 |
+| [#49](https://github.com/byoridb/byoridb/issues/49) | PR #57로 해결·이슈 닫힘 | Standalone `FIXED_STRING`이 영속 음수 `i64` surrogate로 storage key와 RPC/protobuf 정수 계약을 보존함. Unknown read는 miss이고 collision claim은 live graph 점유를 피하며, legacy 0 이상 record는 write-frozen read/delete bridge만 제공함. Distributed mapping과 `RECOMMEND`는 명시적으로 미지원 |
+| [#1](https://github.com/byoridb/byoridb/issues/1) | PR #54로 해결·이슈 닫힘 | Local 단일-field Boolean/정수 `LOOKUP` 비교가 stale-entry 재검증과 정확한 `OFFSET`/`LIMIT`을 포함한 bounded index range scan을 사용함. 미지원 key domain은 predicate-scan fallback을 유지하고 distributed ordered range는 fail-closed함 |
+| [#10](https://github.com/byoridb/byoridb/issues/10) | 엔진 범위 코드 해결·하네스 수용 이슈 열림 | 1,000 VID `FETCH` 회귀 검증, destination projection 단일 deduplicated `batch_get`, `EXPLAIN`/`PROFILE`의 `GetVertices` 노출을 반영했으며 별도 LDBC 하네스의 Q9 전환과 `<10s` 측정은 남음 |
 
 코드 해결 항목은 구현·검증 근거를 이슈에 남긴 뒤 닫고, 부분 해결/미해결 항목은
 남은 수용 기준이 통과할 때까지 유지한다.
@@ -220,11 +222,8 @@ pod 삭제/rollout restart 등 상태 변경은 수행하지 않았다.
   없고 KV/벡터 인덱스/Raft 영속 형식에 사용되므로, 교체는 기존 데이터 호환·마이그레이션
   설계를 포함한 별도 작업으로 진행한다.
 - **nGQL 문자열 escape** ✅ 해소 (2026-06-22): lexer 정규식 `"[^"]*"`/`'[^']*'`가 escape·내부 따옴표·백슬래시를 못 받아, 값에 `"`나 `\`가 있으면 토큰이 끊겨 "Unexpected end of input"으로 실패했음(예: `Chef's`는 OK지만 `6\" pan`, `C:\dir`은 깨짐). `"([^"\\]|\\.)*"`로 확장 + `parser::unquote`가 `\"`/`\\`/`\n`/`\t` 등 해석(흩어진 5개 호출처 통합). **nexprice 도그푸딩으로 발견** — LDBC(INT64·따옴표 없는 VID)만 검증해 와 드러나지 않았던 갭.
-- **INSERT 실행기 문자열 VID 미지원** (미해결): `CREATE SPACE ... vid_type=FIXED_STRING`은 파서·메타가 받지만, `plan.rs`가 INSERT VERTEX/EDGE의 VID를 `Literal::Int`(i64)로 강제(`"Vertex ID must be an integer literal"`)해 문자열 VID 스페이스엔 한 건도 못 넣는다. 우회: 애플리케이션이 문자열 id를 결정적 해시(blake2b 63bit 양수) INT64로 매핑하고 원본 id는 속성으로 보존. 근본 수정은 VID 타입(i64|String) 전파 필요(plan/executor/codec/key 전반, blast radius 큼). nexprice 도그푸딩으로 발견.
-- **MATCH edge accessor projection 제한** (관찰 2026-07-06): `MATCH (a)-[e:edge]->(b) RETURN src(e), dst(e)`가
-  row는 반환하지만 `src(e)`/`dst(e)` 값은 null로 평가된다. `MATCH ... RETURN id(a), id(b)`는 정상이고,
-  GO/FETCH 계열 edge accessor 회귀와는 별개다. nGQL 호환성을 넓힐 때 `MATCH` projection의 edge
-  variable accessor를 별도 후속으로 처리.
+- **FIXED_STRING 문자열 VID** ✅ standalone 해소 (2026-08-03): VID 표현을 `Int|String`으로 확장해 vertex/edge CRUD와 FETCH/GO/FIND/LOOKUP/MATCH endpoint에 전파했다. Space별 UTF-8 문자열↔음수 `i64` mapping을 영속 저장하고 기존 codec/key/partition/storage RPC에는 surrogate를 전달하므로 protobuf와 정수 저장 계약은 바뀌지 않는다. 실제 live unmapped 0 이상 legacy VID는 warning과 함께 read/delete만 허용하고 write는 freeze한다. Distributed mapping ownership/replication과 `RECOMMEND`는 아직 지원하지 않는다. nexprice 도그푸딩으로 발견.
+- **MATCH edge accessor projection 제한** ✅ 해소 (2026-08-03): `MATCH (a)-[e:edge]->(b)`에서 `src(e)`, `dst(e)`, `type(e)`, `rank(e)`/`ranking(e)`, `properties(e)`, `e` projection을 지원한다. Incoming/undirected traversal에서도 저장 방향을 보존하고 잘못된 variable type/name은 typed null을 반환한다.
 - **쿼리 정확성 4건** ✅ 수정 (2026-06-23, 커밋 d2dfd62): cah 스페이스 도그푸딩으로 발견. (A) `MATCH (n:tag) WHERE id(n)==X`가 id 바인딩 fast path(`match_executor.rs` start_vid_override)에서 라벨 필터를 건너뛰어 X가 다른 tag여도 매칭 → `matches_node` 검증 추가. (B) `FETCH PROP ON <tag> <vid>`가 tag 멤버십 미검증으로 다른 tag만 가진 정점 blob 반환 → `plan.tags` 필터(local+distributed). (C) `GO ... OVER * YIELD type(edge)/dst(edge)/src(edge)/edge`가 전부 null(`eval_go_yield_expr`가 `edge` 식별자·`FunctionCall` 미처리) → accessor 추가. (#2) `RETURN expr, COUNT(*)`가 암묵 GROUP BY 미지원으로 전체 1행 뭉침 → 집계 시 비집계 RETURN 컬럼으로 암묵 그룹화(명시 `GROUP BY`는 원래 정상). 회귀 `executor/dogfood_regression.rs` 4건. 버그 A/B가 데이터 모델 디버깅(has_brand src가 product가 아니라 sku)을 방해했었음.
 
 ---
@@ -631,7 +630,8 @@ subPropertyOf 양방향)만 이번 MVP. functional/inverse-functional(sameAs 유
   DRed retraction). executor 224 + parser 117 통과, fmt·clippy 클린.
 - **프로덕션 스모크 ✅ (2026-07-06, AKS sha-0bcab1c)**: HTTP 경로에서 equivalentClass
   `employee` ↔ `human` `is_a` 대칭과 equivalentProperty `likes` ↔ `enjoys` 양방향
-  materialization을 확인. `MATCH` edge projection은 `src(e)/dst(e)` 대신 `id(a)/id(b)`로 검증했다.
+  materialization을 확인. 당시 `MATCH` edge projection은 `src(e)/dst(e)` 대신
+  `id(a)/id(b)`로 검증했지만, 해당 accessor 제한은 2026-08-03 코드에서 해소됐다.
 - **미착수(Phase 2)**: functional / inverse-functional property — materialization 도중 sameAs를 유도해 O-8
   canonical merge를 재진입 호출해야 함(D10 "merge 먼저→materialize" 순서와 얽힘). entity resolution 자동화
   (IFP email→동일 상품 병합)라 가치 크나 복잡.
@@ -1043,7 +1043,7 @@ HTTP API에 쿼리 크기 제한 없음 (gRPC는 64MB 제한 있음).
   sameAs 유지 + 기존 88M 백필)로 O(1) 조회 — 현재는 여전히 O(N) 시간(~6s).
   `max_memory_mb` 강제는 G-11 ①②로 적용 완료.
 - **MATCH pattern execution reorder** — 가장 selective한 노드부터. semantic risk 큼.
-- **LOOKUP range 술어 인덱스 미사용** ([#1](https://github.com/byoridb/byoridb/issues/1)) — `LOOKUP ... WHERE age > 30` 이 인덱스가 있어도 풀스캔으로 폴백. 실행기/플래너 모두 동등(Eq) 조건만 인덱스 경로로 라우팅(`execute_lookup`/`extract_eq_condition`, `explain::lookup_access`/`eq_field`). 근본: `IndexManager::lookup_tag` point-equality만 지원, range index scan 미구현. EXPLAIN/PROFILE 풀스캔 경고(dc5be3b)가 발견.
+- **LOOKUP range 술어 인덱스 사용** ✅ 해결 (2026-08-03, [#1](https://github.com/byoridb/byoridb/issues/1), PR #54) — Local 단일-field Boolean/정수 `>`, `>=`, `<`, `<=`를 bounded index range scan으로 라우팅하고 실제 vertex/tag/predicate를 재검증한다. 모든 partition 결과를 안정적으로 deduplicate하며 stale entry가 있어도 `OFFSET`/`LIMIT`을 정확히 적용한다. 문자열·Float/Double·compound range는 정확성 보존 full-scan fallback을 유지하고 distributed ordered range는 명시적으로 거부한다. `EXPLAIN`/`PROFILE`도 실행 경로와 같은 access path를 표시한다.
 - **label-only MATCH reverse index** ✅ 완료 (2026-05-29) — `{space}:tagvid:{tag}:{vid}` 보조 인덱스 도입. INSERT VERTEX 에서 자동 기록, MATCH 에서 label-only 패턴 시 자동 사용.
 - **역방향 edge 인덱스(incoming)** → **O-1로 승격(P0).** `get_incoming_neighbors` 풀스캔 문제. 온톨로지 transitive 추론의 선결 조건이라 C가 아닌 O 트랙에서 우선 처리.
 - **변길이 경로 `*1..n` 실행** → **O-2로 승격(P0).** transitive closure 하부 연산.

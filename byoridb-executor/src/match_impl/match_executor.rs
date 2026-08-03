@@ -74,6 +74,7 @@ impl MatchExecutor {
             .space
             .clone()
             .ok_or_else(|| ExecutionError::InvalidOperation("No space selected".to_string()))?;
+        let vid_type = crate::vid::space_vid_type(&self.ctx, &space).await?;
 
         let flat = flatten_pattern(&plan.pattern)?;
         let matcher = PatternMatcher::new(self.ctx.clone());
@@ -92,7 +93,7 @@ impl MatchExecutor {
         // Indexed GROUP BY + COUNT(*) fast-path: when grouping by a single
         // indexed property with no WHERE/edges, count via index scan instead of
         // decoding every vertex blob. ORDER BY/OFFSET/LIMIT still apply here.
-        if let Some((columns, mut rows)) = self.try_indexed_group_count(&plan).await? {
+        if let Some((columns, mut rows)) = self.try_indexed_group_count(&plan, vid_type).await? {
             if !plan.order_by.is_empty() {
                 sort_rows_by_order(&mut rows, &columns, &plan.order_by);
             }
@@ -112,7 +113,10 @@ impl MatchExecutor {
         // Edge-degree GROUP BY COUNT fast-path: `MATCH (c:Tag)<-[:e]-() RETURN
         // c.prop, COUNT(*)` — count each group node's edge keys (no EdgeData
         // decode) instead of traversing+decoding every edge. ORDER BY/LIMIT apply.
-        if let Some((columns, mut rows)) = self.try_edge_degree_group_count(&plan, &space).await? {
+        if let Some((columns, mut rows)) = self
+            .try_edge_degree_group_count(&plan, &space, &matcher, vid_type)
+            .await?
+        {
             if !plan.order_by.is_empty() {
                 sort_rows_by_order(&mut rows, &columns, &plan.order_by);
             }
@@ -137,11 +141,19 @@ impl MatchExecutor {
         // Instead of scanning all start-node candidates and traversing forward,
         // we call get_incoming_neighbors(X) once — an O(in-degree) reverse-edge
         // index lookup vs N forward prefix scans (N = candidate count, 100K+).
-        let mut id_bindings = plan
+        let external_id_bindings = plan
             .where_clause
             .as_ref()
             .map(extract_id_eq_bindings)
             .unwrap_or_default();
+        let mut id_bindings = HashMap::with_capacity(external_id_bindings.len());
+        for (variable, external_vid) in external_id_bindings {
+            if let Some(internal) =
+                crate::vid::resolve_vid(&self.ctx, &space, vid_type, &external_vid, false).await?
+            {
+                id_bindings.insert(variable, internal);
+            }
+        }
 
         // O-8 D5: normalize `id(n) == X` constraints to the owl:sameAs
         // representative so a match on a merged-away vid resolves to the
@@ -380,6 +392,15 @@ impl MatchExecutor {
         self.ctx
             .check_result_budget(binding_rows.len().saturating_mul(BINDING_ROW_EST_BYTES))?;
 
+        // MATCH projection helpers intentionally return typed NULLs for many
+        // expression errors, but a missing reverse mapping is storage
+        // corruption and must never be hidden as NULL. Validate every bound
+        // vertex plus both endpoints of every bound edge after all required and
+        // optional joins, before filtering or projection. The legacy
+        // non-negative bridge remains valid and warns.
+        self.validate_match_vid_mappings(&binding_rows, &space, vid_type)
+            .await?;
+
         // Apply WHERE clause against actual vertex properties
         let filtered = if let Some(ref where_expr) = plan.where_clause {
             let filter_profiling = self.ctx.profiling();
@@ -602,7 +623,14 @@ impl MatchExecutor {
     async fn try_indexed_group_count(
         &self,
         plan: &crate::plan::MatchPlan,
+        vid_type: crate::vid::SpaceVidType,
     ) -> Result<Option<(Vec<String>, Vec<Vec<byoridb_common::Value>>)>> {
+        // Property-index entries contain only internal i64 VIDs and this path
+        // never materializes bindings. Until it can validate reverse mappings,
+        // FIXED_STRING must use the normal path where corruption is surfaced.
+        if !matches!(vid_type, crate::vid::SpaceVidType::Int64) {
+            return Ok(None);
+        }
         // Shape gates: no WHERE / OPTIONAL, single-node pattern, single GROUP BY.
         if plan.where_clause.is_some() || !plan.optional_patterns.is_empty() {
             return Ok(None);
@@ -716,7 +744,14 @@ impl MatchExecutor {
         &self,
         plan: &crate::plan::MatchPlan,
         space: &str,
+        matcher: &PatternMatcher,
+        vid_type: crate::vid::SpaceVidType,
     ) -> Result<Option<(Vec<String>, Vec<Vec<byoridb_common::Value>>)>> {
+        // This keys-only path does not visit the far edge endpoint. Use normal
+        // traversal for FIXED_STRING so both endpoint mappings are validated.
+        if !matches!(vid_type, crate::vid::SpaceVidType::Int64) {
+            return Ok(None);
+        }
         if plan.where_clause.is_some() || !plan.optional_patterns.is_empty() {
             return Ok(None);
         }
@@ -805,7 +840,7 @@ impl MatchExecutor {
             // full scan can still answer correctly.
             return Ok(None);
         }
-        let vids: Vec<i64> = tagvid_entries
+        let indexed_vids: Vec<i64> = tagvid_entries
             .iter()
             .filter_map(|(key, _)| {
                 // key = {space}:tagvid:{label}:{vid} — vid is the last segment.
@@ -815,6 +850,28 @@ impl MatchExecutor {
                     .and_then(|s| s.parse::<i64>().ok())
             })
             .collect();
+
+        // Revalidate tag-vid entries before trusting counters or edge prefixes.
+        // Stale keys must not create phantom groups, and a stale-only index must
+        // fall back to traversal so legacy/pre-index live rows remain visible.
+        let vertex_keys: Vec<Vec<u8>> = indexed_vids
+            .iter()
+            .map(|&vid| crate::key::SchemaKey::vertex(space, vid))
+            .collect();
+        let indexed_blobs = self.ctx.kvstore.batch_get(&vertex_keys).await?;
+        let mut vids = Vec::new();
+        let mut blobs = Vec::new();
+        for (vid, blob) in indexed_vids.into_iter().zip(indexed_blobs) {
+            let Some(blob) = blob else { continue };
+            if matcher.matches_node(&blob, flat.start)? {
+                crate::vid::display_vid(&self.ctx, space, vid_type, vid).await?;
+                vids.push(vid);
+                blobs.push(blob);
+            }
+        }
+        if vids.is_empty() {
+            return Ok(None);
+        }
 
         // Counts per group node. Prefer precomputed degree counters — a single
         // batch_get instead of scanning 33M edge keys. Only trust them when the
@@ -872,12 +929,6 @@ impl MatchExecutor {
                 }
             }
         };
-        let vertex_keys: Vec<Vec<u8>> = vids
-            .iter()
-            .map(|&vid| crate::key::SchemaKey::vertex(space, vid))
-            .collect();
-        let blobs = self.ctx.kvstore.batch_get(&vertex_keys).await?;
-
         let col_names: Vec<String> = return_cols
             .iter()
             .map(|c| {
@@ -893,10 +944,7 @@ impl MatchExecutor {
             if count == 0 {
                 continue; // no edges of this type → not interesting for TOP-k
             }
-            let gv = match &blobs[i] {
-                Some(blob) => tag_prop_value(blob, &label, &prop_name),
-                None => byoridb_common::Value::Null(byoridb_common::NullType::Null),
-            };
+            let gv = tag_prop_value(&blobs[i], &label, &prop_name);
             let cv = byoridb_common::Value::Int(count as i64);
             rows.push(if group_is_first {
                 vec![gv, cv]
@@ -1014,25 +1062,50 @@ impl MatchExecutor {
                 let prefix = format!("{}:tagvid:{}:", space, label);
                 let t = std::time::Instant::now();
                 let mut stream = self.ctx.kvstore.scan_stream(prefix.as_bytes()).await?;
-                let mut count = 0u64;
+                let vid_type = crate::vid::space_vid_type(&self.ctx, space).await?;
+                let mut raw_count = 0u64;
+                let mut count = 0usize;
+                let mut pending = Vec::with_capacity(256);
                 while let Some(item) = stream.next().await {
-                    item?;
-                    count += 1;
+                    let (key, _) = item?;
+                    raw_count += 1;
+                    if let Some(vid) = trailing_vid(&key) {
+                        pending.push(vid);
+                    }
+                    if pending.len() == 256 {
+                        count += self
+                            .count_valid_tagvid_chunk(space, node, matcher, vid_type, &pending)
+                            .await?;
+                        pending.clear();
+                    }
+                }
+                if !pending.is_empty() {
+                    count += self
+                        .count_valid_tagvid_chunk(space, node, matcher, vid_type, &pending)
+                        .await?;
                 }
                 // A populated tag-vid index answers the count; an empty result
-                // means the index is absent (pre-index data) — fall through to
-                // the full scan below, preserving the original behavior.
+                // after revalidation means it is stale (or absent) — fall
+                // through to the full scan so pre-index live rows stay visible.
                 if count > 0 {
                     if profiling {
                         self.ctx.record_profile(
                             ProfileOp::TagVidScan,
                             format!("label={} (count)", label),
-                            count,
+                            count as u64,
                             t.elapsed().as_micros() as u64,
                             false,
                         );
                     }
-                    return Ok(count as usize);
+                    return Ok(count);
+                }
+                if raw_count > 0 {
+                    tracing::warn!(
+                        space,
+                        label = label.as_str(),
+                        stale_entries = raw_count,
+                        "MATCH COUNT ignored a stale-only tag-vid index and is falling back to a full scan"
+                    );
                 }
             }
         }
@@ -1041,12 +1114,19 @@ impl MatchExecutor {
         let prefix = format!("{}:vertex:", space);
         let t = std::time::Instant::now();
         let mut stream = self.ctx.kvstore.scan_stream(prefix.as_bytes()).await?;
+        let vid_type = crate::vid::space_vid_type(&self.ctx, space).await?;
         let mut count = 0u64;
         let mut scanned = 0u64;
         while let Some(item) = stream.next().await {
-            let (_, value) = item?;
+            let (key, value) = item?;
             scanned += 1;
             if matcher.matches_node(&value, node)? {
+                let vid = trailing_vid(&key).ok_or_else(|| {
+                    ExecutionError::InvalidOperation(format!(
+                        "corrupt vertex key while scanning FIXED_STRING space '{space}'"
+                    ))
+                })?;
+                crate::vid::display_vid(&self.ctx, space, vid_type, vid).await?;
                 count += 1;
             }
         }
@@ -1062,6 +1142,57 @@ impl MatchExecutor {
         Ok(count as usize)
     }
 
+    async fn count_valid_tagvid_chunk(
+        &self,
+        space: &str,
+        node: &NodePattern,
+        matcher: &PatternMatcher,
+        vid_type: crate::vid::SpaceVidType,
+        vids: &[i64],
+    ) -> Result<usize> {
+        let keys: Vec<Vec<u8>> = vids
+            .iter()
+            .map(|&vid| crate::key::SchemaKey::vertex(space, vid))
+            .collect();
+        let blobs = self.ctx.kvstore.batch_get(&keys).await?;
+        let mut count = 0;
+        for (&vid, blob) in vids.iter().zip(blobs) {
+            let Some(blob) = blob else { continue };
+            if matcher.matches_node(&blob, node)? {
+                crate::vid::display_vid(&self.ctx, space, vid_type, vid).await?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn validate_match_vid_mappings(
+        &self,
+        rows: &[MatchBindings],
+        space: &str,
+        vid_type: crate::vid::SpaceVidType,
+    ) -> Result<()> {
+        if matches!(vid_type, crate::vid::SpaceVidType::Int64) {
+            return Ok(());
+        }
+        let mut vids = std::collections::HashSet::new();
+        for row in rows {
+            for value in row.values.values() {
+                if let byoridb_common::Value::Int(vid) = value {
+                    vids.insert(*vid);
+                }
+            }
+            for edge in row.edges.values() {
+                vids.insert(edge.src_vid);
+                vids.insert(edge.dst_vid);
+            }
+        }
+        for vid in vids {
+            crate::vid::display_vid(&self.ctx, space, vid_type, vid).await?;
+        }
+        Ok(())
+    }
+
     /// Evaluate a return expression against bound variables, fetching vertex
     /// properties from KV when needed.
     async fn eval_return_expr(
@@ -1074,7 +1205,7 @@ impl MatchExecutor {
             // RETURN v — vertex/edge variable: return full object, not just VID
             Expression::Identifier(name) => {
                 if let Some(edge) = bindings.edges.get(name) {
-                    return edge_data_to_value(edge);
+                    return self.edge_data_to_value(edge, space).await;
                 }
                 match bindings.get(name) {
                     Some(byoridb_common::Value::Int(vid)) => {
@@ -1102,7 +1233,20 @@ impl MatchExecutor {
             Expression::FunctionCall { name, args } if name.to_lowercase() == "id" => {
                 if let Some(Expression::Identifier(var)) = args.first() {
                     match bindings.get(var) {
-                        Some(byoridb_common::Value::Int(v)) => byoridb_common::Value::Int(*v),
+                        Some(byoridb_common::Value::Int(v)) => {
+                            match crate::vid::space_vid_type(&self.ctx, space).await {
+                                Ok(vid_type) => {
+                                    crate::vid::display_vid(&self.ctx, space, vid_type, *v)
+                                        .await
+                                        .unwrap_or(byoridb_common::Value::Null(
+                                            byoridb_common::NullType::Null,
+                                        ))
+                                }
+                                Err(_) => {
+                                    byoridb_common::Value::Null(byoridb_common::NullType::Null)
+                                }
+                            }
+                        }
                         Some(other) => other.clone(),
                         None => byoridb_common::Value::Null(byoridb_common::NullType::Null),
                     }
@@ -1132,8 +1276,8 @@ impl MatchExecutor {
                     return byoridb_common::Value::Null(byoridb_common::NullType::BadType);
                 };
                 match name.to_lowercase().as_str() {
-                    "src" => byoridb_common::Value::Int(edge.src_vid),
-                    "dst" => byoridb_common::Value::Int(edge.dst_vid),
+                    "src" => self.display_match_vid(space, edge.src_vid).await,
+                    "dst" => self.display_match_vid(space, edge.dst_vid).await,
                     "type" => byoridb_common::Value::String(edge.edge_type.clone()),
                     "rank" | "ranking" => byoridb_common::Value::Int(edge.ranking),
                     _ => unreachable!(),
@@ -1209,13 +1353,19 @@ impl MatchExecutor {
 
     /// Build a full `Value::Vertex` object from a VID by fetching from KV.
     async fn build_vertex_value(&self, vid: i64, space: &str) -> byoridb_common::Value {
+        let displayed_vid = match crate::vid::space_vid_type(&self.ctx, space).await {
+            Ok(vid_type) => crate::vid::display_vid(&self.ctx, space, vid_type, vid)
+                .await
+                .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null)),
+            Err(_) => byoridb_common::Value::Null(byoridb_common::NullType::Null),
+        };
         let key = format!("{}:vertex:{}", space, vid);
         let blob = match self.ctx.kvstore.get(key.as_bytes()).await {
             Ok(Some(b)) => b,
             _ => {
                 // No vertex data → return bare VID as Vertex
                 return byoridb_common::Value::Vertex(Box::new(byoridb_common::Vertex {
-                    vid: byoridb_common::Value::Int(vid),
+                    vid: displayed_vid,
                     tags: vec![],
                 }));
             }
@@ -1224,7 +1374,7 @@ impl MatchExecutor {
             Ok(v) => v,
             Err(_) => {
                 return byoridb_common::Value::Vertex(Box::new(byoridb_common::Vertex {
-                    vid: byoridb_common::Value::Int(vid),
+                    vid: displayed_vid,
                     tags: vec![],
                 }))
             }
@@ -1244,9 +1394,32 @@ impl MatchExecutor {
             .collect();
 
         byoridb_common::Value::Vertex(Box::new(byoridb_common::Vertex {
-            vid: byoridb_common::Value::Int(vid),
+            vid: displayed_vid,
             tags,
         }))
+    }
+
+    async fn display_match_vid(&self, space: &str, vid: i64) -> byoridb_common::Value {
+        match crate::vid::space_vid_type(&self.ctx, space).await {
+            Ok(vid_type) => crate::vid::display_vid(&self.ctx, space, vid_type, vid)
+                .await
+                .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null)),
+            Err(_) => byoridb_common::Value::Null(byoridb_common::NullType::Null),
+        }
+    }
+
+    /// Build a user-facing edge without leaking internal surrogate VIDs.
+    async fn edge_data_to_value(&self, edge: &EdgeData, space: &str) -> byoridb_common::Value {
+        let src = self.display_match_vid(space, edge.src_vid).await;
+        let dst = self.display_match_vid(space, edge.dst_vid).await;
+        byoridb_common::Value::Edge(Box::new(byoridb_common::Edge::with_props(
+            src,
+            dst,
+            0, // edge_type numeric (unused for display)
+            edge.edge_type.clone(),
+            edge.ranking,
+            edge.properties.clone(),
+        )))
     }
 
     /// Return all vertex properties as a flat map (merging all tags).
@@ -1852,9 +2025,9 @@ impl MatchExecutor {
         if pattern_props.is_empty() {
             // Label-only pattern: use the tag-vid secondary index written by INSERT VERTEX.
             // Key format: {space}:tagvid:{tag_name}:{vid}
-            // If the index has entries for this label, use them directly — no vertex
-            // blob decode needed for filtering. Stale entries (from deleted vertices)
-            // are harmless: edge traversal or dst-blob fetch will produce 0 results.
+            // If the index has entries for this label, batch-load the referenced
+            // vertices and re-check the label. This keeps stale/corrupt entries
+            // from producing phantom rows for edge-free patterns.
             if let Some(label) = node.labels.first() {
                 let prefix = format!("{}:tagvid:{}:", space, label);
                 let scan_limit = if self.ctx.config.max_scan_limit > 0 {
@@ -1879,7 +2052,7 @@ impl MatchExecutor {
                             false,
                         );
                     }
-                    let vids: Vec<i64> = results
+                    let indexed_vids: Vec<i64> = results
                         .iter()
                         .filter_map(|(key, _)| {
                             // Last colon-separated segment is the vid
@@ -1889,12 +2062,33 @@ impl MatchExecutor {
                                 .and_then(|s| s.parse().ok())
                         })
                         .collect();
+                    let vertex_keys: Vec<Vec<u8>> = indexed_vids
+                        .iter()
+                        .map(|vid| format!("{}:vertex:{}", space, vid).into_bytes())
+                        .collect();
+                    let vertex_blobs = self.ctx.kvstore.batch_get(&vertex_keys).await?;
+                    let mut vids = Vec::with_capacity(indexed_vids.len());
+                    for (vid, blob) in indexed_vids.into_iter().zip(vertex_blobs) {
+                        if let Some(blob) = blob {
+                            if matcher.matches_node(&blob, node)? {
+                                vids.push(vid);
+                            }
+                        }
+                    }
                     tracing::debug!(
                         space = space,
                         label = label.as_str(),
                         candidates = vids.len(),
                         "MATCH used tag-vid secondary index for label-only pattern"
                     );
+                    if vids.is_empty() {
+                        tracing::warn!(
+                            space,
+                            label = label.as_str(),
+                            "MATCH ignored a stale-only tag-vid index and is falling back to a full scan"
+                        );
+                        return Ok(None);
+                    }
                     return Ok(Some(vids));
                 }
             }
@@ -2159,17 +2353,6 @@ fn unbind_edge_variable(bindings: &mut MatchBindings, var: &str) {
     bindings.edges.remove(var);
 }
 
-fn edge_data_to_value(edge: &EdgeData) -> byoridb_common::Value {
-    byoridb_common::Value::Edge(Box::new(byoridb_common::Edge::with_props(
-        byoridb_common::Value::Int(edge.src_vid),
-        byoridb_common::Value::Int(edge.dst_vid),
-        0, // edge_type numeric (unused for display)
-        edge.edge_type.clone(),
-        edge.ranking,
-        edge.properties.clone(),
-    )))
-}
-
 fn is_aggregate_expr(expr: &Expression) -> bool {
     matches!(expr, Expression::FunctionCall { name, .. }
         if matches!(name.to_uppercase().as_str(), "COUNT" | "SUM" | "AVG" | "MAX" | "MIN"))
@@ -2308,9 +2491,9 @@ fn compare_values(
     }
 }
 
-/// Extract `id(var) == literal_int` (or reversed) bindings from a WHERE expression.
+/// Extract `id(var) == literal_vid` (or reversed) bindings from a WHERE expression.
 /// Handles AND chains. Returns map from variable name → VID.
-pub(crate) fn extract_id_eq_bindings(expr: &Expression) -> HashMap<String, i64> {
+pub(crate) fn extract_id_eq_bindings(expr: &Expression) -> HashMap<String, crate::plan::Vid> {
     match expr {
         Expression::BinaryOp {
             op: BinaryOperator::And,
@@ -2326,15 +2509,18 @@ pub(crate) fn extract_id_eq_bindings(expr: &Expression) -> HashMap<String, i64> 
             left,
             right,
         } => {
-            let try_extract = |func: &Expression, val: &Expression| -> Option<(String, i64)> {
-                if let (
-                    Expression::FunctionCall { name, args },
-                    Expression::Literal(Literal::Int(v)),
-                ) = (func, val)
-                {
+            let try_extract = |func: &Expression,
+                               val: &Expression|
+             -> Option<(String, crate::plan::Vid)> {
+                let vid = match val {
+                    Expression::Literal(Literal::Int(v)) => crate::plan::Vid::Int(*v),
+                    Expression::Literal(Literal::String(v)) => crate::plan::Vid::String(v.clone()),
+                    _ => return None,
+                };
+                if let Expression::FunctionCall { name, args } = func {
                     if name.to_lowercase() == "id" {
                         if let Some(Expression::Identifier(var)) = args.first() {
-                            return Some((var.clone(), *v));
+                            return Some((var.clone(), vid));
                         }
                     }
                 }
@@ -2399,6 +2585,15 @@ pub(super) fn expression_as_value(expr: &Expression) -> Option<byoridb_common::V
         Expression::Literal(Literal::Null) => Some(byoridb_common::Value::null()),
         _ => None,
     }
+}
+
+fn trailing_vid(key: &[u8]) -> Option<i64> {
+    std::str::from_utf8(key)
+        .ok()?
+        .rsplit(':')
+        .next()?
+        .parse()
+        .ok()
 }
 
 pub(super) fn byoridb_value_to_index_value(value: &byoridb_common::Value) -> IndexValue {

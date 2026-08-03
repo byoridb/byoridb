@@ -208,6 +208,8 @@ impl Executor {
             });
         }
 
+        let vid_type = crate::vid::space_vid_type(&self.ctx, &space).await?;
+
         let mut rows = Vec::new();
         for (key, value) in self
             .ctx
@@ -235,7 +237,7 @@ impl Executor {
             for shape in in_scope {
                 for (prop, reason) in shape_violations(shape, &props) {
                     rows.push(vec![
-                        Value::Int(vid),
+                        crate::vid::display_vid(&self.ctx, &space, vid_type, vid).await?,
                         Value::String(shape.name.clone()),
                         Value::String(prop),
                         Value::String(reason),

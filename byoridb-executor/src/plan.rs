@@ -262,8 +262,32 @@ pub enum InsertPlan {
     },
 }
 
+/// User-visible vertex identifier. Execution resolves string VIDs to a stable
+/// per-space internal i64 surrogate so the existing codec, indexes, partition
+/// hashing, and storage RPC wire format remain backward-compatible.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Vid {
+    Int(i64),
+    String(String),
+}
+
+impl From<i64> for Vid {
+    fn from(value: i64) -> Self {
+        Self::Int(value)
+    }
+}
+
+impl std::fmt::Display for Vid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Int(value) => value.fmt(f),
+            Self::String(value) => value.fmt(f),
+        }
+    }
+}
+
 pub struct VertexInsert {
-    pub vid: i64,
+    pub vid: Vid,
     pub tags: Vec<TagData>,
 }
 
@@ -274,8 +298,8 @@ pub struct TagData {
 }
 
 pub struct EdgeInsert {
-    pub src: i64,
-    pub dst: i64,
+    pub src: Vid,
+    pub dst: Vid,
     pub edge_type: String,
     pub ranking: i64,
     pub props: std::collections::HashMap<String, byoridb_common::Value>,
@@ -283,7 +307,7 @@ pub struct EdgeInsert {
 
 pub struct UpdatePlan {
     pub space: String,
-    pub vid: i64,
+    pub vid: Vid,
     pub tag_name: Option<String>,
     pub updates: std::collections::HashMap<String, byoridb_common::Value>,
     pub conditions: Option<Expression>,
@@ -292,7 +316,7 @@ pub struct UpdatePlan {
 
 pub struct DeletePlan {
     pub space: String,
-    pub vids: Vec<i64>,
+    pub vids: Vec<Vid>,
     pub conditions: Option<Expression>,
 }
 
@@ -300,17 +324,17 @@ pub struct DeleteEdgePlan {
     pub space: String,
     pub edge_name: String,
     /// (src_vid, dst_vid, ranking)
-    pub edge_refs: Vec<(i64, i64, i64)>,
+    pub edge_refs: Vec<(Vid, Vid, i64)>,
 }
 
 pub struct FetchPlan {
     pub space: String,
     /// Vertex VIDs for `FETCH PROP ON tag_name vid1, vid2`
-    pub vids: Vec<i64>,
+    pub vids: Vec<Vid>,
     pub tags: Vec<String>,
     pub yield_clause: Option<String>,
     /// Edge refs `(src, dst)` for `FETCH PROP ON edge_type src->dst`
-    pub edge_refs: Vec<(i64, i64)>,
+    pub edge_refs: Vec<(Vid, Vid)>,
     /// When true the plan fetches edge data; otherwise vertex data
     pub is_edge_fetch: bool,
     /// `$var.col` variable reference — resolved at runtime from ctx.vars
@@ -366,7 +390,7 @@ pub struct GoPlan {
 }
 
 pub struct FromClause {
-    pub vids: Vec<i64>,
+    pub vids: Vec<Vid>,
     pub src: Option<String>,
 }
 
@@ -800,19 +824,19 @@ impl ExecutionPlanBuilder {
                     byoridb_parser::ast::FetchType::Edge | byoridb_parser::ast::FetchType::EdgeProp
                 );
 
-                let mut vids: Vec<i64> = Vec::new();
-                let mut edge_refs: Vec<(i64, i64)> = Vec::new();
+                let mut vids: Vec<Vid> = Vec::new();
+                let mut edge_refs: Vec<(Vid, Vid)> = Vec::new();
 
                 if is_edge_fetch {
                     // Edge fetch: parser encodes src->dst as two consecutive Int literals
-                    let ints: Vec<i64> = fetch
+                    let endpoint_vids: Vec<Vid> = fetch
                         .vids
                         .into_iter()
                         .map(|v| Self::expr_to_vid(v, "Edge VID"))
                         .collect::<Result<Vec<_>>>()?;
-                    for pair in ints.chunks(2) {
+                    for pair in endpoint_vids.chunks(2) {
                         if pair.len() == 2 {
-                            edge_refs.push((pair[0], pair[1]));
+                            edge_refs.push((pair[0].clone(), pair[1].clone()));
                         }
                     }
                 } else {
@@ -967,14 +991,15 @@ impl ExecutionPlanBuilder {
         }
     }
 
-    /// Helper: resolve a VID expression to i64. Negative VIDs arrive from the
+    /// Helper: preserve an integer or string VID literal. Negative VIDs arrive from the
     /// parser as `UnaryOp(Neg, Int)`, not as a bare integer literal, so fold
     /// through `expr_to_value` instead of matching `Literal::Int` directly.
-    fn expr_to_vid(expr: byoridb_parser::ast::Expression, what: &str) -> Result<i64> {
+    fn expr_to_vid(expr: byoridb_parser::ast::Expression, what: &str) -> Result<Vid> {
         match Self::expr_to_value(expr) {
-            Ok(byoridb_common::Value::Int(i)) => Ok(i),
+            Ok(byoridb_common::Value::Int(i)) => Ok(Vid::Int(i)),
+            Ok(byoridb_common::Value::String(s)) => Ok(Vid::String(s)),
             _ => Err(crate::error::ExecutionError::InvalidOperation(format!(
-                "{what} must be an integer literal"
+                "{what} must be an integer or string literal"
             ))),
         }
     }
@@ -1192,10 +1217,10 @@ mod tests {
                         "edge_type must carry the parser's edge_name, not a hardcoded ID"
                     );
                 }
-                assert_eq!(edges[0].src, 1);
-                assert_eq!(edges[0].dst, 2);
-                assert_eq!(edges[1].src, 3);
-                assert_eq!(edges[1].dst, 4);
+                assert_eq!(edges[0].src, Vid::Int(1));
+                assert_eq!(edges[0].dst, Vid::Int(2));
+                assert_eq!(edges[1].src, Vid::Int(3));
+                assert_eq!(edges[1].dst, Vid::Int(4));
             }
             _ => panic!("Expected Insert(InsertPlan::Edge)"),
         }

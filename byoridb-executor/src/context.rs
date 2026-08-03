@@ -15,7 +15,7 @@ use byoridb_kvstore::KVStore;
 use byoridb_meta::MetaClient;
 use byoridb_storage::IndexManager;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -125,6 +125,12 @@ pub struct ExecutionContext {
     /// query, and read the result back across the executor boundary.
     pub full_scan: Arc<AtomicBool>,
 
+    /// FIXED_STRING spaces may temporarily expose an unmapped, non-negative
+    /// legacy VID through the read/delete-only migration bridge. Keep the
+    /// operator warning to once per query context and space so a large scan
+    /// does not flood logs. `USE`-derived siblings share the same set.
+    legacy_vid_warning_spaces: Arc<Mutex<HashSet<String>>>,
+
     /// Cache for the space id resolved from the space *name* (see
     /// [`Self::resolve_space_id`]). Populated once per context; a `USE`-derived
     /// sibling gets a fresh cell so it re-resolves for its own space.
@@ -150,6 +156,7 @@ impl ExecutionContext {
             vars: Arc::new(Mutex::new(HashMap::new())),
             profile: Mutex::new(None),
             full_scan: Arc::new(AtomicBool::new(false)),
+            legacy_vid_warning_spaces: Arc::new(Mutex::new(HashSet::new())),
             resolved_space_id: OnceCell::new(),
         }
     }
@@ -316,8 +323,25 @@ impl ExecutionContext {
             vars: self.vars.clone(),
             profile: Mutex::new(self.profile.lock().clone()),
             full_scan: self.full_scan.clone(),
+            legacy_vid_warning_spaces: self.legacy_vid_warning_spaces.clone(),
             // Fresh cell: the derived context resolves space_id for its own space.
             resolved_space_id: OnceCell::new(),
+        }
+    }
+
+    /// Warn once per query/space when the FIXED_STRING legacy compatibility
+    /// bridge passes through a live, unmapped non-negative VID.
+    pub(crate) fn warn_legacy_fixed_string_vid(&self, space: &str, vid: i64) {
+        if self
+            .legacy_vid_warning_spaces
+            .lock()
+            .insert(space.to_string())
+        {
+            tracing::warn!(
+                space,
+                legacy_vid = vid,
+                "FIXED_STRING read/delete used an unmapped legacy integer VID; writes are frozen — export, recreate the space, and import with string VIDs"
+            );
         }
     }
 

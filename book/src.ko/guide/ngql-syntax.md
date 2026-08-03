@@ -67,16 +67,20 @@ tag/edge property 선언으로 받지 않습니다. Parser와 실행 경로가 �
 
 ## Vertex ID
 
-현재 DML과 query planning은 정수 vertex ID를 요구합니다. 기본 `INT64` VID type을
-사용하세요.
+space마다 하나의 VID type을 선택합니다. `INT64`는 정수 literal을,
+`FIXED_STRING(N)`은 UTF-8로 최대 `N` byte인 따옴표 문자열을 사용합니다.
 
 ```sql
 CREATE SPACE demo (vid_type = INT64);
+CREATE SPACE accounts (vid_type = FIXED_STRING(32));
 ```
 
-space metadata로 `FIXED_STRING(N)`을 parse할 수는 있지만 현재
-INSERT/FETCH/GO planning은 문자열 VID를 거부합니다. 동작하는 문자열 VID mode가
-아닙니다.
+문자열 VID는 standalone graph CRUD, FETCH, GO, FIND, LOOKUP, MATCH에서
+지원합니다. Mapping 기반 `FIXED_STRING`은 distributed 또는 multi-coordinator
+실행에서 지원하지 않으며 `RECOMMEND`는 INT64 전용입니다.
+[space guide](./ngql/spaces.md#legacy-정수-bridge)의 read/delete-only live legacy
+bridge를 제외하면 `FIXED_STRING` space의 정수 literal이나 `INT64` space의 문자열
+literal은 거부됩니다.
 
 ## 표현식
 

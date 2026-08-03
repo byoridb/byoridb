@@ -136,6 +136,12 @@ fn decode_history_value(v: &[u8]) -> Option<(i64, Vec<u8>)> {
 pub trait KVStore: Send + Sync {
     async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
+    /// Atomically insert `value` only when `key` is absent.
+    ///
+    /// Returns `None` when this call inserted the value, or the existing value
+    /// when another writer already owns the key. Implementations must perform
+    /// the existence check and insertion under one write transaction/lock.
+    async fn put_if_absent(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>>;
     async fn delete(&self, key: &[u8]) -> Result<()>;
     async fn batch_put(&self, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()>;
     /// Delete many keys in a single transaction (missing keys are ignored).
@@ -522,6 +528,30 @@ impl KVStore for RedbKVStore {
             }
             wtx.commit()?;
             Ok(())
+        })
+        .await?
+    }
+
+    async fn put_if_absent(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>> {
+        let db = Arc::clone(&self.db);
+        let key = key.to_vec();
+        let value = value.to_vec();
+        let durability = self.next_durability();
+        tokio::task::spawn_blocking(move || {
+            let mut wtx = db.begin_write()?;
+            wtx.set_durability(durability)?;
+            let existing = {
+                let mut table = wtx.open_table(KV_TABLE)?;
+                let existing = table
+                    .get(key.as_slice())?
+                    .map(|guard| guard.value().to_vec());
+                if existing.is_none() {
+                    table.insert(key.as_slice(), value.as_slice())?;
+                }
+                existing
+            };
+            wtx.commit()?;
+            Ok(existing)
         })
         .await?
     }
@@ -1119,6 +1149,15 @@ impl KVStore for MemoryKVStore {
         Ok(())
     }
 
+    async fn put_if_absent(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>> {
+        let mut data = self.data.write().await;
+        if let Some(existing) = data.get(key) {
+            return Ok(Some(existing.clone()));
+        }
+        data.insert(key.to_vec(), value.to_vec());
+        Ok(None)
+    }
+
     async fn put_version(
         &self,
         entity_key: &[u8],
@@ -1384,6 +1423,41 @@ mod tests {
         store.put(b"k", b"v1").await.unwrap();
         store.put(b"k", b"v2").await.unwrap();
         assert_eq!(store.get(b"k").await.unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn test_memory_put_if_absent_preserves_the_winner() {
+        let store = MemoryKVStore::new();
+        assert_eq!(store.put_if_absent(b"k", b"v1").await.unwrap(), None);
+        assert_eq!(
+            store.put_if_absent(b"k", b"v2").await.unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(store.get(b"k").await.unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_memory_concurrent_put_if_absent_has_exactly_one_winner() {
+        let store = Arc::new(MemoryKVStore::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let attempt = |value: &'static [u8]| {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.put_if_absent(b"claim", value).await.unwrap()
+            })
+        };
+
+        let (first, second) = tokio::join!(attempt(b"first"), attempt(b"second"));
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(outcomes.iter().filter(|value| value.is_none()).count(), 1);
+        let stored = store.get(b"claim").await.unwrap().unwrap();
+        assert!(stored == b"first" || stored == b"second");
+        assert!(outcomes
+            .iter()
+            .filter_map(|value| value.as_ref())
+            .all(|existing| existing == &stored));
     }
 
     #[tokio::test]
@@ -1676,6 +1750,18 @@ mod tests {
         store.put(b"k", b"").await.unwrap();
         assert_eq!(store.get(b"k").await.unwrap(), Some(Vec::new()));
         assert!(store.get(b"absent").await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_redb_kvstore_put_if_absent_preserves_the_winner() {
+        let dir = tempdir().unwrap();
+        let store = RedbKVStore::open(dir.path(), KVStoreOptions::default()).unwrap();
+        assert_eq!(store.put_if_absent(b"k", b"v1").await.unwrap(), None);
+        assert_eq!(
+            store.put_if_absent(b"k", b"v2").await.unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(store.get(b"k").await.unwrap(), Some(b"v1".to_vec()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

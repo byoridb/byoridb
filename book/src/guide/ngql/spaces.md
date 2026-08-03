@@ -7,11 +7,12 @@ A space is a logical namespace for graph schema and data. Select a space with
 
 ## Create a space
 
-The reliable standalone form uses integer VIDs:
+Spaces support either integer or fixed-length string VIDs:
 
 ```sql
 CREATE SPACE social;
 CREATE SPACE IF NOT EXISTS social (vid_type = INT64);
+CREATE SPACE accounts (vid_type = FIXED_STRING(32));
 ```
 
 The current defaults are `partition_num = 100`, `replica_factor = 1`,
@@ -30,9 +31,54 @@ The parser also accepts `PARTITION BY MODULO` and
 `PARTITION BY RANGE(100, 200, 300)`. In standalone mode these fields are stored
 as metadata; they do not turn one process into a multi-node cluster.
 
-Although `FIXED_STRING(N)` is accepted as a space VID-type option, current DML
-planning requires integer literal VIDs. Use `INT64` until string-VID execution is
-implemented.
+`FIXED_STRING(N)` accepts quoted UTF-8 identifiers whose encoded length is at
+most `N` bytes. A space uses one VID type consistently, so integer literals are
+normally rejected in a `FIXED_STRING` space and string literals are rejected in
+an `INT64` space:
+
+```sql
+USE accounts;
+CREATE TAG account(name STRING);
+INSERT VERTEX account(name) VALUES "acct-001":("Primary");
+FETCH PROP ON account "acct-001";
+```
+
+Internally, a `FIXED_STRING` space stores a persistent bidirectional mapping
+between each UTF-8 VID and a stable **negative** `i64` surrogate. New mappings
+never use a non-negative value. The records use
+`{space}:vid-map:{hex-utf8}` for string to surrogate, with the signed `i64`
+stored as exactly eight big-endian bytes. The reverse record uses
+`{space}:vid-rev:{surrogate}` with the original UTF-8 bytes as its value. They
+are not recycled when graph data is deleted and are removed with the space's
+normal key prefix when `DROP SPACE` runs.
+
+This mapping preserves the integer contract tracked by
+[issue #49](https://github.com/byoridb/byoridb/issues/49): vertex, edge,
+tag-to-VID, index, partition, codec, and storage keys continue to carry an
+`i64`, and storage RPC/protobuf messages continue to use their existing integer
+VID fields. Query and API inputs/results translate only at the executor
+boundary.
+
+Mapping-backed `FIXED_STRING` execution is supported in standalone mode only.
+The mapping records do not yet have cluster-wide ownership, replication,
+consensus, or routing, so a distributed or multi-coordinator deployment must
+use `INT64` spaces. `RECOMMEND` is also currently INT64-only; see
+[Data queries](./dql.md#recommend).
+
+### Legacy integer bridge
+
+A space created before durable string mappings may contain live graph records
+under non-negative integer VIDs. ByoriDB exposes only an **actual live,
+unmapped, non-negative** VID through a temporary read/delete compatibility
+bridge. It is returned as an integer and emits an operator warning. Such a
+space is write-frozen for those legacy IDs: INSERT, UPDATE, and new edge writes
+with integer endpoints are rejected, and a raw negative internal surrogate is
+always rejected.
+
+Do not use this bridge as a mixed-VID operating mode. Export the legacy graph,
+recreate the `FIXED_STRING` space, and import it with quoted string VIDs. An
+unmapped integer with no live vertex or incident-edge evidence remains a normal
+point miss.
 
 ## Select a space
 
