@@ -115,6 +115,10 @@ curl -X DELETE http://localhost:19669/api/v1/session \
 # {"deleted":true}
 ```
 
+Header가 없거나 형식이 잘못됐으면 HTTP 401과 `AUTH_REQUIRED`를 반환합니다.
+Parsing된 session이 만료됐거나 미등록 상태면 HTTP 401과 `SESSION_EXPIRED`를
+반환합니다.
+
 ### 실행 중 쿼리 진단
 
 ```bash
@@ -175,6 +179,9 @@ byoridb_query_total{space="default",type="show"} 12
 |-----|------|------|
 | Authenticate | 0 | 성공 |
 | Authenticate | 1 | 인증 실패 (`Invalid credentials`) |
+| SignOut | 0 | 성공 |
+| SignOut | 1 | 그 밖의 sign-out 실패 |
+| SignOut | 2 | session이 없거나 만료됨 |
 | Execute / ExecuteJson | 0 | 성공 |
 | Execute / ExecuteJson | 1 | parse/planning/execution 등 query 오류 |
 | Execute / ExecuteJson | 2 | session이 없거나 만료됨 |

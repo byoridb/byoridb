@@ -26,10 +26,38 @@ use byoridb_storage::index::IndexDef;
 use byoridb_storage::key::IndexValue;
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 pub struct MatchExecutor {
     ctx: Arc<ExecutionContext>,
+}
+
+/// One MATCH row's variable bindings.
+///
+/// Vertex/scalar bindings stay in `values` for compatibility with the rest of
+/// MATCH evaluation. Edge identity is kept separately as decoded `EdgeData`
+/// instead of being smuggled through user-visible `e.<property>` keys. This is
+/// important because names such as `__src__` are valid edge properties and
+/// must never be able to overwrite the stored edge identity.
+#[derive(Clone, Default)]
+struct MatchBindings {
+    values: HashMap<String, byoridb_common::Value>,
+    edges: HashMap<String, EdgeData>,
+}
+
+impl Deref for MatchBindings {
+    type Target = HashMap<String, byoridb_common::Value>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl DerefMut for MatchBindings {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.values
+    }
 }
 
 impl MatchExecutor {
@@ -102,8 +130,8 @@ impl MatchExecutor {
         }
 
         // Collect rows as binding maps: variable_name → Value::Int(vid)
-        let mut binding_rows: Vec<HashMap<String, byoridb_common::Value>> = Vec::new();
-        let mut bindings: HashMap<String, byoridb_common::Value> = HashMap::new();
+        let mut binding_rows: Vec<MatchBindings> = Vec::new();
+        let mut bindings = MatchBindings::default();
 
         // Optimisation: detect WHERE id(end_var)==X for single-edge patterns.
         // Instead of scanning all start-node candidates and traversing forward,
@@ -206,7 +234,7 @@ impl MatchExecutor {
                         })
                     });
 
-                    let mut rows_for_base: Vec<HashMap<String, byoridb_common::Value>> = Vec::new();
+                    let mut rows_for_base: Vec<MatchBindings> = Vec::new();
                     if let Some(start_vid) = already_bound_vid {
                         let mut b = base_row.clone();
                         self.match_edges(
@@ -261,7 +289,7 @@ impl MatchExecutor {
         let binding_rows = if !plan.optional_patterns.is_empty() {
             let opt_profiling = self.ctx.profiling();
             let opt_start = std::time::Instant::now();
-            let mut expanded: Vec<HashMap<String, byoridb_common::Value>> = Vec::new();
+            let mut expanded: Vec<MatchBindings> = Vec::new();
             for row in binding_rows {
                 let mut current_rows = vec![row];
                 for opt_pattern in &plan.optional_patterns {
@@ -271,7 +299,7 @@ impl MatchExecutor {
                     };
                     let mut next_rows = Vec::new();
                     for base_row in current_rows {
-                        let mut opt_rows: Vec<HashMap<String, byoridb_common::Value>> = Vec::new();
+                        let mut opt_rows: Vec<MatchBindings> = Vec::new();
 
                         // If the start variable is already bound (common case:
                         // OPTIONAL MATCH (p)-[...]->(...) where p came from
@@ -321,9 +349,8 @@ impl MatchExecutor {
                         } else {
                             for opt_row in opt_rows {
                                 let mut merged = base_row.clone();
-                                for (k, v) in opt_row {
-                                    merged.insert(k, v);
-                                }
+                                merged.values.extend(opt_row.values);
+                                merged.edges.extend(opt_row.edges);
                                 next_rows.push(merged);
                             }
                         }
@@ -422,10 +449,8 @@ impl MatchExecutor {
                 // 2. For each group, project non-agg columns + compute agg columns
 
                 // Group raw binding rows (not yet projected) by key values
-                let mut groups: std::collections::BTreeMap<
-                    Vec<String>,
-                    Vec<HashMap<String, byoridb_common::Value>>,
-                > = std::collections::BTreeMap::new();
+                let mut groups: std::collections::BTreeMap<Vec<String>, Vec<MatchBindings>> =
+                    std::collections::BTreeMap::new();
                 for row_bindings in &filtered {
                     let mut key_parts = Vec::new();
                     for key_expr in &group_exprs {
@@ -1042,23 +1067,18 @@ impl MatchExecutor {
     async fn eval_return_expr(
         &self,
         expr: &Expression,
-        bindings: &HashMap<String, byoridb_common::Value>,
+        bindings: &MatchBindings,
         space: &str,
     ) -> byoridb_common::Value {
         match expr {
             // RETURN v — vertex/edge variable: return full object, not just VID
             Expression::Identifier(name) => {
+                if let Some(edge) = bindings.edges.get(name) {
+                    return edge_data_to_value(edge);
+                }
                 match bindings.get(name) {
                     Some(byoridb_common::Value::Int(vid)) => {
-                        // Check if this is an edge variable (has "name.prop" entries)
-                        let is_edge = bindings
-                            .keys()
-                            .any(|k| k.starts_with(&format!("{}.", name)));
-                        if is_edge {
-                            self.build_edge_value(*vid, name, bindings).await
-                        } else {
-                            self.build_vertex_value(*vid, space).await
-                        }
+                        self.build_vertex_value(*vid, space).await
                     }
                     Some(other) => other.clone(),
                     None => byoridb_common::Value::Null(byoridb_common::NullType::Null),
@@ -1091,27 +1111,46 @@ impl MatchExecutor {
                 }
             }
 
+            // Edge accessors preserve the stored edge orientation, regardless
+            // of whether MATCH traversed it forwards, backwards, or as an
+            // undirected edge. Invalid arguments use typed nulls instead of
+            // silently returning an ordinary NULL.
+            Expression::FunctionCall { name, args }
+                if matches!(
+                    name.to_lowercase().as_str(),
+                    "src" | "dst" | "type" | "rank" | "ranking"
+                ) =>
+            {
+                let [Expression::Identifier(var)] = args.as_slice() else {
+                    return byoridb_common::Value::Null(byoridb_common::NullType::BadType);
+                };
+                if !bindings.contains_key(var) {
+                    return byoridb_common::Value::Null(byoridb_common::NullType::UnknownProp);
+                }
+
+                let Some(edge) = bindings.edges.get(var) else {
+                    return byoridb_common::Value::Null(byoridb_common::NullType::BadType);
+                };
+                match name.to_lowercase().as_str() {
+                    "src" => byoridb_common::Value::Int(edge.src_vid),
+                    "dst" => byoridb_common::Value::Int(edge.dst_vid),
+                    "type" => byoridb_common::Value::String(edge.edge_type.clone()),
+                    "rank" | "ranking" => byoridb_common::Value::Int(edge.ranking),
+                    _ => unreachable!(),
+                }
+            }
+
             // properties(v) / properties(e) — flat map of all properties
             Expression::FunctionCall { name, args } if name.to_lowercase() == "properties" => {
                 if let Some(Expression::Identifier(var)) = args.first() {
+                    if let Some(edge) = bindings.edges.get(var) {
+                        return byoridb_common::Value::Map(byoridb_common::datatypes::map::Map {
+                            data: edge.properties.clone(),
+                        });
+                    }
                     if let Some(byoridb_common::Value::Int(vid)) = bindings.get(var) {
-                        let is_edge = bindings.keys().any(|k| k.starts_with(&format!("{}.", var)));
-                        if is_edge {
-                            // Edge props already stored as "var.prop_name"
-                            let mut map = std::collections::HashMap::new();
-                            for (k, v) in bindings {
-                                let prefix = format!("{}.", var);
-                                if let Some(prop) = k.strip_prefix(&prefix) {
-                                    map.insert(prop.to_string(), v.clone());
-                                }
-                            }
-                            byoridb_common::Value::Map(byoridb_common::datatypes::map::Map {
-                                data: map,
-                            })
-                        } else {
-                            // Vertex: merge all tag properties
-                            self.fetch_vertex_props_flat(*vid, space).await
-                        }
+                        // Vertex: merge all tag properties
+                        self.fetch_vertex_props_flat(*vid, space).await
                     } else {
                         byoridb_common::Value::Null(byoridb_common::NullType::Null)
                     }
@@ -1210,45 +1249,6 @@ impl MatchExecutor {
         }))
     }
 
-    /// Build a `Value::Edge` object from edge variable bindings.
-    async fn build_edge_value(
-        &self,
-        dst_vid: i64,
-        var: &str,
-        bindings: &HashMap<String, byoridb_common::Value>,
-    ) -> byoridb_common::Value {
-        // Edge properties are stored as "var.propname" in bindings
-        let prefix = format!("{}.", var);
-        let mut props = std::collections::HashMap::new();
-        let mut edge_type = String::new();
-        let mut src_vid: i64 = 0;
-
-        for (k, v) in bindings {
-            if let Some(prop) = k.strip_prefix(&prefix) {
-                if prop == "__src__" {
-                    if let byoridb_common::Value::Int(i) = v {
-                        src_vid = *i;
-                    }
-                } else if prop == "__type__" {
-                    if let byoridb_common::Value::String(s) = v {
-                        edge_type = s.clone();
-                    }
-                } else {
-                    props.insert(prop.to_string(), v.clone());
-                }
-            }
-        }
-
-        byoridb_common::Value::Edge(Box::new(byoridb_common::Edge::with_props(
-            byoridb_common::Value::Int(src_vid),
-            byoridb_common::Value::Int(dst_vid),
-            0, // edge_type numeric (unused for display)
-            edge_type,
-            0, // ranking
-            props,
-        )))
-    }
-
     /// Return all vertex properties as a flat map (merging all tags).
     async fn fetch_vertex_props_flat(&self, vid: i64, space: &str) -> byoridb_common::Value {
         let key = format!("{}:vertex:{}", space, vid);
@@ -1292,7 +1292,7 @@ impl MatchExecutor {
         &self,
         object: &str,
         prop: &str,
-        bindings: &HashMap<String, byoridb_common::Value>,
+        bindings: &MatchBindings,
         space: &str,
     ) -> byoridb_common::Value {
         let (var_name, tag_name) = if let Some(dot) = object.find('.') {
@@ -1300,6 +1300,14 @@ impl MatchExecutor {
         } else {
             (object, None)
         };
+
+        if let Some(edge) = bindings.edges.get(var_name) {
+            return edge
+                .properties
+                .get(prop)
+                .cloned()
+                .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null));
+        }
 
         let vid = match bindings.get(var_name) {
             Some(byoridb_common::Value::Int(v)) => *v,
@@ -1317,13 +1325,6 @@ impl MatchExecutor {
         };
 
         if let Some(_tag) = tag_name {
-            // First check if this is an edge property stored as "var.prop"
-            // (edge vars store props as "e.propname" during match traversal)
-            let edge_prop_key = format!("{}.{}", var_name, prop);
-            if let Some(val) = bindings.get(&edge_prop_key) {
-                return val.clone();
-            }
-            // Fall back to vertex tag property lookup
             vertex
                 .tags
                 .iter()
@@ -1347,7 +1348,7 @@ impl MatchExecutor {
     fn eval_condition<'a>(
         &'a self,
         expr: &'a Expression,
-        bindings: &'a HashMap<String, byoridb_common::Value>,
+        bindings: &'a MatchBindings,
         space: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
@@ -1395,7 +1396,7 @@ impl MatchExecutor {
     async fn compute_aggregate_row(
         &self,
         cols: &[crate::plan::MatchReturnColumn],
-        all_bindings: &[HashMap<String, byoridb_common::Value>],
+        all_bindings: &[MatchBindings],
         space: &str,
     ) -> Vec<byoridb_common::Value> {
         let mut row = Vec::new();
@@ -1525,8 +1526,8 @@ impl MatchExecutor {
         end_vid: i64,
         end_var: &str,
         matcher: &PatternMatcher,
-        bindings: &mut HashMap<String, byoridb_common::Value>,
-        rows: &mut Vec<HashMap<String, byoridb_common::Value>>,
+        bindings: &mut MatchBindings,
+        rows: &mut Vec<MatchBindings>,
     ) -> Result<()> {
         let edge_pat = flat.edges[0];
         let start_node = flat.start;
@@ -1599,30 +1600,14 @@ impl MatchExecutor {
             bindings.insert(end_var.to_string(), byoridb_common::Value::Int(end_vid));
 
             if let Some(ref edge_var) = edge_pat.variable {
-                bindings.insert(edge_var.clone(), byoridb_common::Value::Int(end_vid));
-                bindings.insert(
-                    format!("{}.__src__", edge_var),
-                    byoridb_common::Value::Int(src_vid),
-                );
-                bindings.insert(
-                    format!("{}.__type__", edge_var),
-                    byoridb_common::Value::String(edge_data.edge_type.clone()),
-                );
-                for (prop_name, prop_val) in &edge_data.properties {
-                    bindings.insert(format!("{}.{}", edge_var, prop_name), prop_val.clone());
-                }
+                bind_edge_variable(bindings, edge_var, &edge_data);
             }
 
             rows.push(bindings.clone());
 
             // Clean up edge-var bindings
             if let Some(ref edge_var) = edge_pat.variable {
-                bindings.remove(edge_var);
-                bindings.remove(&format!("{}.__src__", edge_var));
-                bindings.remove(&format!("{}.__type__", edge_var));
-                for prop_name in edge_data.properties.keys() {
-                    bindings.remove(&format!("{}.{}", edge_var, prop_name));
-                }
+                unbind_edge_variable(bindings, edge_var);
             }
             bindings.remove(&start_var);
             bindings.remove(end_var);
@@ -1647,8 +1632,8 @@ impl MatchExecutor {
         &self,
         flat: &FlatPattern<'_>,
         matcher: &PatternMatcher,
-        bindings: &mut HashMap<String, byoridb_common::Value>,
-        rows: &mut Vec<HashMap<String, byoridb_common::Value>>,
+        bindings: &mut MatchBindings,
+        rows: &mut Vec<MatchBindings>,
         row_limit: Option<usize>,
         start_vid_override: Option<i64>,
     ) -> Result<()> {
@@ -2026,8 +2011,8 @@ impl MatchExecutor {
         edge_idx: usize,
         current_vid: i64,
         matcher: &'a PatternMatcher,
-        bindings: &'a mut HashMap<String, byoridb_common::Value>,
-        rows: &'a mut Vec<HashMap<String, byoridb_common::Value>>,
+        bindings: &'a mut MatchBindings,
+        rows: &'a mut Vec<MatchBindings>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             if edge_idx >= edges.len() {
@@ -2133,21 +2118,7 @@ impl MatchExecutor {
                 }
 
                 if let Some(ref edge_var) = edge.variable {
-                    // dst_vid stored as the edge binding (for VID access)
-                    bindings.insert(edge_var.clone(), byoridb_common::Value::Int(dst_vid));
-                    // Store src VID and edge type so build_edge_value can reconstruct the edge
-                    bindings.insert(
-                        format!("{}.__src__", edge_var),
-                        byoridb_common::Value::Int(edge_data.src_vid),
-                    );
-                    bindings.insert(
-                        format!("{}.__type__", edge_var),
-                        byoridb_common::Value::String(edge_data.edge_type.clone()),
-                    );
-                    // Store each edge property as "edge_var.prop_name"
-                    for (prop_name, prop_val) in &edge_data.properties {
-                        bindings.insert(format!("{}.{}", edge_var, prop_name), prop_val.clone());
-                    }
+                    bind_edge_variable(bindings, edge_var, &edge_data);
                 }
                 if let Some(ref node_var) = node.variable {
                     bindings.insert(node_var.clone(), byoridb_common::Value::Int(dst_vid));
@@ -2166,12 +2137,7 @@ impl MatchExecutor {
                 .await?;
 
                 if let Some(ref edge_var) = edge.variable {
-                    bindings.remove(edge_var);
-                    bindings.remove(&format!("{}.__src__", edge_var));
-                    bindings.remove(&format!("{}.__type__", edge_var));
-                    for prop_name in edge_data.properties.keys() {
-                        bindings.remove(&format!("{}.{}", edge_var, prop_name));
-                    }
+                    unbind_edge_variable(bindings, edge_var);
                 }
                 if let Some(ref node_var) = node.variable {
                     bindings.remove(node_var);
@@ -2181,6 +2147,27 @@ impl MatchExecutor {
             Ok(())
         })
     }
+}
+
+fn bind_edge_variable(bindings: &mut MatchBindings, var: &str, edge: &EdgeData) {
+    bindings.insert(var.to_string(), byoridb_common::Value::Int(edge.dst_vid));
+    bindings.edges.insert(var.to_string(), edge.clone());
+}
+
+fn unbind_edge_variable(bindings: &mut MatchBindings, var: &str) {
+    bindings.remove(var);
+    bindings.edges.remove(var);
+}
+
+fn edge_data_to_value(edge: &EdgeData) -> byoridb_common::Value {
+    byoridb_common::Value::Edge(Box::new(byoridb_common::Edge::with_props(
+        byoridb_common::Value::Int(edge.src_vid),
+        byoridb_common::Value::Int(edge.dst_vid),
+        0, // edge_type numeric (unused for display)
+        edge.edge_type.clone(),
+        edge.ranking,
+        edge.properties.clone(),
+    )))
 }
 
 fn is_aggregate_expr(expr: &Expression) -> bool {
