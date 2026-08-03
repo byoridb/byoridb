@@ -70,6 +70,7 @@ all issues below are still open even when their implementation has landed:
 | [#23](https://github.com/byoridb/byoridb/issues/23) | Partial | The server now maps missing or expired HTTP sessions to `401 SESSION_EXPIRED` in [PR #35](https://github.com/byoridb/byoridb/pull/35). A tagged engine release and status-code-based `byori` client/MCP integration test are still required. |
 | [#24](https://github.com/byoridb/byoridb/issues/24) | Partial | Windows and the unsigned/notarized macOS Gatekeeper risk are documented, with a source-build recommendation. Prebuilt ARM Linux and actual macOS signing/notarization remain absent. |
 | [#28](https://github.com/byoridb/byoridb/issues/28) | Resolved in code; closes with PR #51 | The release workflow packages and verifies `LICENSE` and `NOTICES.md` at the root of every new tagged archive. Published v0.3.3 and older archives are not changed retroactively. |
+| [#49](https://github.com/byoridb/byoridb/issues/49) | Resolved on the PR #57 branch | Standalone `FIXED_STRING` uses persistent negative `i64` surrogates while preserving storage-key and RPC/protobuf integer contracts. Unknown reads remain misses, collision claims avoid live graph occupancy, legacy non-negative records have a write-frozen read/delete bridge, and distributed mapping plus `RECOMMEND` remain explicitly unsupported. |
 | [#1](https://github.com/byoridb/byoridb/issues/1) | Unresolved | Range predicates still fall back to a full scan instead of an index range scan. |
 | [#10](https://github.com/byoridb/byoridb/issues/10) | Engine scope resolved in code; harness acceptance pending | Multi-ID `FETCH` is covered at 1,000 VIDs, destination projections use one deduplicated `batch_get`, and `EXPLAIN`/`PROFILE` expose the batch as `GetVertices`; the separate LDBC harness still needs the Q9 conversion and `<10s` measurement. |
 
@@ -199,9 +200,12 @@ This is still **partial**, not a supported multi-node deployment:
 
 ### Query and data model
 
-- `FIXED_STRING(N)` VIDs are supported across graph CRUD, FETCH, GO, FIND,
-  LOOKUP, and MATCH. They use a durable per-space string-to-`i64` mapping so
-  existing codec, key, storage, partition, and RPC contracts remain unchanged.
+- `FIXED_STRING(N)` VIDs are supported in standalone graph CRUD, FETCH, GO,
+  FIND, LOOKUP, and MATCH. New durable per-space mappings use the negative
+  `i64` namespace so existing codec, key, storage, partition, and RPC contracts
+  remain unchanged and a write-frozen live non-negative legacy bridge stays
+  disjoint. Cluster-wide mapping ownership/replication is not implemented, and
+  `RECOMMEND` remains INT64-only.
 - `SHOW USER`/`SHOW USERS` and `SHOW ROLE`/`SHOW ROLES` list the built-in root
   and persisted users with their roles. `SHOW SESSIONS` lists active users and
   selected spaces without bearer session IDs.
@@ -238,7 +242,7 @@ This is still **partial**, not a supported multi-node deployment:
 
 | ID | Work | Exit criteria |
 |---|---|---|
-| COR-1 | ✅ Resolve the `FIXED_STRING` VID mismatch | String VIDs round-trip across graph CRUD and traversal while the existing `i64` storage/RPC contract remains compatible |
+| COR-1 | ✅ Resolve the standalone `FIXED_STRING` VID mismatch | String VIDs round-trip across graph CRUD and traversal with negative surrogates while existing `i64` storage/RPC contracts remain compatible; distributed mapping and `RECOMMEND` are out of scope |
 | COR-2 | Complete identity metadata surfaces | Supported user, role, and session listing syntax reports durable, authorized state without secrets |
 | COR-3 | Release/archive completeness | Binary archives include `LICENSE` and `NOTICES` and supported platforms are explicit |
 | OPS-1 | Recovery validation | Automated restore test includes both current and history tables and records recovery time |

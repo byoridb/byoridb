@@ -213,9 +213,10 @@ mod tests {
     use crate::error::ExecutionError;
     use crate::key::SchemaKey;
     use crate::plan::{
-        AlterColumnOp, AlterOpType, AlterPlan, CreatePlan, DeletePlan, DropPlan, FetchPlan,
-        FindPlan, FindType, FromClause, GoPlan, InsertPlan, LookupPlan, LookupType, PropertyDef,
-        ShowPlan, StepClause, TagData, ToClause, VertexInsert, YieldClause, YieldColumn,
+        AlterColumnOp, AlterOpType, AlterPlan, CreatePlan, DeletePlan, DropPlan, EdgeInsert,
+        FetchPlan, FindPlan, FindType, FromClause, GoPlan, InsertPlan, LookupPlan, LookupType,
+        PropertyDef, ShowPlan, StepClause, TagData, ToClause, UpdatePlan, VertexInsert, Vid,
+        YieldClause, YieldColumn,
     };
     use crate::ExecutionPlanBuilder;
     use byoridb_codec::{
@@ -629,6 +630,444 @@ mod tests {
         assert_eq!(vertex.vid, 100);
         assert_eq!(vertex.tags.len(), 1);
         assert_eq!(vertex.tags[0].name, "player");
+    }
+
+    async fn put_empty_tag_schema(executor: &Executor, name: &str) {
+        let schema = serde_json::json!({
+            "name": name,
+            "properties": []
+        });
+        executor
+            .ctx
+            .kvstore
+            .put(
+                &SchemaKey::tag("default", name),
+                &serde_json::to_vec(&schema).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn vertex_overwrite_and_duplicate_rows_replace_tagvid_atomically() {
+        let executor = create_executor();
+        for tag in ["existing", "intermediate", "final"] {
+            put_empty_tag_schema(&executor, tag).await;
+        }
+
+        executor
+            .execute_insert(InsertPlan::Vertex {
+                space: "default".to_string(),
+                vertices: vec![VertexInsert {
+                    vid: Vid::Int(77),
+                    tags: vec![TagData {
+                        name: "existing".to_string(),
+                        props: HashMap::new(),
+                    }],
+                }],
+            })
+            .await
+            .unwrap();
+
+        executor
+            .execute_insert(InsertPlan::Vertex {
+                space: "default".to_string(),
+                vertices: vec![
+                    VertexInsert {
+                        vid: Vid::Int(77),
+                        tags: vec![TagData {
+                            name: "intermediate".to_string(),
+                            props: HashMap::new(),
+                        }],
+                    },
+                    VertexInsert {
+                        vid: Vid::Int(77),
+                        tags: vec![TagData {
+                            name: "final".to_string(),
+                            props: HashMap::new(),
+                        }],
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+
+        for removed in ["existing", "intermediate"] {
+            assert!(executor
+                .ctx
+                .kvstore
+                .get(&SchemaKey::tagvid("default", removed, 77))
+                .await
+                .unwrap()
+                .is_none());
+        }
+        assert!(executor
+            .ctx
+            .kvstore
+            .get(&SchemaKey::tagvid("default", "final", 77))
+            .await
+            .unwrap()
+            .is_some());
+        let blob = executor
+            .ctx
+            .kvstore
+            .get(&SchemaKey::vertex("default", 77))
+            .await
+            .unwrap()
+            .unwrap();
+        let vertex = VertexCodec::decode_vertex(&blob).unwrap();
+        assert_eq!(vertex.tags.len(), 1);
+        assert_eq!(vertex.tags[0].name, "final");
+    }
+
+    async fn fixed_string_executor(max_len: usize) -> Executor {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let ctx = Arc::new(
+            ExecutionContext::new(kvstore)
+                .with_space("default".to_string())
+                .with_space_id(1),
+        );
+        ctx.kvstore
+            .put(
+                &SchemaKey::space("default"),
+                &serde_json::to_vec(&serde_json::json!({
+                    "id": 1,
+                    "name": "default",
+                    "vid_type": format!("FIXED_STRING({max_len})")
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        Executor::new(ctx)
+    }
+
+    #[tokio::test]
+    async fn multirow_validation_and_update_noop_do_not_create_string_mappings() {
+        let executor = fixed_string_executor(4).await;
+        put_empty_tag_schema(&executor, "person").await;
+
+        let result = executor
+            .execute_insert(InsertPlan::Vertex {
+                space: "default".to_string(),
+                vertices: vec![
+                    VertexInsert {
+                        vid: Vid::String("good".to_string()),
+                        tags: vec![TagData {
+                            name: "person".to_string(),
+                            props: HashMap::new(),
+                        }],
+                    },
+                    VertexInsert {
+                        vid: Vid::String("too-long".to_string()),
+                        tags: vec![TagData {
+                            name: "person".to_string(),
+                            props: HashMap::new(),
+                        }],
+                    },
+                ],
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(executor
+            .ctx
+            .kvstore
+            .scan_prefix(b"default:vid-map:")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(executor
+            .ctx
+            .kvstore
+            .scan_prefix(b"default:vid-rev:")
+            .await
+            .unwrap()
+            .is_empty());
+
+        let edge_schema = serde_json::json!({
+            "name": "knows",
+            "properties": []
+        });
+        executor
+            .ctx
+            .kvstore
+            .put(
+                &SchemaKey::edge("default", "knows"),
+                &serde_json::to_vec(&edge_schema).unwrap(),
+            )
+            .await
+            .unwrap();
+        let edge_result = executor
+            .execute_insert(InsertPlan::Edge {
+                space: "default".to_string(),
+                edges: vec![
+                    EdgeInsert {
+                        src: Vid::String("a".to_string()),
+                        dst: Vid::String("b".to_string()),
+                        edge_type: "knows".to_string(),
+                        ranking: 0,
+                        props: HashMap::new(),
+                    },
+                    EdgeInsert {
+                        src: Vid::String("c".to_string()),
+                        dst: Vid::String("d".to_string()),
+                        edge_type: "missing".to_string(),
+                        ranking: 0,
+                        props: HashMap::new(),
+                    },
+                ],
+            })
+            .await;
+        assert!(edge_result.is_err());
+        assert!(executor
+            .ctx
+            .kvstore
+            .scan_prefix(b"default:vid-map:")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(executor
+            .ctx
+            .kvstore
+            .scan_prefix(b"default:vid-rev:")
+            .await
+            .unwrap()
+            .is_empty());
+
+        let no_op = executor
+            .execute_update(UpdatePlan {
+                space: "default".to_string(),
+                vid: Vid::String("none".to_string()),
+                tag_name: Some("person".to_string()),
+                updates: HashMap::new(),
+                conditions: Some(Expression::Literal(Literal::Bool(false))),
+                yield_clause: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(no_op.rows, vec![vec![byoridb_common::Value::Int(0)]]);
+        assert!(executor
+            .ctx
+            .kvstore
+            .scan_prefix(b"default:vid-map:")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn fixed_string_live_positive_legacy_vids_support_read_traverse_and_delete() {
+        let executor = fixed_string_executor(32).await;
+        put_empty_tag_schema(&executor, "person").await;
+        executor
+            .ctx
+            .kvstore
+            .put(
+                &SchemaKey::edge("default", "knows"),
+                &serde_json::to_vec(&serde_json::json!({
+                    "name": "knows",
+                    "properties": []
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        for vid in [10, 20] {
+            let vertex = CodecVertexData {
+                vid,
+                tags: vec![CodecTagData {
+                    name: "person".to_string(),
+                    properties: HashMap::new(),
+                }],
+            };
+            executor
+                .ctx
+                .kvstore
+                .put(
+                    &SchemaKey::vertex("default", vid),
+                    &VertexCodec::encode_vertex(&vertex).unwrap(),
+                )
+                .await
+                .unwrap();
+            executor
+                .ctx
+                .kvstore
+                .put(&SchemaKey::tagvid("default", "person", vid), &[])
+                .await
+                .unwrap();
+        }
+        let edge = CodecEdgeData {
+            src_vid: 10,
+            dst_vid: 20,
+            edge_type: "knows".to_string(),
+            ranking: 0,
+            properties: HashMap::new(),
+        };
+        let edge_blob = VertexCodec::encode_edge(&edge).unwrap();
+        executor
+            .ctx
+            .kvstore
+            .put(
+                &SchemaKey::edge_data("default", 10, "knows", 20, 0),
+                &edge_blob,
+            )
+            .await
+            .unwrap();
+        executor
+            .ctx
+            .kvstore
+            .put(
+                &SchemaKey::in_edge_data("default", 20, "knows", 10, 0),
+                &edge_blob,
+            )
+            .await
+            .unwrap();
+
+        let plan = |query: &str| {
+            ExecutionPlanBuilder::build(byoridb_parser::parse(query).unwrap()).unwrap()
+        };
+        let fetched = executor
+            .execute(plan("FETCH PROP ON person 10"))
+            .await
+            .unwrap();
+        assert_eq!(fetched.rows[0][0], byoridb_common::Value::Int(10));
+
+        let matched = executor
+            .execute(plan("MATCH (n:person) RETURN id(n)"))
+            .await
+            .unwrap();
+        assert_eq!(matched.rows.len(), 2);
+        assert!(matched
+            .rows
+            .iter()
+            .all(|row| matches!(row.first(), Some(byoridb_common::Value::Int(_)))));
+
+        let traversed = executor
+            .execute(plan("GO FROM 10 OVER knows"))
+            .await
+            .unwrap();
+        assert_eq!(
+            traversed.rows,
+            vec![vec![
+                byoridb_common::Value::Int(10),
+                byoridb_common::Value::Int(20)
+            ]]
+        );
+
+        let edge_deleted = executor
+            .execute(plan("DELETE EDGE knows 10->20"))
+            .await
+            .unwrap();
+        assert_eq!(edge_deleted.rows[0][0], byoridb_common::Value::Int(1));
+        let vertex_deleted = executor.execute(plan("DELETE VERTEX 20")).await.unwrap();
+        assert_eq!(vertex_deleted.rows[0][0], byoridb_common::Value::Int(1));
+
+        let integer_edge_write = executor
+            .execute_insert(InsertPlan::Edge {
+                space: "default".to_string(),
+                edges: vec![EdgeInsert {
+                    src: Vid::Int(10),
+                    dst: Vid::String("new".to_string()),
+                    edge_type: "knows".to_string(),
+                    ranking: 0,
+                    props: HashMap::new(),
+                }],
+            })
+            .await;
+        assert!(integer_edge_write
+            .unwrap_err()
+            .to_string()
+            .contains("read/delete-only legacy data"));
+
+        let integer_update = executor
+            .execute_update(UpdatePlan {
+                space: "default".to_string(),
+                vid: Vid::Int(10),
+                tag_name: Some("person".to_string()),
+                updates: HashMap::new(),
+                conditions: None,
+                yield_clause: None,
+            })
+            .await;
+        assert!(integer_update
+            .unwrap_err()
+            .to_string()
+            .contains("read/delete-only legacy data"));
+
+        let vid_type = crate::vid::space_vid_type(&executor.ctx, "default")
+            .await
+            .unwrap();
+        let mapped_internal = crate::vid::resolve_vid(
+            &executor.ctx,
+            "default",
+            vid_type,
+            &Vid::String("mapped".to_string()),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let raw_negative = executor
+            .execute(ExecutionPlan::Fetch(FetchPlan {
+                space: "default".to_string(),
+                vids: vec![Vid::Int(mapped_internal)],
+                tags: vec!["person".to_string()],
+                yield_clause: None,
+                edge_refs: vec![],
+                is_edge_fetch: false,
+                src_var: None,
+                as_of: None,
+            }))
+            .await;
+        assert!(raw_negative
+            .unwrap_err()
+            .to_string()
+            .contains("raw negative internal VID"));
+    }
+
+    #[tokio::test]
+    async fn unknown_string_delete_cannot_remove_old_positive_hash_vid() {
+        let executor = fixed_string_executor(32).await;
+        let external = "unknown-legacy-collision";
+        let mut old_positive =
+            (byoridb_common::hash::hash_bytes(external.as_bytes()) & i64::MAX as u64) as i64;
+        if old_positive == 0 {
+            old_positive = 1;
+        }
+        let vertex = CodecVertexData {
+            vid: old_positive,
+            tags: vec![CodecTagData {
+                name: "person".to_string(),
+                properties: HashMap::new(),
+            }],
+        };
+        executor
+            .ctx
+            .kvstore
+            .put(
+                &SchemaKey::vertex("default", old_positive),
+                &VertexCodec::encode_vertex(&vertex).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let result = executor
+            .execute_delete(DeletePlan {
+                space: "default".to_string(),
+                vids: vec![Vid::String(external.to_string())],
+                conditions: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.rows[0][0], byoridb_common::Value::Int(0));
+        assert!(executor
+            .ctx
+            .kvstore
+            .get(&SchemaKey::vertex("default", old_positive))
+            .await
+            .unwrap()
+            .is_some());
     }
 
     // ===== DELETE Tests =====

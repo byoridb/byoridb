@@ -31,10 +31,12 @@ impl Executor {
                 };
                 let vid_type = crate::vid::space_vid_type(&self.ctx, &effective_space).await?;
                 // Fetch the tag-index list once (not per row), then collect every
-                // KV write into a single batch so the whole multi-row INSERT
-                // commits in one redb transaction (one fsync) instead of one per
-                // put. This is the dominant cost for bulk loads. The batch is
-                // also atomic — a multi-row INSERT now applies all-or-nothing.
+                // Graph/current-view, tag-vid, and history writes share one redb
+                // transaction (one fsync) instead of one per put. This is the
+                // dominant cost for bulk loads and makes that graph-data batch
+                // all-or-nothing. FIXED_STRING reverse-key reservations are
+                // intentionally stable/non-recycled and happen before this
+                // batch, so an I/O failure may leave unused mapping metadata.
                 let space_id = self.ctx.resolve_space_id().await;
                 let tag_indexes = match self.ctx.index_manager.as_ref() {
                     Some(im) => im.list_tag_indexes(space_id).await,
@@ -48,33 +50,42 @@ impl Executor {
                 // index (R-2b) is now stale and must be rebuilt on next query.
                 let mut dirty_vec_props: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
-                for vertex in vertices {
-                    // Schema validation: verify each tag and its fields exist
+                // Validate the complete statement before creating any string
+                // VID mapping. A bad later row must not leave metadata behind
+                // for otherwise-uncommitted earlier rows.
+                for vertex in &vertices {
+                    crate::vid::validate_write_vid(&effective_space, vid_type, &vertex.vid)?;
                     for tag in &vertex.tags {
                         self.validate_tag_props(&effective_space, &tag.name, &tag.props)
                             .await?;
                     }
-                    // Write-time shape validation (SHACL-style constraints):
-                    // reject a vertex violating any in-scope shape. The flattened
-                    // property map mirrors the RECOMMEND filter convention (bare +
-                    // `{tag}.{prop}`). No-op when no shapes are declared.
-                    {
-                        let mut tag_names = Vec::with_capacity(vertex.tags.len());
-                        let mut sprops: std::collections::HashMap<String, byoridb_common::Value> =
-                            std::collections::HashMap::new();
-                        for tag in &vertex.tags {
-                            tag_names.push(tag.name.clone());
-                            for (k, v) in &tag.props {
-                                sprops.insert(format!("{}.{}", tag.name, k), v.clone());
-                                sprops.insert(k.clone(), v.clone());
-                            }
+                    let mut tag_names = Vec::with_capacity(vertex.tags.len());
+                    let mut sprops: std::collections::HashMap<String, byoridb_common::Value> =
+                        std::collections::HashMap::new();
+                    for tag in &vertex.tags {
+                        tag_names.push(tag.name.clone());
+                        for (k, v) in &tag.props {
+                            sprops.insert(format!("{}.{}", tag.name, k), v.clone());
+                            sprops.insert(k.clone(), v.clone());
                         }
-                        self.validate_write_shapes(&effective_space, &tag_names, &sprops)
-                            .await?;
                     }
-                    // Materialize a string mapping only after schema/shape
-                    // validation succeeds, so rejected writes do not leave
-                    // behind unused VID metadata.
+                    self.validate_write_shapes(&effective_space, &tag_names, &sprops)
+                        .await?;
+                }
+
+                // Track the pre-statement tags once per VID and the tags on the
+                // final duplicate row. Tag-vid puts/deletes are derived after
+                // all rows are built, avoiding conflicting operations in the
+                // same atomic batch and making last-row-wins overwrites exact.
+                let mut original_tags: std::collections::HashMap<
+                    i64,
+                    std::collections::HashSet<String>,
+                > = std::collections::HashMap::new();
+                let mut final_tags: std::collections::HashMap<
+                    i64,
+                    std::collections::HashSet<String>,
+                > = std::collections::HashMap::new();
+                for vertex in vertices {
                     let internal_vid = crate::vid::resolve_vid(
                         &self.ctx,
                         &effective_space,
@@ -83,8 +94,28 @@ impl Executor {
                         true,
                     )
                     .await?
-                    .expect("creating a string VID mapping always resolves");
+                    .ok_or_else(|| {
+                        ExecutionError::InvalidOperation(format!(
+                            "failed to create VID mapping in space '{effective_space}'"
+                        ))
+                    })?;
                     let key = format!("{}:vertex:{}", effective_space, internal_vid);
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        original_tags.entry(internal_vid)
+                    {
+                        let tags = match self.ctx.kvstore.get(key.as_bytes()).await? {
+                            Some(existing) => VertexCodec::decode_vertex(&existing)
+                                .map_err(|e| {
+                                    ExecutionError::Io(std::io::Error::other(e.to_string()))
+                                })?
+                                .tags
+                                .into_iter()
+                                .map(|tag| tag.name)
+                                .collect(),
+                            None => std::collections::HashSet::new(),
+                        };
+                        entry.insert(tags);
+                    }
                     // Convert plan TagData to codec TagData and use Proto encoding
                     let codec_vertex = CodecVertexData {
                         vid: internal_vid,
@@ -97,19 +128,20 @@ impl Executor {
                             })
                             .collect(),
                     };
+                    final_tags.insert(
+                        internal_vid,
+                        codec_vertex
+                            .tags
+                            .iter()
+                            .map(|tag| tag.name.clone())
+                            .collect(),
+                    );
                     let data = VertexCodec::encode_vertex(&codec_vertex)
                         .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
                     let key_bytes = key.into_bytes();
                     // T-트랙: 현재뷰 blob을 이력 버전으로도 기록.
                     vertex_versions.push((key_bytes.clone(), data.clone()));
                     batch.push((key_bytes, data));
-                    // Tag-vid secondary index for label-only MATCH acceleration.
-                    // Key: {space}:tagvid:{tag_name}:{vid} → empty value.
-                    for tag in &codec_vertex.tags {
-                        let tagvid_key =
-                            format!("{}:tagvid:{}:{}", effective_space, tag.name, internal_vid);
-                        batch.push((tagvid_key.into_bytes(), Vec::new()));
-                    }
                     // Dense embedding side-store (PLAN.md R-2a): any numeric-list
                     // property is mirrored as packed f32 under {space}:vec:{prop}:{vid}
                     // so cosine KNN scans packed floats instead of decoding vertices.
@@ -154,11 +186,22 @@ impl Executor {
                     }
                     inserted += 1;
                 }
+                let mut tagvid_deletes = Vec::new();
+                for (vid, tags) in &final_tags {
+                    for tag in tags {
+                        batch.push((SchemaKey::tagvid(&effective_space, tag, *vid), Vec::new()));
+                    }
+                    if let Some(old_tags) = original_tags.get(vid) {
+                        for removed in old_tags.difference(tags) {
+                            tagvid_deletes.push(SchemaKey::tagvid(&effective_space, removed, *vid));
+                        }
+                    }
+                }
                 // T-트랙 v1.1: 현재뷰 쓰기 + 이력 버전 append 를 단일 트랜잭션으로
                 // 커밋 (dual-write 원자성).
                 self.ctx
                     .kvstore
-                    .batch_apply(batch, Vec::new(), Self::build_versions(vertex_versions))
+                    .batch_apply(batch, tagvid_deletes, Self::build_versions(vertex_versions))
                     .await?;
                 // Invalidate persisted vector indexes (R-2b) for embedding props
                 // touched by this INSERT — rebuilt lazily on next BY EMBEDDING query.
@@ -208,12 +251,17 @@ impl Executor {
                 // duplicate edge's degree at most once.
                 let mut seen_edges: std::collections::HashSet<Vec<u8>> =
                     std::collections::HashSet::new();
-                for edge in edges {
-                    // Schema validation precedes mapping creation so an invalid
-                    // edge row cannot materialize otherwise-unused VID records.
-                    let edge_type_name = edge.edge_type.clone();
-                    self.validate_edge_props(&effective_space, &edge_type_name, &edge.props)
+                // Validate every row and endpoint type before any string VID
+                // mapping is materialized. The subsequent loop only builds the
+                // already-validated atomic write batch.
+                for edge in &edges {
+                    self.validate_edge_props(&effective_space, &edge.edge_type, &edge.props)
                         .await?;
+                    crate::vid::validate_write_vid(&effective_space, vid_type, &edge.src)?;
+                    crate::vid::validate_write_vid(&effective_space, vid_type, &edge.dst)?;
+                }
+                for edge in edges {
+                    let edge_type_name = edge.edge_type.clone();
                     let src = crate::vid::resolve_vid(
                         &self.ctx,
                         &effective_space,
@@ -222,7 +270,11 @@ impl Executor {
                         true,
                     )
                     .await?
-                    .expect("creating a string VID mapping always resolves");
+                    .ok_or_else(|| {
+                        ExecutionError::InvalidOperation(format!(
+                            "failed to create source VID mapping in space '{effective_space}'"
+                        ))
+                    })?;
                     let dst = crate::vid::resolve_vid(
                         &self.ctx,
                         &effective_space,
@@ -231,7 +283,11 @@ impl Executor {
                         true,
                     )
                     .await?
-                    .expect("creating a string VID mapping always resolves");
+                    .ok_or_else(|| {
+                        ExecutionError::InvalidOperation(format!(
+                            "failed to create destination VID mapping in space '{effective_space}'"
+                        ))
+                    })?;
                     let key = format!(
                         "{}:edge:{}:{}:{}:{}",
                         effective_space, src, edge_type_name, dst, edge.ranking
@@ -478,30 +534,42 @@ impl Executor {
         };
 
         let vid_type = crate::vid::space_vid_type(&self.ctx, &effective_space).await?;
-        let vid = crate::vid::resolve_vid(&self.ctx, &effective_space, vid_type, &plan.vid, true)
-            .await?
-            .expect("UPDATE upsert always resolves a VID");
         let tag_name = plan.tag_name.as_ref().ok_or_else(|| {
             ExecutionError::InvalidOperation("Tag name required for UPDATE".to_string())
         })?;
 
-        // Schema validation: verify tag and updated fields exist
+        // Reject write-ineligible VID forms and bad schemas before looking up or
+        // creating mapping metadata.
+        crate::vid::validate_write_vid(&effective_space, vid_type, &plan.vid)?;
         self.validate_tag_props(&effective_space, tag_name, &plan.updates)
             .await?;
 
-        // Key format matches INSERT: {space}:vertex:{vid}
-        let key = format!("{}:vertex:{}", effective_space, vid);
-
-        let existing_data = self.ctx.kvstore.get(key.as_bytes()).await?;
+        // A read-only resolution finds an existing mapping but returns None for
+        // an unknown string. Mapping creation is deliberately deferred until
+        // WHEN and post-update shape validation have both succeeded.
+        let existing_vid =
+            crate::vid::resolve_vid(&self.ctx, &effective_space, vid_type, &plan.vid, false)
+                .await?;
+        let existing_data = match existing_vid {
+            Some(vid) => {
+                self.ctx
+                    .kvstore
+                    .get(&SchemaKey::vertex(&effective_space, vid))
+                    .await?
+            }
+            None => None,
+        };
         let existed = existing_data.is_some();
 
-        // Upsert: create vertex if it does not exist yet
+        // Build an upsert candidate with a placeholder internal VID. The real
+        // mapping is assigned only after every operation that can reject or
+        // turn this UPDATE into a no-op.
         let mut vertex_data = if let Some(data) = existing_data {
             VertexCodec::decode_vertex(&data)
                 .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?
         } else {
             byoridb_codec::VertexData {
-                vid,
+                vid: existing_vid.unwrap_or(0),
                 tags: vec![byoridb_codec::TagData {
                     name: tag_name.clone(),
                     properties: std::collections::HashMap::new(),
@@ -580,6 +648,20 @@ impl Executor {
             self.validate_write_shapes(&effective_space, &tag_names, &sprops)
                 .await?;
         }
+
+        let vid = match existing_vid {
+            Some(vid) => vid,
+            None => crate::vid::resolve_vid(&self.ctx, &effective_space, vid_type, &plan.vid, true)
+                .await?
+                .ok_or_else(|| {
+                    ExecutionError::InvalidOperation(format!(
+                        "failed to create UPDATE VID mapping in space '{effective_space}'"
+                    ))
+                })?,
+        };
+        vertex_data.vid = vid;
+        // Key format matches INSERT: {space}:vertex:{vid}
+        let key = format!("{}:vertex:{}", effective_space, vid);
 
         // Re-encode using Proto format
         let encoded_data = VertexCodec::encode_vertex(&vertex_data)

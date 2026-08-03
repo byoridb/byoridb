@@ -75,9 +75,12 @@ CREATE SPACE demo (vid_type = INT64);
 CREATE SPACE accounts (vid_type = FIXED_STRING(32));
 ```
 
-문자열 VID는 graph CRUD, FETCH, GO, FIND, LOOKUP, MATCH에서 지원합니다.
-`FIXED_STRING` space의 정수 literal이나 `INT64` space의 문자열 literal은
-거부됩니다.
+문자열 VID는 standalone graph CRUD, FETCH, GO, FIND, LOOKUP, MATCH에서
+지원합니다. Mapping 기반 `FIXED_STRING`은 distributed 또는 multi-coordinator
+실행에서 지원하지 않으며 `RECOMMEND`는 INT64 전용입니다.
+[space guide](./ngql/spaces.md#legacy-정수-bridge)의 read/delete-only live legacy
+bridge를 제외하면 `FIXED_STRING` space의 정수 literal이나 `INT64` space의 문자열
+literal은 거부됩니다.
 
 ## 표현식
 

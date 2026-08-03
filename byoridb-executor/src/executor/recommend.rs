@@ -28,7 +28,7 @@
 
 use super::{Executor, ExecutorResult};
 use crate::algo;
-use crate::error::Result;
+use crate::error::{ExecutionError, Result};
 use crate::evaluator::{EvalContext, Evaluator};
 use crate::key::SchemaKey;
 use byoridb_common::Value;
@@ -41,6 +41,14 @@ impl Executor {
         plan: crate::plan::RecommendPlan,
     ) -> Result<ExecutorResult> {
         let space = self.require_space()?.to_string();
+        if matches!(
+            crate::vid::space_vid_type(&self.ctx, &space).await?,
+            crate::vid::SpaceVidType::FixedString(_)
+        ) {
+            return Err(ExecutionError::InvalidOperation(format!(
+                "RECOMMEND is INT64-only and is unsupported in FIXED_STRING space '{space}'"
+            )));
+        }
         // O-8 D5: recommend from the owl:sameAs representative. If the seed was
         // merged away, its edges/embedding now live on the representative, so a
         // RECOMMEND on the merged-away vid normalizes to the surviving node —
@@ -517,6 +525,31 @@ mod tests {
         let kvstore = Arc::new(MemoryKVStore::new());
         let ctx = Arc::new(ExecutionContext::new(kvstore).with_space("default".to_string()));
         Executor::new(ctx)
+    }
+
+    #[tokio::test]
+    async fn fixed_string_space_rejects_recommend_before_internal_vid_leaks() {
+        let executor = create_executor();
+        executor
+            .ctx
+            .kvstore
+            .put(
+                &SchemaKey::space("default"),
+                &serde_json::to_vec(&serde_json::json!({
+                    "id": 1,
+                    "name": "default",
+                    "vid_type": "FIXED_STRING(32)"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let error = executor
+            .execute_recommend(neighbors_plan(1, &["has"], 10))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("RECOMMEND is INT64-only"));
     }
 
     // ---- neighbors (R-1) ----

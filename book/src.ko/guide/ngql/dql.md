@@ -70,9 +70,11 @@ GO FROM 1 OVER knows
 YIELD $$.person.name AS friend_name;
 ```
 
-destination-property projection은 동작하지만 현재 executor는 결과 행마다 destination
-vertex를 개별 조회합니다. 이 내부 조회의 batching과 대규모 회귀 테스트도
-[이슈 #10](https://github.com/byoridb/byoridb/issues/10)의 남은 작업입니다.
+destination-property projection은 destination VID를 deduplicate한 뒤 내부
+`batch_get` 한 번으로 읽습니다. `EXPLAIN`과 `PROFILE`에서는 이 작업을
+`GetVertices`로 보여 줍니다. [이슈 #10](https://github.com/byoridb/byoridb/issues/10)의
+engine 범위는 회귀 검증됐고, 외부 LDBC Q9 harness 전환과 `<10s` 수용 측정만
+남았습니다.
 
 기본 execution guard는 20 step을 넘는 GO range를 거부합니다.
 
@@ -97,6 +99,12 @@ MATCH (a:person)-[:knows*1..3]->(b:person) RETURN id(b) AS vid;
 
 comma-separated pattern은 공유 variable로 join합니다. 현재 MATCH path는
 `OPTIONAL MATCH`, `GROUP BY`, `ORDER BY`, `LIMIT`, `OFFSET`도 지원합니다.
+
+Edge variable은 저장된 edge identity를 보존합니다. `src(e)`, `dst(e)`, `type(e)`,
+`rank(e)` 또는 `ranking(e)`, `properties(e)`를 사용하거나 `e` 자체를 반환할 수
+있습니다. Incoming 또는 undirected pattern에서도 `src(e)`와 `dst(e)`는 저장된
+방향을 유지합니다. Bound vertex를 edge accessor에 넘기면 typed bad-type null,
+존재하지 않는 variable을 넘기면 typed unknown-property null을 반환합니다.
 
 aggregate는 `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`를 지원합니다.
 
@@ -169,6 +177,9 @@ LIMIT 5;
 기본 recommendation limit은 10입니다. 작은 vector collection은 exact scan을 사용하고
 implementation threshold를 넘으면 current mutation path가 유지하는 persisted HNSW
 index를 사용합니다.
+
+`RECOMMEND`는 현재 정수 seed를 받고 정수 VID를 반환하므로 `INT64` space에서만
+지원합니다. `FIXED_STRING` space에서는 실행하지 마세요.
 
 ## Compound query와 검사
 

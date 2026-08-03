@@ -76,9 +76,13 @@ CREATE SPACE demo (vid_type = INT64);
 CREATE SPACE accounts (vid_type = FIXED_STRING(32));
 ```
 
-String VIDs are supported by graph CRUD, FETCH, GO, FIND, LOOKUP, and MATCH.
-Mixing an integer literal into a `FIXED_STRING` space, or a string literal into
-an `INT64` space, is rejected.
+String VIDs are supported in standalone graph CRUD, FETCH, GO, FIND, LOOKUP,
+and MATCH. Mapping-backed `FIXED_STRING` is not supported in distributed or
+multi-coordinator execution, and `RECOMMEND` remains INT64-only. Except for the
+read/delete-only live legacy bridge described in the
+[space guide](./ngql/spaces.md#legacy-integer-bridge), mixing an integer literal
+into a `FIXED_STRING` space, or a string literal into an `INT64` space, is
+rejected.
 
 ## Expressions
 

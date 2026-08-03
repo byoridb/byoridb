@@ -836,6 +836,17 @@ async fn test_fixed_string_vid_crud_traversal_and_type_contract() {
                 Value::String("bob".to_string())
             ]
     ));
+    let unknown_same = execute(
+        &service,
+        session_id,
+        r#"FIND SHORTEST PATH FROM "missing" TO "missing" OVER knows"#,
+    )
+    .await;
+    assert_eq!(
+        unknown_same.row_count(),
+        0,
+        "an unknown string VID must remain a point miss even when both FIND endpoints are equal"
+    );
 
     execute(
         &service,

@@ -947,4 +947,86 @@ mod h6_multipattern_tests {
         let res = exec.execute_match(plan).await.unwrap();
         assert_eq!(res.rows.len(), 1, "LIMIT 1 must cap the joined result");
     }
+
+    #[tokio::test]
+    async fn count_revalidates_stale_tagvid_entries() {
+        let ctx = make_context();
+        ctx.kvstore
+            .put(b"default:vertex:1", &vblob("person", "live"))
+            .await
+            .unwrap();
+        ctx.kvstore
+            .put(b"default:tagvid:person:1", &[])
+            .await
+            .unwrap();
+        ctx.kvstore
+            .put(b"default:tagvid:person:999", &[])
+            .await
+            .unwrap();
+
+        let result = MatchExecutor::new(ctx)
+            .execute_match(match_plan("MATCH (n:person) RETURN count(n)"))
+            .await
+            .unwrap();
+        assert_eq!(result.rows, vec![vec![byoridb_common::Value::Int(1)]]);
+    }
+
+    #[tokio::test]
+    async fn stale_only_tagvid_falls_back_to_live_vertex_scan() {
+        let ctx = make_context();
+        ctx.kvstore
+            .put(b"default:vertex:1", &vblob("person", "live"))
+            .await
+            .unwrap();
+        ctx.kvstore
+            .put(b"default:tagvid:person:999", &[])
+            .await
+            .unwrap();
+
+        let result = MatchExecutor::new(ctx.clone())
+            .execute_match(match_plan("MATCH (n:person) RETURN id(n) AS vid"))
+            .await
+            .unwrap();
+        assert_eq!(returned_vids(&result), vec![1]);
+        assert!(ctx.took_full_scan());
+    }
+
+    #[tokio::test]
+    async fn fixed_string_match_surfaces_missing_reverse_mapping() {
+        let ctx = make_context();
+        ctx.kvstore
+            .put(
+                &crate::key::SchemaKey::space("default"),
+                &serde_json::to_vec(&serde_json::json!({
+                    "id": 1,
+                    "name": "default",
+                    "vid_type": "FIXED_STRING(32)"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        ctx.kvstore
+            .put(b"default:vertex:-7", &vblob("person", "corrupt"))
+            .await
+            .unwrap();
+        ctx.kvstore
+            .put(b"default:tagvid:person:-7", &[])
+            .await
+            .unwrap();
+        let exec = MatchExecutor::new(ctx);
+
+        for query in [
+            "MATCH (n:person) RETURN id(n)",
+            "MATCH (n:person) RETURN count(n)",
+        ] {
+            let error = exec.execute_match(match_plan(query)).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("missing reverse string VID mapping"),
+                "query {query}: {error}"
+            );
+        }
+    }
 }

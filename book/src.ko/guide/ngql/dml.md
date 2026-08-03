@@ -29,6 +29,11 @@ INSERT VERTEX person(name, age) VALUES
     3:("Carol", 28);
 ```
 
+이미 존재하는 VID에 INSERT하면 해당 vertex의 현재 tag set을 교체합니다. 한 문장에
+같은 VID가 여러 번 나오면 마지막 행이 current view가 됩니다. Overwrite로 제거된
+tag와 앞 duplicate 행의 tag에 대한 tag-to-VID entry도 같은 graph-data transaction에서
+삭제되므로 label-only MATCH와 COUNT에 이전 label이 남지 않습니다.
+
 명시한 속성만 전달됩니다. 존재하지 않는 속성명과 명백히 맞지 않는 scalar 타입은
 거부됩니다. 현재 INSERT 경로는 schema default로 누락 속성을 채우지 않으므로 필요한
 값을 직접 전달하거나 shape로 강제하세요.
@@ -112,7 +117,15 @@ asserted semantic edge를 삭제하면 현재 inference-maintenance 경로가 in
 ## 원자성과 history
 
 - 여러 행을 넣는 vertex/edge INSERT는 current-view record와 history version을 한 storage
-  transaction에 적용합니다.
+  transaction에 적용합니다. Vertex overwrite의 tag-to-VID 추가와 삭제도 이
+  transaction에 포함됩니다.
+- `FIXED_STRING`에서는 새 mapping을 claim하기 전에 deterministic schema, shape,
+  VID-length, endpoint, `WHEN` 검증을 모두 끝냅니다. Mapping uniqueness는 graph-data
+  transaction 전에 별도 atomic reverse-key claim으로 보장합니다. 따라서 claim 뒤
+  storage failure가 발생하면 graph row가 commit되지 않아도 사용되지 않은 mapping
+  record가 남을 수 있으며 mapping은 재사용하지 않습니다. Statement의 all-or-nothing
+  보장은 graph current view, tag-to-VID state, history에 적용되며 I/O failure 뒤 unused
+  mapping metadata cleanup까지 포함하지 않습니다.
 - UPDATE와 DELETE도 current view와 temporal history를 함께 기록합니다.
 - 서로 다른 nGQL 요청은 cross-statement transaction이 아닙니다.
 - 세미콜론으로 묶은 compound statement도 순차 실행일 뿐 transactional하지 않습니다.

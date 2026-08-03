@@ -71,10 +71,11 @@ GO FROM 1 OVER knows
 YIELD $$.person.name AS friend_name;
 ```
 
-Destination-property projection is supported, but the current executor loads
-destination vertices one row at a time. Batching that internal work and fixing
-large-result regression coverage are also part of
-[issue #10](https://github.com/byoridb/byoridb/issues/10).
+Destination-property projection deduplicates destination VIDs and loads them
+with one internal `batch_get`. `EXPLAIN` and `PROFILE` expose this operation as
+`GetVertices`. The engine portion of
+[issue #10](https://github.com/byoridb/byoridb/issues/10) is covered; conversion
+of the external LDBC Q9 harness and its `<10s` acceptance measurement remain.
 
 The configured execution guard rejects GO ranges above 20 steps by default.
 
@@ -100,6 +101,12 @@ MATCH (a:person)-[:knows*1..3]->(b:person) RETURN id(b) AS vid;
 Multiple comma-separated patterns join on shared variables. `OPTIONAL MATCH`,
 `GROUP BY`, `ORDER BY`, `LIMIT`, and `OFFSET` are also available in the current
 MATCH path.
+
+An edge variable preserves stored edge identity. Use `src(e)`, `dst(e)`,
+`type(e)`, `rank(e)` (or `ranking(e)`), `properties(e)`, or return `e` itself.
+`src(e)` and `dst(e)` preserve the stored orientation even when the pattern is
+incoming or undirected. Passing a bound vertex instead of an edge returns a
+typed bad-type null; an unknown variable returns a typed unknown-property null.
 
 Aggregates include `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`:
 
@@ -173,6 +180,9 @@ LIMIT 5;
 The default recommendation limit is 10. Small vector collections use an exact
 scan; above the implementation threshold, a persisted HNSW index is used and
 maintained by current mutation paths.
+
+`RECOMMEND` currently accepts an integer seed and returns integer VIDs, so it is
+supported only in `INT64` spaces. Do not run it in a `FIXED_STRING` space.
 
 ## Compound queries and inspection
 
