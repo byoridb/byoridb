@@ -114,10 +114,29 @@ pub(crate) async fn resolve_vid(
             }
             loop {
                 let rev = reverse_key(space, candidate);
-                match ctx.kvstore.get(&rev).await? {
+                let reverse_owner = if create_mapping {
+                    // The reverse key is the uniqueness claim for an internal
+                    // surrogate. A plain get followed by batch_put lets two
+                    // colliding strings both observe an empty key and alias the
+                    // same vertex. Claim it atomically before publishing the
+                    // forward mapping.
+                    ctx.kvstore.put_if_absent(&rev, value.as_bytes()).await?
+                } else {
+                    ctx.kvstore.get(&rev).await?
+                };
+                match reverse_owner {
                     Some(existing) if existing == value.as_bytes() => {
                         if create_mapping {
-                            ctx.kvstore.put(&fwd, &candidate.to_be_bytes()).await?;
+                            let encoded = candidate.to_be_bytes();
+                            if let Some(existing) =
+                                ctx.kvstore.put_if_absent(&fwd, &encoded).await?
+                            {
+                                if decode_internal(&existing) != Some(candidate) {
+                                    return Err(ExecutionError::InvalidOperation(format!(
+                                        "conflicting string VID mapping in space '{space}'"
+                                    )));
+                                }
+                            }
                         }
                         return Ok(Some(candidate));
                     }
@@ -135,12 +154,19 @@ pub(crate) async fn resolve_vid(
                             // FETCH/GO/FIND/MATCH without creating metadata.
                             return Ok(Some(candidate));
                         }
-                        ctx.kvstore
-                            .batch_put(vec![
-                                (fwd, candidate.to_be_bytes().to_vec()),
-                                (rev, value.as_bytes().to_vec()),
-                            ])
-                            .await?;
+                        // `None` from put_if_absent means this call now owns the
+                        // reverse key. Publishing the forward key separately is
+                        // crash-safe: a retry recognizes the reverse owner and
+                        // repairs a missing forward entry. Never overwrite a
+                        // conflicting forward entry.
+                        let encoded = candidate.to_be_bytes();
+                        if let Some(existing) = ctx.kvstore.put_if_absent(&fwd, &encoded).await? {
+                            if decode_internal(&existing) != Some(candidate) {
+                                return Err(ExecutionError::InvalidOperation(format!(
+                                    "conflicting string VID mapping in space '{space}'"
+                                )));
+                            }
+                        }
                         return Ok(Some(candidate));
                     }
                 }
@@ -262,5 +288,57 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("6 bytes"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_hash_collisions_reserve_distinct_internal_vids() {
+        // hash_bytes zero-pads its final chunk, so these two valid UTF-8 VIDs
+        // intentionally collide and exercise the probing path without relying
+        // on a probabilistic hash collision.
+        let first = "a";
+        let second = "a\0";
+        assert_eq!(
+            byoridb_common::hash::hash_bytes(first.as_bytes()) & i64::MAX as u64,
+            byoridb_common::hash::hash_bytes(second.as_bytes()) & i64::MAX as u64
+        );
+
+        let ctx = Arc::new(fixed_context(8).await);
+        let vid_type = space_vid_type(&ctx, "accounts").await.unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let resolve = |external: &'static str| {
+            let ctx = Arc::clone(&ctx);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                resolve_vid(
+                    &ctx,
+                    "accounts",
+                    vid_type,
+                    &Vid::String(external.to_string()),
+                    true,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            })
+        };
+
+        let (first_internal, second_internal) = tokio::join!(resolve(first), resolve(second));
+        let first_internal = first_internal.unwrap();
+        let second_internal = second_internal.unwrap();
+        assert_ne!(first_internal, second_internal);
+        assert_eq!(
+            display_vid(&ctx, "accounts", vid_type, first_internal)
+                .await
+                .unwrap(),
+            byoridb_common::Value::String(first.to_string())
+        );
+        assert_eq!(
+            display_vid(&ctx, "accounts", vid_type, second_internal)
+                .await
+                .unwrap(),
+            byoridb_common::Value::String(second.to_string())
+        );
     }
 }

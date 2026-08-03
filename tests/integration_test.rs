@@ -775,6 +775,27 @@ async fn test_fixed_string_vid_crud_traversal_and_type_contract() {
         vec!["alice".to_string(), "bob".to_string()]
     );
 
+    execute(
+        &service,
+        session_id,
+        r#"UPDATE VERTEX ON person "carol" SET name = "Carol""#,
+    )
+    .await;
+    let after_upsert = execute(&service, session_id, "MATCH (n:person) RETURN id(n) AS vid").await;
+    let mut after_upsert_vids: Vec<String> = after_upsert
+        .rows
+        .iter()
+        .map(|row| match row.first() {
+            Some(Value::String(vid)) => vid.clone(),
+            other => panic!("expected FIXED_STRING VID after upsert, got {other:?}"),
+        })
+        .collect();
+    after_upsert_vids.sort();
+    assert_eq!(
+        after_upsert_vids,
+        vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
+    );
+
     let found = execute(
         &service,
         session_id,
@@ -812,6 +833,21 @@ async fn test_fixed_string_vid_crud_traversal_and_type_contract() {
     execute(&service, session_id, r#"DELETE VERTEX "bob""#).await;
     let after_vertex_delete = execute(&service, session_id, r#"FETCH PROP ON person "bob""#).await;
     assert_eq!(after_vertex_delete.row_count(), 0);
+    let matched_after_delete =
+        execute(&service, session_id, "MATCH (n:person) RETURN id(n) AS vid").await;
+    let mut surviving_vids: Vec<String> = matched_after_delete
+        .rows
+        .iter()
+        .map(|row| match row.first() {
+            Some(Value::String(vid)) => vid.clone(),
+            other => panic!("expected FIXED_STRING VID after delete, got {other:?}"),
+        })
+        .collect();
+    surviving_vids.sort();
+    assert_eq!(
+        surviving_vids,
+        vec!["alice".to_string(), "carol".to_string()]
+    );
 
     let wrong_fixed_type = service
         .execute(

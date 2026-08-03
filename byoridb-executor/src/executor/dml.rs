@@ -587,10 +587,17 @@ impl Executor {
 
         // T-트랙 v1.1: 현재뷰 갱신 + 이력 버전 append 단일 트랜잭션.
         let key_bytes = key.into_bytes();
+        let mut current_puts = vec![(key_bytes.clone(), encoded_data.clone())];
+        for tag in &vertex_data.tags {
+            current_puts.push((
+                format!("{}:tagvid:{}:{}", effective_space, tag.name, vid).into_bytes(),
+                Vec::new(),
+            ));
+        }
         self.ctx
             .kvstore
             .batch_apply(
-                vec![(key_bytes.clone(), encoded_data.clone())],
+                current_puts,
                 Vec::new(),
                 Self::build_versions(vec![(key_bytes, encoded_data)]),
             )
@@ -781,6 +788,9 @@ impl Executor {
             deleted += 1;
             if let Some(vertex) = &vertex {
                 for tag in &vertex.tags {
+                    del_keys.push(
+                        format!("{}:tagvid:{}:{}", effective_space, tag.name, vid).into_bytes(),
+                    );
                     for (prop, value) in &tag.properties {
                         if crate::executor::recommend::pack_embedding(value).is_some() {
                             let vkey =

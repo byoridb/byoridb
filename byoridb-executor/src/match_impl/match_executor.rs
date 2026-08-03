@@ -1907,9 +1907,9 @@ impl MatchExecutor {
         if pattern_props.is_empty() {
             // Label-only pattern: use the tag-vid secondary index written by INSERT VERTEX.
             // Key format: {space}:tagvid:{tag_name}:{vid}
-            // If the index has entries for this label, use them directly — no vertex
-            // blob decode needed for filtering. Stale entries (from deleted vertices)
-            // are harmless: edge traversal or dst-blob fetch will produce 0 results.
+            // If the index has entries for this label, batch-load the referenced
+            // vertices and re-check the label. This keeps stale/corrupt entries
+            // from producing phantom rows for edge-free patterns.
             if let Some(label) = node.labels.first() {
                 let prefix = format!("{}:tagvid:{}:", space, label);
                 let scan_limit = if self.ctx.config.max_scan_limit > 0 {
@@ -1934,7 +1934,7 @@ impl MatchExecutor {
                             false,
                         );
                     }
-                    let vids: Vec<i64> = results
+                    let indexed_vids: Vec<i64> = results
                         .iter()
                         .filter_map(|(key, _)| {
                             // Last colon-separated segment is the vid
@@ -1944,6 +1944,19 @@ impl MatchExecutor {
                                 .and_then(|s| s.parse().ok())
                         })
                         .collect();
+                    let vertex_keys: Vec<Vec<u8>> = indexed_vids
+                        .iter()
+                        .map(|vid| format!("{}:vertex:{}", space, vid).into_bytes())
+                        .collect();
+                    let vertex_blobs = self.ctx.kvstore.batch_get(&vertex_keys).await?;
+                    let mut vids = Vec::with_capacity(indexed_vids.len());
+                    for (vid, blob) in indexed_vids.into_iter().zip(vertex_blobs) {
+                        if let Some(blob) = blob {
+                            if matcher.matches_node(&blob, node)? {
+                                vids.push(vid);
+                            }
+                        }
+                    }
                     tracing::debug!(
                         space = space,
                         label = label.as_str(),
