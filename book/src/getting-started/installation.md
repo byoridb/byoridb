@@ -3,10 +3,11 @@
 # Installation
 
 Tagged [GitHub releases](https://github.com/byoridb/byoridb/releases) publish
-prebuilt archives for Linux x86_64 and macOS x86_64/arm64. A tagged
-release can lag the current `main` branch; the instructions below build the
-exact checkout. The repository pins Rust 1.90, so a `rustup` installation will
-select the expected compiler automatically.
+prebuilt archives for Linux x86_64/arm64 and macOS x86_64/arm64. Releases made
+before the arm64 workflow landed do not retroactively gain that artifact. A
+tagged release can lag the current `main` branch; the instructions below build
+the exact checkout. The repository pins Rust 1.90, so a `rustup` installation
+will select the expected compiler automatically.
 
 ## Supported systems
 
@@ -16,12 +17,10 @@ select the expected compiler automatically.
 Windows is not currently supported. ByoriDB uses the pure-Rust `redb` storage
 engine, so RocksDB and a C++ RocksDB toolchain are not required.
 
-The release workflow does not currently publish an ARM Linux archive. Its macOS
-archives are neither code-signed nor notarized, so Gatekeeper may warn or refuse
-to launch them. The project does not document an officially supported
-Gatekeeper bypass; build the desired tag from source instead. These notes do not
-supply the missing ARM Linux artifact or macOS signing; both remain unresolved
-release work.
+The release workflow builds Linux arm64 natively on GitHub's arm64 runner.
+macOS archives are not currently code-signed or notarized, so Gatekeeper may
+warn or refuse to launch them. The project does not document an officially
+supported Gatekeeper bypass; build the desired tag from source instead.
 
 The release workflow includes `LICENSE` and `NOTICES.md` at the root of every
 new tagged archive and verifies both files before publishing it. Published
