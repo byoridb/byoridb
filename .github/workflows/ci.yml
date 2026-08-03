@@ -177,3 +177,42 @@ jobs:
             target/release/byoridb-cli
             target/release/byoridb-backup
           retention-days: 7
+
+  arm-linux-build:
+    name: Build Release (Linux arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.90"
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: Linux-aarch64-unknown-linux-gnu-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            Linux-aarch64-unknown-linux-gnu-cargo-release-
+
+      - name: Build release binaries
+        run: cargo build --locked --release --workspace --target aarch64-unknown-linux-gnu
+
+      - name: Verify arm64 binaries
+        run: |
+          RELEASE_DIR=target/aarch64-unknown-linux-gnu/release
+          test -x "$RELEASE_DIR/byoridb-server"
+          test -x "$RELEASE_DIR/byoridb-cli"
+          file "$RELEASE_DIR/byoridb-server" | tee /tmp/byoridb-server-file
+          grep -Eq 'ARM aarch64|ARM64' /tmp/byoridb-server-file
