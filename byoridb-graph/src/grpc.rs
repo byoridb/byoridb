@@ -98,14 +98,24 @@ impl GraphService for GrpcService {
     ) -> Result<Response<SignOutResponse>, Status> {
         let req = request.into_inner();
         // Caller signs out their own session (session_id == caller_session_id)
-        self.internal_service
+        match self
+            .internal_service
             .sign_out(req.session_id, req.session_id)
-            .await;
-
-        Ok(Response::new(SignOutResponse {
-            error_code: 0,
-            error_msg: "".to_string(),
-        }))
+            .await
+        {
+            Ok(()) => Ok(Response::new(SignOutResponse {
+                error_code: 0,
+                error_msg: "".to_string(),
+            })),
+            Err(error) => Ok(Response::new(SignOutResponse {
+                error_code: if matches!(error, crate::error::GraphError::SessionNotFound(_)) {
+                    2
+                } else {
+                    1
+                },
+                error_msg: error.to_string(),
+            })),
+        }
     }
 
     #[allow(deprecated)] // intentional: populate legacy `data` field for backward compat
@@ -278,6 +288,58 @@ mod tests {
             assert_eq!(response.error_code, 1);
             assert_eq!(response.error_msg, "Invalid credentials");
         }
+    }
+
+    #[tokio::test]
+    async fn sign_out_unknown_session_returns_session_error() {
+        let internal = Arc::new(InternalGraphService::with_auth(
+            Arc::new(MemoryKVStore::new()),
+            AuthManager::with_config("root-password", Duration::from_secs(3600)),
+        ));
+        let service = GrpcService::new(internal);
+
+        let response = GraphService::sign_out(
+            &service,
+            Request::new(SignOutRequest {
+                session_id: 99_999_999,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.error_code, 2);
+        assert_eq!(response.error_msg, "Session not found");
+        assert!(!response.error_msg.contains("99999999"));
+    }
+
+    #[tokio::test]
+    async fn sign_out_expired_session_returns_session_error() {
+        const ROOT_PASSWORD: &str = "root-password";
+        let internal = Arc::new(InternalGraphService::with_auth(
+            Arc::new(MemoryKVStore::new()),
+            AuthManager::with_config(ROOT_PASSWORD, Duration::from_millis(20)),
+        ));
+        let session = internal
+            .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let service = GrpcService::new(internal);
+
+        let response = GraphService::sign_out(
+            &service,
+            Request::new(SignOutRequest {
+                session_id: session,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.error_code, 2);
+        assert_eq!(response.error_msg, "Session not found");
+        assert!(!response.error_msg.contains(&session.to_string()));
     }
 
     #[test]

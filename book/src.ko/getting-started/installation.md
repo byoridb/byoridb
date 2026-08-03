@@ -2,8 +2,10 @@
 
 # 설치
 
-ByoriDB는 현재 소스에서 빌드합니다. 저장소가 Rust 1.90을 고정하므로 `rustup`을
-사용하면 알맞은 컴파일러가 자동으로 선택됩니다.
+태그된 [GitHub release](https://github.com/byoridb/byoridb/releases)는 Linux
+x86_64/arm64와 macOS x86_64/arm64 archive를 제공합니다. arm64 workflow 도입 전
+release에는 artifact가 소급 추가되지 않습니다. 저장소가 Rust 1.90을 고정하므로
+`rustup`을 사용하면 알맞은 컴파일러가 자동으로 선택됩니다.
 
 ## 지원 운영체제
 
@@ -12,6 +14,11 @@ ByoriDB는 현재 소스에서 빌드합니다. 저장소가 Rust 1.90을 고정
 
 Windows는 현재 지원하지 않습니다. ByoriDB의 저장소 엔진은 순수 Rust 기반
 `redb`이므로 RocksDB나 RocksDB용 C++ 툴체인은 필요하지 않습니다.
+
+Release workflow는 GitHub arm64 runner에서 Linux arm64를 native build합니다. macOS
+archive는 아직 code signing이나 notarization을 거치지 않으므로 Gatekeeper가 경고하거나
+실행을 거부할 수 있습니다. 프로젝트는 공식적인 Gatekeeper 우회 방법을 안내하지
+않으므로 필요한 tag를 source에서 build하세요.
 
 Release workflow는 새 tag archive의 root에 `LICENSE`와 `NOTICES.md`를 포함하고,
 게시 전에 두 파일이 모두 있는지 검증합니다. 이미 게시된 v0.3.3 이하 archive는 이

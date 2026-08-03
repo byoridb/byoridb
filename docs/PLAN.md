@@ -2,7 +2,8 @@
 
 > **English** | [한국어](PLAN.ko.md)
 >
-> Last code verification: 2026-07-30, against current `main` at `8209f28`.
+> Last code verification: 2026-08-03, against `main` at `3f5f1a5` plus the
+> current PR #57 branch changes.
 > This document records code and repository state, not the live state of any
 > Kubernetes cluster.
 
@@ -53,13 +54,14 @@ multi-node launcher remains a roadmap item.
 | Static gates | `cargo fmt --all -- --check` and locked workspace Clippy with `-D warnings` |
 
 The full test, formatting, Clippy, dependency-audit, and release-build gates
-above passed on 2026-07-30. Avoid hard-coding a test count: it changes whenever
+above passed on 2026-08-03. Avoid hard-coding a test count: it changes whenever
 a regression test is added.
 
 ## Audited GitHub issue status
 
-Code state and GitHub issue state are tracked separately. As of 2026-07-30,
-all issues below are still open even when their implementation has landed:
+Code state and GitHub issue state are tracked separately. The issue state below
+was checked on 2026-08-03; a code-complete branch does not imply that its issue
+is closed:
 
 | Issue | Code status | Evidence or remaining work |
 |---|---|---|
@@ -68,10 +70,10 @@ all issues below are still open even when their implementation has landed:
 | [#29](https://github.com/byoridb/byoridb/issues/29) | Resolved in code; issue open | Dependabot now targets `main`, and follow-up dependency PRs have opened and merged; the configuration fix landed in [PR #35](https://github.com/byoridb/byoridb/pull/35). |
 | [#25](https://github.com/byoridb/byoridb/issues/25) | Resolved in `byori`; issue open here | Agent-memory ownership moved to [byoridb/byori](https://github.com/byoridb/byori); typed-wiki schema bootstrap/versioned migration landed in [3ce7730](https://github.com/byoridb/byori/commit/3ce7730e19f04bd980b10829c9c6e34b9ecf86d4), followed by guarded structured-memory tools in [18d605f](https://github.com/byoridb/byori/commit/18d605f214a8fb8ce6476b9eccdc9efc9162b714). |
 | [#23](https://github.com/byoridb/byoridb/issues/23) | Partial | The server now maps missing or expired HTTP sessions to `401 SESSION_EXPIRED` in [PR #35](https://github.com/byoridb/byoridb/pull/35). A tagged engine release and status-code-based `byori` client/MCP integration test are still required. |
-| [#24](https://github.com/byoridb/byoridb/issues/24) | Partial | Windows and the unsigned/notarized macOS Gatekeeper risk are documented, with a source-build recommendation. Prebuilt ARM Linux and actual macOS signing/notarization remain absent. |
+| [#24](https://github.com/byoridb/byoridb/issues/24) | Partial; issue open | New tagged releases build Linux x86_64/arm64 and macOS x86_64/arm64 archives. Windows remains unsupported and macOS artifacts are still unsigned and unnotarized; older releases do not gain artifacts retroactively. |
 | [#28](https://github.com/byoridb/byoridb/issues/28) | Resolved in code; closes with PR #51 | The release workflow packages and verifies `LICENSE` and `NOTICES.md` at the root of every new tagged archive. Published v0.3.3 and older archives are not changed retroactively. |
-| [#49](https://github.com/byoridb/byoridb/issues/49) | Resolved on the PR #57 branch | Standalone `FIXED_STRING` uses persistent negative `i64` surrogates while preserving storage-key and RPC/protobuf integer contracts. Unknown reads remain misses, collision claims avoid live graph occupancy, legacy non-negative records have a write-frozen read/delete bridge, and distributed mapping plus `RECOMMEND` remain explicitly unsupported. |
-| [#1](https://github.com/byoridb/byoridb/issues/1) | Unresolved | Range predicates still fall back to a full scan instead of an index range scan. |
+| [#49](https://github.com/byoridb/byoridb/issues/49) | Resolved on the PR #57 branch; issue open | Standalone `FIXED_STRING` uses persistent negative `i64` surrogates while preserving storage-key and RPC/protobuf integer contracts. Unknown reads remain misses, collision claims avoid live graph occupancy, legacy non-negative records have a write-frozen read/delete bridge, and distributed mapping plus `RECOMMEND` remain explicitly unsupported. |
+| [#1](https://github.com/byoridb/byoridb/issues/1) | Resolved by PR #54; issue closed | Local single-field Boolean and integer `LOOKUP` comparisons use bounded index range scans with stale-entry revalidation and correct `OFFSET`/`LIMIT`; unsupported key domains retain the predicate-scan fallback, and distributed ordered ranges fail closed. |
 | [#10](https://github.com/byoridb/byoridb/issues/10) | Engine scope resolved in code; harness acceptance pending | Multi-ID `FETCH` is covered at 1,000 VIDs, destination projections use one deduplicated `batch_get`, and `EXPLAIN`/`PROFILE` expose the batch as `GetVertices`; the separate LDBC harness still needs the Q9 conversion and `<10s` measurement. |
 
 Close a resolved-in-code issue only after recording its implementation and
@@ -210,7 +212,9 @@ This is still **partial**, not a supported multi-node deployment:
   and persisted users with their roles. `SHOW SESSIONS` lists active users and
   selected spaces without bearer session IDs.
 - `UPDATE EDGE` is parser-only and has no working execution path. Edge
-  `LOOKUP` is rejected; range predicates do not use an index.
+  `LOOKUP` is rejected. Local single-field Boolean and integer ordered
+  predicates can use a tag index; strings, floating-point key domains,
+  compound ranges, and distributed range execution are not index-enabled.
 - Geography encoding exists, but WKT/WKB decoding is not implemented.
 - Many query paths still materialize intermediate rows rather than pulling a
   stream through physical operators.
@@ -278,7 +282,9 @@ This is still **partial**, not a supported multi-node deployment:
 
 ### P2 — measured performance and execution architecture
 
-- Add indexed range scans for `LOOKUP` ([issue #1](https://github.com/byoridb/byoridb/issues/1)).
+- Extend indexed `LOOKUP` range coverage beyond local single-field Boolean and
+  integer predicates only after string/float key ordering and distributed
+  execution have explicit correctness contracts.
 - Harden multi-ID fetch and projection at large scale
   ([issue #10](https://github.com/byoridb/byoridb/issues/10)).
 - Add parallel range scans and partial aggregation only after a reproducible
@@ -360,6 +366,7 @@ The focused integration suite is `tests/security_authz_test.rs`.
 | 2026-07-13 | Atomic current/history writes, monotonic transaction time, seek-based resolution, and temporal E2E tests |
 | 2026-07-14 | Edge and wildcard-edge `AS OF` reads, including negative integer VIDs |
 | 2026-07-30 | Recursive RBAC, durable auth/cache reconciliation, session revocation, credential redaction, shared HTTP/gRPC auth state, root-secret hardening, and the config/tonic dependency migrations |
+| 2026-08-03 | Local bounded `LOOKUP` index range scans, Linux arm64 release artifacts, and standalone `FIXED_STRING` VID support on PR #57 |
 
 ## Decision rules
 

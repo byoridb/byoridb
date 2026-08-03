@@ -40,6 +40,11 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            # Build natively: avoids a cross-linker/sysroot dependency and
+            # exercises the artifact on the architecture that will run it.
+            os: ubuntu-24.04-arm
+            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
@@ -85,12 +90,22 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --workspace --target ${{ matrix.target }}
 
+      - name: Verify release binaries
+        run: |
+          RELEASE_DIR="target/${{ matrix.target }}/release"
+          test -x "$RELEASE_DIR/byoridb-server"
+          test -x "$RELEASE_DIR/byoridb-cli"
+          file "$RELEASE_DIR/byoridb-server"
+          file "$RELEASE_DIR/byoridb-cli"
+
       - name: Package (Linux/macOS)
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           cd target/${{ matrix.target }}/release
           BINS=(byoridb-server byoridb-cli)
           [ -f byoridb-backup ] && BINS+=(byoridb-backup)
-          ARCHIVE=../../../byoridb-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          ARCHIVE="../../../byoridb-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
           tar -czvf "$ARCHIVE" "${BINS[@]}" -C ../../.. LICENSE NOTICES.md
           tar -tzf "$ARCHIVE" | grep -Fxq LICENSE
           tar -tzf "$ARCHIVE" | grep -Fxq NOTICES.md

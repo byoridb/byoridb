@@ -311,6 +311,33 @@ pub trait KVStore: Send + Sync {
 
     async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
+    /// Scan the ordered key interval `[start, end)`, stopping after `limit`
+    /// rows when a cap is provided. Secondary-index range lookups use this to
+    /// seek directly to an encoded property boundary instead of materializing
+    /// the whole index prefix.
+    async fn scan_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if start >= end || limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let common_len = start
+            .iter()
+            .zip(end.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        Ok(self
+            .scan_prefix(&start[..common_len])
+            .await?
+            .into_iter()
+            .filter(|(key, _)| key.as_slice() >= start && key.as_slice() < end)
+            .take(limit.unwrap_or(usize::MAX))
+            .collect())
+    }
+
     /// Batch get multiple keys in a single operation
     /// Returns results in the same order as input keys
     async fn batch_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>>;
@@ -756,6 +783,35 @@ impl KVStore for RedbKVStore {
                     break;
                 }
                 results.push((kb.to_vec(), v.value().to_vec()));
+            }
+            Ok(results)
+        })
+        .await?
+    }
+
+    async fn scan_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if start >= end || limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let db = Arc::clone(&self.db);
+        let start = start.to_vec();
+        let end = end.to_vec();
+        let limit = limit.unwrap_or(usize::MAX);
+        tokio::task::spawn_blocking(move || {
+            let rtx = db.begin_read()?;
+            let table = rtx.open_table(KV_TABLE)?;
+            let mut results = Vec::new();
+            for entry in table.range(start.as_slice()..end.as_slice())? {
+                let (key, value) = entry?;
+                results.push((key.value().to_vec(), value.value().to_vec()));
+                if results.len() >= limit {
+                    break;
+                }
             }
             Ok(results)
         })
@@ -1251,6 +1307,23 @@ impl KVStore for MemoryKVStore {
         Ok(results)
     }
 
+    async fn scan_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if start >= end || limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let data = self.data.read().await;
+        Ok(data
+            .range(start.to_vec()..end.to_vec())
+            .take(limit.unwrap_or(usize::MAX))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
+    }
+
     async fn batch_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
         let data = self.data.read().await;
         let results: Vec<_> = keys.iter().map(|k| data.get(k).cloned()).collect();
@@ -1516,6 +1589,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_memory_scan_range_respects_bounds_and_limit() {
+        let store = MemoryKVStore::new();
+        for key in [b"a", b"b", b"c", b"d", b"e"] {
+            store.put(key, key).await.unwrap();
+        }
+        let results = store.scan_range(b"b", b"e", Some(2)).await.unwrap();
+        let keys: Vec<Vec<u8>> = results.into_iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec()]);
+    }
+
+    #[tokio::test]
     async fn test_memory_scan_with_filter_visit_stops_when_visitor_returns_false() {
         let store = MemoryKVStore::new();
         for i in 0..10u8 {
@@ -1752,6 +1836,18 @@ mod tests {
 
         let results = store.scan_prefix_limited(b"p", Some(3)).await.unwrap();
         assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_redb_kvstore_scan_range_respects_bounds_and_limit() {
+        let dir = tempdir().unwrap();
+        let store = RedbKVStore::open(dir.path(), KVStoreOptions::default()).unwrap();
+        for key in [b"a", b"b", b"c", b"d", b"e"] {
+            store.put(key, key).await.unwrap();
+        }
+        let results = store.scan_range(b"b", b"e", Some(2)).await.unwrap();
+        let keys: Vec<Vec<u8>> = results.into_iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec()]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

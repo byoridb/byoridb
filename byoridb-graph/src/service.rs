@@ -325,26 +325,47 @@ impl GraphService {
     ///
     /// `caller_session_id` is the session making the request. A session can
     /// only sign out itself unless the caller has GOD/ADMIN role.
-    pub async fn sign_out(&self, caller_session_id: i64, target_session_id: i64) {
+    pub async fn sign_out(&self, caller_session_id: i64, target_session_id: i64) -> Result<()> {
         info!("Sign out request received");
 
+        // A bearer is valid only while both session stores agree that it is
+        // live. `live_session` also removes a surviving orphan from either
+        // store before returning SessionNotFound.
+        let (caller_roles, _) = self.live_session(caller_session_id).await?;
+
         // Ownership check: caller must own the target session or be an admin.
+        // Check authorization before target liveness so a non-admin caller
+        // cannot use sign-out as a target-session existence oracle.
         if caller_session_id != target_session_id {
-            let is_admin = self
-                .auth_manager
-                .get_session_roles(caller_session_id)
-                .await
-                .map(|roles| roles.iter().any(|r| r == "GOD" || r == "ADMIN"))
-                .unwrap_or(false);
+            let is_admin = caller_roles
+                .iter()
+                .any(|role| role == "GOD" || role == "ADMIN");
 
             if !is_admin {
                 tracing::warn!("Sign out request denied");
-                return;
+                return Err(GraphError::InvalidOperation(
+                    "Not authorized to sign out the target session".to_string(),
+                ));
             }
+
+            // Cross-session sign-out requires a live target under the same
+            // dual-store contract as every query bearer.
+            self.live_session(target_session_id).await?;
         }
 
-        let _ = self.auth_manager.sign_out(target_session_id).await;
+        // AuthManager is the authoritative removal point. It gives concurrent
+        // sign-outs one winner; every path still removes any graph-session
+        // residue. A target that disappeared after liveness validation is
+        // reported as missing rather than as false success.
+        let auth_result = self.auth_manager.sign_out(target_session_id).await;
         self.session_manager.remove_session(target_session_id).await;
+        match auth_result {
+            Ok(()) => Ok(()),
+            Err(GraphError::InvalidOperation(_)) => {
+                Err(GraphError::SessionNotFound(target_session_id))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Execute a query statement
@@ -752,6 +773,218 @@ mod tests {
             .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sign_out_invalidates_both_session_stores() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        let session = root_session(&service).await;
+
+        service.sign_out(session, session).await.unwrap();
+
+        assert!(
+            !service
+                .auth_manager
+                .has_live_session_without_touch(session)
+                .await
+        );
+        assert!(!service.session_manager.has_session(session).await);
+    }
+
+    #[tokio::test]
+    async fn sign_out_expired_session_returns_not_found_and_cleans_both_stores() {
+        let service = GraphService::with_auth(
+            Arc::new(MemoryKVStore::new()),
+            AuthManager::with_config(ROOT_PASSWORD, Duration::from_millis(20)),
+        );
+        let session = root_session(&service).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let error = service.sign_out(session, session).await.unwrap_err();
+
+        assert!(matches!(error, GraphError::SessionNotFound(_)));
+        assert!(
+            !service
+                .auth_manager
+                .has_live_session_without_touch(session)
+                .await
+        );
+        assert!(!service.session_manager.has_session(session).await);
+    }
+
+    #[tokio::test]
+    async fn sign_out_auth_only_session_returns_not_found_and_cleans_auth_store() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        let session = root_session(&service).await;
+        assert!(service.session_manager.remove_session(session).await);
+
+        let error = service.sign_out(session, session).await.unwrap_err();
+
+        assert!(matches!(error, GraphError::SessionNotFound(_)));
+        assert!(
+            !service
+                .auth_manager
+                .has_live_session_without_touch(session)
+                .await
+        );
+        assert!(!service.session_manager.has_session(session).await);
+    }
+
+    #[tokio::test]
+    async fn sign_out_graph_only_session_returns_not_found_and_cleans_graph_store() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        let session = root_session(&service).await;
+        service.auth_manager.sign_out(session).await.unwrap();
+
+        let error = service.sign_out(session, session).await.unwrap_err();
+
+        assert!(matches!(error, GraphError::SessionNotFound(_)));
+        assert!(
+            !service
+                .auth_manager
+                .has_live_session_without_touch(session)
+                .await
+        );
+        assert!(!service.session_manager.has_session(session).await);
+    }
+
+    #[tokio::test]
+    async fn sign_out_unknown_session_returns_not_found() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+
+        let error = service.sign_out(99_999_999, 99_999_999).await.unwrap_err();
+
+        assert!(matches!(error, GraphError::SessionNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_sign_out_another_session() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        service
+            .auth_manager
+            .create_user("alice", "alice-password", vec!["USER".to_string()])
+            .await
+            .unwrap();
+        let caller = service
+            .authenticate("alice".to_string(), "alice-password".to_string())
+            .await
+            .unwrap();
+        let target = service
+            .authenticate("alice".to_string(), "alice-password".to_string())
+            .await
+            .unwrap();
+
+        let error = service.sign_out(caller, target).await.unwrap_err();
+
+        assert!(matches!(error, GraphError::InvalidOperation(_)));
+        assert!(service.validate_session(target).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn admin_can_sign_out_another_session() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        let root = root_session(&service).await;
+        service
+            .auth_manager
+            .create_user("alice", "alice-password", vec!["USER".to_string()])
+            .await
+            .unwrap();
+        let target = service
+            .authenticate("alice".to_string(), "alice-password".to_string())
+            .await
+            .unwrap();
+
+        service.sign_out(root, target).await.unwrap();
+
+        assert!(matches!(
+            service.validate_session(target).await,
+            Err(GraphError::SessionNotFound(_))
+        ));
+        assert!(service.validate_session(root).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn auth_only_admin_cannot_sign_out_another_session() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        let root = root_session(&service).await;
+        service
+            .auth_manager
+            .create_user("alice", "alice-password", vec!["USER".to_string()])
+            .await
+            .unwrap();
+        let target = service
+            .authenticate("alice".to_string(), "alice-password".to_string())
+            .await
+            .unwrap();
+        assert!(service.session_manager.remove_session(root).await);
+
+        let error = service.sign_out(root, target).await.unwrap_err();
+
+        assert!(matches!(error, GraphError::SessionNotFound(_)));
+        assert!(
+            !service
+                .auth_manager
+                .has_live_session_without_touch(root)
+                .await
+        );
+        assert!(!service.session_manager.has_session(root).await);
+        assert!(service.validate_session(target).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn admin_cannot_sign_out_an_auth_only_target() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        let root = root_session(&service).await;
+        service
+            .auth_manager
+            .create_user("alice", "alice-password", vec!["USER".to_string()])
+            .await
+            .unwrap();
+        let target = service
+            .authenticate("alice".to_string(), "alice-password".to_string())
+            .await
+            .unwrap();
+        assert!(service.session_manager.remove_session(target).await);
+
+        let error = service.sign_out(root, target).await.unwrap_err();
+
+        assert!(matches!(error, GraphError::SessionNotFound(_)));
+        assert!(
+            !service
+                .auth_manager
+                .has_live_session_without_touch(target)
+                .await
+        );
+        assert!(!service.session_manager.has_session(target).await);
+        assert!(service.validate_session(root).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn admin_cannot_sign_out_a_graph_only_target() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        let root = root_session(&service).await;
+        service
+            .auth_manager
+            .create_user("alice", "alice-password", vec!["USER".to_string()])
+            .await
+            .unwrap();
+        let target = service
+            .authenticate("alice".to_string(), "alice-password".to_string())
+            .await
+            .unwrap();
+        service.auth_manager.sign_out(target).await.unwrap();
+
+        let error = service.sign_out(root, target).await.unwrap_err();
+
+        assert!(matches!(error, GraphError::SessionNotFound(_)));
+        assert!(
+            !service
+                .auth_manager
+                .has_live_session_without_touch(target)
+                .await
+        );
+        assert!(!service.session_manager.has_session(target).await);
+        assert!(service.validate_session(root).await.is_ok());
     }
 
     #[tokio::test]

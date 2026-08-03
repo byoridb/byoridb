@@ -235,9 +235,10 @@ impl DistributedQueryExecutor {
             }
         }
 
-        // If all partitions failed, return error
-        if !errors.is_empty() && all_vertices.is_empty() {
-            return Err(errors.pop().unwrap().into());
+        // Any failed partition makes the aggregate incomplete. Never return
+        // successfully fetched vertices as though they were the whole result.
+        if let Some(error) = errors.pop() {
+            return Err(error.into());
         }
 
         info!(
@@ -530,38 +531,52 @@ impl DistributedQueryExecutor {
             .get_parts_alloc(space_id)
             .await
             .map_err(|e| DistributedQueryError::MetaError(e.to_string()))?;
+        if partition_num == 0 || allocs.len() != partition_num as usize {
+            return Err(DistributedQueryError::InvalidConfig(format!(
+                "expected {partition_num} partition allocations for space {space_id}, got {}",
+                allocs.len()
+            )));
+        }
 
         // Create lookup task for each partition
-        let limit_per_partition = (limit / partition_num).max(100);
+        // Each partition may contain every globally requested row. Dividing the
+        // limit by partition count under-fetches skewed indexes, so over-fetch
+        // per partition and truncate only after every response succeeds.
+        let limit_per_partition = limit;
         let mut tasks = Vec::new();
 
         for alloc in allocs {
-            if let Some((host, port)) = alloc.hosts.first() {
-                let storage_client = self.storage_client.clone();
-                let index_name = index_name.to_string();
-                let values = values.clone();
-                let host = host.clone();
-                let port = *port;
-                let part_id = alloc.part_id;
+            let (host, port) =
+                alloc
+                    .hosts
+                    .first()
+                    .ok_or(DistributedQueryError::NoPartitionHosts {
+                        part_id: alloc.part_id,
+                    })?;
+            let storage_client = self.storage_client.clone();
+            let index_name = index_name.to_string();
+            let values = values.clone();
+            let host = host.clone();
+            let port = *port;
+            let part_id = alloc.part_id;
 
-                let task = async move {
-                    storage_client
-                        .lookup_tag_index(
-                            &host,
-                            port,
-                            space_id,
-                            part_id,
-                            index_id,
-                            index_name,
-                            values,
-                            limit_per_partition,
-                            vec![], // No cursor for initial request
-                        )
-                        .await
-                };
+            let task = async move {
+                storage_client
+                    .lookup_tag_index(
+                        &host,
+                        port,
+                        space_id,
+                        part_id,
+                        index_id,
+                        index_name,
+                        values,
+                        limit_per_partition,
+                        vec![], // No cursor for initial request
+                    )
+                    .await
+            };
 
-                tasks.push(task);
-            }
+            tasks.push(task);
         }
 
         // Execute all tasks in parallel
@@ -575,11 +590,6 @@ impl DistributedQueryExecutor {
             match result {
                 Ok(response) => {
                     all_vids.extend(response.vids);
-                    // Check if we've hit the total limit
-                    if all_vids.len() >= limit as usize {
-                        all_vids.truncate(limit as usize);
-                        break;
-                    }
                 }
                 Err(e) => {
                     warn!("Partition index lookup failed: {}", e);
@@ -588,8 +598,11 @@ impl DistributedQueryExecutor {
             }
         }
 
-        if !errors.is_empty() && all_vids.is_empty() {
-            return Err(errors.pop().unwrap().into());
+        if let Some(error) = errors.pop() {
+            return Err(error.into());
+        }
+        if all_vids.len() > limit as usize {
+            all_vids.truncate(limit as usize);
         }
 
         info!(

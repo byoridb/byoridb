@@ -83,6 +83,27 @@ pub struct ScanOptions {
     pub include_end: bool,
 }
 
+/// Comparison operator for a single-field ordered index range lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeOperator {
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+}
+
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for index in (0..end.len()).rev() {
+        if end[index] != u8::MAX {
+            end[index] += 1;
+            end.truncate(index + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
 /// Index manager for a storage node
 pub struct IndexManager {
     kvstore: Arc<dyn KVStore>,
@@ -591,20 +612,50 @@ impl IndexManager {
         options: &ScanOptions,
     ) -> Result<Vec<TagIndexScanResult>, IndexError> {
         let prefix = KeyUtils::tag_index_prefix_with_values(part_id, index_def.id, prefix_values);
+        let limit = (options.limit > 0).then_some(options.limit);
 
-        // Calculate property value length for parsing
-        let prop_len: usize = prefix_values.iter().map(|v| v.encoded_len()).sum();
-
-        let entries = self
-            .kvstore
-            .scan_prefix(&prefix)
-            .await
-            .map_err(|e| IndexError::Storage(e.to_string()))?;
+        let entries = if options.start_values.is_none() && options.end_values.is_none() {
+            self.kvstore.scan_prefix_limited(&prefix, limit).await
+        } else {
+            let prefix_end = prefix_successor(&prefix).ok_or_else(|| {
+                IndexError::InvalidValue("index prefix has no upper bound".to_string())
+            })?;
+            let start = match options.start_values.as_ref() {
+                Some(values) => {
+                    let mut all_values = prefix_values.to_vec();
+                    all_values.extend(values.iter().cloned());
+                    let boundary =
+                        KeyUtils::tag_index_prefix_with_values(part_id, index_def.id, &all_values);
+                    if options.include_start {
+                        boundary
+                    } else {
+                        prefix_successor(&boundary).unwrap_or_else(|| prefix_end.clone())
+                    }
+                }
+                None => prefix.clone(),
+            };
+            let end = match options.end_values.as_ref() {
+                Some(values) => {
+                    let mut all_values = prefix_values.to_vec();
+                    all_values.extend(values.iter().cloned());
+                    let boundary =
+                        KeyUtils::tag_index_prefix_with_values(part_id, index_def.id, &all_values);
+                    if options.include_end {
+                        prefix_successor(&boundary).unwrap_or_else(|| prefix_end.clone())
+                    } else {
+                        boundary
+                    }
+                }
+                None => prefix_end,
+            };
+            self.kvstore.scan_range(&start, &end, limit).await
+        }
+        .map_err(|e| IndexError::Storage(e.to_string()))?;
 
         let mut results: Vec<TagIndexScanResult> = entries
             .iter()
             .filter_map(|(key, _)| {
-                KeyUtils::parse_tag_index_vid(key, prop_len).map(|vid| TagIndexScanResult { vid })
+                KeyUtils::parse_tag_index_vid(key, 0).map(|vid| TagIndexScanResult { vid })
             })
             .collect();
 
@@ -614,6 +665,72 @@ impl IndexManager {
         }
 
         Ok(results)
+    }
+
+    /// Lookup a single-field tag index using an ordered comparison.
+    pub async fn lookup_tag_range(
+        &self,
+        part_id: u32,
+        index_def: &IndexDef,
+        value: IndexValue,
+        operator: RangeOperator,
+        limit: usize,
+    ) -> Result<Vec<i64>, IndexError> {
+        if index_def.fields.len() != 1 {
+            return Err(IndexError::InvalidValue(
+                "range lookup requires a single-field index".to_string(),
+            ));
+        }
+        if matches!(value, IndexValue::Null | IndexValue::String(_))
+            || matches!(value, IndexValue::Float(number) if number.is_nan() || number == 0.0)
+        {
+            return Err(IndexError::InvalidValue(
+                "ordered range lookup requires bool, int, or a non-zero non-NaN float boundary"
+                    .to_string(),
+            ));
+        }
+
+        let (type_min, type_max) = match &value {
+            IndexValue::Bool(_) => (IndexValue::Bool(false), IndexValue::Bool(true)),
+            IndexValue::Int(_) => (IndexValue::Int(i64::MIN), IndexValue::Int(i64::MAX)),
+            IndexValue::Float(_) => (
+                IndexValue::Float(f64::NEG_INFINITY),
+                IndexValue::Float(f64::INFINITY),
+            ),
+            IndexValue::Null | IndexValue::String(_) => unreachable!(),
+        };
+        let mut options = ScanOptions {
+            limit,
+            start_values: Some(vec![type_min]),
+            end_values: Some(vec![type_max]),
+            include_start: true,
+            include_end: true,
+        };
+        match operator {
+            RangeOperator::GreaterThan => {
+                options.start_values = Some(vec![value]);
+                options.include_start = false;
+            }
+            RangeOperator::GreaterThanOrEqual => {
+                options.start_values = Some(vec![value]);
+                options.include_start = true;
+            }
+            RangeOperator::LessThan => {
+                options.end_values = Some(vec![value]);
+                options.include_end = false;
+            }
+            RangeOperator::LessThanOrEqual => {
+                options.end_values = Some(vec![value]);
+                options.include_end = true;
+            }
+        }
+
+        Ok(self
+            .scan_tag_index(part_id, index_def, &[], &options)
+            .await?
+            .into_iter()
+            .map(|result| result.vid)
+            .collect())
     }
 
     /// Scan an edge index with given prefix values
@@ -1070,6 +1187,141 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.contains(&100));
         assert!(results.contains(&101));
+    }
+
+    #[tokio::test]
+    async fn test_lookup_tag_range_boundaries_and_null_exclusion() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let manager = IndexManager::new(kvstore);
+        let index_id = manager
+            .create_tag_index(
+                1,
+                "person_age_idx".to_string(),
+                10,
+                "person".to_string(),
+                vec!["age".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        let index_def = manager.get_index(1, "person_age_idx").await.unwrap();
+
+        for (value, vid) in [(-10, 1), (0, 2), (30, 3), (30, 4), (50, 5)] {
+            manager
+                .insert_tag_index(1, index_id, &[IndexValue::Int(value)], vid)
+                .await
+                .unwrap();
+        }
+        manager
+            .insert_tag_index(1, index_id, &[IndexValue::Null], 99)
+            .await
+            .unwrap();
+
+        for (operator, expected) in [
+            (RangeOperator::GreaterThan, vec![5]),
+            (RangeOperator::GreaterThanOrEqual, vec![3, 4, 5]),
+            (RangeOperator::LessThan, vec![1, 2]),
+            (RangeOperator::LessThanOrEqual, vec![1, 2, 3, 4]),
+        ] {
+            let results = manager
+                .lookup_tag_range(1, &index_def, IndexValue::Int(30), operator, 100)
+                .await
+                .unwrap();
+            assert_eq!(results, expected, "operator: {operator:?}");
+            assert!(!results.contains(&99), "NULL must not satisfy a range");
+        }
+
+        let limited = manager
+            .lookup_tag_range(
+                1,
+                &index_def,
+                IndexValue::Int(30),
+                RangeOperator::LessThanOrEqual,
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_tag_range_float_and_bool_domains() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let manager = IndexManager::new(kvstore);
+        let float_id = manager
+            .create_tag_index(
+                1,
+                "score_idx".to_string(),
+                10,
+                "result".to_string(),
+                vec!["score".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        let bool_id = manager
+            .create_tag_index(
+                1,
+                "active_idx".to_string(),
+                11,
+                "result".to_string(),
+                vec!["active".to_string()],
+                vec![1],
+            )
+            .await
+            .unwrap();
+        let float_def = manager.get_index(1, "score_idx").await.unwrap();
+        let bool_def = manager.get_index(1, "active_idx").await.unwrap();
+
+        for (value, vid) in [(-2.5, 1), (-0.0, 2), (0.0, 3), (1.5, 4), (3.0, 5)] {
+            manager
+                .insert_tag_index(1, float_id, &[IndexValue::Float(value)], vid)
+                .await
+                .unwrap();
+        }
+        for (value, vid) in [(false, 10), (true, 11)] {
+            manager
+                .insert_tag_index(1, bool_id, &[IndexValue::Bool(value)], vid)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            manager
+                .lookup_tag_range(
+                    1,
+                    &float_def,
+                    IndexValue::Float(1.5),
+                    RangeOperator::LessThanOrEqual,
+                    100,
+                )
+                .await
+                .unwrap(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(manager
+            .lookup_tag_range(
+                1,
+                &float_def,
+                IndexValue::Float(0.0),
+                RangeOperator::GreaterThan,
+                100,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            manager
+                .lookup_tag_range(
+                    1,
+                    &bool_def,
+                    IndexValue::Bool(false),
+                    RangeOperator::GreaterThan,
+                    100,
+                )
+                .await
+                .unwrap(),
+            vec![11]
+        );
     }
 
     #[tokio::test]
