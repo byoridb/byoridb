@@ -94,7 +94,10 @@ async fn use_graph_service() -> Result<(), Box<dyn std::error::Error>> {
     println!("Query result: {} rows", result.row_count());
 
     // Sign out
-    graph_service.sign_out(session_id, session_id).await;
+    graph_service
+        .sign_out(session_id, session_id)
+        .await
+        .unwrap();
     println!("Session closed");
 
     // Cleanup

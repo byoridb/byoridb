@@ -224,6 +224,32 @@ const SESSION_ID_HEADER: &str = "x-byoridb-session-id";
 
 type HttpApiError = (StatusCode, Json<ErrorResponse>);
 
+fn sign_out_http_error(error: crate::error::GraphError) -> HttpApiError {
+    match error {
+        crate::error::GraphError::SessionNotFound(_) => (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Invalid or expired session".to_string(),
+                code: "SESSION_EXPIRED".to_string(),
+            }),
+        ),
+        crate::error::GraphError::InvalidOperation(_) => (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Sign out is not allowed".to_string(),
+                code: "FORBIDDEN".to_string(),
+            }),
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Sign out failed".to_string(),
+                code: "INTERNAL_ERROR".to_string(),
+            }),
+        ),
+    }
+}
+
 fn session_id_from_headers(headers: &HeaderMap) -> Result<i64, HttpApiError> {
     let session_id = headers
         .get(SESSION_ID_HEADER)
@@ -323,18 +349,9 @@ async fn delete_session(
     let session_id = session_id_from_headers(&headers)?;
     state
         .service
-        .validate_session(session_id)
+        .sign_out(session_id, session_id)
         .await
-        .map_err(|_| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse {
-                    error: "Invalid or expired session".to_string(),
-                    code: "AUTH_REQUIRED".to_string(),
-                }),
-            )
-        })?;
-    state.service.sign_out(session_id, session_id).await;
+        .map_err(sign_out_http_error)?;
     info!("Session deleted");
     Ok(Json(serde_json::json!({"deleted": true})))
 }
@@ -748,6 +765,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_query_sessions_return_401_session_expired_on_both_http_surfaces() {
+        const ROOT_PASSWORD: &str = "root-password";
+        let state = test_state(AuthManager::with_config(
+            ROOT_PASSWORD,
+            Duration::from_millis(20),
+        ));
+
+        let json_session = state
+            .service
+            .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (status, Json(error)) = match execute_query(
+            State(state.clone()),
+            Json(QueryRequest {
+                session_id: json_session,
+                query: "SHOW SPACES".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("expired session unexpectedly executed a JSON query"),
+        };
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code, "SESSION_EXPIRED");
+
+        let raw_session = state
+            .service
+            .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (status, body) = execute_query_json(
+            State(state),
+            Json(QueryRequest {
+                session_id: raw_session,
+                query: "SHOW SPACES".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(error["code"], "SESSION_EXPIRED");
+    }
+
+    #[tokio::test]
     async fn logout_uses_header_and_does_not_echo_bearer_token() {
         let state = test_state(AuthManager::with_config(
             "root-password",
@@ -764,6 +830,84 @@ mod tests {
         assert_eq!(response, serde_json::json!({"deleted": true}));
         assert!(!response.to_string().contains(&root.to_string()));
         assert!(state.service.validate_session(root).await.is_err());
+
+        let (status, Json(error)) = delete_session(State(state), session_headers(root))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code, "SESSION_EXPIRED");
+        assert!(!error.error.contains(&root.to_string()));
+    }
+
+    #[tokio::test]
+    async fn expired_logout_returns_the_same_session_expired_contract_as_absent_logout() {
+        const ROOT_PASSWORD: &str = "root-password";
+        let state = test_state(AuthManager::with_config(
+            ROOT_PASSWORD,
+            Duration::from_millis(20),
+        ));
+        let session = state
+            .service
+            .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (status, Json(error)) = delete_session(State(state), session_headers(session))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code, "SESSION_EXPIRED");
+        assert!(!error.error.contains(&session.to_string()));
+    }
+
+    #[tokio::test]
+    async fn concurrent_logout_race_has_one_winner_and_a_stable_rest_error() {
+        let state = test_state(AuthManager::with_config(
+            "root-password",
+            Duration::from_secs(3600),
+        ));
+        let session = state
+            .service
+            .authenticate("root".to_string(), "root-password".to_string())
+            .await
+            .unwrap();
+        let service = state.service.clone();
+
+        let (direct_result, http_result) = tokio::join!(
+            service.sign_out(session, session),
+            delete_session(State(state), session_headers(session)),
+        );
+
+        assert_eq!(
+            usize::from(direct_result.is_ok()) + usize::from(http_result.is_ok()),
+            1,
+            "the auth-store removal must select exactly one sign-out winner"
+        );
+        if let Err(error) = direct_result {
+            assert!(matches!(
+                error,
+                crate::error::GraphError::SessionNotFound(_)
+            ));
+        }
+        if let Err((status, Json(error))) = http_result {
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(error.code, "SESSION_EXPIRED");
+            assert!(!error.error.contains(&session.to_string()));
+        }
+    }
+
+    #[test]
+    fn sign_out_race_error_mapping_does_not_expose_the_bearer() {
+        let session = 99_999_999;
+
+        let (status, Json(error)) =
+            sign_out_http_error(crate::error::GraphError::SessionNotFound(session));
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code, "SESSION_EXPIRED");
+        assert!(!error.error.contains(&session.to_string()));
     }
 
     #[test]

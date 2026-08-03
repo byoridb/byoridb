@@ -15,25 +15,14 @@ release에는 artifact가 소급 추가되지 않습니다. 저장소가 Rust 1.
 Windows는 현재 지원하지 않습니다. ByoriDB의 저장소 엔진은 순수 Rust 기반
 `redb`이므로 RocksDB나 RocksDB용 C++ 툴체인은 필요하지 않습니다.
 
-Release workflow는 GitHub arm64 runner에서 Linux arm64를 native build합니다. 또한
-Developer ID 서명 및 App Store Connect notarization credential이 모두 없으면 새 macOS
-tag release를 실패시킵니다. v0.3.3 이하 macOS archive는 이 gate보다 오래되어 여전히
-unsigned 상태이므로 Gatekeeper를 우회하지 말고 해당 tag를 source에서 build하세요.
+Release workflow는 GitHub arm64 runner에서 Linux arm64를 native build합니다. macOS
+archive는 아직 code signing이나 notarization을 거치지 않으므로 Gatekeeper가 경고하거나
+실행을 거부할 수 있습니다. 프로젝트는 공식적인 Gatekeeper 우회 방법을 안내하지
+않으므로 필요한 tag를 source에서 build하세요.
 
-Release maintainer는 tag 생성 전에 다음 repository secret을 설정해야 합니다.
-
-- Developer ID Application certificate용 `MACOS_CERTIFICATE_P12_BASE64`,
-  `MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGNING_IDENTITY`
-- `xcrun notarytool`용 `APPLE_API_KEY_P8_BASE64`, `APPLE_API_KEY_ID`,
-  `APPLE_API_ISSUER_ID`
-
-Workflow는 모든 macOS executable을 hardened runtime과 secure timestamp로 서명하고
-signature를 검증하며 Apple notarization 성공을 기다린 뒤 package합니다. Credential이
-없으면 unsigned archive를 조용히 배포하지 않고 macOS build를 실패시킵니다.
-
-현재 release archive에는 binary만 포함되고 `LICENSE`와 `NOTICES.md`는 누락되어
-있습니다. 이 packaging 작업은
-[issue #28](https://github.com/byoridb/byoridb/issues/28)에 열려 있습니다. Archive를
+Release workflow는 새 tag archive의 root에 `LICENSE`와 `NOTICES.md`를 포함하고,
+게시 전에 두 파일이 모두 있는지 검증합니다. 이미 게시된 v0.3.3 이하 archive는 이
+검증이 도입되기 전에 만들어졌으며 소급 변경되지 않습니다. 해당 legacy archive를
 재배포하기 전에 저장소의 license와 notices를 확인하세요.
 
 ## 빌드 요구사항
