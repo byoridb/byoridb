@@ -13,9 +13,9 @@ ByoriDB는 현재 소스에서 빌드합니다. 저장소가 Rust 1.90을 고정
 Windows는 현재 지원하지 않습니다. ByoriDB의 저장소 엔진은 순수 Rust 기반
 `redb`이므로 RocksDB나 RocksDB용 C++ 툴체인은 필요하지 않습니다.
 
-현재 release archive에는 binary만 포함되고 `LICENSE`와 `NOTICES.md`는 누락되어
-있습니다. 이 packaging 작업은
-[issue #28](https://github.com/byoridb/byoridb/issues/28)에 열려 있습니다. Archive를
+Release workflow는 새 tag archive의 root에 `LICENSE`와 `NOTICES.md`를 포함하고,
+게시 전에 두 파일이 모두 있는지 검증합니다. 이미 게시된 v0.3.3 이하 archive는 이
+검증이 도입되기 전에 만들어졌으며 소급 변경되지 않습니다. 해당 legacy archive를
 재배포하기 전에 저장소의 license와 notices를 확인하세요.
 
 ## 빌드 요구사항
