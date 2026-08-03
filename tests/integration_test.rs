@@ -796,6 +796,31 @@ async fn test_fixed_string_vid_crud_traversal_and_type_contract() {
         vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
     );
 
+    let matched_edge = execute(
+        &service,
+        session_id,
+        r#"MATCH (a:person)-[e:knows]->(b:person) WHERE id(a) == "alice" RETURN src(e), dst(e), type(e), rank(e), e"#,
+    )
+    .await;
+    assert_eq!(matched_edge.row_count(), 1);
+    assert_eq!(
+        &matched_edge.rows[0][..4],
+        &[
+            Value::String("alice".to_string()),
+            Value::String("bob".to_string()),
+            Value::String("knows".to_string()),
+            Value::Int(0),
+        ]
+    );
+    assert!(matches!(
+        &matched_edge.rows[0][4],
+        Value::Edge(edge)
+            if edge.src == Value::String("alice".to_string())
+                && edge.dst == Value::String("bob".to_string())
+                && edge.name == "knows"
+                && edge.ranking == 0
+    ));
+
     let found = execute(
         &service,
         session_id,
