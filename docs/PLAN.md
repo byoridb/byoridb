@@ -71,7 +71,7 @@ all issues below are still open even when their implementation has landed:
 | [#24](https://github.com/byoridb/byoridb/issues/24) | Partial | Windows and the unsigned/notarized macOS Gatekeeper risk are documented, with a source-build recommendation. Prebuilt ARM Linux and actual macOS signing/notarization remain absent. |
 | [#28](https://github.com/byoridb/byoridb/issues/28) | Unresolved | Binary release archives still package only executables; `LICENSE` and `NOTICES.md` are not included. The former installer now belongs to `byori`. |
 | [#1](https://github.com/byoridb/byoridb/issues/1) | Unresolved | Range predicates still fall back to a full scan instead of an index range scan. |
-| [#10](https://github.com/byoridb/byoridb/issues/10) | Unresolved | Large-scale multi-ID fetch/destination projection tests, batching, profiling, and the LDBC acceptance target remain open. |
+| [#10](https://github.com/byoridb/byoridb/issues/10) | Engine scope resolved in code; harness acceptance pending | Multi-ID `FETCH` is covered at 1,000 VIDs, destination projections use one deduplicated `batch_get`, and `EXPLAIN`/`PROFILE` expose the batch as `GetVertices`; the separate LDBC harness still needs the Q9 conversion and `<10s` measurement. |
 
 Close a resolved-in-code issue only after recording its implementation and
 verification evidence. Keep partial and unresolved issues open until their
