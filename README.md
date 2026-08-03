@@ -41,6 +41,20 @@ inferred edges, and temporal reads from one standalone server process.
 - **Pure-Rust storage:** redb provides the embedded KV layer; no C++ toolchain is
   required.
 
+### Batch-read behavior and limits
+
+`FETCH PROP ON <tag> vid, ...` sends all current-view vertex keys through one
+storage `batch_get`. Results retain the input VID order; missing VIDs are
+omitted. The HTTP query-text limit is 1 MiB, so a typical 500–1,000 numeric-VID
+request is comfortably below the transport limit. Response size still depends
+on projected property payloads and remains subject to the configured query
+result-memory cap.
+
+For `GO ... YIELD $$.tag.prop` and `YIELD vertex`, ByoriDB deduplicates the
+destination VIDs and loads them in one batch before projection. Missing tags,
+properties, or destination vertices project as `NULL`. `EXPLAIN` and `PROFILE`
+show this work as `GetVertices` with `batch destination projection` detail.
+
 ByoriDB does not implement the complete OWL 2 RL rule set or a general temporal
 query language. In the current temporal model, valid time and transaction time
 are generated together by the server; temporal `MATCH`, `GO`, `BETWEEN`, and
