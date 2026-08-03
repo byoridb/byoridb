@@ -2,8 +2,8 @@
 
 > **English** | [한국어](PLAN.ko.md)
 >
-> Last code verification: 2026-08-03, against `main` at `3f5f1a5` plus the
-> current PR #57 branch changes.
+> Last code verification: 2026-08-03, against the integration of `main` at
+> `3f5f1a5` with PR #57.
 > This document records code and repository state, not the live state of any
 > Kubernetes cluster.
 
@@ -65,16 +65,16 @@ is closed:
 
 | Issue | Code status | Evidence or remaining work |
 |---|---|---|
-| [#26](https://github.com/byoridb/byoridb/issues/26) | Resolved in code; issue open | Atomic current/history writes, monotonic transaction timestamps, seek-based `AS OF`, and E2E coverage landed in [PR #32](https://github.com/byoridb/byoridb/pull/32). |
-| [#27](https://github.com/byoridb/byoridb/issues/27) | Resolved in code; issue open | Workspace-wide Clippy with `-D warnings` is enforced by CI; the change landed with the core/product split in [PR #30](https://github.com/byoridb/byoridb/pull/30). |
-| [#29](https://github.com/byoridb/byoridb/issues/29) | Resolved in code; issue open | Dependabot now targets `main`, and follow-up dependency PRs have opened and merged; the configuration fix landed in [PR #35](https://github.com/byoridb/byoridb/pull/35). |
-| [#25](https://github.com/byoridb/byoridb/issues/25) | Resolved in `byori`; issue open here | Agent-memory ownership moved to [byoridb/byori](https://github.com/byoridb/byori); typed-wiki schema bootstrap/versioned migration landed in [3ce7730](https://github.com/byoridb/byori/commit/3ce7730e19f04bd980b10829c9c6e34b9ecf86d4), followed by guarded structured-memory tools in [18d605f](https://github.com/byoridb/byori/commit/18d605f214a8fb8ce6476b9eccdc9efc9162b714). |
-| [#23](https://github.com/byoridb/byoridb/issues/23) | Partial | The server now maps missing or expired HTTP sessions to `401 SESSION_EXPIRED` in [PR #35](https://github.com/byoridb/byoridb/pull/35). A tagged engine release and status-code-based `byori` client/MCP integration test are still required. |
+| [#26](https://github.com/byoridb/byoridb/issues/26) | Resolved by PR #32; issue closed | Atomic current/history writes, monotonic transaction timestamps, seek-based `AS OF`, and E2E coverage landed in [PR #32](https://github.com/byoridb/byoridb/pull/32). |
+| [#27](https://github.com/byoridb/byoridb/issues/27) | Resolved by PR #30; issue closed | Workspace-wide Clippy with `-D warnings` is enforced by CI; the change landed with the core/product split in [PR #30](https://github.com/byoridb/byoridb/pull/30). |
+| [#29](https://github.com/byoridb/byoridb/issues/29) | Resolved by PR #35; issue closed | Dependabot now targets `main`, and follow-up dependency PRs have opened and merged; the configuration fix landed in [PR #35](https://github.com/byoridb/byoridb/pull/35). |
+| [#25](https://github.com/byoridb/byoridb/issues/25) | Resolved in `byori`; tracking issue closed | Agent-memory ownership moved to [byoridb/byori](https://github.com/byoridb/byori); typed-wiki schema bootstrap/versioned migration landed in [3ce7730](https://github.com/byoridb/byori/commit/3ce7730e19f04bd980b10829c9c6e34b9ecf86d4), followed by guarded structured-memory tools in [18d605f](https://github.com/byoridb/byori/commit/18d605f214a8fb8ce6476b9eccdc9efc9162b714). |
+| [#23](https://github.com/byoridb/byoridb/issues/23) | Partial; issue open | The server now maps missing or expired HTTP sessions to `401 SESSION_EXPIRED` in [PR #35](https://github.com/byoridb/byoridb/pull/35). A tagged engine release and status-code-based `byori` client/MCP integration test are still required. |
 | [#24](https://github.com/byoridb/byoridb/issues/24) | Partial; issue open | New tagged releases build Linux x86_64/arm64 and macOS x86_64/arm64 archives. Windows remains unsupported and macOS artifacts are still unsigned and unnotarized; older releases do not gain artifacts retroactively. |
-| [#28](https://github.com/byoridb/byoridb/issues/28) | Resolved in code; closes with PR #51 | The release workflow packages and verifies `LICENSE` and `NOTICES.md` at the root of every new tagged archive. Published v0.3.3 and older archives are not changed retroactively. |
-| [#49](https://github.com/byoridb/byoridb/issues/49) | Resolved on the PR #57 branch; issue open | Standalone `FIXED_STRING` uses persistent negative `i64` surrogates while preserving storage-key and RPC/protobuf integer contracts. Unknown reads remain misses, collision claims avoid live graph occupancy, legacy non-negative records have a write-frozen read/delete bridge, and distributed mapping plus `RECOMMEND` remain explicitly unsupported. |
+| [#28](https://github.com/byoridb/byoridb/issues/28) | Resolved by PR #51; issue closed | The release workflow packages and verifies `LICENSE` and `NOTICES.md` at the root of every new tagged archive. Published v0.3.3 and older archives are not changed retroactively. |
+| [#49](https://github.com/byoridb/byoridb/issues/49) | Resolved by PR #57; issue closed | Standalone `FIXED_STRING` uses persistent negative `i64` surrogates while preserving storage-key and RPC/protobuf integer contracts. Unknown reads remain misses, collision claims avoid live graph occupancy, legacy non-negative records have a write-frozen read/delete bridge, and distributed mapping plus `RECOMMEND` remain explicitly unsupported. |
 | [#1](https://github.com/byoridb/byoridb/issues/1) | Resolved by PR #54; issue closed | Local single-field Boolean and integer `LOOKUP` comparisons use bounded index range scans with stale-entry revalidation and correct `OFFSET`/`LIMIT`; unsupported key domains retain the predicate-scan fallback, and distributed ordered ranges fail closed. |
-| [#10](https://github.com/byoridb/byoridb/issues/10) | Engine scope resolved in code; harness acceptance pending | Multi-ID `FETCH` is covered at 1,000 VIDs, destination projections use one deduplicated `batch_get`, and `EXPLAIN`/`PROFILE` expose the batch as `GetVertices`; the separate LDBC harness still needs the Q9 conversion and `<10s` measurement. |
+| [#10](https://github.com/byoridb/byoridb/issues/10) | Engine scope resolved in code; issue open for harness acceptance | Multi-ID `FETCH` is covered at 1,000 VIDs, destination projections use one deduplicated `batch_get`, and `EXPLAIN`/`PROFILE` expose the batch as `GetVertices`; the separate LDBC harness still needs the Q9 conversion and `<10s` measurement. |
 
 Close a resolved-in-code issue only after recording its implementation and
 verification evidence. Keep partial and unresolved issues open until their

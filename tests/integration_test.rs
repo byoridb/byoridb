@@ -929,7 +929,7 @@ async fn test_fixed_string_vid_crud_traversal_and_type_contract() {
         "string VID in INT64 space should fail clearly: {wrong_int_type:?}"
     );
 
-    service.sign_out(session_id, session_id).await;
+    service.sign_out(session_id, session_id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

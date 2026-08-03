@@ -2,8 +2,8 @@
 
 > [English](PLAN.md) | **한국어**
 >
-> **현재 코드 기준선:** 2026-08-03, `origin/main`의 `3f5f1a5`와 현재 PR #57
-> 브랜치 변경. 아래 장문의 날짜별
+> **현재 코드 기준선:** 2026-08-03, `origin/main`의 `3f5f1a5`와 PR #57의
+> 통합 결과. 아래 장문의 날짜별
 > 기록은 역사적 맥락으로 보존하며, 현재 상태 판단에는 이 기준선과 구현/테스트를
 > 우선한다.
 
@@ -14,16 +14,16 @@
 
 | 이슈 | 현재 판정 | 근거 또는 남은 작업 |
 |---|---|---|
-| [#26](https://github.com/byoridb/byoridb/issues/26) | 코드 해결·이슈 열림 | 원자적 dual-write, 단조 transaction timestamp, seek 기반 `AS OF`, E2E가 [PR #32](https://github.com/byoridb/byoridb/pull/32)에 반영됨 |
-| [#27](https://github.com/byoridb/byoridb/issues/27) | 코드 해결·이슈 열림 | workspace Clippy `-D warnings` CI gate가 [PR #30](https://github.com/byoridb/byoridb/pull/30)에 반영됨 |
-| [#29](https://github.com/byoridb/byoridb/issues/29) | 코드 해결·이슈 열림 | Dependabot의 `main` 대상 수정과 후속 PR 생성을 [PR #35](https://github.com/byoridb/byoridb/pull/35) 이후 확인함 |
-| [#25](https://github.com/byoridb/byoridb/issues/25) | `byori`에서 해결·이슈 열림 | 책임 저장소가 [byoridb/byori](https://github.com/byoridb/byori)로 이동했고 typed-wiki schema bootstrap/version migration [3ce7730](https://github.com/byoridb/byori/commit/3ce7730e19f04bd980b10829c9c6e34b9ecf86d4)과 guarded structured-memory 도구 [18d605f](https://github.com/byoridb/byori/commit/18d605f214a8fb8ce6476b9eccdc9efc9162b714)가 반영됨 |
-| [#23](https://github.com/byoridb/byoridb/issues/23) | 부분 해결 | 서버의 만료/누락 세션은 [PR #35](https://github.com/byoridb/byoridb/pull/35)에서 `401 SESSION_EXPIRED`가 됐지만, 태그 릴리스와 `byori` 클라이언트/MCP 통합 테스트가 남음 |
+| [#26](https://github.com/byoridb/byoridb/issues/26) | PR #32로 해결·이슈 닫힘 | 원자적 dual-write, 단조 transaction timestamp, seek 기반 `AS OF`, E2E가 [PR #32](https://github.com/byoridb/byoridb/pull/32)에 반영됨 |
+| [#27](https://github.com/byoridb/byoridb/issues/27) | PR #30으로 해결·이슈 닫힘 | workspace Clippy `-D warnings` CI gate가 [PR #30](https://github.com/byoridb/byoridb/pull/30)에 반영됨 |
+| [#29](https://github.com/byoridb/byoridb/issues/29) | PR #35로 해결·이슈 닫힘 | Dependabot의 `main` 대상 수정과 후속 PR 생성을 [PR #35](https://github.com/byoridb/byoridb/pull/35) 이후 확인함 |
+| [#25](https://github.com/byoridb/byoridb/issues/25) | `byori`에서 해결·tracking 이슈 닫힘 | 책임 저장소가 [byoridb/byori](https://github.com/byoridb/byori)로 이동했고 typed-wiki schema bootstrap/version migration [3ce7730](https://github.com/byoridb/byori/commit/3ce7730e19f04bd980b10829c9c6e34b9ecf86d4)과 guarded structured-memory 도구 [18d605f](https://github.com/byoridb/byori/commit/18d605f214a8fb8ce6476b9eccdc9efc9162b714)가 반영됨 |
+| [#23](https://github.com/byoridb/byoridb/issues/23) | 부분 해결·이슈 열림 | 서버의 만료/누락 세션은 [PR #35](https://github.com/byoridb/byoridb/pull/35)에서 `401 SESSION_EXPIRED`가 됐지만, 태그 릴리스와 `byori` 클라이언트/MCP 통합 테스트가 남음 |
 | [#24](https://github.com/byoridb/byoridb/issues/24) | 부분 해결·이슈 열림 | 새 tag release가 Linux x86_64/arm64와 macOS x86_64/arm64 archive를 빌드함. Windows는 미지원이고 macOS artifact는 아직 서명/notarization되지 않았으며, 과거 release에는 artifact가 소급 추가되지 않음 |
-| [#28](https://github.com/byoridb/byoridb/issues/28) | 코드 해결; PR #51 머지 시 닫힘 | Release workflow가 새 tag archive의 root에 `LICENSE`와 `NOTICES.md`를 포함하고 검증함; 이미 게시된 v0.3.3 이하 archive는 소급 변경되지 않음 |
-| [#49](https://github.com/byoridb/byoridb/issues/49) | PR #57 branch에서 해결·이슈 열림 | Standalone `FIXED_STRING`이 영속 음수 `i64` surrogate로 storage key와 RPC/protobuf 정수 계약을 보존함. Unknown read는 miss이고 collision claim은 live graph 점유를 피하며, legacy 0 이상 record는 write-frozen read/delete bridge만 제공함. Distributed mapping과 `RECOMMEND`는 명시적으로 미지원 |
+| [#28](https://github.com/byoridb/byoridb/issues/28) | PR #51로 해결·이슈 닫힘 | Release workflow가 새 tag archive의 root에 `LICENSE`와 `NOTICES.md`를 포함하고 검증함; 이미 게시된 v0.3.3 이하 archive는 소급 변경되지 않음 |
+| [#49](https://github.com/byoridb/byoridb/issues/49) | PR #57로 해결·이슈 닫힘 | Standalone `FIXED_STRING`이 영속 음수 `i64` surrogate로 storage key와 RPC/protobuf 정수 계약을 보존함. Unknown read는 miss이고 collision claim은 live graph 점유를 피하며, legacy 0 이상 record는 write-frozen read/delete bridge만 제공함. Distributed mapping과 `RECOMMEND`는 명시적으로 미지원 |
 | [#1](https://github.com/byoridb/byoridb/issues/1) | PR #54로 해결·이슈 닫힘 | Local 단일-field Boolean/정수 `LOOKUP` 비교가 stale-entry 재검증과 정확한 `OFFSET`/`LIMIT`을 포함한 bounded index range scan을 사용함. 미지원 key domain은 predicate-scan fallback을 유지하고 distributed ordered range는 fail-closed함 |
-| [#10](https://github.com/byoridb/byoridb/issues/10) | 엔진 범위 코드 해결·하네스 수용 검증 대기 | 1,000 VID `FETCH` 회귀 검증, destination projection 단일 deduplicated `batch_get`, `EXPLAIN`/`PROFILE`의 `GetVertices` 노출을 반영했으며 별도 LDBC 하네스의 Q9 전환과 `<10s` 측정은 남음 |
+| [#10](https://github.com/byoridb/byoridb/issues/10) | 엔진 범위 코드 해결·하네스 수용 이슈 열림 | 1,000 VID `FETCH` 회귀 검증, destination projection 단일 deduplicated `batch_get`, `EXPLAIN`/`PROFILE`의 `GetVertices` 노출을 반영했으며 별도 LDBC 하네스의 Q9 전환과 `<10s` 측정은 남음 |
 
 코드 해결 항목은 구현·검증 근거를 이슈에 남긴 뒤 닫고, 부분 해결/미해결 항목은
 남은 수용 기준이 통과할 때까지 유지한다.

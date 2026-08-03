@@ -1288,7 +1288,6 @@ impl Executor {
                         space.as_str(),
                         &tag_or_edge_name,
                         lookup_window,
-                        vid_type,
                     )
                     .await?
                 {
@@ -1518,7 +1517,6 @@ impl Executor {
                                     vids,
                                     lookup_window,
                                     candidate_cap_reached,
-                                    vid_type,
                                 )
                                 .await;
                         }
@@ -1867,7 +1865,6 @@ impl Executor {
         space: &str,
         tag: &str,
         lookup_window: LookupWindow,
-        vid_type: crate::vid::SpaceVidType,
     ) -> Result<Option<ExecutorResult>> {
         // String index encoding is length-prefixed and therefore not globally
         // lexical. Unsupported or cross-type boundaries return None and keep
@@ -1952,7 +1949,6 @@ impl Executor {
             vids,
             lookup_window,
             candidate_cap_reached,
-            vid_type,
         )
         .await
         .map(Some)
@@ -1966,8 +1962,8 @@ impl Executor {
         vids: Vec<i64>,
         lookup_window: LookupWindow,
         candidate_cap_reached: bool,
-        vid_type: crate::vid::SpaceVidType,
     ) -> Result<ExecutorResult> {
+        let vid_type = crate::vid::space_vid_type(&self.ctx, space).await?;
         let result_columns = vec![format!("{tag}.vid"), format!("{tag}.*")];
         if vids.is_empty() {
             return Ok(ExecutorResult {
