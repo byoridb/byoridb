@@ -1,8 +1,19 @@
 mod config;
 
 use crate::config::AppConfig;
+use anyhow::Context;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
+
+fn validate_root_password(value: Option<String>) -> anyhow::Result<String> {
+    match value {
+        Some(password) if !password.trim().is_empty() => Ok(password),
+        _ => anyhow::bail!(
+            "{} must be set to a non-blank value",
+            byoridb_graph::auth::ROOT_PASSWORD_ENV
+        ),
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -18,22 +29,15 @@ async fn main() -> anyhow::Result<()> {
     info!("Metrics initialized (Prometheus endpoint: /metrics)");
 
     // 2. Load Configuration
-    let config = AppConfig::load().expect("Failed to load configuration");
+    let config = AppConfig::load().context("Failed to load configuration")?;
     info!("Configuration loaded: {:?}", config);
 
     // A network server must never start with an unknown or logged bootstrap
     // credential. Embedded callers may choose their own AuthManager, but the
     // standalone process requires an explicit secret and fails before opening
     // listeners or storage when it is absent.
-    let root_password = std::env::var(byoridb_graph::auth::ROOT_PASSWORD_ENV)
-        .ok()
-        .filter(|password| !password.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} must be set to a non-empty value",
-                byoridb_graph::auth::ROOT_PASSWORD_ENV
-            )
-        })?;
+    let root_password =
+        validate_root_password(std::env::var(byoridb_graph::auth::ROOT_PASSWORD_ENV).ok())?;
 
     // 3. Create shutdown channel + shared readiness/drain state.
     // The gRPC and HTTP services both report in-flight queries into this
@@ -54,11 +58,9 @@ async fn main() -> anyhow::Result<()> {
         );
         let meta_config = byoridb_meta::MetaServerConfig {
             data_path: std::path::PathBuf::from("data/meta"),
-            grpc_addr: config
-                .cluster
-                .meta_addr
-                .parse()
-                .expect("Invalid cluster.meta_addr"),
+            grpc_addr: config.cluster.meta_addr.parse().with_context(|| {
+                format!("Invalid cluster.meta_addr: {}", config.cluster.meta_addr)
+            })?,
             http_addr: None,
             advertise_host: config
                 .cluster
@@ -78,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
         };
         let mut meta_server = byoridb_meta::MetaServer::with_config(meta_config)
             .await
-            .expect("Failed to initialize Meta server");
+            .context("Failed to initialize Meta server")?;
         let mut meta_shutdown_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             tokio::select! {
@@ -143,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
     // Get KVStore from storage server
     let kvstore = storage_server
         .env()
-        .expect("Storage server not started")
+        .context("Storage server did not expose its environment after startup")?
         .kvstore
         .clone();
 
@@ -153,10 +155,10 @@ async fn main() -> anyhow::Result<()> {
     let graph_service = std::sync::Arc::new(
         byoridb_graph::GraphService::with_auth(
             kvstore.clone(),
-            byoridb_graph::AuthManager::with_config(
+            byoridb_graph::AuthManager::try_with_config(
                 &root_password,
                 std::time::Duration::from_secs(byoridb_graph::auth::DEFAULT_SESSION_TTL_SECS),
-            ),
+            )?,
         )
         .with_shutdown_state(shutdown_state.clone()),
     );
@@ -281,13 +283,37 @@ async fn main() -> anyhow::Result<()> {
 async fn terminate_signal() {
     use tokio::signal::unix::{signal, SignalKind};
 
-    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
-
-    sigterm.recv().await;
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            sigterm.recv().await;
+        }
+        Err(error) => {
+            error!(err = %error, "Failed to register SIGTERM handler");
+            // A registration failure is not a termination request. Keep this
+            // branch pending so Ctrl+C remains available to stop the server.
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// On non-Unix platforms, this never completes
 #[cfg(not(unix))]
 async fn terminate_signal() {
     std::future::pending::<()>().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_root_password;
+
+    #[test]
+    fn root_password_is_required_and_must_not_be_blank() {
+        assert!(validate_root_password(None).is_err());
+        assert!(validate_root_password(Some(String::new())).is_err());
+        assert!(validate_root_password(Some(" \t\r\n".to_string())).is_err());
+        assert_eq!(
+            validate_root_password(Some(" configured-secret ".to_string())).unwrap(),
+            " configured-secret "
+        );
+    }
 }

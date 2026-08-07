@@ -106,8 +106,8 @@ impl Parser {
             }
             _ => {
                 return Err(ParseError::InvalidSyntax(format!(
-                    "DEFAULT value must be a literal, found {:?}",
-                    token
+                    "DEFAULT value must be a literal, found {}",
+                    Self::diagnostic_token(&token)
                 )))
             }
         };
@@ -169,8 +169,8 @@ impl Parser {
             }
             _ => {
                 return Err(ParseError::InvalidSyntax(format!(
-                    "Expected data type, found {:?}",
-                    token
+                    "Expected data type, found {}",
+                    Self::diagnostic_token(&token)
                 )))
             }
         })
@@ -522,8 +522,8 @@ impl Parser {
                     }
                 } else {
                     Err(ParseError::UnexpectedToken(format!(
-                        "Expected expression, found {:?}",
-                        token
+                        "Expected expression, found {}",
+                        Self::diagnostic_token(&token)
                     )))
                 }
             }

@@ -101,13 +101,13 @@ impl Parser {
                     }
                     other => {
                         return Err(ParseError::UnexpectedToken(format!(
-                            "Expected TAG or EDGE after SHOW CREATE, got {:?}",
-                            other
+                            "Expected TAG or EDGE after SHOW CREATE, got {}",
+                            Self::diagnostic_token(&other)
                         )))
                     }
                 }
             }
-            _ => return Err(ParseError::UnexpectedToken(format!("{:?}", token))),
+            _ => return Err(ParseError::UnexpectedToken(Self::diagnostic_token(&token))),
         };
 
         Ok(Statement::Show(stmt))
@@ -123,8 +123,8 @@ impl Parser {
             Token::Describe | Token::Desc => self.advance(),
             _ => {
                 return Err(ParseError::UnexpectedToken(format!(
-                    "Expected DESCRIBE or DESC, got {:?}",
-                    token
+                    "Expected DESCRIBE or DESC, got {}",
+                    Self::diagnostic_token(&token)
                 )))
             }
         }
@@ -167,8 +167,8 @@ impl Parser {
             }
             other => {
                 return Err(ParseError::UnexpectedToken(format!(
-                    "Expected TAG, EDGE, SPACE, or CLASS after DESCRIBE, got {:?}",
-                    other
+                    "Expected TAG, EDGE, SPACE, or CLASS after DESCRIBE, got {}",
+                    Self::diagnostic_token(&other)
                 )))
             }
         };
@@ -226,7 +226,7 @@ impl Parser {
             }
             Token::Index => self.parse_create_index(),
             Token::User => self.parse_create_user(),
-            _ => Err(ParseError::UnexpectedToken(format!("{:?}", token))),
+            _ => Err(ParseError::UnexpectedToken(Self::diagnostic_token(&token))),
         }
     }
 
@@ -321,8 +321,8 @@ impl Parser {
                 Ok(VidType::FixedString(len))
             }
             _ => Err(ParseError::UnexpectedToken(format!(
-                "Expected INT64 or FIXED_STRING, found {:?}",
-                token
+                "Expected INT64 or FIXED_STRING, found {}",
+                Self::diagnostic_token(&token)
             ))),
         }
     }
@@ -357,8 +357,8 @@ impl Parser {
                 Ok(PartitionStrategySpec::Range { boundaries })
             }
             _ => Err(ParseError::UnexpectedToken(format!(
-                "Expected HASH, RANGE, or MODULO, found {:?}",
-                token
+                "Expected HASH, RANGE, or MODULO, found {}",
+                Self::diagnostic_token(&token)
             ))),
         }
     }
@@ -600,7 +600,7 @@ impl Parser {
         match token {
             Token::Tag => self.parse_create_tag_index(),
             Token::Edge => self.parse_create_edge_index(),
-            _ => Err(ParseError::UnexpectedToken(format!("{:?}", token))),
+            _ => Err(ParseError::UnexpectedToken(Self::diagnostic_token(&token))),
         }
     }
 
@@ -713,8 +713,8 @@ impl Parser {
             Token::Edge => self.parse_alter_edge(),
             Token::User => self.parse_alter_user(),
             _ => Err(ParseError::UnexpectedToken(format!(
-                "Expected TAG, EDGE, or USER, found {:?}",
-                token
+                "Expected TAG, EDGE, or USER, found {}",
+                Self::diagnostic_token(&token)
             ))),
         }
     }
@@ -856,8 +856,8 @@ impl Parser {
             }
             _ => {
                 return Err(ParseError::InvalidSyntax(format!(
-                    "Expected ADD, DROP, or CHANGE after ALTER TAG/EDGE, got {:?}",
-                    op_token
+                    "Expected ADD, DROP, or CHANGE after ALTER TAG/EDGE, got {}",
+                    Self::diagnostic_token(&op_token)
                 )));
             }
         }
@@ -879,7 +879,7 @@ impl Parser {
             Token::Edge => self.parse_drop_edge(),
             Token::Index => self.parse_drop_index(),
             Token::User => self.parse_drop_user(),
-            _ => Err(ParseError::UnexpectedToken(format!("{:?}", token))),
+            _ => Err(ParseError::UnexpectedToken(Self::diagnostic_token(&token))),
         }
     }
 
@@ -934,7 +934,7 @@ impl Parser {
         match token {
             Token::Tag => self.parse_drop_tag_index(),
             Token::Edge => self.parse_drop_edge_index(),
-            _ => Err(ParseError::UnexpectedToken(format!("{:?}", token))),
+            _ => Err(ParseError::UnexpectedToken(Self::diagnostic_token(&token))),
         }
     }
 
@@ -1029,8 +1029,8 @@ impl Parser {
             }
             _ => {
                 return Err(ParseError::UnexpectedToken(format!(
-                    "Expected LEADER, DATA, STATUS, STOP, or RESET, found {:?}",
-                    token
+                    "Expected LEADER, DATA, STATUS, STOP, or RESET, found {}",
+                    Self::diagnostic_token(&token)
                 )))
             }
         };
