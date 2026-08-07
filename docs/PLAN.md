@@ -2,8 +2,7 @@
 
 > **English** | [한국어](PLAN.ko.md)
 >
-> Last code verification: 2026-08-03, against the integration of `main` at
-> `3f5f1a5` with PR #57.
+> Last code verification: 2026-08-08, against `main` at `9200800` with PR #65.
 > This document records code and repository state, not the live state of any
 > Kubernetes cluster.
 
@@ -54,13 +53,13 @@ multi-node launcher remains a roadmap item.
 | Static gates | `cargo fmt --all -- --check` and locked workspace Clippy with `-D warnings` |
 
 The full test, formatting, Clippy, dependency-audit, and release-build gates
-above passed on 2026-08-03. Avoid hard-coding a test count: it changes whenever
+above passed on 2026-08-08. Avoid hard-coding a test count: it changes whenever
 a regression test is added.
 
 ## Audited GitHub issue status
 
 Code state and GitHub issue state are tracked separately. The issue state below
-was checked on 2026-08-03; a code-complete branch does not imply that its issue
+was checked on 2026-08-08; a code-complete branch does not imply that its issue
 is closed:
 
 | Issue | Code status | Evidence or remaining work |
@@ -134,19 +133,25 @@ transaction time. Writes use the engine-assigned current time for both axes.
 
 The current single-process security model includes:
 
-- A non-empty `BYORIDB_ROOT_PASSWORD` requirement in the standalone server.
-- Generic authentication failures and dummy password verification for unknown
-  users to reduce account enumeration signals.
-- Rejection of malformed durable-user records with an empty username or
-  password hash during authentication-cache reconciliation.
+- A non-blank `BYORIDB_ROOT_PASSWORD` requirement in the standalone server.
+- Generic authentication failures and valid dummy Argon2 verification for
+  unknown, blank, disabled, or locked users to reduce account enumeration
+  signals.
+- Rejection of malformed durable-user records with a blank username or an
+  unsupported, incomplete, or out-of-policy Argon2id password hash before any
+  authentication-cache mutation.
 - Recursive authorization of compound statements and mutating `PROFILE`
   statements.
 - GOD/ADMIN-only user and role mutation, balance operations, and sensitive
   session/user listings.
 - Session invalidation after local password, role, enablement, or user changes.
 - Shared HTTP/gRPC authentication state and race-safe durable-user cache sync.
-- Redaction of password-bearing queries and bearer session IDs from diagnostics,
-  logs, and invalid-session responses.
+- Payload-free parser diagnostics for identifier, string, and numeric tokens,
+  including malformed credential statements split by comments, plus redaction
+  of password-bearing queries and bearer session IDs from diagnostics, logs,
+  and invalid-session responses.
+- Fallible entropy handling for bootstrap credentials, Argon2 salts, and
+  authentication session identifiers instead of startup or login panics.
 - Administrator authentication for the active-query diagnostics endpoint.
 
 See [SECURITY.md](../SECURITY.md) for the supported reporting channel and the
@@ -353,7 +358,13 @@ Changes to graph auth, sessions, HTTP/gRPC wiring, or user execution must cover:
 - invalid and blank credential behavior;
 - concurrent authentication, revocation, diagnostics, and sign-out.
 
-The focused integration suite is `tests/security_authz_test.rs`.
+The focused coverage is inline in the parser and graph crates; there is no
+standalone `tests/security_authz_test.rs`. Run:
+
+```bash
+cargo test --locked -p byoridb-parser --lib
+cargo test --locked -p byoridb-graph --lib -- --test-threads=1
+```
 
 ## Completed milestones
 
@@ -367,6 +378,7 @@ The focused integration suite is `tests/security_authz_test.rs`.
 | 2026-07-14 | Edge and wildcard-edge `AS OF` reads, including negative integer VIDs |
 | 2026-07-30 | Recursive RBAC, durable auth/cache reconciliation, session revocation, credential redaction, shared HTTP/gRPC auth state, root-secret hardening, and the config/tonic dependency migrations |
 | 2026-08-03 | Local bounded `LOOKUP` index range scans, Linux arm64 release artifacts, and standalone `FIXED_STRING` VID support on PR #57 |
+| 2026-08-08 | Non-blank credential enforcement, validated persisted Argon2id profiles, fallible authentication entropy, and payload-free parser diagnostics on PR #65 |
 
 ## Decision rules
 

@@ -2,14 +2,14 @@
 
 > [English](PLAN.md) | **한국어**
 >
-> **현재 코드 기준선:** 2026-08-03, `origin/main`의 `3f5f1a5`와 PR #57의
+> **현재 코드 기준선:** 2026-08-08, `origin/main`의 `9200800`과 PR #65의
 > 통합 결과. 아래 장문의 날짜별
 > 기록은 역사적 맥락으로 보존하며, 현재 상태 판단에는 이 기준선과 구현/테스트를
 > 우선한다.
 
-## GitHub 이슈 감사 상태 (2026-08-03)
+## GitHub 이슈 감사 상태 (2026-08-08)
 
-구현 상태와 GitHub 이슈 상태는 별개다. 아래 상태는 2026-08-03에 확인했으며,
+구현 상태와 GitHub 이슈 상태는 별개다. 아래 상태는 2026-08-08에 확인했으며,
 코드가 완료된 브랜치가 있다고 해서 이슈가 자동으로 닫힌 것은 아니다.
 
 | 이슈 | 현재 판정 | 근거 또는 남은 작업 |
@@ -1005,16 +1005,34 @@ Meta gRPC heartbeat에 인증 없음. 가짜 노드 클러스터 등록 가능.
 HTTP API에 쿼리 크기 제한 없음 (gRPC는 64MB 제한 있음).
 - `byoridb-graph/src/server.rs` — MAX_QUERY_LEN=1MiB, 초과 시 413 반환
 
-**S-19 [Critical~Medium, L] 인증 경계 재감사** ✅ 완료 (2026-07-27)
-- standalone launcher는 비어 있지 않은 `BYORIDB_ROOT_PASSWORD` 없이는 listener/storage를
+**S-19 [Critical~Medium, L] 인증 경계 재감사** ✅ 완료 (2026-08-08, PR #65 보강)
+- standalone launcher는 공백이 아닌 `BYORIDB_ROOT_PASSWORD` 없이는 listener/storage를
   시작하지 않고, HTTP/gRPC가 하나의 `GraphService`와 bearer/session 상태를 공유한다.
 - KV 사용자는 시작 시 hydration되고 CREATE/ALTER/DROP/GRANT/REVOKE 직후 live auth cache와
-  수렴한다. credential/role 변경은 기존 bearer를 폐기하되 동시 새 로그인은 보존한다.
+  수렴한다. 공백 username과 지원하지 않거나 불완전하거나 비용 정책을 벗어난 Argon2id
+  hash는 cache 변경 전에 거부한다. credential/role 변경은 기존 bearer를 폐기하되 동시
+  새 로그인은 보존한다.
 - compound 및 PROFILE 내부까지 RBAC를 재귀 검사하고, GOD는 built-in root 전용이다.
   사용자·role·session 열람과 diagnostics는 GOD/ADMIN에 한정하며 session ID/쿼리 원문을
   노출하지 않는다.
-- unknown/wrong/disabled/locked 로그인은 transport에서 같은 응답을 반환하고 Argon2 dummy
-  verify로 계산량을 맞춘다. auth/graph sliding TTL과 만료·고아 세션 정리도 함께 수렴한다.
+- unknown/blank/wrong/disabled/locked 로그인은 transport에서 같은 응답을 반환하고 유효한
+  Argon2 dummy verify로 계산량을 맞춘다. bootstrap credential, Argon2 salt, 인증 session ID의
+  entropy 오류는 panic 대신 오류로 반환한다. auth/graph sliding TTL과 만료·고아 세션 정리도
+  함께 수렴한다.
+- parser가 외부에 노출하는 identifier/string/number token 진단은 payload를 포함하지 않는다.
+  주석 안 semicolon으로 나뉜 malformed credential 문장도 HTTP/gRPC 응답에 secret을 반사하지
+  않는다.
+
+인증·인가 변경의 집중 회귀는 존재하지 않는 `tests/security_authz_test.rs`가 아니라 parser와
+graph crate의 inline suite다:
+
+```bash
+cargo test --locked -p byoridb-parser --lib
+cargo test --locked -p byoridb-graph --lib -- --test-threads=1
+```
+
+SEC-2는 아직 열려 있다. 계정/source별 throttling, Argon2 동시 실행 상한, blocking hash/verify의
+async worker 분리가 완료되기 전에는 외부 rate limit을 유지한다.
 
 ### A. 운영 도구 연동 (P1, 운영 시작 전 필수)
 
