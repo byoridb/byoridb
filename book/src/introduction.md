@@ -2,6 +2,10 @@
 
 [한국어](ko/introduction.html)
 
+<p align="center">
+  <img src="assets/byoridb-icon.png" alt="ByoriDB official icon" width="256">
+</p>
+
 ByoriDB is an ontology graph database written in Rust. It provides an
 nGQL-inspired query language, a persistent property graph, RDFS-Plus-style
 forward reasoning, recommendation primitives, and point-in-time reads for
