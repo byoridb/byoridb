@@ -101,7 +101,7 @@ redb = "4.1"
 tonic = { version = "0.14", features = ["gzip", "zstd"] }
 tonic-prost = "0.14"
 prost = "0.14"
-axum = "0.7"
+axum = "0.8"
 
 # Error handling
 anyhow = "1.0"
