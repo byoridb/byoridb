@@ -75,8 +75,8 @@ impl Parser {
             }
             other => {
                 return Err(ParseError::UnexpectedToken(format!(
-                "expected OVER, BY EMBEDDING, or BLEND after RECOMMEND SIMILAR TO <vid>, found {:?} at {}",
-                other,
+                "expected OVER, BY EMBEDDING, or BLEND after RECOMMEND SIMILAR TO <vid>, found {} at {}",
+                Self::diagnostic_token(&other),
                 self.err_location()
             )))
             }
@@ -640,8 +640,8 @@ impl Parser {
             }
             _ => {
                 return Err(ParseError::InvalidSyntax(format!(
-                    "Pattern property value must be a literal, found {:?}",
-                    token
+                    "Pattern property value must be a literal, found {}",
+                    Self::diagnostic_token(&token)
                 )))
             }
         };

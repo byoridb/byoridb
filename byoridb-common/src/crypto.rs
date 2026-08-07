@@ -11,11 +11,26 @@ use crate::Result;
 /// Hash a password using argon2 (cryptographically secure)
 pub fn hash_password(password: &str) -> Result<String> {
     use argon2::{
-        password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
+        password_hash::{
+            rand_core::{OsRng, RngCore},
+            PasswordHasher, SaltString,
+        },
         Argon2,
     };
 
-    let salt = SaltString::generate(&mut OsRng);
+    if password.trim().is_empty() {
+        return Err(crate::Error::BadData(
+            "Password must not be blank".to_string(),
+        ));
+    }
+
+    let mut salt_bytes = [0u8; 16];
+    OsRng.try_fill_bytes(&mut salt_bytes).map_err(|error| {
+        crate::Error::Internal(format!("Password salt generation failed: {error}"))
+    })?;
+    let salt = SaltString::encode_b64(&salt_bytes).map_err(|error| {
+        crate::Error::Internal(format!("Password salt encoding failed: {error}"))
+    })?;
     let argon2 = Argon2::default();
 
     argon2
@@ -66,5 +81,12 @@ mod tests {
         // But both should verify correctly
         assert!(verify_password(password, &hash1));
         assert!(verify_password(password, &hash2));
+    }
+
+    #[test]
+    fn test_blank_passwords_are_rejected() {
+        for password in ["", " ", "\t\r\n"] {
+            assert!(hash_password(password).is_err());
+        }
     }
 }

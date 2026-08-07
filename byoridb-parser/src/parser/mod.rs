@@ -142,8 +142,8 @@ impl Parser {
                     }
                     other => {
                         return Err(ParseError::UnexpectedToken(format!(
-                            "Expected TAG or EDGE after REBUILD, got {:?}",
-                            other
+                            "Expected TAG or EDGE after REBUILD, got {}",
+                            Self::diagnostic_token(&other)
                         )))
                     }
                 };
@@ -180,8 +180,8 @@ impl Parser {
                         Ok(Statement::CheckShape)
                     }
                     other => Err(ParseError::UnexpectedToken(format!(
-                        "Expected CONSISTENCY or SHAPE after CHECK, got {:?}",
-                        other
+                        "Expected CONSISTENCY or SHAPE after CHECK, got {}",
+                        Self::diagnostic_token(&other)
                     ))),
                 }
             }
@@ -209,7 +209,7 @@ impl Parser {
                     statement: Box::new(inner),
                 })
             }
-            _ => Err(ParseError::UnexpectedToken(format!("{:?}", token))),
+            _ => Err(ParseError::UnexpectedToken(Self::diagnostic_token(&token))),
         }
     }
 
@@ -241,6 +241,20 @@ impl Parser {
         false
     }
 
+    /// Render a token for an externally visible parser diagnostic without
+    /// retaining literal or identifier payloads. Those values may contain
+    /// credentials when a statement is malformed.
+    pub(crate) fn diagnostic_token(token: &Token) -> String {
+        match token {
+            Token::StringLiteral(_) => "StringLiteral".to_string(),
+            Token::SingleQuotedString(_) => "SingleQuotedString".to_string(),
+            Token::Integer(_) => "Integer".to_string(),
+            Token::FloatLiteral(_) => "FloatLiteral".to_string(),
+            Token::Identifier(_) => "Identifier".to_string(),
+            _ => format!("{token:?}"),
+        }
+    }
+
     /// Human-readable position of the current token, for error messages.
     pub(crate) fn err_location(&self) -> String {
         match self.tokens.get(self.pos) {
@@ -256,9 +270,9 @@ impl Parser {
                 return Ok(());
             }
             return Err(ParseError::UnexpectedToken(format!(
-                "expected {:?}, found {:?} at {}",
-                expected,
-                token,
+                "expected {}, found {} at {}",
+                Self::diagnostic_token(&expected),
+                Self::diagnostic_token(&token),
                 self.err_location()
             )));
         }
@@ -279,8 +293,8 @@ impl Parser {
                     Ok(keyword_str)
                 } else {
                     Err(ParseError::UnexpectedToken(format!(
-                        "identifier expected, found {:?} at {}",
-                        token,
+                        "identifier expected, found {} at {}",
+                        Self::diagnostic_token(&token),
                         self.err_location()
                     )))
                 }
@@ -362,8 +376,8 @@ impl Parser {
                 Ok(unquote(&s))
             }
             _ => Err(ParseError::UnexpectedToken(format!(
-                "String literal expected, found {:?}",
-                token
+                "String literal expected, found {}",
+                Self::diagnostic_token(&token)
             ))),
         }
     }
@@ -381,8 +395,8 @@ impl Parser {
                 Ok(n)
             }
             _ => Err(ParseError::UnexpectedToken(format!(
-                "Integer expected, found {:?}",
-                token
+                "Integer expected, found {}",
+                Self::diagnostic_token(&token)
             ))),
         }
     }
@@ -396,8 +410,8 @@ impl Parser {
             Token::FloatLiteral(f) => f,
             other => {
                 return Err(ParseError::UnexpectedToken(format!(
-                    "number expected, found {:?} at {}",
-                    other,
+                    "number expected, found {} at {}",
+                    Self::diagnostic_token(&other),
                     self.err_location()
                 )))
             }
@@ -449,4 +463,36 @@ pub(crate) fn unquote(s: &str) -> String {
 pub fn parse(input: &str) -> ParseResult {
     let mut parser = Parser::new(input);
     parser.parse()
+}
+
+#[cfg(test)]
+mod diagnostic_security_tests {
+    use super::parse;
+
+    #[test]
+    fn parse_errors_do_not_expose_token_payloads() {
+        const SENTINEL: &str = "supersecret123";
+        for query in [
+            "CREATE USER malformed WITH PASSWORD supersecret123",
+            "CREATE USER malformed WITH PASSWORD 'supersecret123'",
+            "CREATE USER malformed WITH PASSWORD 123456789",
+            "CREATE /* ; */ USER malformed WITH \"supersecret123\"",
+            "CREATE USER \"supersecret123\" WITH PASSWORD \"valid-shape\"",
+            "CREATE \"supersecret123\"",
+            "CREATE TAG t(value STRING DEFAULT supersecret123)",
+            "CREATE TAG t(value supersecret123)",
+            "ALTER TAG t supersecret123",
+            "MATCH (n:person {password: supersecret123}) RETURN n",
+        ] {
+            let message = parse(query).unwrap_err().to_string();
+            assert!(
+                !message.contains(SENTINEL),
+                "query: {query}; error: {message}"
+            );
+            assert!(
+                !message.contains("123456789"),
+                "query: {query}; error: {message}"
+            );
+        }
+    }
 }

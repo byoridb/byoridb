@@ -24,8 +24,8 @@ impl Parser {
             Token::Vertex => self.parse_insert_vertex(),
             Token::Edge => self.parse_insert_edge(),
             _ => Err(ParseError::UnexpectedToken(format!(
-                "Expected VERTEX or EDGE, found {:?}",
-                token
+                "Expected VERTEX or EDGE, found {}",
+                Self::diagnostic_token(&token)
             ))),
         }
     }
@@ -168,8 +168,8 @@ impl Parser {
             Token::Vertex => self.parse_update_vertex(),
             Token::Edge => self.parse_update_edge(),
             _ => Err(ParseError::UnexpectedToken(format!(
-                "Expected VERTEX or EDGE, found {:?}",
-                token
+                "Expected VERTEX or EDGE, found {}",
+                Self::diagnostic_token(&token)
             ))),
         }
     }
@@ -378,8 +378,8 @@ impl Parser {
                 }))
             }
             _ => Err(ParseError::UnexpectedToken(format!(
-                "Expected VERTEX or EDGE, found {:?}",
-                token
+                "Expected VERTEX or EDGE, found {}",
+                Self::diagnostic_token(&token)
             ))),
         }
     }
