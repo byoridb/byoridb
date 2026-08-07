@@ -2,6 +2,10 @@
 
 [English](../introduction.html) | **한국어**
 
+<p align="center">
+  <img src="assets/byoridb-icon.png" alt="ByoriDB official icon" width="256">
+</p>
+
 nGQL 호환 쿼리 언어, 온톨로지 추론(RDFS-Plus)과 bitemporal history를 갖춘 Rust
 그래프 데이터베이스입니다. 분산은 설계와 라이브러리에 반영되어 있으나 다중 노드
 launcher는 아직 로드맵 단계이며, 운영 경로는 단일 노드입니다.

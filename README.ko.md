@@ -2,6 +2,10 @@
 
 [English (기본)](README.md) | [한국어](README.ko.md)
 
+<p align="center">
+  <img src="book/src/assets/byoridb-icon.png" alt="ByoriDB official icon" width="256">
+</p>
+
 > Rust로 작성된 시맨틱 그래프 데이터베이스로, 온톨로지 추론, provenance,
 > 시점 이력 조회를 제공합니다.
 

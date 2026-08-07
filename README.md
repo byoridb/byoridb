@@ -2,6 +2,10 @@
 
 [English (default)](README.md) | [한국어](README.ko.md)
 
+<p align="center">
+  <img src="book/src/assets/byoridb-icon.png" alt="ByoriDB official icon" width="256">
+</p>
+
 > A semantic graph database written in Rust, with ontology inference,
 > provenance, and point-in-time history.
 
