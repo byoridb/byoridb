@@ -152,6 +152,9 @@ The current single-process security model includes:
   and invalid-session responses.
 - Fallible entropy handling for bootstrap credentials, Argon2 salts, and
   authentication session identifiers instead of startup or login panics.
+- Process-local 60-second login windows capped at 20 attempts per account and
+  60 per peer IP, with at most four concurrent Argon2 verifications executed
+  on Tokio's blocking pool.
 - Administrator authentication for the active-query diagnostics endpoint.
 
 See [SECURITY.md](../SECURITY.md) for the supported reporting channel and the
@@ -164,9 +167,10 @@ deployment controls that remain the operator's responsibility.
 1. **No native transport encryption.** Passwords and bearer sessions are exposed
    to interception on an untrusted network. Use a private network and a trusted
    TLS/mTLS proxy until native TLS exists.
-2. **No effective login rate limit.** Failed-attempt counters exist, but a correct
-   password is not blocked and parallel Argon2 verification can consume async
-   workers and CPU. Apply an external rate limit for exposed deployments.
+2. **Process-local login limits.** Account and direct-peer-IP windows plus an
+   Argon2 concurrency bound protect one process, but counters are not shared
+   across replicas and a proxy's address is treated as the source. Keep an
+   external trusted-proxy/cluster-wide limit for exposed deployments.
 3. **No space-scoped grants.** Built-in role permissions use `space="*"`, and
    public `GRANT`/`REVOKE` syntax assigns roles rather than per-space ACLs.
 4. **Broad `Write` semantics.** `INSERT`, `UPDATE`, and `DELETE` currently map to
@@ -242,7 +246,7 @@ This is still **partial**, not a supported multi-node deployment:
 | ID | Work | Exit criteria |
 |---|---|---|
 | SEC-1 | Native TLS/mTLS or a documented, tested TLS proxy profile | Credentials never cross an untrusted network in plaintext; rotation is documented and tested |
-| SEC-2 | Authentication load control | Per-source/account throttling, bounded Argon2 concurrency, and blocking work moved off async workers |
+| SEC-2 | ✅ Authentication load control | Per-account/direct-peer throttling, bounded Argon2 verification concurrency, and login verification moved to the blocking pool |
 | SEC-3 | Space-scoped authorization | Grant syntax, durable ACL model, enforcement tests for every statement and compound/profile nesting |
 | SEC-4 | Cluster-wide identity/session strategy | Revocation and authorization changes are consistent across supported server processes |
 | SEC-5 | Operational endpoint hardening | Metrics access policy and bearer-free sign-out API are explicit and tested |
@@ -379,6 +383,7 @@ cargo test --locked -p byoridb-graph --lib -- --test-threads=1
 | 2026-07-30 | Recursive RBAC, durable auth/cache reconciliation, session revocation, credential redaction, shared HTTP/gRPC auth state, root-secret hardening, and the config/tonic dependency migrations |
 | 2026-08-03 | Local bounded `LOOKUP` index range scans, Linux arm64 release artifacts, and standalone `FIXED_STRING` VID support on PR #57 |
 | 2026-08-08 | Non-blank credential enforcement, validated persisted Argon2id profiles, fallible authentication entropy, and payload-free parser diagnostics on PR #65 |
+| 2026-08-08 | Process-local account/IP login throttling and bounded blocking-pool Argon2 verification |
 
 ## Decision rules
 

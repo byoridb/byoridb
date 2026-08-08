@@ -70,11 +70,12 @@ impl GraphService for GrpcService {
         &self,
         request: Request<AuthenticateRequest>,
     ) -> Result<Response<AuthenticateResponse>, Status> {
+        let source = request.remote_addr().map(|address| address.ip());
         let req = request.into_inner();
 
         match self
             .internal_service
-            .authenticate(req.username, req.password)
+            .authenticate_from(req.username, req.password, source)
             .await
         {
             Ok(session_id) => Ok(Response::new(AuthenticateResponse {

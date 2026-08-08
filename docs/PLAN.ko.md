@@ -1031,8 +1031,10 @@ cargo test --locked -p byoridb-parser --lib
 cargo test --locked -p byoridb-graph --lib -- --test-threads=1
 ```
 
-SEC-2는 아직 열려 있다. 계정/source별 throttling, Argon2 동시 실행 상한, blocking hash/verify의
-async worker 분리가 완료되기 전에는 외부 rate limit을 유지한다.
+SEC-2의 단일 프로세스 경계는 완료됐다. 60초 window에서 계정별 20회, 직접 peer IP별 60회로
+제한하고 Argon2 검증은 최대 4개만 Tokio blocking pool에서 동시에 실행한다. 이 counter는
+replica 간 공유되지 않고 proxy 주소가 source로 보이므로, 외부 노출 환경에서는 trusted proxy의
+cluster-wide rate limit을 함께 유지한다.
 
 ### A. 운영 도구 연동 (P1, 운영 시작 전 필수)
 
