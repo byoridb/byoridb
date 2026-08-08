@@ -328,10 +328,24 @@ impl GraphService {
 
     /// Authenticate a user and create a session
     pub async fn authenticate(&self, username: String, password: String) -> Result<i64> {
+        self.authenticate_from(username, password, None).await
+    }
+
+    /// Authenticate with an optional transport peer address for source-based
+    /// throttling.
+    pub async fn authenticate_from(
+        &self,
+        username: String,
+        password: String,
+        source: Option<std::net::IpAddr>,
+    ) -> Result<i64> {
         info!("Authentication request received");
 
         // Use AuthManager for authentication
-        let session_id = self.auth_manager.authenticate(&username, &password).await?;
+        let session_id = self
+            .auth_manager
+            .authenticate_from(&username, &password, source)
+            .await?;
 
         // Also register in session manager for space tracking
         self.session_manager

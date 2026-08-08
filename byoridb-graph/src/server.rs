@@ -6,7 +6,7 @@
 
 use super::service::GraphService;
 use axum::{
-    extract::{Json, State},
+    extract::{ConnectInfo, Json, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
     Router,
@@ -168,7 +168,11 @@ impl HttpServer {
         let listener = tokio::net::TcpListener::bind(self.addr).await?;
         info!("HTTP server listening on {}", self.addr);
 
-        axum::serve(listener, app).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
 
         Ok(())
     }
@@ -306,12 +310,13 @@ async fn list_active_queries(
 
 /// Create a new session (authenticate)
 async fn create_session(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Json(payload): Json<CreateSessionRequest>,
 ) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
     match state
         .service
-        .authenticate(payload.username, payload.password)
+        .authenticate_from(payload.username, payload.password, Some(peer.ip()))
         .await
     {
         Ok(session_id) => {
@@ -685,6 +690,7 @@ mod tests {
         password: &str,
     ) -> (StatusCode, ErrorResponse) {
         match create_session(
+            ConnectInfo("127.0.0.1:12345".parse().unwrap()),
             State(state),
             Json(CreateSessionRequest {
                 username: username.to_string(),
