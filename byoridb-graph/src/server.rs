@@ -228,6 +228,32 @@ const SESSION_ID_HEADER: &str = "x-byoridb-session-id";
 
 type HttpApiError = (StatusCode, Json<ErrorResponse>);
 
+/// Classify a query failure into an HTTP status and a stable machine-readable
+/// code.
+///
+/// Clients must be able to tell "log in again" from "you may not do this" from
+/// "your query is wrong" without matching on error text. Collapsing the first
+/// two into `400 QUERY_ERROR` forced consumers to substring-match the message
+/// body, and a permission denial reads as an authentication problem
+/// (`Authentication failed: Permission denied: ...`), so such a client
+/// re-authenticates on a failure that re-authenticating cannot fix — spending a
+/// login attempt against the throttle each time.
+///
+/// Both `AuthFailed` cases reachable from the query path are authorization
+/// decisions ("GOD or ADMIN role required" and "Permission denied: requires
+/// ..."); a genuine session problem is already turned into `SessionNotFound`
+/// before this point. So `AuthFailed` is safe to report as `403`, and only `401`
+/// means a new session will help.
+fn query_error_status(error: &crate::error::GraphError) -> (StatusCode, &'static str) {
+    match error {
+        crate::error::GraphError::SessionNotFound(_) => {
+            (StatusCode::UNAUTHORIZED, "SESSION_EXPIRED")
+        }
+        crate::error::GraphError::AuthFailed(_) => (StatusCode::FORBIDDEN, "PERMISSION_DENIED"),
+        _ => (StatusCode::BAD_REQUEST, "QUERY_ERROR"),
+    }
+}
+
 fn sign_out_http_error(error: crate::error::GraphError) -> HttpApiError {
     match error {
         crate::error::GraphError::SessionNotFound(_) => (
@@ -415,11 +441,7 @@ async fn execute_query(
                 query_length_bytes = payload.query.len(),
                 "Query execution failed"
             );
-            let (status, code) = if matches!(e, crate::error::GraphError::SessionNotFound(_)) {
-                (StatusCode::UNAUTHORIZED, "SESSION_EXPIRED")
-            } else {
-                (StatusCode::BAD_REQUEST, "QUERY_ERROR")
-            };
+            let (status, code) = query_error_status(&e);
             Err((
                 status,
                 Json(ErrorResponse {
@@ -467,11 +489,7 @@ async fn execute_query_json(
             Ok(response.to_string())
         }
         Err(e) => {
-            let (status, code) = if matches!(e, crate::error::GraphError::SessionNotFound(_)) {
-                (StatusCode::UNAUTHORIZED, "SESSION_EXPIRED")
-            } else {
-                (StatusCode::BAD_REQUEST, "QUERY_ERROR")
-            };
+            let (status, code) = query_error_status(&e);
             let error_response = serde_json::json!({
                 "error": format!("Query execution failed: {}", e),
                 "code": code
@@ -925,5 +943,139 @@ mod tests {
         let grpc = GraphServer::with_service("127.0.0.1:9669".parse().unwrap(), service.clone());
         let http = HttpServer::with_service("127.0.0.1:19669".parse().unwrap(), service.clone());
         assert!(Arc::ptr_eq(&grpc.service, &http.service));
+    }
+
+    /// A permission denial must not look like a session problem. It previously
+    /// returned `400 QUERY_ERROR` with the text "Authentication failed:
+    /// Permission denied: ...", so a client that substring-matched the body for
+    /// "auth" re-authenticated on a failure a new session cannot fix.
+    #[tokio::test]
+    async fn permission_denial_is_403_permission_denied_not_a_session_error() {
+        let state = test_state(AuthManager::with_config(
+            "root-password",
+            Duration::from_secs(3600),
+        ));
+        let root = state
+            .service
+            .authenticate("root".to_string(), "root-password".to_string())
+            .await
+            .unwrap();
+
+        // A GUEST may read but not write.
+        let stmt = r#"CREATE USER reader WITH PASSWORD "reader-password" ROLE GUEST"#;
+        let _created = execute_query(
+            State(state.clone()),
+            Json(QueryRequest {
+                session_id: root,
+                query: stmt.to_string(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("setup statement failed: {stmt}: {e:?}"));
+
+        let reader = state
+            .service
+            .authenticate("reader".to_string(), "reader-password".to_string())
+            .await
+            .expect("reader should authenticate");
+
+        let (status, Json(error)) = match execute_query(
+            State(state.clone()),
+            Json(QueryRequest {
+                session_id: reader,
+                query: "CREATE SPACE forbidden_space".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a guest must not create a space"),
+        };
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a permission denial is 403, not 400 or 401"
+        );
+        assert_eq!(error.code, "PERMISSION_DENIED");
+        assert_ne!(
+            error.code, "SESSION_EXPIRED",
+            "a client must not be told to re-authenticate"
+        );
+
+        // The reader's session is still valid: the denial did not revoke it.
+        let _still_valid = execute_query(
+            State(state),
+            Json(QueryRequest {
+                session_id: reader,
+                query: "SHOW SPACES".to_string(),
+            }),
+        )
+        .await
+        .expect("a denied write must not invalidate the session");
+    }
+
+    /// An ordinary bad query stays `400 QUERY_ERROR`, so the three outcomes a
+    /// client has to distinguish map onto three distinct statuses.
+    #[tokio::test]
+    async fn a_malformed_query_is_400_query_error() {
+        let state = test_state(AuthManager::with_config(
+            "root-password",
+            Duration::from_secs(3600),
+        ));
+        let root = state
+            .service
+            .authenticate("root".to_string(), "root-password".to_string())
+            .await
+            .unwrap();
+
+        let (status, Json(error)) = match execute_query(
+            State(state),
+            Json(QueryRequest {
+                session_id: root,
+                query: "THIS IS NOT NGQL".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a malformed query must fail"),
+        };
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.code, "QUERY_ERROR");
+    }
+
+    /// The two query handlers classify identically; they used to carry
+    /// independent copies of the mapping.
+    #[test]
+    fn both_query_handlers_share_one_classification() {
+        use crate::error::GraphError;
+        for (error, expected_status, expected_code) in [
+            (
+                GraphError::SessionNotFound(1),
+                StatusCode::UNAUTHORIZED,
+                "SESSION_EXPIRED",
+            ),
+            (
+                GraphError::AuthFailed("Permission denied: requires Write".to_string()),
+                StatusCode::FORBIDDEN,
+                "PERMISSION_DENIED",
+            ),
+            (
+                GraphError::BadSyntax("nope".to_string()),
+                StatusCode::BAD_REQUEST,
+                "QUERY_ERROR",
+            ),
+            (
+                GraphError::ExecutionError("nope".to_string()),
+                StatusCode::BAD_REQUEST,
+                "QUERY_ERROR",
+            ),
+        ] {
+            let (status, code) = query_error_status(&error);
+            assert_eq!(status, expected_status, "status for {error:?}");
+            assert_eq!(code, expected_code, "code for {error:?}");
+        }
     }
 }
