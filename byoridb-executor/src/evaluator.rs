@@ -242,6 +242,13 @@ impl Evaluator {
                 (Value::Null(_), _) | (_, Value::Null(_)) => Ok(Value::null()),
                 _ => Ok(Value::Bool(true)),
             },
+
+            // Set membership
+            BinaryOperator::In => Ok(Self::eval_in(&left, &right)),
+            BinaryOperator::NotIn => Ok(match Self::eval_in(&left, &right) {
+                Value::Bool(found) => Value::Bool(!found),
+                other => other,
+            }),
             BinaryOperator::StartsWith => match (&left, &right) {
                 (Value::String(s), Value::String(pre)) => {
                     Ok(Value::Bool(s.starts_with(pre.as_str())))
@@ -515,6 +522,33 @@ impl Evaluator {
     }
 
     // Comparison helpers
+    /// `left IN right` under three-valued logic: a match wins over an unknown,
+    /// and an unknown wins over "not found". So `2 IN [1, NULL]` is NULL rather
+    /// than false, because the NULL element might have been a 2.
+    ///
+    /// A non-list right operand is `false` rather than an error, matching how
+    /// the string operators above treat a type mismatch.
+    fn eval_in(left: &Value, right: &Value) -> Value {
+        if matches!(left, Value::Null(_)) {
+            return Value::null();
+        }
+        let Value::List(list) = right else {
+            return Value::Bool(false);
+        };
+        let mut saw_null = false;
+        for item in &list.values {
+            if Self::values_equal(left, item) {
+                return Value::Bool(true);
+            }
+            saw_null |= matches!(item, Value::Null(_));
+        }
+        if saw_null {
+            Value::null()
+        } else {
+            Value::Bool(false)
+        }
+    }
+
     fn values_equal(left: &Value, right: &Value) -> bool {
         match (left, right) {
             (Value::Null(_), Value::Null(_)) => true,
@@ -719,5 +753,147 @@ mod tests {
             args: vec![Expression::Literal(Literal::Int(1))],
         };
         assert!(Evaluator::evaluate_with_context(&expr, &ctx).is_err());
+    }
+
+    /// `left <op> right` where both sides are literals or list literals.
+    fn eval_op(left: Literal, op: BinaryOperator, items: Vec<Literal>) -> Value {
+        let expr = Expression::BinaryOp {
+            op,
+            left: Box::new(Expression::Literal(left)),
+            right: Box::new(Expression::List(
+                items.into_iter().map(Expression::Literal).collect(),
+            )),
+        };
+        Evaluator::evaluate_with_context(&expr, &EvalContext::new()).unwrap()
+    }
+
+    #[test]
+    fn in_finds_a_matching_element() {
+        assert_eq!(
+            eval_op(
+                Literal::Int(2),
+                BinaryOperator::In,
+                vec![Literal::Int(1), Literal::Int(2)]
+            ),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn in_is_false_when_no_element_matches() {
+        assert_eq!(
+            eval_op(
+                Literal::Int(9),
+                BinaryOperator::In,
+                vec![Literal::Int(1), Literal::Int(2)]
+            ),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn in_an_empty_list_is_false() {
+        assert_eq!(
+            eval_op(Literal::Int(1), BinaryOperator::In, vec![]),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn in_compares_int_and_float_the_way_equality_does() {
+        assert_eq!(
+            eval_op(
+                Literal::Int(1),
+                BinaryOperator::In,
+                vec![Literal::Float(1.0)]
+            ),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn in_matches_strings() {
+        assert_eq!(
+            eval_op(
+                Literal::String("grace".into()),
+                BinaryOperator::In,
+                vec![
+                    Literal::String("ada".into()),
+                    Literal::String("grace".into())
+                ]
+            ),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn null_in_anything_is_unknown() {
+        assert!(matches!(
+            eval_op(Literal::Null, BinaryOperator::In, vec![Literal::Int(1)]),
+            Value::Null(_)
+        ));
+    }
+
+    #[test]
+    fn a_null_element_makes_a_miss_unknown_but_not_a_hit() {
+        // 2 IN [1, NULL] is unknown: the NULL might have been a 2.
+        assert!(matches!(
+            eval_op(
+                Literal::Int(2),
+                BinaryOperator::In,
+                vec![Literal::Int(1), Literal::Null]
+            ),
+            Value::Null(_)
+        ));
+        // 1 IN [1, NULL] is true regardless: a match outranks the unknown.
+        assert_eq!(
+            eval_op(
+                Literal::Int(1),
+                BinaryOperator::In,
+                vec![Literal::Int(1), Literal::Null]
+            ),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn not_in_negates_a_known_result_and_preserves_unknown() {
+        assert_eq!(
+            eval_op(
+                Literal::Int(9),
+                BinaryOperator::NotIn,
+                vec![Literal::Int(1)]
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_op(
+                Literal::Int(1),
+                BinaryOperator::NotIn,
+                vec![Literal::Int(1)]
+            ),
+            Value::Bool(false)
+        );
+        assert!(matches!(
+            eval_op(
+                Literal::Int(2),
+                BinaryOperator::NotIn,
+                vec![Literal::Int(1), Literal::Null]
+            ),
+            Value::Null(_)
+        ));
+    }
+
+    #[test]
+    fn in_a_non_list_is_false_like_other_type_mismatches() {
+        let expr = Expression::BinaryOp {
+            op: BinaryOperator::In,
+            left: Box::new(Expression::Literal(Literal::Int(1))),
+            right: Box::new(Expression::Literal(Literal::Int(1))),
+        };
+        assert_eq!(
+            Evaluator::evaluate_with_context(&expr, &EvalContext::new()).unwrap(),
+            Value::Bool(false)
+        );
     }
 }

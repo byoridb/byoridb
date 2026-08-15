@@ -1347,6 +1347,17 @@ impl MatchExecutor {
                 byoridb_common::Value::Bool(false)
             }
 
+            // List literal — the right operand of `IN`, and projectable on its
+            // own. Without this arm a list evaluated to NULL and every `IN`
+            // comparison silently failed.
+            Expression::List(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(Box::pin(self.eval_return_expr(item, bindings, space)).await);
+                }
+                byoridb_common::Value::List(byoridb_common::datatypes::list::List { values })
+            }
+
             _ => byoridb_common::Value::Null(byoridb_common::NullType::Null),
         }
     }
@@ -2454,6 +2465,21 @@ fn tag_prop_value(blob: &[u8], label: &str, prop: &str) -> byoridb_common::Value
     }
 }
 
+/// Whether `lv` equals any element of `rv`, which must be a list.
+///
+/// Element equality reuses `compare_values`' `Eq`, so `1 IN [1.0]` holds the
+/// same way `1 == 1.0` does. This path is two-valued like the rest of the MATCH
+/// filter — a NULL element is simply not a match, rather than making the whole
+/// comparison unknown as it does in the tri-valued evaluators.
+fn value_in_list(lv: &byoridb_common::Value, rv: &byoridb_common::Value) -> bool {
+    let byoridb_common::Value::List(list) = rv else {
+        return false;
+    };
+    list.values
+        .iter()
+        .any(|item| compare_values(lv, item, &BinaryOperator::Eq))
+}
+
 /// Compare two Values with a binary operator; returns bool.
 fn compare_values(
     lv: &byoridb_common::Value,
@@ -2470,6 +2496,14 @@ fn compare_values(
         (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
         _ => None,
     };
+    // Set membership takes the whole right operand as a list rather than an
+    // ordering, so it is resolved before the ord-based comparisons below.
+    match op {
+        BinaryOperator::In => return value_in_list(lv, rv),
+        BinaryOperator::NotIn => return !value_in_list(lv, rv),
+        _ => {}
+    }
+
     // String containment operators don't use ord
     if let (Value::String(s), Value::String(sub)) = (lv, rv) {
         match op {

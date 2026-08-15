@@ -1553,3 +1553,120 @@ fn test_parse_string_with_quotes_and_backslash() {
     assert!(parse(r#"INSERT VERTEX p(name) VALUES 1:("a\"b")"#).is_ok());
     assert!(parse(r#"INSERT VERTEX p(name) VALUES 1:("C:\\dir")"#).is_ok());
 }
+
+/// Extract the top-level WHERE expression from a MATCH statement.
+fn match_where(query: &str) -> Expression {
+    match parse(query).expect("query should parse") {
+        Statement::Match(m) => m.where_clause.expect("MATCH should carry a WHERE"),
+        other => panic!("expected MATCH, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_in_with_int_list() {
+    let expr = match_where("MATCH (a:person) WHERE id(a) IN [1, 2, 3] RETURN a");
+    match expr {
+        Expression::BinaryOp {
+            op: BinaryOperator::In,
+            right,
+            ..
+        } => match *right {
+            Expression::List(items) => assert_eq!(items.len(), 3),
+            other => panic!("expected a list on the right, got {other:?}"),
+        },
+        other => panic!("expected IN, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_in_with_string_list() {
+    let expr = match_where("MATCH (a:person) WHERE a.person.name IN ['ada', 'grace'] RETURN a");
+    assert!(matches!(
+        expr,
+        Expression::BinaryOp {
+            op: BinaryOperator::In,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn test_parse_in_with_empty_list() {
+    // An empty list is a valid always-false predicate, not a syntax error.
+    let expr = match_where("MATCH (a:person) WHERE id(a) IN [] RETURN a");
+    match expr {
+        Expression::BinaryOp {
+            op: BinaryOperator::In,
+            right,
+            ..
+        } => match *right {
+            Expression::List(items) => assert!(items.is_empty()),
+            other => panic!("expected a list, got {other:?}"),
+        },
+        other => panic!("expected IN, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_not_in() {
+    let expr = match_where("MATCH (a:person) WHERE id(a) NOT IN [1, 2] RETURN a");
+    assert!(
+        matches!(
+            expr,
+            Expression::BinaryOp {
+                op: BinaryOperator::NotIn,
+                ..
+            }
+        ),
+        "expected NOT IN, got {expr:?}"
+    );
+}
+
+#[test]
+fn test_parse_in_is_case_insensitive() {
+    for query in [
+        "MATCH (a:person) WHERE id(a) in [1] RETURN a",
+        "MATCH (a:person) WHERE id(a) In [1] RETURN a",
+        "MATCH (a:person) WHERE id(a) IN [1] RETURN a",
+    ] {
+        assert!(
+            matches!(
+                match_where(query),
+                Expression::BinaryOp {
+                    op: BinaryOperator::In,
+                    ..
+                }
+            ),
+            "IN should be case-insensitive: {query}"
+        );
+    }
+}
+
+#[test]
+fn test_in_keyword_does_not_shadow_longer_keywords() {
+    // `IN` is a prefix of several existing keywords; logos must still prefer the
+    // longest match or these statements would stop parsing.
+    for query in [
+        "INSERT VERTEX person(name) VALUES 1:('ada')",
+        "CREATE TAG INDEX idx ON person(name)",
+        "CREATE SPACE s(vid_type=FIXED_STRING(32))",
+    ] {
+        assert!(parse(query).is_ok(), "should still parse: {query}");
+    }
+}
+
+#[test]
+fn test_in_remains_usable_as_a_property_name() {
+    // Reserving a keyword must not take `in` away from users as an identifier.
+    let expr = match_where("MATCH (a:node) WHERE a.node.in == 1 RETURN a");
+    assert!(
+        matches!(
+            expr,
+            Expression::BinaryOp {
+                op: BinaryOperator::Eq,
+                ..
+            }
+        ),
+        "expected an equality on a property named `in`, got {expr:?}"
+    );
+}

@@ -317,6 +317,9 @@ impl Parser {
             Token::Classes => "classes",
             Token::Subclass => "subclass",
             Token::Of => "of",
+            // `IN` became a keyword for set membership; keep it usable as an
+            // ordinary property or alias name, as `edge`/`index`/`range` are.
+            Token::In => "in",
             Token::Weight => "weight",
             Token::Space => "space",
             Token::Spaces => "spaces",

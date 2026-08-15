@@ -88,6 +88,38 @@ predicate는 `==`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR` 등의 비교·boolea
 operator를 지원합니다. `MATCH`에서는 query guide에 설명된 실행 경로를 통해 `id`,
 `count`, `sum`, `avg`, `min`, `max` 등의 function과 aggregate를 사용할 수 있습니다.
 
+### 집합 멤버십
+
+`IN`과 `NOT IN`은 값을 list literal과 비교합니다. 등가 비교를 `OR`로 이어붙인
+것의 축약형입니다:
+
+```ngql
+MATCH (p:person) WHERE id(p) IN [1, 2, 3] RETURN p;
+MATCH (p:person) WHERE p.person.name NOT IN ['ada', 'grace'] RETURN p;
+LOOKUP ON person WHERE person.name IN ['ada', 'grace'] YIELD person.name;
+```
+
+우변은 list literal이어야 합니다. 의미는 다음과 같습니다:
+
+- 빈 list는 아무것도 매칭하지 않으므로 `x IN []`는 false, `x NOT IN []`는 true입니다.
+- `NULL IN <list>`는 unknown이고, list에 `NULL` 원소가 있으면 매칭 실패가 false가
+  아니라 unknown이 됩니다. 즉 `2 IN [1, NULL]`은 unknown이지만, `1 IN [1, NULL]`은
+  매칭이 unknown보다 우선하므로 여전히 true입니다.
+- `WHERE` 절은 unknown을 매칭 실패로 처리하므로, 해당 행은 오류가 아니라 필터로
+  제외됩니다.
+- 우변이 list가 아니면 오류가 아니라 false입니다. 문자열 operator가 타입 불일치를
+  처리하는 방식과 같습니다.
+
+`IN`은 index 기반 lookup이 아닙니다. filter로 평가되므로 행에 도달하는 방식은
+바꾸지 않고 결과만 좁힙니다.
+
+`LOOKUP`은 값을 엄격하게 비교하고 `MATCH`는 숫자를 타입 간에 비교합니다. 따라서
+`p.person.age IN [36.0]`은 `MATCH`에서는 정수 `36`과 매칭되지만 `LOOKUP`에서는
+매칭되지 않습니다. 이 비대칭은 `IN` 이전부터 있던 것이고 `==`에도 동일하게
+적용됩니다.
+
+`in`은 일반 속성명이나 alias로 계속 사용할 수 있습니다.
+
 mutation assignment 값은 query expression보다 제한적입니다. 특히 현재
 `UPDATE VERTEX ... SET` planning은 `score = score + 1` 같은 arithmetic expression이
 아니라 literal과 list 값을 처리합니다.

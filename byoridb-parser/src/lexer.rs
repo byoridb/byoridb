@@ -160,6 +160,12 @@ pub enum Token {
     Indexes,
     #[token("CONTAINS", ignore(case))]
     Contains,
+    // Set membership: `x IN [a, b]`. Longer keywords starting with the same two
+    // letters (INSERT, INDEX, INVERSE, INT64, ...) still win, because logos
+    // prefers the longest match; `in` as a bare property name is preserved by
+    // `keyword_to_string`.
+    #[token("IN", ignore(case))]
+    In,
     #[token("STARTS", ignore(case))]
     Starts,
     #[token("ENDS", ignore(case))]
