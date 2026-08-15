@@ -6,7 +6,22 @@ The standalone server reads built-in defaults, then an optional `byoridb.toml`
 in its working directory, then `BYORIDB__...` environment variables. Environment
 variables use double underscores to separate configuration keys.
 
-The server does not currently expose command-line flags for these settings.
+The server does not expose command-line flags for these settings. It accepts
+only `--version` and `--help`, and rejects anything else:
+
+```bash
+$ byoridb-server --version
+byoridb-server 0.3.3 (commit 9200800a1b2c, release)
+
+$ byoridb-server --help    # lists every key and environment variable below
+```
+
+`--version` reports the commit the binary was built from, which is how a
+deployed artifact is identified while there is no maintained semver release
+line. A build made from a modified working tree is marked `-dirty`, and a build
+made outside a git checkout reports `unknown`. Both flags exit without reading
+credentials, opening storage, or binding a listener, so they are safe to run
+against an installed binary at any time.
 
 ## Minimal local configuration
 

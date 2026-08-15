@@ -3,8 +3,24 @@
 [English](../../getting-started/configuration.html) | **한국어**
 
 standalone server는 built-in default, working directory의 선택적 `byoridb.toml`,
-`BYORIDB__...` 환경변수 순서로 설정을 읽습니다. 현재 server 설정용 명령줄 flag는
-없습니다. CLI 연결 설정에는 아래 명령줄 옵션을 사용할 수 있습니다.
+`BYORIDB__...` 환경변수 순서로 설정을 읽습니다. server 설정용 명령줄 flag는
+없습니다. server는 `--version`과 `--help`만 받고, 그 외 인자는 거부합니다:
+
+```bash
+$ byoridb-server --version
+byoridb-server 0.3.3 (commit 9200800a1b2c, release)
+
+$ byoridb-server --help    # 아래의 모든 key와 환경변수를 출력합니다
+```
+
+`--version`은 해당 binary가 어느 commit에서 build되었는지 보고합니다. 유지되는
+semver release line이 아직 없으므로, 배포된 artifact는 이 값으로 식별합니다.
+수정된 working tree에서 build한 경우 `-dirty`가 붙고, git checkout 밖에서
+build한 경우 `unknown`으로 보고합니다. 두 flag 모두 credential을 읽거나 storage를
+열거나 listener를 bind하지 않고 종료하므로, 설치된 binary에 언제든 안전하게
+실행할 수 있습니다.
+
+CLI 연결 설정에는 아래 명령줄 옵션을 사용할 수 있습니다.
 
 ## CLI 옵션
 

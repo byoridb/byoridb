@@ -2,8 +2,60 @@ mod config;
 
 use crate::config::AppConfig;
 use anyhow::Context;
+use clap::Parser;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
+
+/// Crate version, the commit it was built from, and the build profile. Both
+/// extra values come from `build.rs`; the SHA is what identifies a deployed
+/// artifact, since there is no maintained semver release line yet.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (commit ",
+    env!("BYORIDB_GIT_SHA"),
+    ", ",
+    env!("BYORIDB_BUILD_PROFILE"),
+    ")"
+);
+
+/// Shown after the generated usage. The server takes no options of its own —
+/// every knob is a config file key or an environment variable — so `--help` is
+/// only useful if it names them.
+const CONFIG_HELP: &str = "\
+Configuration is read from `byoridb.toml` (optional), then from environment
+variables, which take precedence. Section keys use a double underscore:
+
+  BYORIDB__SERVER__GRAPH_ADDR       gRPC listen address          [0.0.0.0:9669]
+  BYORIDB__SERVER__HTTP_ADDR        HTTP listen address          [0.0.0.0:19669]
+  BYORIDB__SERVER__STORAGE_ADDR     storage RPC listen address   [0.0.0.0:44500]
+  BYORIDB__STORAGE__DATA_PATHS      comma-separated data dirs    [data/storage]
+  BYORIDB__CLUSTER__PEERS           comma-separated meta peers   [empty]
+  BYORIDB__CLUSTER__NODE_ID         raft node id                 [1]
+  BYORIDB__CLUSTER__META_ADDR       meta gRPC listen address     [0.0.0.0:9559]
+  BYORIDB__CLUSTER__ADVERTISE_ADDR  advertised meta address      [127.0.0.1:9559]
+
+Other environment variables:
+
+  BYORIDB_ROOT_PASSWORD  required; the server refuses to start without a
+                         non-blank value
+  BYORIDB_CACHE_SIZE_MB  redb page cache size                            [256]
+  BYORIDB_DURABILITY     none|relaxed|eventual drops the per-commit fsync for
+                         bulk loading; anything else keeps immediate durability
+  BYORIDB_MAX_MEMORY_MB  per-query result-memory cap                    [1024]
+  BYORIDB_MAX_SCAN_LIMIT per-scan row cap                            [100_000]
+  RUST_LOG               tracing filter
+
+Leaving BYORIDB__CLUSTER__PEERS empty selects single-node mode, which is the
+only supported deployment. See docs/PLAN.md before configuring peers.";
+
+#[derive(Parser)]
+#[command(
+    name = "byoridb-server",
+    version = VERSION,
+    about = "ByoriDB standalone server (gRPC + HTTP)",
+    after_help = CONFIG_HELP
+)]
+struct Cli {}
 
 fn validate_root_password(value: Option<String>) -> anyhow::Result<String> {
     match value {
@@ -17,6 +69,12 @@ fn validate_root_password(value: Option<String>) -> anyhow::Result<String> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 0. Parse arguments before anything observable happens. `--version` and
+    // `--help` must answer without initializing logging, resolving credentials,
+    // opening storage, or binding a listener, and an unrecognized flag must fail
+    // instead of silently starting a server against default configuration.
+    Cli::parse();
+
     // 1. Initialize Logging
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
