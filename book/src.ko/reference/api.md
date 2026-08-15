@@ -188,10 +188,26 @@ byoridb_query_total{space="default",type="show"} 12
 
 HTTP API는 상태 코드와 문자열 `code`를 함께 반환합니다. 인증/인가 경로의 주요 값은
 `AUTH_FAILED`, `AUTH_REQUIRED`, `FORBIDDEN`, `SESSION_EXPIRED`이고, query 길이 제한은
-`/api/v1/query`에서 `QUERY_TOO_LARGE`, 그 밖의 query 실패는 `QUERY_ERROR`입니다.
-`/api/v1/query`와 `/api/v1/query/json`에서 session이 없거나 만료되면 HTTP 401과
-`SESSION_EXPIRED`를 반환합니다.
-`/api/v1/query/json`의 길이 제한 응답은 현재 structured `code` 없이 plain string입니다.
+`/api/v1/query`에서 query 문자열이 1 MiB를 넘으면 HTTP 413과 `QUERY_TOO_LARGE`입니다.
+query 실패는 다음 세 부류로 갈라지며, client는 status만으로 다음 행동을 결정할 수
+있습니다:
+
+| Status | Code | 조건 | client가 할 일 |
+|---:|---|---|---|
+| `401` | `SESSION_EXPIRED` | session이 없거나 만료됨 | 재인증 후 `USE`로 space 재선택 |
+| `403` | `PERMISSION_DENIED` | 인증은 됐지만 해당 role로는 실행 불가 | 재인증해도 해결되지 않음 |
+| `400` | `QUERY_ERROR` | parse·planning·execution 실패 | 같은 문장을 재시도해도 실패 |
+
+`401`은 session이 사라진 경우입니다. 새 session에는 space가 선택되어 있지 않으므로
+재인증 후 `USE`를 다시 실행해야 합니다. `403`에서는 session이 그대로 유효하며,
+재인증은 도움이 되지 않고 login throttle 시도만 소모합니다.
+
+인가 실패는 이전에 `Authentication failed:`로 시작하는 본문과 함께 `400`
+`QUERY_ERROR`로 반환되었습니다. client가 error text로 분류해서는 안 되는 이유입니다.
+error text는 안정적인 machine interface가 아니므로 status와 code를 사용하세요.
+
+`/api/v1/query/json`도 같은 status와 code를 반환하지만, 길이 제한 응답만은 현재
+structured `code` 없이 plain string입니다.
 NebulaGraph의 음수 error code 전체를 구현한 것으로 가정하면 안 됩니다.
 
 ## 데이터 타입

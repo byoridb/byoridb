@@ -196,15 +196,30 @@ Common JSON error responses from the session and `/api/v1/query` routes are:
 
 | Route | Status | Code | Condition |
 |---|---:|---|---|
-| `/api/v1/query` | `400` | `QUERY_ERROR` | Parse, authorization, or execution failure |
+| `/api/v1/query` | `400` | `QUERY_ERROR` | Parse, planning, or execution failure |
 | `/api/v1/session` | `401` | `AUTH_FAILED` | Session creation failed |
 | `/api/v1/query` | `401` | `SESSION_EXPIRED` | Query session is missing or expired |
+| `/api/v1/query` | `403` | `PERMISSION_DENIED` | Authenticated, but the role may not run this statement |
 | `/api/v1/query` | `413` | `QUERY_TOO_LARGE` | Query string exceeds 1 MiB |
 
-`/api/v1/query/json` puts `QUERY_ERROR` or `SESSION_EXPIRED` in its raw JSON
-text for the corresponding failures, but its HTTP 413 response is a plain
-string without a `QUERY_TOO_LARGE` code. Error text is not a stable machine
-interface; use the status and a code where that route provides one.
+The three failure classes are deliberately distinct, so a client can decide what
+to do from the status alone:
+
+- **`401`** — the session is gone. Authenticate again, then re-select the space
+  with `USE`, because a new session starts with none selected.
+- **`403`** — the session is valid and stays valid. Re-authenticating cannot help
+  and only spends an attempt against the login throttle.
+- **`400`** — the statement itself is wrong. Retrying it unchanged will fail
+  again.
+
+Authorization failures previously reported `400` `QUERY_ERROR` with text
+beginning `Authentication failed:`, which is why clients should never classify on
+error text. Error text is not a stable machine interface; use the status and the
+code.
+
+`/api/v1/query/json` returns the same statuses and codes in its raw JSON text,
+except that its HTTP 413 response is a plain string without a `QUERY_TOO_LARGE`
+code.
 
 ### Sign out
 
