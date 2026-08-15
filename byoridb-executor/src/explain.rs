@@ -857,6 +857,8 @@ fn binop_str(op: &BinaryOperator) -> &'static str {
         BinaryOperator::Mod => "%",
         BinaryOperator::Contains => "CONTAINS",
         BinaryOperator::NotContains => "NOT CONTAINS",
+        BinaryOperator::In => "IN",
+        BinaryOperator::NotIn => "NOT IN",
         BinaryOperator::StartsWith => "STARTS WITH",
         BinaryOperator::EndsWith => "ENDS WITH",
         BinaryOperator::Regex => "=~",

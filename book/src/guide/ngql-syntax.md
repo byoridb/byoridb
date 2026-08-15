@@ -91,6 +91,37 @@ Predicates support comparison and boolean operators such as `==`, `!=`, `<`,
 including `id`, `count`, `sum`, `avg`, `min`, and `max` in the execution paths
 described in the query guide.
 
+### Set membership
+
+`IN` and `NOT IN` test a value against a list literal, which is the compact form
+of an `OR` chain over equality:
+
+```ngql
+MATCH (p:person) WHERE id(p) IN [1, 2, 3] RETURN p;
+MATCH (p:person) WHERE p.person.name NOT IN ['ada', 'grace'] RETURN p;
+LOOKUP ON person WHERE person.name IN ['ada', 'grace'] YIELD person.name;
+```
+
+The right operand must be a list literal. Semantics:
+
+- An empty list matches nothing, so `x IN []` is false and `x NOT IN []` is true.
+- `NULL IN <list>` is unknown, and a `NULL` element makes a non-match unknown
+  rather than false: `2 IN [1, NULL]` is unknown, while `1 IN [1, NULL]` is
+  still true because a match outranks an unknown.
+- A `WHERE` clause treats unknown as not matching, so an unknown row is filtered
+  out rather than raising an error.
+- A right operand that is not a list is false rather than an error, the same way
+  the string operators treat a type mismatch.
+
+`IN` is not an index-driven lookup. It is evaluated as a filter, so it narrows
+results without changing how the rows are reached.
+
+Note that `LOOKUP` compares values strictly, while `MATCH` compares numbers
+across types. So `p.person.age IN [36.0]` matches an integer `36` under `MATCH`
+but not under `LOOKUP`. That asymmetry predates `IN` and applies to `==` as well.
+
+`in` remains usable as an ordinary property or alias name.
+
 Mutation assignment values are more restricted than query expressions. In
 particular, `UPDATE VERTEX ... SET` currently plans literal and list values, not
 arithmetic expressions such as `score = score + 1`.

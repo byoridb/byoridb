@@ -1723,6 +1723,25 @@ impl Executor {
                         RangeOperator::LessThanOrEqual => FilterExpr::le(field, value),
                     })
                 }
+                // `field IN [a, b]` maps onto the existing InList variant, which
+                // the pushdown filter already evaluates. An empty list is a
+                // legitimate always-false predicate, not a missing one.
+                BinaryOperator::In | BinaryOperator::NotIn => {
+                    let field = Self::field_name_of(left)?;
+                    let Expression::List(items) = right.as_ref() else {
+                        return None;
+                    };
+                    let values = items
+                        .iter()
+                        .map(Self::expr_to_value)
+                        .collect::<Option<Vec<_>>>()?;
+                    let filter = FilterExpr::in_list(field, values);
+                    Some(if matches!(op, BinaryOperator::NotIn) {
+                        filter.not()
+                    } else {
+                        filter
+                    })
+                }
                 BinaryOperator::And => {
                     let left_filter = self.expr_to_filter_expr(left.as_ref())?;
                     let right_filter = self.expr_to_filter_expr(right.as_ref())?;

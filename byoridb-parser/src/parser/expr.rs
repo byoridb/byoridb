@@ -255,6 +255,7 @@ impl Parser {
             Token::Gte => Some(BinaryOperator::Gte),
             Token::RegexMatch => Some(BinaryOperator::Regex),
             Token::Contains => Some(BinaryOperator::Contains),
+            Token::In => Some(BinaryOperator::In),
             _ => None,
         };
 
@@ -268,20 +269,25 @@ impl Parser {
             });
         }
 
-        // Multi-token operators: NOT CONTAINS, STARTS WITH, ENDS WITH
+        // Multi-token operators: NOT CONTAINS, NOT IN, STARTS WITH, ENDS WITH
         match self.peek_token()? {
             Token::Not => {
                 self.advance();
-                if matches!(self.peek_token(), Ok(Token::Contains)) {
+                let negated = match self.peek_token() {
+                    Ok(Token::Contains) => Some(BinaryOperator::NotContains),
+                    Ok(Token::In) => Some(BinaryOperator::NotIn),
+                    _ => None,
+                };
+                if let Some(op) = negated {
                     self.advance();
                     let right = self.parse_additive_expression()?;
                     return Ok(Expression::BinaryOp {
-                        op: BinaryOperator::NotContains,
+                        op,
                         left: Box::new(left),
                         right: Box::new(right),
                     });
                 }
-                // NOT alone without CONTAINS — backtrack is not possible; return left
+                // NOT alone without CONTAINS/IN — backtrack is not possible; return left
             }
             Token::Starts => {
                 self.advance();

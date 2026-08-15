@@ -403,6 +403,10 @@ pub enum BinaryOperator {
     Contains,
     /// `NOT CONTAINS` negative substring check
     NotContains,
+    /// `IN` set membership against a list on the right
+    In,
+    /// `NOT IN` negative set membership
+    NotIn,
     /// `STARTS WITH`
     StartsWith,
     /// `ENDS WITH`

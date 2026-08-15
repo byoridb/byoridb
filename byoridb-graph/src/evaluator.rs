@@ -240,6 +240,13 @@ impl Evaluator {
                 (Value::Null(_), _) | (_, Value::Null(_)) => Ok(Value::null()),
                 _ => Ok(Value::Bool(true)),
             },
+
+            // Set membership
+            BinaryOperator::In => Ok(Self::eval_in(&left, &right)),
+            BinaryOperator::NotIn => Ok(match Self::eval_in(&left, &right) {
+                Value::Bool(found) => Value::Bool(!found),
+                other => other,
+            }),
             BinaryOperator::StartsWith => match (&left, &right) {
                 (Value::String(s), Value::String(pre)) => {
                     Ok(Value::Bool(s.starts_with(pre.as_str())))
@@ -491,6 +498,33 @@ impl Evaluator {
     }
 
     // Comparison helpers
+    /// `left IN right` under three-valued logic: a match wins over an unknown,
+    /// and an unknown wins over "not found". So `2 IN [1, NULL]` is NULL rather
+    /// than false, because the NULL element might have been a 2.
+    ///
+    /// A non-list right operand is `false` rather than an error, matching how
+    /// the string operators above treat a type mismatch.
+    fn eval_in(left: &Value, right: &Value) -> Value {
+        if matches!(left, Value::Null(_)) {
+            return Value::null();
+        }
+        let Value::List(list) = right else {
+            return Value::Bool(false);
+        };
+        let mut saw_null = false;
+        for item in &list.values {
+            if Self::values_equal(left, item) {
+                return Value::Bool(true);
+            }
+            saw_null |= matches!(item, Value::Null(_));
+        }
+        if saw_null {
+            Value::null()
+        } else {
+            Value::Bool(false)
+        }
+    }
+
     fn values_equal(left: &Value, right: &Value) -> bool {
         match (left, right) {
             (Value::Null(_), Value::Null(_)) => true,

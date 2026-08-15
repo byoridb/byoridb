@@ -2395,3 +2395,158 @@ async fn test_sameas_merges_nodes_and_blocks_deletion() {
 
     service.sign_out(session_id, session_id).await.unwrap();
 }
+
+/// `IN` must select exactly the rows an equivalent OR chain selects. That
+/// equivalence is the whole point of the operator: callers previously had to
+/// build the OR chain themselves, one term per seed VID.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_in_matches_the_equivalent_or_chain() {
+    let (service, _temp_dir) = create_test_service();
+
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE in_operator_test").await;
+    execute(&service, session_id, "USE in_operator_test").await;
+    execute(
+        &service,
+        session_id,
+        "CREATE TAG person(name STRING, age INT64)",
+    )
+    .await;
+    for (vid, name, age) in [
+        (1, "Ada", 36),
+        (2, "Grace", 45),
+        (3, "Alan", 41),
+        (4, "Edsger", 72),
+    ] {
+        execute(
+            &service,
+            session_id,
+            &format!("INSERT VERTEX person(name, age) VALUES {vid}:('{name}', {age})"),
+        )
+        .await;
+    }
+
+    let ids_via_in = execute(
+        &service,
+        session_id,
+        "MATCH (p:person) WHERE id(p) IN [1, 3] RETURN id(p) AS vid",
+    )
+    .await;
+    let ids_via_or = execute(
+        &service,
+        session_id,
+        "MATCH (p:person) WHERE id(p) == 1 OR id(p) == 3 RETURN id(p) AS vid",
+    )
+    .await;
+
+    let sorted = |data: &byoridb_common::DataSet| {
+        let mut vids: Vec<i64> = data
+            .rows
+            .iter()
+            .filter_map(|row| {
+                row.iter().find_map(|v| match v {
+                    Value::Int(i) => Some(*i),
+                    _ => None,
+                })
+            })
+            .collect();
+        vids.sort_unstable();
+        vids
+    };
+
+    assert_eq!(
+        sorted(&ids_via_in),
+        vec![1, 3],
+        "IN should select exactly the listed vertices"
+    );
+    assert_eq!(
+        sorted(&ids_via_in),
+        sorted(&ids_via_or),
+        "IN must agree with the equivalent OR chain"
+    );
+
+    // NOT IN is the complement over the same population.
+    let ids_via_not_in = execute(
+        &service,
+        session_id,
+        "MATCH (p:person) WHERE id(p) NOT IN [1, 3] RETURN id(p) AS vid",
+    )
+    .await;
+    assert_eq!(
+        sorted(&ids_via_not_in),
+        vec![2, 4],
+        "NOT IN should select the complement"
+    );
+
+    // An empty list matches nothing rather than erroring or matching everything.
+    let ids_via_empty = execute(
+        &service,
+        session_id,
+        "MATCH (p:person) WHERE id(p) IN [] RETURN id(p) AS vid",
+    )
+    .await;
+    assert_eq!(
+        ids_via_empty.row_count(),
+        0,
+        "IN [] should match nothing, got {:?}",
+        ids_via_empty.rows
+    );
+
+    // String property lists work the same way.
+    let by_name = execute(
+        &service,
+        session_id,
+        "MATCH (p:person) WHERE p.person.name IN ['Ada', 'Alan'] RETURN id(p) AS vid",
+    )
+    .await;
+    assert_eq!(
+        sorted(&by_name),
+        vec![1, 3],
+        "IN should filter on a string property"
+    );
+
+    service.sign_out(session_id, session_id).await.unwrap();
+}
+
+/// LOOKUP pushes its predicate down to the storage filter, which previously
+/// rejected `IN` outright (fail-closed) rather than returning unfiltered rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_lookup_supports_in_predicate() {
+    let (service, _temp_dir) = create_test_service();
+
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE in_lookup_test").await;
+    execute(&service, session_id, "USE in_lookup_test").await;
+    execute(&service, session_id, "CREATE TAG person(name STRING)").await;
+    for (vid, name) in [(1, "Ada"), (2, "Grace"), (3, "Alan")] {
+        execute(
+            &service,
+            session_id,
+            &format!("INSERT VERTEX person(name) VALUES {vid}:('{name}')"),
+        )
+        .await;
+    }
+
+    let found = execute(
+        &service,
+        session_id,
+        "LOOKUP ON person WHERE person.name IN ['Ada', 'Alan'] YIELD person.name AS name",
+    )
+    .await;
+    assert_eq!(
+        found.row_count(),
+        2,
+        "LOOKUP should accept an IN predicate, got {:?}",
+        found.rows
+    );
+
+    service.sign_out(session_id, session_id).await.unwrap();
+}
