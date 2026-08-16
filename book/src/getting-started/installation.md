@@ -18,9 +18,26 @@ Windows is not currently supported. ByoriDB uses the pure-Rust `redb` storage
 engine, so RocksDB and a C++ RocksDB toolchain are not required.
 
 The release workflow builds Linux arm64 natively on GitHub's arm64 runner.
-macOS archives are not currently code-signed or notarized, so Gatekeeper may
-warn or refuse to launch them. The project does not document an officially
-supported Gatekeeper bypass; build the desired tag from source instead.
+
+Every macOS binary in a new tagged archive — `byoridb-server`, `byoridb-cli`,
+and `byoridb-backup` — is signed with a Developer ID Application certificate
+under the hardened runtime and submitted to Apple for notarization. The release
+fails rather than publishing if notarization returns anything other than
+`Accepted`. You can confirm what you downloaded:
+
+```bash
+codesign --verify --strict --verbose=2 byoridb-server
+codesign --display --verbose=2 byoridb-server | grep '^Authority'
+```
+
+The notarization ticket is **not stapled** to these binaries. `xcrun stapler`
+writes tickets only into `.app`, `.dmg`, and `.pkg` containers, not into a bare
+executable inside a tarball, so Gatekeeper resolves the ticket from Apple over
+the network on first launch. On a machine with no outbound network access that
+lookup cannot happen and Gatekeeper may still refuse; build from source there.
+
+**v0.3.3 and earlier archives are unsigned and unnotarized.** They are not
+re-signed retroactively.
 
 The release workflow includes `LICENSE` and `NOTICES.md` at the root of every
 new tagged archive and verifies both files before publishing it. Published
