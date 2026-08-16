@@ -6,7 +6,9 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+// `name` is set explicitly: without it clap reports CARGO_PKG_NAME, so
+// `byoridb-cli --version` announced itself as "byoridb-client".
+#[command(name = "byoridb-cli", version, about, long_about = None)]
 struct Args {
     /// Server address
     #[arg(short, long, default_value = "127.0.0.1:9669")]

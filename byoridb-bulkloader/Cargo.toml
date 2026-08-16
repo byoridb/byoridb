@@ -1,6 +1,6 @@
 [package]
 name = "byoridb-bulkloader"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Offline bulk loader: writes vertices/edges directly into the redb store, bypassing nGQL/HTTP"
 license = "Apache-2.0"
