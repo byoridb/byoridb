@@ -186,6 +186,38 @@ byoridb_query_total{space="default",type="show"} 12
 | Execute / ExecuteJson | 1 | parse/planning/execution 등 query 오류 |
 | Execute / ExecuteJson | 2 | session이 없거나 만료됨 |
 
+### 읽기 전용 요청
+
+두 query route 모두 선택적 `read_only` flag를 받습니다. gRPC `ExecuteRequest`에도
+같은 field가 있습니다.
+
+```bash
+curl -sS http://127.0.0.1:19669/api/v1/query \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id": "1234", "query": "MATCH (p:person) RETURN p LIMIT 10", "read_only": true}'
+```
+
+읽기 전용 요청은 실행될 모든 절이 읽기가 아니면 `403 PERMISSION_DENIED`로 거부됩니다.
+`SHOW USERS`, `SHOW ROLES`, `SHOW SESSIONS`는 읽기 권한만 필요하지만 관리 문장이므로
+함께 거부됩니다.
+
+이 flag는 **직접 작성하지 않은 문장** — 최종 사용자가 넣거나 모델이 생성한 문장 — 을
+쓰기 권한이 있는 session으로 실행하면서도 그 문장에 session의 권한을 주지 않기 위한
+것입니다. server가 compound와 `PROFILE`을 펼친 뒤 절 단위로 인가하므로, 호출자가
+안전을 위해 세미콜론·주석·pipeline을 금지할 필요가 없습니다:
+
+- `SHOW SPACES; DELETE VERTEX 1`은 읽기로 시작하더라도 거부됩니다.
+- `PROFILE INSERT ...`는 `PROFILE`이 내부 문장을 실행하므로 거부됩니다. 일반
+  `EXPLAIN`은 실행하지 않으므로 허용됩니다.
+- `SHOW SPACES; SHOW TAGS`는 모든 절이 읽기이므로 허용됩니다.
+
+flag는 **요청 하나만** 제약하고 흔적을 남기지 않습니다. 같은 session은 다음 요청에서
+쓸 수 있습니다. 생략하면 기존 동작과 동일합니다.
+
+**tenant나 credential 경계가 아닙니다.** built-in role은 모든 space에 적용되므로,
+읽기 전용 요청도 해당 session이 읽을 수 있는 모든 space를 읽습니다. 권한 모델이 무엇을
+격리하고 무엇을 격리하지 않는지는 [보안](../operations/security.md)을 참고하세요.
+
 HTTP API는 상태 코드와 문자열 `code`를 함께 반환합니다. 인증/인가 경로의 주요 값은
 `AUTH_FAILED`, `AUTH_REQUIRED`, `FORBIDDEN`, `SESSION_EXPIRED`이고, query 길이 제한은
 `/api/v1/query`에서 query 문자열이 1 MiB를 넘으면 HTTP 413과 `QUERY_TOO_LARGE`입니다.

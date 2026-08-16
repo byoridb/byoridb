@@ -412,7 +412,13 @@ async fn execute_query(
 
     match state
         .service
-        .execute(payload.session_id, payload.query.clone())
+        .execute_with_options(
+            payload.session_id,
+            payload.query.clone(),
+            crate::service::QueryOptions {
+                read_only: payload.read_only,
+            },
+        )
         .await
     {
         Ok(dataset) => {
@@ -472,7 +478,13 @@ async fn execute_query_json(
 
     match state
         .service
-        .execute(payload.session_id, payload.query.clone())
+        .execute_with_options(
+            payload.session_id,
+            payload.query.clone(),
+            crate::service::QueryOptions {
+                read_only: payload.read_only,
+            },
+        )
         .await
     {
         Ok(dataset) => {
@@ -637,6 +649,10 @@ struct QueryRequest {
     #[serde(deserialize_with = "id_str::deserialize")]
     session_id: i64,
     query: String,
+    /// Refuse the request unless every clause is a read. Absent means false, so
+    /// existing clients are unaffected.
+    #[serde(default)]
+    read_only: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -807,6 +823,7 @@ mod tests {
             Json(QueryRequest {
                 session_id: json_session,
                 query: "SHOW SPACES".to_string(),
+                read_only: false,
             }),
         )
         .await
@@ -828,6 +845,7 @@ mod tests {
             Json(QueryRequest {
                 session_id: raw_session,
                 query: "SHOW SPACES".to_string(),
+                read_only: false,
             }),
         )
         .await
@@ -968,6 +986,7 @@ mod tests {
             Json(QueryRequest {
                 session_id: root,
                 query: stmt.to_string(),
+                read_only: false,
             }),
         )
         .await
@@ -984,6 +1003,7 @@ mod tests {
             Json(QueryRequest {
                 session_id: reader,
                 query: "CREATE SPACE forbidden_space".to_string(),
+                read_only: false,
             }),
         )
         .await
@@ -1009,6 +1029,7 @@ mod tests {
             Json(QueryRequest {
                 session_id: reader,
                 query: "SHOW SPACES".to_string(),
+                read_only: false,
             }),
         )
         .await
@@ -1034,6 +1055,7 @@ mod tests {
             Json(QueryRequest {
                 session_id: root,
                 query: "THIS IS NOT NGQL".to_string(),
+                read_only: false,
             }),
         )
         .await
@@ -1077,5 +1099,68 @@ mod tests {
             assert_eq!(status, expected_status, "status for {error:?}");
             assert_eq!(code, expected_code, "code for {error:?}");
         }
+    }
+
+    /// The HTTP contract: a read-only request that would mutate is refused with
+    /// 403 PERMISSION_DENIED, so a client can distinguish it from a session
+    /// problem (401) and from a bad statement (400) without reading error text.
+    #[tokio::test]
+    async fn read_only_request_is_refused_with_403_over_http() {
+        let state = test_state(AuthManager::with_config(
+            "root-password",
+            Duration::from_secs(3600),
+        ));
+        let session = state
+            .service
+            .authenticate("root".to_string(), "root-password".to_string())
+            .await
+            .unwrap();
+
+        let (status, Json(error)) = match execute_query(
+            State(state.clone()),
+            Json(QueryRequest {
+                session_id: session,
+                query: "CREATE SPACE http_read_only_probe".to_string(),
+                read_only: true,
+            }),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a read-only request must not create a space"),
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(error.code, "PERMISSION_DENIED");
+
+        // Same statement, same session, flag off: allowed. The refusal is a
+        // property of the request, not of the caller.
+        let _created = execute_query(
+            State(state),
+            Json(QueryRequest {
+                session_id: session,
+                query: "CREATE SPACE http_read_only_probe".to_string(),
+                read_only: false,
+            }),
+        )
+        .await
+        .expect("the same session must still be able to write");
+    }
+
+    /// `read_only` is absent from existing clients' payloads and must default to
+    /// off, so adding the field cannot change what they could already do.
+    #[test]
+    fn read_only_defaults_to_false_when_absent_from_the_payload() {
+        let payload: QueryRequest =
+            serde_json::from_str(r#"{"session_id": 7, "query": "SHOW SPACES"}"#).unwrap();
+        assert_eq!(payload.session_id, 7);
+        assert!(
+            !payload.read_only,
+            "an absent read_only must not silently constrain an existing client"
+        );
+
+        let explicit: QueryRequest =
+            serde_json::from_str(r#"{"session_id": 7, "query": "SHOW SPACES", "read_only": true}"#)
+                .unwrap();
+        assert!(explicit.read_only);
     }
 }

@@ -122,9 +122,31 @@ impl Client {
     /// callers walk rows / columns / typed values directly instead of
     /// re-parsing JSON.
     pub async fn execute_raw(&mut self, stmt: &str) -> Result<graph_proto::ExecuteResponse> {
+        self.execute_raw_with(stmt, false).await
+    }
+
+    /// Execute a statement this caller did not author, under the server's
+    /// read-only guarantee.
+    ///
+    /// The server refuses the request unless every clause it would execute is a
+    /// read, and refuses administrative statements. Use this for a statement
+    /// that came from an end user or a model, instead of trying to classify it
+    /// here: the parser that decides is the server's.
+    ///
+    /// The constraint applies to this request only. The session stays writable.
+    pub async fn execute_read_only(&mut self, stmt: &str) -> Result<graph_proto::ExecuteResponse> {
+        self.execute_raw_with(stmt, true).await
+    }
+
+    async fn execute_raw_with(
+        &mut self,
+        stmt: &str,
+        read_only: bool,
+    ) -> Result<graph_proto::ExecuteResponse> {
         let request = tonic::Request::new(ExecuteRequest {
             session_id: self.session_id,
             statement: stmt.to_string(),
+            read_only,
         });
         let response = self.client.execute(request).await?.into_inner();
         if response.error_code != 0 {
@@ -137,6 +159,7 @@ impl Client {
         let request = tonic::Request::new(ExecuteRequest {
             session_id: self.session_id,
             statement: stmt.to_string(),
+            read_only: false,
         });
 
         let response = self.client.execute_json(request).await?.into_inner();

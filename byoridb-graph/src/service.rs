@@ -71,6 +71,31 @@ impl Drop for ActiveQueryGuard {
 pub const DEFAULT_SESSION_CLEANUP_INTERVAL_SECS: u64 = 60;
 
 /// Graph service
+/// Caller-supplied constraints on a single query request.
+///
+/// Defaults to today's behavior, so an unset field never changes what a caller
+/// could already do.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueryOptions {
+    /// Refuse the request unless every clause it will execute is a read.
+    ///
+    /// This is a constraint on one request, not a property of the session or of
+    /// the credential. It exists so a caller can pass an untrusted or
+    /// model-generated statement through a writable session and still be sure it
+    /// cannot mutate anything, without reimplementing statement classification
+    /// outside the parser.
+    ///
+    /// Administrative statements are refused as well. `SHOW USERS`,
+    /// `SHOW ROLES`, and `SHOW SESSIONS` only require `Permission::Read`, so
+    /// without that clause an administrator's read-only request would still
+    /// enumerate users and live sessions — a surprising thing to inherit when the
+    /// point of the flag is to sandbox a statement you did not write.
+    ///
+    /// It is not a tenant boundary. Built-in roles apply to every space, so a
+    /// read-only request can still read any space the session could read.
+    pub read_only: bool,
+}
+
 pub struct GraphService {
     session_manager: Arc<SessionManager>,
     auth_manager: Arc<AuthManager>,
@@ -404,8 +429,25 @@ impl GraphService {
         }
     }
 
-    /// Execute a query statement
+    /// Execute a query statement.
     pub async fn execute(&self, session_id: i64, stmt: String) -> Result<DataSet> {
+        self.execute_with_options(session_id, stmt, QueryOptions::default())
+            .await
+    }
+
+    /// Execute a query statement under caller-supplied constraints.
+    ///
+    /// [`QueryOptions::read_only`] lets a caller run an untrusted or
+    /// model-generated statement over a session that genuinely has write
+    /// permission, without granting that statement the session's authority. It
+    /// constrains one request and leaves no residue: the next request on the
+    /// same session may write.
+    pub async fn execute_with_options(
+        &self,
+        session_id: i64,
+        stmt: String,
+        options: QueryOptions,
+    ) -> Result<DataSet> {
         // Graceful shutdown: once the signal handler flips readiness off, new
         // queries fail fast and clearly; queries already past this gate drain
         // to completion before the servers stop.
@@ -434,6 +476,32 @@ impl GraphService {
                 GraphError::ParseError(error.to_string())
             }
         })?;
+
+        // A read-only request is refused before the role checks below, so the
+        // caller learns the flag rejected the statement rather than that their
+        // role was insufficient — their role may well have been sufficient.
+        //
+        // `required_permissions` has already expanded compound statements and
+        // PROFILE recursively, and every statement maps to exactly one
+        // permission of which only `Read` is a read. So this single check covers
+        // `PROFILE INSERT ...` and `SHOW SPACES; DELETE VERTEX 1` too, and a
+        // caller does not have to ban semicolons or comments to stay safe.
+        if options.read_only {
+            if Self::is_admin_only_statement(&statement) {
+                return Err(GraphError::AuthFailed(
+                    "read-only request may not run an administrative statement".to_string(),
+                ));
+            }
+            if let Some(required) = Self::required_permissions(&statement)
+                .into_iter()
+                .find(|permission| *permission != crate::auth::Permission::Read)
+            {
+                return Err(GraphError::AuthFailed(format!(
+                    "read-only request may not run a statement requiring {:?}",
+                    required
+                )));
+            }
+        }
 
         // Administrative statements must be checked at the service boundary as
         // well as in executors so compound/profile statements cannot bypass
@@ -791,7 +859,21 @@ impl GraphService {
 
     /// Execute a query and return JSON result
     pub async fn execute_json(&self, session_id: i64, stmt: String) -> Result<String> {
-        let dataset = self.execute(session_id, stmt).await?;
+        self.execute_json_with_options(session_id, stmt, QueryOptions::default())
+            .await
+    }
+
+    /// [`Self::execute_json`] under caller-supplied constraints. The JSON path
+    /// must honor [`QueryOptions`] too: a silently ignored `read_only` would be
+    /// worse than one that does not exist, because a caller would believe a
+    /// guarantee it never got.
+    pub async fn execute_json_with_options(
+        &self,
+        session_id: i64,
+        stmt: String,
+        options: QueryOptions,
+    ) -> Result<String> {
+        let dataset = self.execute_with_options(session_id, stmt, options).await?;
         serde_json::to_string(&dataset).map_err(|e| GraphError::ExecutionError(e.to_string()))
     }
 }
@@ -1602,5 +1684,166 @@ mod tests {
             "INSERT VERTEX person(email) VALUES 1:(\"private@example.com\")".to_string(),
         );
         assert_eq!(GraphService::error_kind(&private), "parse_error");
+    }
+
+    /// A read-only request must refuse every mutating shape, including the two
+    /// that a client-side keyword scrubber has the most trouble with: a mutation
+    /// hidden behind a read in a compound statement, and one wrapped in PROFILE
+    /// (which executes its inner statement, unlike plain EXPLAIN).
+    #[tokio::test]
+    async fn read_only_request_refuses_mutations_including_compound_and_profile() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        let session = service
+            .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
+            .await
+            .unwrap();
+
+        for stmt in [
+            "CREATE SPACE ro_probe",
+            "INSERT VERTEX person(name) VALUES 1:('ada')",
+            r#"UPDATE VERTEX ON person 1 SET name = "grace""#,
+            "DELETE VERTEX 1",
+            "DROP SPACE ro_probe",
+            "CREATE TAG person(name STRING)",
+            // A read first, so a scrubber keying on the leading token passes it.
+            "SHOW SPACES; DELETE VERTEX 1",
+            // PROFILE executes the inner statement.
+            "PROFILE INSERT VERTEX person(name) VALUES 1:('ada')",
+        ] {
+            let error = service
+                .execute_with_options(session, stmt.to_string(), QueryOptions { read_only: true })
+                .await
+                .expect_err(&format!("read-only must refuse: {stmt}"));
+            assert!(
+                matches!(error, GraphError::AuthFailed(_)),
+                "read-only refusal should be an authorization failure for {stmt}, got {error:?}"
+            );
+        }
+    }
+
+    /// Administrative statements require only `Permission::Read`, so without an
+    /// explicit clause a root read-only request would still enumerate users and
+    /// live sessions.
+    #[tokio::test]
+    async fn read_only_request_refuses_administrative_reads() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        let session = service
+            .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
+            .await
+            .unwrap();
+
+        for stmt in ["SHOW USERS", "SHOW ROLES", "SHOW SESSIONS"] {
+            let error = service
+                .execute_with_options(session, stmt.to_string(), QueryOptions { read_only: true })
+                .await
+                .expect_err(&format!("read-only must refuse administrative {stmt}"));
+            assert!(
+                matches!(error, GraphError::AuthFailed(_)),
+                "{stmt}: {error:?}"
+            );
+        }
+
+        // The same statements still work without the flag, so the refusal comes
+        // from the request constraint and not from the session's authority.
+        service
+            .execute(session, "SHOW USERS".to_string())
+            .await
+            .expect("root should be able to list users on an unconstrained request");
+    }
+
+    /// Reads must still work, and the flag must leave no residue: the very next
+    /// request on the same session writes. A byori coordinator reads and writes
+    /// over one connection and cannot afford a sticky downgrade.
+    #[tokio::test]
+    async fn read_only_permits_reads_and_leaves_the_session_writable() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        let session = service
+            .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
+            .await
+            .unwrap();
+
+        for stmt in [
+            "CREATE SPACE ro_ok",
+            "USE ro_ok",
+            "CREATE TAG p(name STRING)",
+        ] {
+            service.execute(session, stmt.to_string()).await.unwrap();
+        }
+
+        for stmt in [
+            "SHOW SPACES",
+            "MATCH (n:p) RETURN n LIMIT 1",
+            "LOOKUP ON p WHERE p.name == 'ada'",
+            // Read-only compound statements are fine; a caller no longer has to
+            // ban semicolons to stay safe.
+            "SHOW SPACES; SHOW TAGS",
+            // Plain EXPLAIN does not execute its inner statement.
+            "EXPLAIN INSERT VERTEX p(name) VALUES 1:('ada')",
+        ] {
+            service
+                .execute_with_options(session, stmt.to_string(), QueryOptions { read_only: true })
+                .await
+                .unwrap_or_else(|e| panic!("read-only should permit {stmt}: {e:?}"));
+        }
+
+        // No residue.
+        service
+            .execute(
+                session,
+                "INSERT VERTEX p(name) VALUES 1:('ada')".to_string(),
+            )
+            .await
+            .expect("the session must still be writable after a read-only request");
+    }
+
+    /// The JSON entry point must honor the flag too. A silently ignored
+    /// `read_only` is worse than none: the caller believes a guarantee it never
+    /// received.
+    #[tokio::test]
+    async fn read_only_is_enforced_on_the_json_entry_point() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        let session = service
+            .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
+            .await
+            .unwrap();
+
+        let error = service
+            .execute_json_with_options(
+                session,
+                "CREATE SPACE ro_json".to_string(),
+                QueryOptions { read_only: true },
+            )
+            .await
+            .expect_err("the JSON path must refuse a mutation under read_only");
+        assert!(matches!(error, GraphError::AuthFailed(_)), "{error:?}");
+
+        service
+            .execute_json_with_options(
+                session,
+                "SHOW SPACES".to_string(),
+                QueryOptions { read_only: true },
+            )
+            .await
+            .expect("the JSON path must still allow reads");
+    }
+
+    /// Default options are exactly today's behavior.
+    #[tokio::test]
+    async fn default_options_do_not_constrain_anything() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        let session = service
+            .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
+            .await
+            .unwrap();
+
+        assert!(!QueryOptions::default().read_only);
+        service
+            .execute_with_options(
+                session,
+                "CREATE SPACE ro_default".to_string(),
+                QueryOptions::default(),
+            )
+            .await
+            .expect("an unconstrained request must behave as before");
     }
 }
