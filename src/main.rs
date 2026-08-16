@@ -6,17 +6,9 @@ use clap::Parser;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
-/// Crate version, the commit it was built from, and the build profile. Both
-/// extra values come from `build.rs`; the SHA is what identifies a deployed
-/// artifact, since there is no maintained semver release line yet.
-const VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (commit ",
-    env!("BYORIDB_GIT_SHA"),
-    ", ",
-    env!("BYORIDB_BUILD_PROFILE"),
-    ")"
-);
+#[path = "version.rs"]
+mod version;
+use version::VERSION;
 
 /// Shown after the generated usage. The server takes no options of its own —
 /// every knob is a config file key or an environment variable — so `--help` is

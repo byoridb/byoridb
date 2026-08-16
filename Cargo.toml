@@ -1,6 +1,6 @@
 [package]
 name = "byoridb"
-version = "0.3.3"
+version.workspace = true
 edition = "2021"
 authors = ["ByoriDB Contributors"]
 description = "A fast, durable ontology graph database built in Rust (nGQL-compatible, RDFS-Plus reasoning; distribution on the roadmap)"
@@ -53,6 +53,13 @@ tempfile = "3.10"
 # which turns this on; embedded/default builds keep it off so the distributed
 # test is configured out instead of failing to compile.
 distributed = ["byoridb-executor/distributed", "byoridb-storage/distributed"]
+
+# One version for every crate in the workspace, so `byoridb-server --version`
+# and `byoridb-cli --version` cannot disagree about which release they came
+# from. Members were pinned at 0.1.0 while the root package moved to 0.3.3,
+# which meant a v0.3.3 archive shipped a CLI that called itself 0.1.0.
+[workspace.package]
+version = "0.4.0"
 
 [workspace]
 members = [

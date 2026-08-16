@@ -31,12 +31,16 @@
 use anyhow::{Context, Result};
 use byoridb_kvstore::{format_bytes, format_timestamp, BackupManager, BackupOptions};
 use clap::{Parser, Subcommand};
+
+#[path = "version.rs"]
+mod version;
 use std::path::PathBuf;
+use version::VERSION;
 
 #[derive(Parser)]
 #[command(name = "byoridb-backup")]
 #[command(author = "ByoriDB")]
-#[command(version = "0.1.0")]
+#[command(version = VERSION)]
 #[command(about = "ByoriDB Backup and Restore Tool", long_about = None)]
 struct Cli {
     #[command(subcommand)]
