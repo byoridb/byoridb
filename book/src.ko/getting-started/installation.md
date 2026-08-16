@@ -15,10 +15,26 @@ release에는 artifact가 소급 추가되지 않습니다. 저장소가 Rust 1.
 Windows는 현재 지원하지 않습니다. ByoriDB의 저장소 엔진은 순수 Rust 기반
 `redb`이므로 RocksDB나 RocksDB용 C++ 툴체인은 필요하지 않습니다.
 
-Release workflow는 GitHub arm64 runner에서 Linux arm64를 native build합니다. macOS
-archive는 아직 code signing이나 notarization을 거치지 않으므로 Gatekeeper가 경고하거나
-실행을 거부할 수 있습니다. 프로젝트는 공식적인 Gatekeeper 우회 방법을 안내하지
-않으므로 필요한 tag를 source에서 build하세요.
+Release workflow는 GitHub arm64 runner에서 Linux arm64를 native build합니다.
+
+새 tag archive의 macOS binary — `byoridb-server`, `byoridb-cli`,
+`byoridb-backup` — 는 모두 Developer ID Application 인증서로 hardened runtime
+아래에서 signing되고 Apple notarization에 제출됩니다. notarization이 `Accepted`가
+아니면 release는 게시되지 않고 실패합니다. 내려받은 파일은 다음으로 확인할 수 있습니다:
+
+```bash
+codesign --verify --strict --verbose=2 byoridb-server
+codesign --display --verbose=2 byoridb-server | grep '^Authority'
+```
+
+notarization ticket은 이 binary에 **staple되지 않습니다.** `xcrun stapler`는
+`.app`, `.dmg`, `.pkg` container에만 ticket을 기록하고 tarball 안의 단독 실행 파일에는
+기록하지 못하므로, Gatekeeper가 첫 실행 시 Apple에서 네트워크로 ticket을 조회합니다.
+외부 네트워크가 없는 머신에서는 이 조회가 불가능해 Gatekeeper가 여전히 실행을 거부할
+수 있습니다. 그런 환경에서는 source에서 build하세요.
+
+**v0.3.3 이하 archive는 signing과 notarization을 거치지 않았습니다.** 소급해서
+다시 signing하지 않습니다.
 
 Release workflow는 새 tag archive의 root에 `LICENSE`와 `NOTICES.md`를 포함하고,
 게시 전에 두 파일이 모두 있는지 검증합니다. 이미 게시된 v0.3.3 이하 archive는 이

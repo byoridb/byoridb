@@ -29,6 +29,33 @@ jobs:
         run: cargo fmt --all --check
       - name: Workspace tests (serial)
         run: cargo test --locked --workspace --all-features -- --test-threads=1
+      # Checked here rather than on the macOS runner so a tag pushed without the
+      # signing credentials fails in a minute instead of after four release
+      # builds. Only presence is checked; the values are verified when the
+      # certificate is imported.
+      - name: Check macOS signing credentials are present
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in CERTIFICATE_P12 CERTIFICATE_PASSWORD SIGN_IDENTITY \
+                      APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD; do
+            [ -n "${!name:-}" ] || missing+=("$name")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::missing macOS signing secrets: ${missing[*]}."
+            echo "::error::These are organization secrets shared with byoridb/byori."
+            echo "::error::Publishing macOS archives that the documentation calls signed,"
+            echo "::error::without signing them, is worse than not publishing; failing here."
+            exit 1
+          fi
+          echo "all six signing secrets are present"
 
   build:
     name: Build ${{ matrix.target }}
@@ -98,6 +125,124 @@ jobs:
           file "$RELEASE_DIR/byoridb-server"
           file "$RELEASE_DIR/byoridb-cli"
 
+      # Reuses the hard-won details from byoridb/byori's signing job: a
+      # Keychain Access .p12 export carries only the leaf and its private key,
+      # so codesign reports "no identity found" unless Apple's Developer ID
+      # intermediates are imported alongside it; and `security list-keychains -s`
+      # replaces the search list rather than extending it, evicting the keychains
+      # that hold the trust anchors.
+      - name: Import Developer ID certificate (macOS)
+        if: runner.os == 'macOS'
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ runner.temp }}-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          CERTIFICATE_PATH="$RUNNER_TEMP/certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/byoridb-signing.keychain-db"
+
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$CERTIFICATE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          for authority in DeveloperIDG2CA DeveloperIDCA; do
+            authority_path="$RUNNER_TEMP/$authority.cer"
+            curl -fsSL "https://www.apple.com/certificateauthority/$authority.cer" \
+              -o "$authority_path"
+            security import "$authority_path" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign
+          done
+
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" \
+            -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+            $(security list-keychains -d user | sed -e 's/^[[:space:]]*//' -e 's/"//g')
+
+          rm -f "$CERTIFICATE_PATH"
+
+          # Fail here with a readable reason rather than minutes later inside
+          # codesign. A correct MACOS_SIGN_IDENTITY also masks the identity name
+          # in this output, which is why the count is checked separately.
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | tee "$RUNNER_TEMP/identities"
+          grep -q "1 valid identities found" "$RUNNER_TEMP/identities" \
+            || { echo "::error::expected exactly one codesigning identity"; exit 1; }
+          grep -qF "$SIGN_IDENTITY" "$RUNNER_TEMP/identities" \
+            || { echo "::error::MACOS_SIGN_IDENTITY does not name the imported identity"; exit 1; }
+
+      - name: Sign and notarize binaries (macOS)
+        if: runner.os == 'macOS'
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ runner.temp }}-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          RELEASE_DIR="target/${{ matrix.target }}/release"
+          KEYCHAIN_PATH="$RUNNER_TEMP/byoridb-signing.keychain-db"
+          BINS=(byoridb-server byoridb-cli)
+          [ -f "$RELEASE_DIR/byoridb-backup" ] && BINS+=(byoridb-backup)
+
+          # Every shipped Mach-O is signed individually: unlike an .app bundle
+          # there is nothing that covers the others. The hardened runtime
+          # (--options runtime) and a secure timestamp are both required for
+          # notarization to succeed.
+          for bin in "${BINS[@]}"; do
+            codesign --sign "$SIGN_IDENTITY" \
+              --keychain "$KEYCHAIN_PATH" \
+              --timestamp \
+              --options runtime \
+              --force \
+              "$RELEASE_DIR/$bin"
+            codesign --verify --strict --verbose=2 "$RELEASE_DIR/$bin"
+          done
+
+          # notarytool takes a container, not a bare executable, and `ditto -c -k`
+          # archives one path. Stage the binaries so the zip holds exactly what
+          # ships and none of the build tree.
+          STAGE="$RUNNER_TEMP/notarize"
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          for bin in "${BINS[@]}"; do
+            cp "$RELEASE_DIR/$bin" "$STAGE/$bin"
+          done
+          ditto -c -k --keepParent "$STAGE" "$RUNNER_TEMP/notarize.zip"
+
+          # Check the reported status as well as the exit code: a release must
+          # not proceed on anything short of Accepted.
+          set +e
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait > "$RUNNER_TEMP/notarize.log" 2>&1
+          notarize_status=$?
+          set -e
+          cat "$RUNNER_TEMP/notarize.log"
+          if [ "$notarize_status" -ne 0 ] \
+            || ! grep -q "status: Accepted" "$RUNNER_TEMP/notarize.log"; then
+            echo "::error::notarization did not return Accepted"
+            echo "::error::run 'xcrun notarytool log <submission-id>' with the id above"
+            exit 1
+          fi
+
+          # A stapled ticket is impossible here: `xcrun stapler` only writes into
+          # .app, .dmg, and .pkg containers, not a bare executable inside a
+          # tarball. Gatekeeper resolves the ticket online instead, so the
+          # binaries are notarized but a first run on an offline machine can
+          # still prompt. Switching to a .pkg is the fix if that matters.
+          for bin in "${BINS[@]}"; do
+            codesign --display --verbose=2 "$RELEASE_DIR/$bin" 2>&1 \
+              | grep -q "^Authority=Developer ID Application" \
+              || { echo "::error::$bin is not signed by a Developer ID authority"; exit 1; }
+          done
+
       - name: Package (Linux/macOS)
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -109,6 +254,13 @@ jobs:
           tar -czvf "$ARCHIVE" "${BINS[@]}" -C ../../.. LICENSE NOTICES.md
           tar -tzf "$ARCHIVE" | grep -Fxq LICENSE
           tar -tzf "$ARCHIVE" | grep -Fxq NOTICES.md
+
+      - name: Remove signing keychain (macOS)
+        if: always() && runner.os == 'macOS'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/byoridb-signing.keychain-db" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/notarize.zip" \
+            "$RUNNER_TEMP/notarize" "$RUNNER_TEMP/notarize.log"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
