@@ -45,6 +45,11 @@ message SignOutResponse {
 message ExecuteRequest {
   int64 session_id = 1;
   string statement = 2;
+  // Refuse the request unless every clause it will execute is a read, and
+  // refuse administrative statements. Lets a caller run an untrusted or
+  // model-generated statement over a writable session without granting it that
+  // session's authority. Absent (false) is the pre-existing behavior.
+  bool read_only = 3;
 }
 
 // Response from execution.

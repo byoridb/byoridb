@@ -40,5 +40,5 @@ pub use metrics::{QueryTimer, QueryType};
 pub use partition::{compute_partition, compute_partitions, PartitionRouter, SpacePartitionInfo};
 #[cfg(feature = "server")]
 pub use server::{GraphServer, HttpServer};
-pub use service::GraphService;
+pub use service::{GraphService, QueryOptions};
 pub use shutdown::ShutdownState;

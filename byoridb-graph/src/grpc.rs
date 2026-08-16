@@ -129,7 +129,13 @@ impl GraphService for GrpcService {
 
         match self
             .internal_service
-            .execute(req.session_id, req.statement)
+            .execute_with_options(
+                req.session_id,
+                req.statement,
+                crate::service::QueryOptions {
+                    read_only: req.read_only,
+                },
+            )
             .await
         {
             Ok(dataset) => {
@@ -175,7 +181,13 @@ impl GraphService for GrpcService {
 
         match self
             .internal_service
-            .execute_json(req.session_id, req.statement)
+            .execute_json_with_options(
+                req.session_id,
+                req.statement,
+                crate::service::QueryOptions {
+                    read_only: req.read_only,
+                },
+            )
             .await
         {
             Ok(json_data) => {
