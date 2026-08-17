@@ -72,6 +72,56 @@ data_paths = ["/var/lib/byoridb/storage"]
 `BYORIDB_ROOT_PASSWORD`가 없거나 빈 값이면 시작을 거부합니다. credential은 로그에
 출력되지 않으므로 secret manager에서 주입하세요.
 
+## 로그인 throttling
+
+실패한 로그인은 계정별·출처 주소별 budget과 lockout으로 제한됩니다. 성공한 로그인은
+throttle되지 않고 동시 로그인 수에도 상한이 없습니다 — wire 계약은
+[Login throttling](../reference/api.md#login-throttling)을 참고하세요. 기본값은
+외부에 노출된 listener에 적합한 값입니다:
+
+```toml
+[auth]
+login_window_secs = 60
+max_account_failures_per_window = 20
+max_source_failures_per_window = 60
+max_concurrent_verifications = 4
+max_failed_attempts = 5
+lockout_duration_secs = 300
+```
+
+| 키 | 환경변수 | 기본값 | 의미 |
+|---|---|---|---|
+| `auth.login_window_secs` | `BYORIDB__AUTH__LOGIN_WINDOW_SECS` | `60` | 실패를 집계하는 sliding window |
+| `auth.max_account_failures_per_window` | `BYORIDB__AUTH__MAX_ACCOUNT_FAILURES_PER_WINDOW` | `20` | username당 window 내 허용 실패 수 |
+| `auth.max_source_failures_per_window` | `BYORIDB__AUTH__MAX_SOURCE_FAILURES_PER_WINDOW` | `60` | peer 주소당 window 내 허용 실패 수 |
+| `auth.max_concurrent_verifications` | `BYORIDB__AUTH__MAX_CONCURRENT_VERIFICATIONS` | `4` | 동시 Argon2 검증 수; 초과분은 대기 |
+| `auth.max_failed_attempts` | `BYORIDB__AUTH__MAX_FAILED_ATTEMPTS` | `5` | 존재하는 계정을 잠그는 연속 실패 수 |
+| `auth.lockout_duration_secs` | `BYORIDB__AUTH__LOCKOUT_DURATION_SECS` | `300` | 그 lockout의 지속 시간; `0`이면 lockout 비활성화 |
+
+> **이 값을 완화하는 것은 network 경계에서 접근이 제한된 listener에서만 안전합니다.**
+> 엔진이 credential 추측에 대해 가진 유일한 방어이고, 대체할 다른 rate limiter가
+> 없습니다. bind 주소로부터 자동 완화되는 것은 아무것도 없습니다 — `127.0.0.1`에
+> bind해도 완화되지 않습니다. 프로세스는 단일 사용자 데스크톱과 forwarded port로
+> 도달 가능한 호스트를 구분할 수 없기 때문입니다. 판단과 기록은 운영자의 몫입니다.
+
+이 설정이 존재하는 이유는 단일 사용자 배포입니다 — 비밀번호를 잘못 입력하면 유일한
+계정이 잠기고, 복구해 줄 두 번째 관리자가 없는 상황입니다. lockout만 비활성화하면
+window budget은 그대로 남아 추측을 계속 제한합니다:
+
+```bash
+export BYORIDB__AUTH__LOCKOUT_DURATION_SECS=0
+```
+
+모든 로그인을 거부하게 만드는 값은 조용히 clamp하지 않고 **시작 시 거부**합니다.
+window가 0, 계정·출처 budget이 0, 검증 permit이 0, lockout 임계값이 0인 경우 모두
+`[auth]`를 명시한 오류와 함께 로드에 실패합니다. lockout을 끄려면
+`lockout_duration_secs = 0`을 쓰세요. `max_failed_attempts = 0`은 그 표현이 아니라
+오류입니다.
+
+`max_concurrent_verifications`는 세션 수가 아니라 CPU 비용을 제한합니다. 초과한
+로그인은 거부되지 않고 permit을 기다리므로, 값을 낮추면 burst가 느려질 뿐 정상
+비밀번호가 실패로 바뀌지 않습니다.
+
 ## 디렉터리 구조
 
 서버를 시작한 후:

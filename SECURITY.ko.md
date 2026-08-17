@@ -93,8 +93,9 @@ Session ID를 로그, analytics, trace 또는 issue report에 넣지 마세요.
   성공한 로그인은 throttle되지 않으므로 동시 session 수에는 상한이 없습니다. 전부
   process-local이고 server가 관측한 peer address에 의존하므로, 재시작 후 유지되지 않고
   client IP를 보존하지 않는 proxy 뒤에서는 동작하지 않습니다. Network edge에서도
-  connection 및 login limit을 적용하세요. 임계값은 설정할 수 없습니다
-  ([#76](https://github.com/byoridb/byoridb/issues/76)).
+  connection 및 login limit을 적용하세요. 모든 임계값은 `[auth]` 아래에서 설정할 수
+  있고 lockout도 끌 수 있습니다 — 엔진이 credential 추측에 대해 가진 유일한 방어이므로,
+  network 경계에서 접근이 제한된 listener에서만 완화하세요.
 - **Space별 grant 표면 없음:** 서로 신뢰하지 않는 tenant 사이에 강한 격리가
   필요하면 분리된 trusted deployment를 사용하세요.
 - **Process-local session:** standalone Graph service를 shared session authority가

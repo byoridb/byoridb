@@ -8,6 +8,8 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub cluster: ClusterConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 /// Cluster / distributed mode configuration.
@@ -48,6 +50,73 @@ impl Default for ClusterConfig {
     }
 }
 
+/// Brute-force login protection.
+///
+/// The defaults are the values the engine compiles in and are the right choice
+/// for an exposed listener. They are settable because they are wrong for a
+/// single-user deployment bound to a loopback address, where a mistyped secret
+/// locks the only account and no second administrator exists to recover it.
+///
+/// **Relaxing any of these is only safe when the listener is restricted at the
+/// network boundary.** Nothing is adjusted automatically from the bind address:
+/// the trust decision belongs to the operator and is recorded here.
+#[derive(Debug, Deserialize)]
+pub struct AuthConfig {
+    /// Sliding window over which login *failures* are counted, in seconds.
+    /// Env: `BYORIDB__AUTH__LOGIN_WINDOW_SECS`
+    pub login_window_secs: u64,
+    /// Failures allowed per username per window.
+    /// Env: `BYORIDB__AUTH__MAX_ACCOUNT_FAILURES_PER_WINDOW`
+    pub max_account_failures_per_window: usize,
+    /// Failures allowed per peer address per window, across all usernames.
+    /// Env: `BYORIDB__AUTH__MAX_SOURCE_FAILURES_PER_WINDOW`
+    pub max_source_failures_per_window: usize,
+    /// Simultaneous Argon2 verifications. Logins beyond this queue rather than
+    /// failing, so it bounds CPU cost and not the number of sessions.
+    /// Env: `BYORIDB__AUTH__MAX_CONCURRENT_VERIFICATIONS`
+    pub max_concurrent_verifications: usize,
+    /// Consecutive failures that lock an existing account.
+    /// Env: `BYORIDB__AUTH__MAX_FAILED_ATTEMPTS`
+    pub max_failed_attempts: u32,
+    /// How long that lockout lasts, in seconds. `0` disables the lockout,
+    /// leaving the window budgets above as the only throttle — the reason a
+    /// single-user deployment would set any of this.
+    /// Env: `BYORIDB__AUTH__LOCKOUT_DURATION_SECS`
+    pub lockout_duration_secs: u64,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        let engine = byoridb_graph::auth::LoginThrottleConfig::default();
+        AuthConfig {
+            login_window_secs: engine.window.as_secs(),
+            max_account_failures_per_window: engine.max_account_failures_per_window,
+            max_source_failures_per_window: engine.max_source_failures_per_window,
+            max_concurrent_verifications: engine.max_concurrent_verifications,
+            max_failed_attempts: engine.max_failed_attempts,
+            lockout_duration_secs: engine.lockout_duration.as_secs(),
+        }
+    }
+}
+
+impl AuthConfig {
+    /// Translate into the engine's policy type.
+    ///
+    /// Validation lives on that type, so a value that would degenerate a
+    /// control is rejected identically whether it arrived from `byoridb.toml`,
+    /// the environment, or an embedded caller.
+    pub fn to_throttle(&self) -> byoridb_graph::auth::LoginThrottleConfig {
+        byoridb_graph::auth::LoginThrottleConfig {
+            window: std::time::Duration::from_secs(self.login_window_secs),
+            max_account_failures_per_window: self.max_account_failures_per_window,
+            max_source_failures_per_window: self.max_source_failures_per_window,
+            max_concurrent_verifications: self.max_concurrent_verifications,
+            max_failed_attempts: self.max_failed_attempts,
+            lockout_duration: std::time::Duration::from_secs(self.lockout_duration_secs),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
     pub graph_addr: SocketAddr,
@@ -63,6 +132,7 @@ pub struct StorageConfig {
 
 impl AppConfig {
     pub fn load() -> Result<Self, config::ConfigError> {
+        let auth_defaults = AuthConfig::default();
         let builder = Config::builder()
             // Start with default values
             .set_default("server.graph_addr", "0.0.0.0:9669")?
@@ -74,6 +144,27 @@ impl AppConfig {
             .set_default("cluster.advertise_addr", "127.0.0.1:9559")?
             .set_default("cluster.bootstrap", false)?
             .set_default("cluster.meta_addr", "0.0.0.0:9559")?
+            .set_default("auth.login_window_secs", auth_defaults.login_window_secs)?
+            .set_default(
+                "auth.max_account_failures_per_window",
+                auth_defaults.max_account_failures_per_window as u64,
+            )?
+            .set_default(
+                "auth.max_source_failures_per_window",
+                auth_defaults.max_source_failures_per_window as u64,
+            )?
+            .set_default(
+                "auth.max_concurrent_verifications",
+                auth_defaults.max_concurrent_verifications as u64,
+            )?
+            .set_default(
+                "auth.max_failed_attempts",
+                auth_defaults.max_failed_attempts as u64,
+            )?
+            .set_default(
+                "auth.lockout_duration_secs",
+                auth_defaults.lockout_duration_secs,
+            )?
             // Add configuration file (optional)
             .add_source(File::with_name("byoridb").required(false))
             // Environment variables: BYORIDB__SECTION__KEY → section.key.
@@ -92,7 +183,17 @@ impl AppConfig {
                     .with_list_parse_key("cluster.peers"),
             );
 
-        builder.build()?.try_deserialize()
+        let config: Self = builder.build()?.try_deserialize()?;
+        // Reject a degenerate throttle here rather than at first login. A zero
+        // window or a zero budget refuses every login including a correct one,
+        // so it must fail at startup where an operator sees it, not silently
+        // become the lockout it was meant to prevent.
+        config
+            .auth
+            .to_throttle()
+            .validate()
+            .map_err(|problem| config::ConfigError::Message(format!("[auth] {problem}")))?;
+        Ok(config)
     }
 }
 
@@ -176,6 +277,77 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn auth_defaults_are_the_engine_policy_unchanged() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let cfg = AppConfig::load().expect("defaults must load");
+        let engine = byoridb_graph::auth::LoginThrottleConfig::default();
+
+        // Defaults must not drift from the engine's compiled-in policy: making
+        // these settable is not an occasion to change what they are.
+        assert_eq!(cfg.auth.to_throttle(), engine);
+        assert_eq!(cfg.auth.login_window_secs, 60);
+        assert_eq!(cfg.auth.max_account_failures_per_window, 20);
+        assert_eq!(cfg.auth.max_source_failures_per_window, 60);
+        assert_eq!(cfg.auth.max_concurrent_verifications, 4);
+        assert_eq!(cfg.auth.max_failed_attempts, 5);
+        assert_eq!(cfg.auth.lockout_duration_secs, 300);
+    }
+
+    #[test]
+    fn auth_policy_is_settable_from_the_environment() {
+        with_env(
+            &[
+                ("BYORIDB__AUTH__LOGIN_WINDOW_SECS", "30"),
+                ("BYORIDB__AUTH__MAX_ACCOUNT_FAILURES_PER_WINDOW", "200"),
+                ("BYORIDB__AUTH__MAX_SOURCE_FAILURES_PER_WINDOW", "500"),
+                ("BYORIDB__AUTH__MAX_CONCURRENT_VERIFICATIONS", "8"),
+                ("BYORIDB__AUTH__MAX_FAILED_ATTEMPTS", "50"),
+                // The single-user case: no lockout at all.
+                ("BYORIDB__AUTH__LOCKOUT_DURATION_SECS", "0"),
+            ],
+            || {
+                let cfg = AppConfig::load().expect("a relaxed auth policy must load");
+                let throttle = cfg.auth.to_throttle();
+                assert_eq!(throttle.window, std::time::Duration::from_secs(30));
+                assert_eq!(throttle.max_account_failures_per_window, 200);
+                assert_eq!(throttle.max_source_failures_per_window, 500);
+                assert_eq!(throttle.max_concurrent_verifications, 8);
+                assert_eq!(throttle.max_failed_attempts, 50);
+                assert_eq!(throttle.lockout_duration, std::time::Duration::ZERO);
+            },
+        );
+    }
+
+    #[test]
+    fn a_degenerate_auth_policy_is_rejected_at_startup() {
+        // Each of these would refuse every login, including a correct one, so
+        // loading must fail where an operator sees it rather than turning into
+        // the lockout the setting was meant to avoid.
+        for key in [
+            "BYORIDB__AUTH__LOGIN_WINDOW_SECS",
+            "BYORIDB__AUTH__MAX_ACCOUNT_FAILURES_PER_WINDOW",
+            "BYORIDB__AUTH__MAX_SOURCE_FAILURES_PER_WINDOW",
+            "BYORIDB__AUTH__MAX_CONCURRENT_VERIFICATIONS",
+            "BYORIDB__AUTH__MAX_FAILED_ATTEMPTS",
+        ] {
+            with_env(&[(key, "0")], || {
+                let error = AppConfig::load()
+                    .expect_err("a zero value must not load")
+                    .to_string();
+                assert!(
+                    error.contains("[auth]"),
+                    "the error must name the section responsible: {error}"
+                );
+            });
+        }
+
+        // A zero lockout duration is a supported way to disable the lockout.
+        with_env(&[("BYORIDB__AUTH__LOCKOUT_DURATION_SECS", "0")], || {
+            AppConfig::load().expect("disabling the lockout must be allowed");
+        });
     }
 
     #[test]
