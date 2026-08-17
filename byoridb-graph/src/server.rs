@@ -7,7 +7,7 @@
 use super::service::GraphService;
 use axum::{
     extract::{ConnectInfo, Json, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     routing::{get, post},
     Router,
 };
@@ -334,12 +334,56 @@ async fn list_active_queries(
     })))
 }
 
+/// Classify a login failure.
+///
+/// A client must be able to tell a credential it should stop presenting from a
+/// refusal that never looked at one. Collapsing both into `401 AUTH_FAILED`
+/// left "retry in a moment" indistinguishable from "your password is wrong",
+/// so the safe client behaviour was to stop retrying — the opposite of what a
+/// transient throttle wants.
+///
+/// The throttle is keyed on the presented username and the peer address
+/// whether or not that account exists, so `429` discloses nothing about the
+/// account. Everything the credential check itself decided stays collapsed
+/// into one response: whether the account is missing, disabled, locked, or
+/// simply got the password wrong is not disclosed.
+fn create_session_error(
+    error: &crate::error::GraphError,
+) -> (StatusCode, HeaderMap, ErrorResponse) {
+    match error {
+        crate::error::GraphError::TooManyAttempts { retry_after_secs } => {
+            let mut headers = HeaderMap::new();
+            if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                headers.insert(header::RETRY_AFTER, value);
+            }
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                headers,
+                ErrorResponse {
+                    error: format!(
+                        "Too many authentication attempts. Retry in {retry_after_secs}s."
+                    ),
+                    code: "TOO_MANY_ATTEMPTS".to_string(),
+                },
+            )
+        }
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            HeaderMap::new(),
+            ErrorResponse {
+                error: "Invalid credentials".to_string(),
+                code: "AUTH_FAILED".to_string(),
+            },
+        ),
+    }
+}
+
 /// Create a new session (authenticate)
 async fn create_session(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Json(payload): Json<CreateSessionRequest>,
-) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<SessionResponse>, (StatusCode, HeaderMap, Json<ErrorResponse>)> {
     match state
         .service
         .authenticate_from(payload.username, payload.password, Some(peer.ip()))
@@ -353,19 +397,16 @@ async fn create_session(
             }))
         }
         Err(e) => {
+            let (status, headers, body) = create_session_error(&e);
+            // `error_kind` never carries dynamic text, so logging it records
+            // *why* the login was refused — throttled versus evaluated-and-
+            // wrong — without putting a credential or a username in the log.
             error!(
                 error_type = GraphService::error_kind(&e),
+                status = status.as_u16(),
                 "Authentication failed"
             );
-            Err((
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse {
-                    // Never disclose whether the account exists, is disabled,
-                    // locked, or merely received a wrong password.
-                    error: "Invalid credentials".to_string(),
-                    code: "AUTH_FAILED".to_string(),
-                }),
-            ))
+            Err((status, headers, Json(body)))
         }
     }
 }
@@ -718,13 +759,14 @@ mod tests {
         headers
     }
 
-    async fn failed_http_auth(
+    async fn http_auth(
         state: AppState,
+        peer: &str,
         username: &str,
         password: &str,
-    ) -> (StatusCode, ErrorResponse) {
-        match create_session(
-            ConnectInfo("127.0.0.1:12345".parse().unwrap()),
+    ) -> Result<i64, (StatusCode, HeaderMap, ErrorResponse)> {
+        create_session(
+            ConnectInfo(peer.parse().unwrap()),
             State(state),
             Json(CreateSessionRequest {
                 username: username.to_string(),
@@ -732,10 +774,19 @@ mod tests {
             }),
         )
         .await
-        {
-            Ok(_) => panic!("invalid credentials unexpectedly authenticated"),
-            Err((status, Json(error))) => (status, error),
-        }
+        .map(|Json(session)| session.session_id)
+        .map_err(|(status, headers, Json(error))| (status, headers, error))
+    }
+
+    async fn failed_http_auth(
+        state: AppState,
+        username: &str,
+        password: &str,
+    ) -> (StatusCode, ErrorResponse) {
+        let (status, _, error) = http_auth(state, "127.0.0.1:12345", username, password)
+            .await
+            .expect_err("invalid credentials unexpectedly authenticated");
+        (status, error)
     }
 
     #[tokio::test]
@@ -772,8 +823,10 @@ mod tests {
         assert_eq!(response["count"], 0);
     }
 
+    /// Failures the credential check itself decided stay collapsed into one
+    /// `401`. A lockout is not among them; see the throttle test below.
     #[tokio::test]
-    async fn authentication_failures_do_not_enumerate_accounts() {
+    async fn evaluated_authentication_failures_do_not_enumerate_accounts() {
         let auth = AuthManager::with_config("root-password", Duration::from_secs(3600));
         auth.create_user(
             "disabled-user",
@@ -783,6 +836,57 @@ mod tests {
         .await
         .unwrap();
         auth.set_user_enabled("disabled-user", false).await.unwrap();
+        let state = test_state(auth);
+
+        for (username, password) in [
+            ("missing-user", "wrong-password"),
+            ("root", "wrong-password"),
+            ("disabled-user", "disabled-password"),
+        ] {
+            let (status, error) = failed_http_auth(state.clone(), username, password).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(error.error, "Invalid credentials");
+            assert_eq!(error.code, "AUTH_FAILED");
+        }
+    }
+
+    /// Regression for #90. A client that fans out reads opens several sessions
+    /// at once; all of those logins carry the same correct password, so all of
+    /// them must succeed, and the burst must leave the account usable.
+    #[tokio::test]
+    async fn concurrent_valid_logins_all_return_a_session_over_http() {
+        const ROOT_PASSWORD: &str = "root-password";
+        let state = test_state(AuthManager::with_config(
+            ROOT_PASSWORD,
+            Duration::from_secs(3600),
+        ));
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                http_auth(state, "127.0.0.1:12345", "root", ROOT_PASSWORD).await
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .unwrap()
+                .expect("a correct credential must not be refused because of concurrency");
+        }
+
+        // No residue: a subsequent sequential login still works.
+        http_auth(state, "127.0.0.1:12345", "root", ROOT_PASSWORD)
+            .await
+            .expect("the burst must not have locked the account");
+    }
+
+    /// A refusal that never evaluated the credential is a `429` naming its
+    /// retry window, so a client can tell it from a wrong password and knows
+    /// when retrying can help.
+    #[tokio::test]
+    async fn a_throttled_login_is_429_with_a_retry_after_window() {
+        let auth = AuthManager::with_config("root-password", Duration::from_secs(3600));
         auth.create_user("locked-user", "locked-password", vec!["USER".to_string()])
             .await
             .unwrap();
@@ -791,17 +895,26 @@ mod tests {
         }
         let state = test_state(auth);
 
-        for (username, password) in [
-            ("missing-user", "wrong-password"),
-            ("root", "wrong-password"),
-            ("disabled-user", "disabled-password"),
-            ("locked-user", "locked-password"),
-        ] {
-            let (status, error) = failed_http_auth(state.clone(), username, password).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED);
-            assert_eq!(error.error, "Invalid credentials");
-            assert_eq!(error.code, "AUTH_FAILED");
-        }
+        let (status, headers, error) =
+            http_auth(state, "127.0.0.1:12345", "locked-user", "locked-password")
+                .await
+                .expect_err("a locked account must not authenticate");
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.code, "TOO_MANY_ATTEMPTS");
+        let retry_after = headers
+            .get(header::RETRY_AFTER)
+            .expect("a 429 must carry Retry-After")
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .expect("Retry-After must be a whole number of seconds");
+        assert!(retry_after > 0);
+        assert!(
+            error.error.contains(&format!("{retry_after}s")),
+            "the body must name the same window as the header: {}",
+            error.error
+        );
     }
 
     #[tokio::test]

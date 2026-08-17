@@ -34,8 +34,8 @@ pub const MAX_FAILED_ATTEMPTS: u32 = 5;
 pub const LOCKOUT_DURATION_SECS: u64 = 300; // 5 minutes
 const MAX_CONCURRENT_ARGON2_VERIFICATIONS: usize = 4;
 const LOGIN_RATE_WINDOW: Duration = Duration::from_secs(60);
-const MAX_ACCOUNT_ATTEMPTS_PER_WINDOW: usize = 20;
-const MAX_SOURCE_ATTEMPTS_PER_WINDOW: usize = 60;
+const MAX_ACCOUNT_FAILURES_PER_WINDOW: usize = 20;
+const MAX_SOURCE_FAILURES_PER_WINDOW: usize = 60;
 const MAX_RATE_LIMIT_KEYS: usize = 10_000;
 
 /// Verification honors cost parameters embedded in a PHC string. Accept only
@@ -61,49 +61,114 @@ struct FailedAttempt {
     locked_until: Option<SystemTime>,
 }
 
+/// Sliding-window brute-force throttle over *failed* logins.
+///
+/// Only attempts whose credential was actually evaluated and rejected are
+/// recorded. A successful login is not a brute-force signal, so it neither
+/// consumes the budget nor allocates a key: a client that opens several
+/// sessions at once (fanning out reads) is indistinguishable from one that
+/// opens them one at a time. Counting successes here is what let a burst of
+/// correct credentials exhaust the window and then reject a correct password
+/// for the rest of it.
+///
+/// Concurrency is bounded separately, by queueing on
+/// [`AuthManager::argon2_verification_limit`], so admission control never has
+/// to reject a valid credential.
 #[derive(Default)]
 struct LoginRateLimiter {
-    attempts: Mutex<HashMap<String, VecDeque<Instant>>>,
+    failures: Mutex<HashMap<String, VecDeque<Instant>>>,
 }
 
 impl LoginRateLimiter {
-    async fn check_and_record(&self, username: &str, source: Option<IpAddr>) -> bool {
-        let now = Instant::now();
-        let cutoff = now.checked_sub(LOGIN_RATE_WINDOW).unwrap_or(now);
+    /// Budgets are per key, so a single account cannot spend the whole source
+    /// budget and a single source cannot be evaded by rotating usernames.
+    fn keys(username: &str, source: Option<IpAddr>) -> Vec<(String, usize)> {
         let mut keys = vec![(
             format!("account:{}", username.trim().to_ascii_lowercase()),
-            MAX_ACCOUNT_ATTEMPTS_PER_WINDOW,
+            MAX_ACCOUNT_FAILURES_PER_WINDOW,
         )];
         if let Some(source) = source {
-            keys.push((format!("source:{source}"), MAX_SOURCE_ATTEMPTS_PER_WINDOW));
+            keys.push((format!("source:{source}"), MAX_SOURCE_FAILURES_PER_WINDOW));
+        }
+        keys
+    }
+
+    fn expire(entries: &mut VecDeque<Instant>, cutoff: Instant) {
+        while entries.front().is_some_and(|entry| *entry < cutoff) {
+            entries.pop_front();
+        }
+    }
+
+    /// Whether this attempt must be refused without evaluating its credential,
+    /// and for how long. `None` admits the attempt.
+    async fn retry_after(&self, username: &str, source: Option<IpAddr>) -> Option<Duration> {
+        let now = Instant::now();
+        let cutoff = now.checked_sub(LOGIN_RATE_WINDOW).unwrap_or(now);
+        let keys = Self::keys(username, source);
+
+        let mut failures = self.failures.lock().await;
+        if failures.len() >= MAX_RATE_LIMIT_KEYS {
+            failures.retain(|_, entries| entries.back().is_some_and(|entry| *entry >= cutoff));
+        }
+        // A saturated table cannot account for a key it does not hold yet, so
+        // refuse rather than admit attempts the throttle would not be able to
+        // count. Recording is bounded by the same cap.
+        if failures.len() >= MAX_RATE_LIMIT_KEYS
+            && keys.iter().any(|(key, _)| !failures.contains_key(key))
+        {
+            return Some(LOGIN_RATE_WINDOW);
         }
 
-        let mut attempts = self.attempts.lock().await;
-        if attempts.len() >= MAX_RATE_LIMIT_KEYS {
-            attempts.retain(|_, entries| entries.back().is_some_and(|entry| *entry >= cutoff));
-        }
-        let new_key_count = keys
-            .iter()
-            .filter(|(key, _)| !attempts.contains_key(key))
-            .count();
-        if attempts.len().saturating_add(new_key_count) > MAX_RATE_LIMIT_KEYS {
-            return false;
-        }
-
+        let mut retry_after = None;
         for (key, limit) in &keys {
-            if let Some(entries) = attempts.get_mut(key) {
-                while entries.front().is_some_and(|entry| *entry < cutoff) {
-                    entries.pop_front();
+            let Some(entries) = failures.get_mut(key) else {
+                continue;
+            };
+            Self::expire(entries, cutoff);
+            if entries.len() < *limit {
+                continue;
+            }
+            // Every surviving entry is inside the window, so the oldest one is
+            // the first to free a slot.
+            let oldest = *entries.front().expect("a full window is non-empty");
+            let wait = oldest
+                .checked_add(LOGIN_RATE_WINDOW)
+                .map(|expiry| expiry.saturating_duration_since(now))
+                .unwrap_or(LOGIN_RATE_WINDOW);
+            retry_after = Some(retry_after.map_or(wait, |longest: Duration| longest.max(wait)));
+        }
+        retry_after
+    }
+
+    /// Charge one failure to every key for this attempt.
+    async fn record_failure(&self, username: &str, source: Option<IpAddr>) {
+        let now = Instant::now();
+        let cutoff = now.checked_sub(LOGIN_RATE_WINDOW).unwrap_or(now);
+
+        let mut failures = self.failures.lock().await;
+        if failures.len() >= MAX_RATE_LIMIT_KEYS {
+            failures.retain(|_, entries| entries.back().is_some_and(|entry| *entry >= cutoff));
+        }
+        for (key, limit) in Self::keys(username, source) {
+            let has_budget_for_a_new_key = failures.len() < MAX_RATE_LIMIT_KEYS;
+            match failures.get_mut(&key) {
+                Some(entries) => {
+                    Self::expire(entries, cutoff);
+                    // A key at its limit is already refused before any
+                    // verification, so capping the deque bounds memory without
+                    // losing a countable attempt.
+                    if entries.len() < limit {
+                        entries.push_back(now);
+                    }
                 }
-                if entries.len() >= *limit {
-                    return false;
+                // A saturated table drops the record; `retry_after` refuses
+                // such attempts up front, so nothing goes uncounted silently.
+                None if has_budget_for_a_new_key => {
+                    failures.entry(key).or_default().push_back(now);
                 }
+                None => {}
             }
         }
-        for (key, _) in keys {
-            attempts.entry(key).or_default().push_back(now);
-        }
-        true
     }
 }
 
@@ -274,40 +339,56 @@ impl AuthManager {
         password: &str,
         source: Option<IpAddr>,
     ) -> Result<i64> {
-        if !self
-            .login_rate_limiter
-            .check_and_record(username, source)
-            .await
-        {
-            return Err(GraphError::AuthFailed(
-                "Too many authentication attempts".to_string(),
-            ));
+        // Both refusals below happen before the credential is read. Neither is
+        // a failed attempt, so neither is counted as one, and both name the
+        // window after which retrying can succeed.
+        if let Some(retry_after) = self.login_rate_limiter.retry_after(username, source).await {
+            return Err(GraphError::TooManyAttempts {
+                retry_after_secs: retry_after.as_secs().max(1),
+            });
         }
+        if let Some(remaining) = self.lockout_remaining(username).await {
+            return Err(GraphError::TooManyAttempts {
+                retry_after_secs: remaining.as_secs().max(1),
+            });
+        }
+
+        let outcome = self.authenticate_evaluated(username, password).await;
+        // Only a credential that was evaluated and rejected is a failed
+        // attempt. An `InternalError` is a server fault and must not spend the
+        // account's budget, and a success must not spend it either.
+        if matches!(outcome, Err(GraphError::AuthFailed(_))) {
+            self.login_rate_limiter
+                .record_failure(username, source)
+                .await;
+        }
+        outcome
+    }
+
+    /// How long an account's lockout still has to run, if it is locked.
+    ///
+    /// A locked account is reported to callers as a throttle with this window
+    /// rather than as a credential failure, so it needs no timing equalization:
+    /// the state is disclosed explicitly, which is the tradeoff taken for
+    /// clients that otherwise cannot tell "retry later" from "wrong password".
+    async fn lockout_remaining(&self, username: &str) -> Option<Duration> {
+        let attempts = self.failed_attempts.read().await;
+        attempts
+            .get(username)
+            .and_then(|entry| entry.locked_until)
+            .and_then(|locked_until| locked_until.duration_since(SystemTime::now()).ok())
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    /// Evaluate a credential. Every `Err(AuthFailed)` return from here has paid
+    /// for one Argon2 verification, which is what makes it countable.
+    async fn authenticate_evaluated(&self, username: &str, password: &str) -> Result<i64> {
         if username.trim().is_empty() || password.trim().is_empty() {
             // Preserve comparable Argon2 work for invalid blank credentials.
             let _ = self
                 .verify_password_bounded(password, &self.dummy_password_hash)
                 .await?;
             return Err(GraphError::AuthFailed("Invalid credentials".to_string()));
-        }
-
-        // Brute-force check: reject if account is locked
-        let account_locked = {
-            let attempts = self.failed_attempts.read().await;
-            attempts
-                .get(username)
-                .and_then(|entry| entry.locked_until)
-                .is_some_and(|locked_until| SystemTime::now() < locked_until)
-        };
-        if account_locked {
-            // Keep locked-account responses computationally comparable to a
-            // normal password attempt. Do not reveal this state at transports.
-            let _ = self
-                .verify_password_bounded(password, &self.dummy_password_hash)
-                .await?;
-            return Err(GraphError::AuthFailed(
-                "Account locked due to too many failed attempts. Try again later.".to_string(),
-            ));
         }
 
         let user = self.users.read().await.get(username).cloned();
@@ -1035,18 +1116,50 @@ mod tests {
         assert!(matches!(err, GraphError::AuthFailed(_)));
     }
 
+    /// The per-account budget is what bounds guessing against one username.
+    /// An unknown username exercises it in isolation, because a known account
+    /// hits the stricter lockout first.
     #[tokio::test]
-    async fn account_login_rate_limit_applies_even_to_locked_accounts() {
+    async fn account_failure_budget_throttles_a_single_username() {
         let mgr = make_manager();
-        for _ in 0..MAX_ACCOUNT_ATTEMPTS_PER_WINDOW {
-            assert!(mgr.authenticate("root", "wrong-password").await.is_err());
+        for _ in 0..MAX_ACCOUNT_FAILURES_PER_WINDOW {
+            let error = mgr
+                .authenticate("ghost", "wrong-password")
+                .await
+                .unwrap_err();
+            assert!(matches!(error, GraphError::AuthFailed(_)), "{error:?}");
         }
         let error = mgr
-            .authenticate("root", TEST_PW)
+            .authenticate("ghost", "wrong-password")
             .await
-            .expect_err("rate limit must reject a correct password after the window is exhausted");
+            .expect_err("the account budget must refuse further guesses");
         assert!(
-            matches!(error, GraphError::AuthFailed(message) if message == "Too many authentication attempts")
+            matches!(error, GraphError::TooManyAttempts { retry_after_secs } if retry_after_secs > 0),
+            "{error:?}"
+        );
+
+        // The budget is per key, so another username is unaffected.
+        assert!(mgr.authenticate("root", TEST_PW).await.is_ok());
+    }
+
+    /// A locked account is reported as a throttle carrying its remaining
+    /// window, not as a credential failure, so a client can tell "retry later"
+    /// from "this password is wrong" (#90).
+    #[tokio::test]
+    async fn locked_account_reports_its_remaining_window() {
+        let mgr = make_manager();
+        for _ in 0..MAX_FAILED_ATTEMPTS {
+            assert!(mgr.authenticate("root", "wrong-password").await.is_err());
+        }
+
+        let error = mgr.authenticate("root", TEST_PW).await.unwrap_err();
+        let GraphError::TooManyAttempts { retry_after_secs } = error else {
+            panic!("a locked account must not be reported as a credential failure: {error:?}");
+        };
+        assert!(
+            retry_after_secs > LOCKOUT_DURATION_SECS - 10
+                && retry_after_secs <= LOCKOUT_DURATION_SECS,
+            "the reported window must be the lockout's remainder, got {retry_after_secs}s"
         );
     }
 
@@ -1054,7 +1167,7 @@ mod tests {
     async fn source_login_rate_limit_spans_distinct_accounts() {
         let mgr = make_manager();
         let source = Some("192.0.2.10".parse().unwrap());
-        for index in 0..MAX_SOURCE_ATTEMPTS_PER_WINDOW {
+        for index in 0..MAX_SOURCE_FAILURES_PER_WINDOW {
             let username = format!("unknown-{index}");
             assert!(mgr
                 .authenticate_from(&username, "wrong-password", source)
@@ -1066,8 +1179,105 @@ mod tests {
             .await
             .expect_err("source limit must apply across usernames");
         assert!(
-            matches!(error, GraphError::AuthFailed(message) if message == "Too many authentication attempts")
+            matches!(error, GraphError::TooManyAttempts { retry_after_secs } if retry_after_secs > 0),
+            "{error:?}"
         );
+    }
+
+    /// The throttle must spend its budget on failures only. Successful logins
+    /// are what a working client produces, and counting them is what turned a
+    /// burst of correct credentials into a lockout (#90).
+    #[tokio::test]
+    async fn successful_logins_never_consume_the_failure_budget() {
+        let mgr = make_manager();
+        let source = Some("192.0.2.12".parse().unwrap());
+
+        for _ in 0..MAX_ACCOUNT_FAILURES_PER_WINDOW * 3 {
+            mgr.authenticate_from("root", TEST_PW, source)
+                .await
+                .expect("a correct credential must never exhaust the throttle");
+        }
+
+        // The budget is untouched afterwards: genuine wrong guesses are still
+        // evaluated and reported as credential failures rather than throttled.
+        // (Only the lockout, below this count, ends that.)
+        for _ in 0..MAX_FAILED_ATTEMPTS - 1 {
+            let error = mgr
+                .authenticate_from("root", "wrong-password", source)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, GraphError::AuthFailed(_)), "{error:?}");
+        }
+    }
+
+    /// A throttled attempt never reaches the credential check, so it must not
+    /// be charged to the account's lockout counter either. Otherwise capacity
+    /// pressure alone would lock an account that never guessed wrong.
+    #[tokio::test]
+    async fn throttled_attempts_do_not_count_toward_lockout() {
+        let mgr = make_manager();
+        let source = Some("192.0.2.13".parse().unwrap());
+
+        for index in 0..MAX_SOURCE_FAILURES_PER_WINDOW {
+            let _ = mgr
+                .authenticate_from(&format!("unknown-{index}"), "wrong-password", source)
+                .await;
+        }
+
+        // The source budget is gone, so root is refused without evaluation.
+        for _ in 0..MAX_FAILED_ATTEMPTS * 2 {
+            let error = mgr
+                .authenticate_from("root", TEST_PW, source)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, GraphError::TooManyAttempts { .. }),
+                "{error:?}"
+            );
+        }
+
+        assert!(
+            !mgr.failed_attempts.read().await.contains_key("root"),
+            "a refusal that never read the password must not lock the account"
+        );
+        // A different source is unaffected, and root is not locked.
+        assert!(mgr
+            .authenticate_from("root", TEST_PW, Some("192.0.2.14".parse().unwrap()))
+            .await
+            .is_ok());
+    }
+
+    /// Regression for #90: a client that fans out reads opens several sessions
+    /// at once. Every one of those logins presents a correct credential, so
+    /// every one must succeed — a burst of valid logins is not a brute-force
+    /// signal and must not be spent against the failure budget.
+    #[tokio::test]
+    async fn concurrent_valid_logins_all_succeed() {
+        let mgr = Arc::new(make_manager());
+        let source = Some("192.0.2.11".parse().unwrap());
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let mgr = Arc::clone(&mgr);
+            handles.push(tokio::spawn(async move {
+                mgr.authenticate_from("root", TEST_PW, source).await
+            }));
+        }
+
+        let mut sessions = Vec::new();
+        for handle in handles {
+            sessions.push(handle.await.unwrap().expect(
+                "a correct credential must not be rejected because other logins were in flight",
+            ));
+        }
+
+        sessions.sort_unstable();
+        sessions.dedup();
+        assert_eq!(sessions.len(), 32, "each login must get its own session");
+
+        // The burst must leave no residue: a subsequent sequential login with
+        // the same correct password still works.
+        assert!(mgr.authenticate_from("root", TEST_PW, source).await.is_ok());
     }
 
     #[tokio::test]
@@ -1421,9 +1631,9 @@ mod tests {
             assert!(matches!(err, GraphError::AuthFailed(_)));
         }
 
-        // Next attempt should be locked
+        // Next attempt is refused without evaluating the credential
         let err = mgr.authenticate("root", TEST_PW).await.unwrap_err();
-        assert!(err.to_string().contains("locked"));
+        assert!(matches!(err, GraphError::TooManyAttempts { .. }), "{err:?}");
     }
 
     #[tokio::test]
@@ -1438,10 +1648,10 @@ mod tests {
         // Successful login clears counter
         assert!(mgr.authenticate("root", TEST_PW).await.is_ok());
 
-        // Should be able to fail again without immediate lockout
+        // Should be able to fail again without immediate lockout: the failure
+        // is evaluated, not refused up front.
         let err = mgr.authenticate("root", "wrong").await.unwrap_err();
-        assert!(matches!(err, GraphError::AuthFailed(_)));
-        assert!(!err.to_string().contains("locked"));
+        assert!(matches!(err, GraphError::AuthFailed(_)), "{err:?}");
     }
 
     #[tokio::test]

@@ -767,6 +767,7 @@ impl GraphService {
     pub(crate) fn error_kind(error: &GraphError) -> &'static str {
         match error {
             GraphError::AuthFailed(_) => "auth_failed",
+            GraphError::TooManyAttempts { .. } => "too_many_attempts",
             GraphError::SessionNotFound(_) => "session_not_found",
             GraphError::ParseError(_) => "parse_error",
             GraphError::ValidationError(_) => "validation_error",

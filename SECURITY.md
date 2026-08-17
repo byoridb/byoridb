@@ -94,9 +94,14 @@ availability or operational metadata is sensitive.
 
 - **No native transport encryption:** HTTP and gRPC are plaintext. Terminate
   TLS at a trusted ingress, proxy, or service mesh and protect the backend hop.
-- **No general login rate limiter:** in-process account lockout is not a
-  substitute for per-source throttling. Apply connection and login limits at
-  the network edge.
+- **In-process login throttling only:** failed logins are throttled per account
+  (20 per 60 s), per source IP (60 per 60 s), and by a 300 s lockout after five
+  consecutive failures. Successful logins are never throttled, so there is no
+  ceiling on concurrent sessions. All of it is process-local and driven by the
+  peer address the server observes, so it neither survives a restart nor sees
+  through a proxy that does not preserve the client IP. Apply connection and
+  login limits at the network edge as well. Thresholds are not configurable
+  ([#76](https://github.com/byoridb/byoridb/issues/76)).
 - **No per-space grant surface:** use separate trusted deployments when strong
   isolation between mutually untrusted tenants is required.
 - **Process-local sessions:** do not horizontally scale the standalone Graph
