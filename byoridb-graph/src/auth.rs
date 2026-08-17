@@ -32,11 +32,99 @@ pub const ROOT_PASSWORD_ENV: &str = "BYORIDB_ROOT_PASSWORD";
 pub const MAX_FAILED_ATTEMPTS: u32 = 5;
 /// Lockout duration after exceeding MAX_FAILED_ATTEMPTS.
 pub const LOCKOUT_DURATION_SECS: u64 = 300; // 5 minutes
-const MAX_CONCURRENT_ARGON2_VERIFICATIONS: usize = 4;
-const LOGIN_RATE_WINDOW: Duration = Duration::from_secs(60);
-const MAX_ACCOUNT_FAILURES_PER_WINDOW: usize = 20;
-const MAX_SOURCE_FAILURES_PER_WINDOW: usize = 60;
+/// Default bound on simultaneous Argon2 verifications. Logins beyond it queue
+/// rather than being refused, so this caps CPU cost without capping sessions.
+pub const MAX_CONCURRENT_ARGON2_VERIFICATIONS: usize = 4;
+/// Default sliding window over which login *failures* are counted.
+pub const LOGIN_RATE_WINDOW_SECS: u64 = 60;
+/// Default failure budget for one username per window.
+pub const MAX_ACCOUNT_FAILURES_PER_WINDOW: usize = 20;
+/// Default failure budget for one peer address per window, across usernames.
+pub const MAX_SOURCE_FAILURES_PER_WINDOW: usize = 60;
+
+/// Upper bound on tracked rate-limit keys. A memory bound rather than a
+/// policy knob: it exists so a flood of distinct usernames or source addresses
+/// cannot grow the table without limit, and an operator has no reason to tune
+/// it. Attempts that a saturated table could not account for are refused.
 const MAX_RATE_LIMIT_KEYS: usize = 10_000;
+
+/// Brute-force protection policy.
+///
+/// Every field defaults to the value this release compiles in, which is the
+/// right choice for an exposed listener. They are settable because they are
+/// wrong for a single-user deployment bound to a loopback address, where a
+/// mistyped secret locks the only account and no second administrator exists
+/// to recover it.
+///
+/// Relaxing any of these is only safe when the listener is restricted at the
+/// network boundary. Nothing here is adjusted automatically from the bind
+/// address: the trust decision belongs to the operator, recorded in
+/// configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoginThrottleConfig {
+    /// Sliding window over which failures are counted.
+    pub window: Duration,
+    /// Failures allowed per username per window.
+    pub max_account_failures_per_window: usize,
+    /// Failures allowed per peer address per window, across all usernames.
+    pub max_source_failures_per_window: usize,
+    /// Simultaneous Argon2 verifications. Excess logins queue, never fail.
+    pub max_concurrent_verifications: usize,
+    /// Consecutive failures that lock an existing account.
+    pub max_failed_attempts: u32,
+    /// How long that lockout lasts. `Duration::ZERO` disables the lockout:
+    /// the window-based budgets above remain the only throttle.
+    pub lockout_duration: Duration,
+}
+
+impl Default for LoginThrottleConfig {
+    fn default() -> Self {
+        Self {
+            window: Duration::from_secs(LOGIN_RATE_WINDOW_SECS),
+            max_account_failures_per_window: MAX_ACCOUNT_FAILURES_PER_WINDOW,
+            max_source_failures_per_window: MAX_SOURCE_FAILURES_PER_WINDOW,
+            max_concurrent_verifications: MAX_CONCURRENT_ARGON2_VERIFICATIONS,
+            max_failed_attempts: MAX_FAILED_ATTEMPTS,
+            lockout_duration: Duration::from_secs(LOCKOUT_DURATION_SECS),
+        }
+    }
+}
+
+impl LoginThrottleConfig {
+    /// Reject values that would disable a control by degenerating rather than
+    /// by saying so. A zero window or a zero budget would refuse every login,
+    /// including a correct one, which is a lockout dressed as a setting.
+    ///
+    /// `lockout_duration` is exempt: zero there means "no lockout", which is a
+    /// coherent choice for a single-user deployment and is the reason this is
+    /// configurable at all.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let mut problems = Vec::new();
+        if self.window.is_zero() {
+            problems.push("window must be at least 1s");
+        }
+        if self.max_account_failures_per_window == 0 {
+            problems.push("max_account_failures_per_window must be at least 1");
+        }
+        if self.max_source_failures_per_window == 0 {
+            problems.push("max_source_failures_per_window must be at least 1");
+        }
+        if self.max_concurrent_verifications == 0 {
+            problems.push("max_concurrent_verifications must be at least 1");
+        }
+        if self.max_failed_attempts == 0 {
+            problems.push(
+                "max_failed_attempts must be at least 1; \
+                 set lockout_duration to 0 to disable the lockout instead",
+            );
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("invalid login throttle: {}", problems.join("; ")))
+        }
+    }
+}
 
 /// Verification honors cost parameters embedded in a PHC string. Accept only
 /// a narrow envelope around the profile generated by this release so a
@@ -77,18 +165,29 @@ struct FailedAttempt {
 #[derive(Default)]
 struct LoginRateLimiter {
     failures: Mutex<HashMap<String, VecDeque<Instant>>>,
+    config: LoginThrottleConfig,
 }
 
 impl LoginRateLimiter {
+    fn new(config: LoginThrottleConfig) -> Self {
+        Self {
+            failures: Mutex::default(),
+            config,
+        }
+    }
+
     /// Budgets are per key, so a single account cannot spend the whole source
     /// budget and a single source cannot be evaded by rotating usernames.
-    fn keys(username: &str, source: Option<IpAddr>) -> Vec<(String, usize)> {
+    fn keys(&self, username: &str, source: Option<IpAddr>) -> Vec<(String, usize)> {
         let mut keys = vec![(
             format!("account:{}", username.trim().to_ascii_lowercase()),
-            MAX_ACCOUNT_FAILURES_PER_WINDOW,
+            self.config.max_account_failures_per_window,
         )];
         if let Some(source) = source {
-            keys.push((format!("source:{source}"), MAX_SOURCE_FAILURES_PER_WINDOW));
+            keys.push((
+                format!("source:{source}"),
+                self.config.max_source_failures_per_window,
+            ));
         }
         keys
     }
@@ -102,9 +201,10 @@ impl LoginRateLimiter {
     /// Whether this attempt must be refused without evaluating its credential,
     /// and for how long. `None` admits the attempt.
     async fn retry_after(&self, username: &str, source: Option<IpAddr>) -> Option<Duration> {
+        let window = self.config.window;
         let now = Instant::now();
-        let cutoff = now.checked_sub(LOGIN_RATE_WINDOW).unwrap_or(now);
-        let keys = Self::keys(username, source);
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+        let keys = self.keys(username, source);
 
         let mut failures = self.failures.lock().await;
         if failures.len() >= MAX_RATE_LIMIT_KEYS {
@@ -116,7 +216,7 @@ impl LoginRateLimiter {
         if failures.len() >= MAX_RATE_LIMIT_KEYS
             && keys.iter().any(|(key, _)| !failures.contains_key(key))
         {
-            return Some(LOGIN_RATE_WINDOW);
+            return Some(window);
         }
 
         let mut retry_after = None;
@@ -132,9 +232,9 @@ impl LoginRateLimiter {
             // the first to free a slot.
             let oldest = *entries.front().expect("a full window is non-empty");
             let wait = oldest
-                .checked_add(LOGIN_RATE_WINDOW)
+                .checked_add(window)
                 .map(|expiry| expiry.saturating_duration_since(now))
-                .unwrap_or(LOGIN_RATE_WINDOW);
+                .unwrap_or(window);
             retry_after = Some(retry_after.map_or(wait, |longest: Duration| longest.max(wait)));
         }
         retry_after
@@ -143,13 +243,13 @@ impl LoginRateLimiter {
     /// Charge one failure to every key for this attempt.
     async fn record_failure(&self, username: &str, source: Option<IpAddr>) {
         let now = Instant::now();
-        let cutoff = now.checked_sub(LOGIN_RATE_WINDOW).unwrap_or(now);
+        let cutoff = now.checked_sub(self.config.window).unwrap_or(now);
 
         let mut failures = self.failures.lock().await;
         if failures.len() >= MAX_RATE_LIMIT_KEYS {
             failures.retain(|_, entries| entries.back().is_some_and(|entry| *entry >= cutoff));
         }
-        for (key, limit) in Self::keys(username, source) {
+        for (key, limit) in self.keys(username, source) {
             let has_budget_for_a_new_key = failures.len() < MAX_RATE_LIMIT_KEYS;
             match failures.get_mut(&key) {
                 Some(entries) => {
@@ -184,6 +284,7 @@ pub struct AuthManager {
     failed_attempts: Arc<RwLock<HashMap<String, FailedAttempt>>>,
     login_rate_limiter: Arc<LoginRateLimiter>,
     argon2_verification_limit: Arc<Semaphore>,
+    throttle: LoginThrottleConfig,
     session_ttl: Duration,
 }
 
@@ -243,7 +344,24 @@ impl AuthManager {
     /// Construct with an explicit root password and return initialization
     /// failures to the caller. Blank credentials are rejected rather than
     /// silently changing the configured password.
+    ///
+    /// Uses the default brute-force policy; see [`Self::try_with_throttle`] to
+    /// supply one.
     pub fn try_with_config(root_password: &str, session_ttl: Duration) -> Result<Self> {
+        Self::try_with_throttle(root_password, session_ttl, LoginThrottleConfig::default())
+    }
+
+    /// Construct with an explicit brute-force policy.
+    ///
+    /// The policy is validated here rather than clamped, so a launcher that was
+    /// handed a degenerate value fails at startup instead of running with a
+    /// throttle that silently refuses every login.
+    pub fn try_with_throttle(
+        root_password: &str,
+        session_ttl: Duration,
+        throttle: LoginThrottleConfig,
+    ) -> Result<Self> {
+        throttle.validate().map_err(GraphError::InvalidOperation)?;
         let root_hash = Self::hash_password(root_password)?;
         // Generate the timing sentinel at startup and immediately discard its
         // plaintext. A source-known sentinel could be supplied deliberately,
@@ -255,6 +373,7 @@ impl AuthManager {
             Some(root_hash),
             dummy_password_hash,
             session_ttl,
+            throttle,
         ))
     }
 
@@ -273,13 +392,21 @@ impl AuthManager {
             }
         };
 
-        Self::from_password_hashes(None, dummy_password_hash, session_ttl)
+        // A fail-closed manager has no root identity to protect, so the policy
+        // it carries is immaterial; the default keeps it a valid one.
+        Self::from_password_hashes(
+            None,
+            dummy_password_hash,
+            session_ttl,
+            LoginThrottleConfig::default(),
+        )
     }
 
     fn from_password_hashes(
         root_hash: Option<String>,
         dummy_password_hash: String,
         session_ttl: Duration,
+        throttle: LoginThrottleConfig,
     ) -> Self {
         let mut users = HashMap::new();
         if let Some(root_hash) = root_hash {
@@ -307,10 +434,11 @@ impl AuthManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             dummy_password_hash,
             failed_attempts: Arc::new(RwLock::new(HashMap::new())),
-            login_rate_limiter: Arc::new(LoginRateLimiter::default()),
+            login_rate_limiter: Arc::new(LoginRateLimiter::new(throttle)),
             argon2_verification_limit: Arc::new(Semaphore::new(
-                MAX_CONCURRENT_ARGON2_VERIFICATIONS,
+                throttle.max_concurrent_verifications,
             )),
+            throttle,
             session_ttl,
         }
     }
@@ -421,9 +549,13 @@ impl AuthManager {
                     locked_until: None,
                 });
             entry.count += 1;
-            if entry.count >= MAX_FAILED_ATTEMPTS {
-                entry.locked_until =
-                    Some(SystemTime::now() + Duration::from_secs(LOCKOUT_DURATION_SECS));
+            // A zero lockout duration disables the lockout: recording a
+            // `locked_until` in the past would be indistinguishable from not
+            // being locked, so skip it rather than rely on that.
+            if entry.count >= self.throttle.max_failed_attempts
+                && !self.throttle.lockout_duration.is_zero()
+            {
+                entry.locked_until = Some(SystemTime::now() + self.throttle.lockout_duration);
                 tracing::warn!(
                     failed_attempts = entry.count,
                     "Account locked after repeated authentication failures"
@@ -1029,6 +1161,11 @@ mod tests {
         AuthManager::with_config(TEST_PW, ttl)
     }
 
+    fn make_manager_with_throttle(throttle: LoginThrottleConfig) -> AuthManager {
+        AuthManager::try_with_throttle(TEST_PW, Duration::from_secs(3600), throttle)
+            .expect("a valid throttle must build a manager")
+    }
+
     #[tokio::test]
     async fn test_authenticate_root_success() {
         let mgr = make_manager();
@@ -1114,6 +1251,148 @@ mod tests {
         let mgr = make_manager();
         let err = mgr.authenticate("root", "wrong").await.unwrap_err();
         assert!(matches!(err, GraphError::AuthFailed(_)));
+    }
+
+    /// A configured budget must replace the default, not be merged with or
+    /// clamped against it (#76).
+    #[tokio::test]
+    async fn a_configured_account_budget_replaces_the_default() {
+        let mgr = make_manager_with_throttle(LoginThrottleConfig {
+            max_account_failures_per_window: 2,
+            ..LoginThrottleConfig::default()
+        });
+
+        for _ in 0..2 {
+            let error = mgr
+                .authenticate("ghost", "wrong-password")
+                .await
+                .unwrap_err();
+            assert!(matches!(error, GraphError::AuthFailed(_)), "{error:?}");
+        }
+        // The default budget of 20 would still admit this one.
+        let error = mgr
+            .authenticate("ghost", "wrong-password")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, GraphError::TooManyAttempts { .. }),
+            "the configured budget of 2 must bind, not the default: {error:?}"
+        );
+    }
+
+    /// The scenario #76 was filed for: one operator, one account, a loopback
+    /// listener, and a mistyped secret that must not cost five minutes of
+    /// downtime with no second administrator to recover it.
+    #[tokio::test]
+    async fn a_zero_lockout_duration_disables_the_lockout() {
+        let mgr = make_manager_with_throttle(LoginThrottleConfig {
+            lockout_duration: Duration::ZERO,
+            ..LoginThrottleConfig::default()
+        });
+
+        // Well past the lockout threshold, and still under the window budget,
+        // so every one of these is evaluated rather than refused up front.
+        for _ in 0..MAX_FAILED_ATTEMPTS * 2 {
+            let error = mgr
+                .authenticate("root", "wrong-password")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, GraphError::AuthFailed(_)),
+                "a disabled lockout must not refuse attempts up front: {error:?}"
+            );
+        }
+
+        // The correct secret works immediately: no lockout to wait out.
+        assert!(mgr.authenticate("root", TEST_PW).await.is_ok());
+    }
+
+    /// Bounding concurrent verifications must stay a cost control, not a
+    /// session limit — even at one permit, concurrent valid logins queue.
+    #[tokio::test]
+    async fn a_single_verification_permit_still_admits_concurrent_valid_logins() {
+        let mgr = Arc::new(make_manager_with_throttle(LoginThrottleConfig {
+            max_concurrent_verifications: 1,
+            ..LoginThrottleConfig::default()
+        }));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let mgr = Arc::clone(&mgr);
+            handles.push(tokio::spawn(async move {
+                mgr.authenticate("root", TEST_PW).await
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .unwrap()
+                .expect("a narrowed pool must queue logins, not refuse them");
+        }
+    }
+
+    #[test]
+    fn a_degenerate_throttle_is_rejected_rather_than_clamped() {
+        let default = LoginThrottleConfig::default();
+        assert!(default.validate().is_ok());
+
+        for (label, throttle) in [
+            (
+                "window",
+                LoginThrottleConfig {
+                    window: Duration::ZERO,
+                    ..default
+                },
+            ),
+            (
+                "account budget",
+                LoginThrottleConfig {
+                    max_account_failures_per_window: 0,
+                    ..default
+                },
+            ),
+            (
+                "source budget",
+                LoginThrottleConfig {
+                    max_source_failures_per_window: 0,
+                    ..default
+                },
+            ),
+            (
+                "verification permits",
+                LoginThrottleConfig {
+                    max_concurrent_verifications: 0,
+                    ..default
+                },
+            ),
+            (
+                "lockout threshold",
+                LoginThrottleConfig {
+                    max_failed_attempts: 0,
+                    ..default
+                },
+            ),
+        ] {
+            assert!(
+                throttle.validate().is_err(),
+                "a zero {label} refuses every login and must not be accepted"
+            );
+            // A launcher handed such a value fails to construct rather than
+            // running with a throttle that denies a correct credential.
+            assert!(
+                AuthManager::try_with_throttle(TEST_PW, Duration::from_secs(3600), throttle)
+                    .is_err(),
+                "construction must reject a zero {label}"
+            );
+        }
+
+        // Zero lockout duration is the one exempt value: it means "no lockout".
+        assert!(LoginThrottleConfig {
+            lockout_duration: Duration::ZERO,
+            ..default
+        }
+        .validate()
+        .is_ok());
     }
 
     /// The per-account budget is what bounds guessing against one username.

@@ -205,9 +205,10 @@ async fn main() -> anyhow::Result<()> {
     let graph_service = std::sync::Arc::new(
         byoridb_graph::GraphService::with_auth(
             kvstore.clone(),
-            byoridb_graph::AuthManager::try_with_config(
+            byoridb_graph::AuthManager::try_with_throttle(
                 &root_password,
                 std::time::Duration::from_secs(byoridb_graph::auth::DEFAULT_SESSION_TTL_SECS),
+                config.auth.to_throttle(),
             )?,
         )
         .with_shutdown_state(shutdown_state.clone()),

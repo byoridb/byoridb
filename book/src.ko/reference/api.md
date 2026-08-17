@@ -60,8 +60,10 @@ credential을 **평가한** 거부는 `401 AUTH_FAILED`와 본문 `Invalid crede
 때문입니다. 그 대가로, 어떤 username에 틀린 추측을 5회 쓸 의지가 있는 호출자는 그
 계정의 존재를 알아낼 수 있습니다.
 
-이 임계값들은 컴파일 시점 상수입니다. 설정 가능하게 만드는 작업은
-[#76](https://github.com/byoridb/byoridb/issues/76)에서 다룹니다.
+위 임계값은 모두 `[auth]` 아래에서 설정할 수 있고, 표시된 값이 기본값입니다.
+단일 사용자 배포에서 lockout을 비활성화하는 방법과 그것이 제한된 listener 뒤에서만
+안전한 이유는 [로그인 throttling](../getting-started/configuration.md#로그인-throttling)을
+참고하세요.
 
 ## gRPC API
 

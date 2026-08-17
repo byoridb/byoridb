@@ -79,6 +79,57 @@ The CLI uses separate variables:
 | `BYORIDB_USER` | Required CLI username |
 | `BYORIDB_PASSWORD` | Required CLI password |
 
+## Login throttling
+
+Failed logins are throttled per account, per source address, and by a lockout.
+Successful logins are never throttled and there is no ceiling on concurrent
+logins — see [Login throttling](../reference/api.md#login-throttling) for the
+wire contract. The defaults are the right choice for an exposed listener:
+
+```toml
+[auth]
+login_window_secs = 60
+max_account_failures_per_window = 20
+max_source_failures_per_window = 60
+max_concurrent_verifications = 4
+max_failed_attempts = 5
+lockout_duration_secs = 300
+```
+
+| Key | Environment variable | Default | Meaning |
+| --- | --- | --- | --- |
+| `auth.login_window_secs` | `BYORIDB__AUTH__LOGIN_WINDOW_SECS` | `60` | Sliding window over which failures are counted |
+| `auth.max_account_failures_per_window` | `BYORIDB__AUTH__MAX_ACCOUNT_FAILURES_PER_WINDOW` | `20` | Failures allowed per username per window |
+| `auth.max_source_failures_per_window` | `BYORIDB__AUTH__MAX_SOURCE_FAILURES_PER_WINDOW` | `60` | Failures allowed per peer address per window |
+| `auth.max_concurrent_verifications` | `BYORIDB__AUTH__MAX_CONCURRENT_VERIFICATIONS` | `4` | Simultaneous Argon2 verifications; excess logins queue |
+| `auth.max_failed_attempts` | `BYORIDB__AUTH__MAX_FAILED_ATTEMPTS` | `5` | Consecutive failures that lock an existing account |
+| `auth.lockout_duration_secs` | `BYORIDB__AUTH__LOCKOUT_DURATION_SECS` | `300` | How long that lockout lasts; `0` disables the lockout |
+
+> **Relaxing these is only safe for a listener restricted at the network
+> boundary.** They are the engine's only defence against credential guessing,
+> and it has no other rate limiter to fall back on. Nothing here is adjusted
+> automatically from the bind address: binding to `127.0.0.1` does not relax
+> anything, because the process cannot tell a single-user desktop from a host
+> reachable through a forwarded port. The decision is yours to record.
+
+The case this exists for is a single-user deployment where a mistyped secret
+locks the only account and no second administrator can recover it. Disabling
+just the lockout keeps the window budgets, which still bound guessing:
+
+```bash
+export BYORIDB__AUTH__LOCKOUT_DURATION_SECS=0
+```
+
+Startup **rejects** a value that would refuse every login rather than clamping
+it silently: a zero window, a zero per-account or per-source budget, zero
+verification permits, or a zero lockout threshold all fail to load with an
+error naming `[auth]`. Use `lockout_duration_secs = 0` to disable the lockout;
+`max_failed_attempts = 0` is an error, not a way to express that.
+
+`max_concurrent_verifications` bounds CPU cost, not sessions. Logins beyond it
+wait for a permit instead of being refused, so lowering it makes a burst slower
+and never turns a correct password into a failure.
+
 ## Runtime tuning
 
 These variables are read directly by the current process:

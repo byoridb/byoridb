@@ -65,8 +65,10 @@ this collapse — a client that cannot tell "retry later" from "wrong password"
 has to stop retrying — so a caller willing to spend five wrong guesses on a
 username can learn that it exists.
 
-These thresholds are compile-time constants; making them configurable is
-tracked in [#76](https://github.com/byoridb/byoridb/issues/76).
+Every threshold above is configurable under `[auth]`; the values shown are the
+defaults. See [Login throttling](../getting-started/configuration.md#login-throttling),
+including how to disable the lockout for a single-user deployment and why doing
+so is only safe behind a restricted listener.
 
 ## gRPC GraphService
 
