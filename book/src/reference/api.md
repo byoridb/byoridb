@@ -33,6 +33,41 @@ state is process-local: sessions do not survive a restart and are not shared
 across replicas. The default TTL is 24 hours. Treat a session ID as a bearer
 credential and never place it in logs or telemetry.
 
+### Login throttling
+
+There is **no ceiling on concurrent logins**. A client may open any number of
+sessions at once, and a correct credential is never refused because other
+logins are in flight: concurrent attempts queue on a bounded pool of four
+Argon2 verifications rather than being rejected, so a burst of 32 logins costs
+latency, not failures. Only the throttles below refuse an attempt, and both
+are driven exclusively by *failures*:
+
+| Control | Budget | Window | Applies to |
+|---|---:|---:|---|
+| Per-account failures | 20 | 60 s sliding | The presented username, whether or not it exists |
+| Per-source failures | 60 | 60 s sliding | The peer IP address, across all usernames |
+| Account lockout | 5 consecutive failures | 300 s | An existing account |
+
+A successful login consumes none of these budgets and resets the account's
+consecutive-failure count. This matters for clients that fan out reads: opening
+many sessions is not a brute-force signal and is not treated as one.
+
+Every refusal that did **not** evaluate a credential — a spent failure budget or
+a locked account — is reported as `429 TOO_MANY_ATTEMPTS` with a `Retry-After`
+header (gRPC: `error_code` 3), and is not itself counted as a failed attempt.
+Retrying the same credential after that window can succeed.
+
+Every refusal that **did** evaluate a credential is reported as
+`401 AUTH_FAILED` with the body `Invalid credentials` (gRPC: `error_code` 1).
+Whether the account is missing, disabled, or merely got the password wrong is
+not disclosed. A locked account is the one state deliberately excluded from
+this collapse — a client that cannot tell "retry later" from "wrong password"
+has to stop retrying — so a caller willing to spend five wrong guesses on a
+username can learn that it exists.
+
+These thresholds are compile-time constants; making them configurable is
+tracked in [#76](https://github.com/byoridb/byoridb/issues/76).
+
 ## gRPC GraphService
 
 The source definition is `byoridb-graph/proto/graph.proto`:
@@ -232,18 +267,23 @@ Common JSON error responses from the session and `/api/v1/query` routes are:
 | Route | Status | Code | Condition |
 |---|---:|---|---|
 | `/api/v1/query` | `400` | `QUERY_ERROR` | Parse, planning, or execution failure |
-| `/api/v1/session` | `401` | `AUTH_FAILED` | Session creation failed |
+| `/api/v1/session` | `401` | `AUTH_FAILED` | The credential was evaluated and rejected |
+| `/api/v1/session` | `429` | `TOO_MANY_ATTEMPTS` | Refused before the credential was evaluated; carries `Retry-After` |
 | `/api/v1/query` | `401` | `SESSION_EXPIRED` | Query session is missing or expired |
 | `/api/v1/query` | `403` | `PERMISSION_DENIED` | Authenticated, but the role may not run this statement |
 | `/api/v1/query` | `413` | `QUERY_TOO_LARGE` | Query string exceeds 1 MiB |
 
-The three failure classes are deliberately distinct, so a client can decide what
-to do from the status alone:
+The failure classes are deliberately distinct, so a client can decide what to do
+from the status alone:
 
-- **`401`** — the session is gone. Authenticate again, then re-select the space
-  with `USE`, because a new session starts with none selected.
+- **`401`** — on `/api/v1/query`, the session is gone: authenticate again, then
+  re-select the space with `USE`, because a new session starts with none
+  selected. On `/api/v1/session`, the credential itself was rejected: retrying
+  it unchanged will fail again and will spend the account's failure budget.
 - **`403`** — the session is valid and stays valid. Re-authenticating cannot help
   and only spends an attempt against the login throttle.
+- **`429`** — nothing was checked. Wait out `Retry-After` and retry the same
+  credential; see [Login throttling](#login-throttling).
 - **`400`** — the statement itself is wrong. Retrying it unchanged will fail
   again.
 

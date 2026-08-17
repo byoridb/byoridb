@@ -83,11 +83,26 @@ impl GraphService for GrpcService {
                 error_code: 0,
                 error_msg: "".to_string(),
             })),
+            // A refusal that never evaluated a credential is reported apart
+            // from one that did, so a caller can tell "retry shortly" from
+            // "stop presenting this password". The throttle is keyed on the
+            // presented username whether or not it exists, so this discloses
+            // nothing about the account.
+            Err(crate::error::GraphError::TooManyAttempts { retry_after_secs }) => {
+                Ok(Response::new(AuthenticateResponse {
+                    session_id: 0,
+                    error_code: 3,
+                    error_msg: format!(
+                        "Too many authentication attempts. Retry in {retry_after_secs}s."
+                    ),
+                }))
+            }
             Err(_) => Ok(Response::new(AuthenticateResponse {
                 session_id: 0,
                 error_code: 1,
-                // Authentication failures are intentionally indistinguishable
-                // to remote callers (unknown/disabled/locked/wrong password).
+                // Decisions the credential check itself made are intentionally
+                // indistinguishable to remote callers (unknown, disabled,
+                // locked, or wrong password).
                 error_msg: "Invalid credentials".to_string(),
             })),
         }
@@ -267,8 +282,17 @@ mod tests {
         .into_inner()
     }
 
+    /// Every decision the credential check itself makes stays collapsed into
+    /// one response, so a caller cannot tell a missing account from a disabled
+    /// one or from a wrong password.
+    ///
+    /// A lockout is deliberately *not* in this set: it is reported as a
+    /// throttle naming its remaining window, because a client that cannot tell
+    /// "retry later" from "wrong password" has to stop retrying (#90). That
+    /// discloses the existence of an account to a caller willing to spend
+    /// `MAX_FAILED_ATTEMPTS` wrong guesses on it, which is the accepted cost.
     #[tokio::test]
-    async fn authentication_failures_do_not_enumerate_accounts() {
+    async fn evaluated_authentication_failures_do_not_enumerate_accounts() {
         let auth = AuthManager::with_config("root-password", Duration::from_secs(3600));
         auth.create_user(
             "disabled-user",
@@ -278,6 +302,27 @@ mod tests {
         .await
         .unwrap();
         auth.set_user_enabled("disabled-user", false).await.unwrap();
+        let internal = Arc::new(InternalGraphService::with_auth(
+            Arc::new(MemoryKVStore::new()),
+            auth,
+        ));
+        let service = GrpcService::new(internal);
+
+        for (username, password) in [
+            ("missing-user", "wrong-password"),
+            ("root", "wrong-password"),
+            ("disabled-user", "disabled-password"),
+        ] {
+            let response = failed_grpc_auth(&service, username, password).await;
+            assert_eq!(response.session_id, 0);
+            assert_eq!(response.error_code, 1);
+            assert_eq!(response.error_msg, "Invalid credentials");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_locked_account_is_reported_apart_from_a_wrong_credential() {
+        let auth = AuthManager::with_config("root-password", Duration::from_secs(3600));
         auth.create_user("locked-user", "locked-password", vec!["USER".to_string()])
             .await
             .unwrap();
@@ -290,17 +335,16 @@ mod tests {
         ));
         let service = GrpcService::new(internal);
 
-        for (username, password) in [
-            ("missing-user", "wrong-password"),
-            ("root", "wrong-password"),
-            ("disabled-user", "disabled-password"),
-            ("locked-user", "locked-password"),
-        ] {
-            let response = failed_grpc_auth(&service, username, password).await;
-            assert_eq!(response.session_id, 0);
-            assert_eq!(response.error_code, 1);
-            assert_eq!(response.error_msg, "Invalid credentials");
-        }
+        let response = failed_grpc_auth(&service, "locked-user", "locked-password").await;
+        assert_eq!(response.session_id, 0);
+        assert_eq!(response.error_code, 3);
+        assert!(
+            response
+                .error_msg
+                .starts_with("Too many authentication attempts. Retry in "),
+            "the refusal must name its remaining window: {}",
+            response.error_msg
+        );
     }
 
     #[tokio::test]

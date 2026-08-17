@@ -30,6 +30,39 @@ ByoriDB는 시작 시 `root` 슈퍼유저를 생성합니다. network server는 
 폐기합니다. Session은 기본 24시간 수명의 암호학적으로 무작위인 양의 63-bit bearer
 credential이며, 프로세스를 재시작하거나 다른 replica로 이동해 유지되지 않습니다.
 
+### Login throttling
+
+**동시 로그인 수에는 상한이 없습니다.** client는 session을 몇 개든 동시에 열 수 있고,
+다른 로그인이 진행 중이라는 이유로 정상 credential이 거부되는 일은 없습니다. 동시
+시도는 거부되지 않고 4개짜리 Argon2 검증 pool에서 대기하므로, 32개를 한꺼번에 보내면
+실패가 아니라 지연만 발생합니다. 아래 throttle만이 시도를 거부하며, 셋 다 **실패**만
+집계합니다:
+
+| 제어 | Budget | Window | 적용 대상 |
+|---|---:|---:|---|
+| 계정별 실패 | 20 | 60초 sliding | 제시된 username (존재하지 않아도 적용) |
+| 출처별 실패 | 60 | 60초 sliding | peer IP, username 무관 |
+| 계정 lockout | 연속 5회 실패 | 300초 | 존재하는 계정 |
+
+성공한 로그인은 이 budget을 전혀 소모하지 않고 계정의 연속 실패 횟수를 초기화합니다.
+읽기를 fan-out하는 client에 중요한 지점입니다 — session을 많이 여는 것은 brute-force
+신호가 아니며 그렇게 취급되지도 않습니다.
+
+credential을 **평가하지 않고** 거부한 경우 — 실패 budget 소진 또는 계정 lockout — 는
+`Retry-After` header와 함께 `429 TOO_MANY_ATTEMPTS`로 반환되고(gRPC는 `error_code` 3),
+그 거부 자체는 실패로 집계되지 않습니다. 해당 window가 지난 뒤 같은 credential로
+재시도하면 성공할 수 있습니다.
+
+credential을 **평가한** 거부는 `401 AUTH_FAILED`와 본문 `Invalid credentials`로
+반환됩니다(gRPC는 `error_code` 1). 계정이 없는지, 비활성인지, 비밀번호만 틀렸는지는
+노출하지 않습니다. 계정 lockout은 이 통합에서 의도적으로 제외한 유일한 상태입니다 —
+"나중에 재시도"와 "비밀번호가 틀림"을 구분할 수 없는 client는 재시도를 멈춰야 하기
+때문입니다. 그 대가로, 어떤 username에 틀린 추측을 5회 쓸 의지가 있는 호출자는 그
+계정의 존재를 알아낼 수 있습니다.
+
+이 임계값들은 컴파일 시점 상수입니다. 설정 가능하게 만드는 작업은
+[#76](https://github.com/byoridb/byoridb/issues/76)에서 다룹니다.
+
 ## gRPC API
 
 ### 서비스 정의
@@ -219,20 +252,24 @@ flag는 **요청 하나만** 제약하고 흔적을 남기지 않습니다. 같�
 격리하고 무엇을 격리하지 않는지는 [보안](../operations/security.md)을 참고하세요.
 
 HTTP API는 상태 코드와 문자열 `code`를 함께 반환합니다. 인증/인가 경로의 주요 값은
-`AUTH_FAILED`, `AUTH_REQUIRED`, `FORBIDDEN`, `SESSION_EXPIRED`이고, query 길이 제한은
-`/api/v1/query`에서 query 문자열이 1 MiB를 넘으면 HTTP 413과 `QUERY_TOO_LARGE`입니다.
-query 실패는 다음 세 부류로 갈라지며, client는 status만으로 다음 행동을 결정할 수
-있습니다:
+`AUTH_FAILED`, `AUTH_REQUIRED`, `FORBIDDEN`, `SESSION_EXPIRED`, `TOO_MANY_ATTEMPTS`이고,
+query 길이 제한은 `/api/v1/query`에서 query 문자열이 1 MiB를 넘으면 HTTP 413과
+`QUERY_TOO_LARGE`입니다. 실패는 다음 부류로 갈라지며, client는 status만으로 다음
+행동을 결정할 수 있습니다:
 
 | Status | Code | 조건 | client가 할 일 |
 |---:|---|---|---|
 | `401` | `SESSION_EXPIRED` | session이 없거나 만료됨 | 재인증 후 `USE`로 space 재선택 |
+| `401` | `AUTH_FAILED` | credential이 평가되어 거부됨 | 같은 credential을 재시도해도 실패 |
 | `403` | `PERMISSION_DENIED` | 인증은 됐지만 해당 role로는 실행 불가 | 재인증해도 해결되지 않음 |
+| `429` | `TOO_MANY_ATTEMPTS` | credential을 평가하기 전에 거부됨 | `Retry-After`만큼 기다린 뒤 같은 credential로 재시도 |
 | `400` | `QUERY_ERROR` | parse·planning·execution 실패 | 같은 문장을 재시도해도 실패 |
 
-`401`은 session이 사라진 경우입니다. 새 session에는 space가 선택되어 있지 않으므로
-재인증 후 `USE`를 다시 실행해야 합니다. `403`에서는 session이 그대로 유효하며,
-재인증은 도움이 되지 않고 login throttle 시도만 소모합니다.
+`401`은 `/api/v1/query`에서는 session이 사라진 경우입니다. 새 session에는 space가
+선택되어 있지 않으므로 재인증 후 `USE`를 다시 실행해야 합니다. `/api/v1/session`에서는
+credential 자체가 거부된 것이므로, 그대로 재시도하면 계정의 실패 budget만 소모합니다.
+`403`에서는 session이 그대로 유효하며, 재인증은 도움이 되지 않고 login throttle 시도만
+소모합니다. `429`는 아무것도 검사되지 않은 경우입니다([login throttling](#login-throttling)).
 
 인가 실패는 이전에 `Authentication failed:`로 시작하는 본문과 함께 `400`
 `QUERY_ERROR`로 반환되었습니다. client가 error text로 분류해서는 안 되는 이유입니다.

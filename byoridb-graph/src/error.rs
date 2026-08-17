@@ -11,6 +11,17 @@ pub enum GraphError {
     #[error("Authentication failed: {0}")]
     AuthFailed(String),
 
+    /// A login was refused *before* its credential was evaluated, because the
+    /// account or the network source had already exhausted its failed-attempt
+    /// budget for the current window.
+    ///
+    /// This is deliberately not an `AuthFailed`. A caller must be able to tell
+    /// "your credential is wrong, stop retrying" from "nothing was checked,
+    /// retry shortly", and a refusal that never looked at a password must not
+    /// be counted as a failed attempt against the account.
+    #[error("Too many authentication attempts")]
+    TooManyAttempts { retry_after_secs: u64 },
+
     // The inner value is retained for source compatibility and matching, but
     // never formatted: session IDs are bearer credentials.
     #[error("Session not found")]
