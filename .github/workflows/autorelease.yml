@@ -10,6 +10,13 @@ name: Auto-release
 on:
   push:
     branches: [main]
+  # Everything above depends on GitHub turning a push into a run. That link was
+  # broken for this repository on the day this workflow landed — `pull_request`
+  # and `push` created no check suites at all while `workflow_dispatch` kept
+  # working — so v0.4.1 could not be cut. This is the way out of that, and of
+  # any later gap between a merge and the release it should have produced. It
+  # resolves the same version the push path would.
+  workflow_dispatch:
 
 # Two merges landing minutes apart must not both claim the same patch number,
 # and a bump that has been pushed but not yet released must not be cancelled
@@ -24,7 +31,8 @@ jobs:
     runs-on: ubuntu-latest
     # The bump commit is itself a push to main. It carries [skip ci], which
     # already stops GitHub from starting a run for it; this guard is what keeps
-    # the loop closed without depending on that behaviour.
+    # the loop closed without depending on that behaviour. A manual dispatch has
+    # no head_commit, so the message reads as empty and the job proceeds.
     # Quoted: the expression contains ": ", which a plain YAML scalar may not.
     if: "${{ !startsWith(github.event.head_commit.message, 'chore(release): v') }}"
     permissions:
