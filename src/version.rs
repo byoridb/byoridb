@@ -6,8 +6,10 @@
 //! hardcoded `0.1.0` while the package was at `0.3.3`.
 
 /// Crate version, the commit it was built from, and the build profile. The two
-/// extra values come from `build.rs`; the SHA is what identifies a deployed
-/// artifact, since there is no maintained semver release line yet.
+/// extra values come from `build.rs`. The version is the release line that
+/// `.github/workflows/autorelease.yml` maintains — one patch per push to
+/// `main` — and the SHA pins the exact commit within it, including the `-dirty`
+/// case a tag cannot express.
 pub const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (commit ",
