@@ -1,9 +1,10 @@
 //! Build script for the `byoridb` binaries.
 //!
 //! Records the commit each binary was built from so a deployed artifact can
-//! identify itself. `docs/PLAN.md` requires deployments to be identified by
-//! commit SHA until a maintained release line exists, which is only actionable
-//! if the binary carries the SHA.
+//! identify itself. The released version comes from `Cargo.toml`, which
+//! `.github/workflows/autorelease.yml` bumps once per push to `main`; the SHA
+//! is what distinguishes builds a version alone cannot — a local build from a
+//! modified tree, or any commit that was never tagged.
 
 use std::path::Path;
 use std::process::Command;

@@ -4,9 +4,28 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag to publish; created at `ref` by this run if absent'
+        required: true
+        type: string
+      ref:
+        description: 'Commit to build, tag, and publish'
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
+  # A tag push names itself. A workflow_call names a tag that does not exist
+  # yet, so both paths collapse into one variable and no step below has to know
+  # which trigger it is running under.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  # Auto-release pushes its version bump to main *after* the push event that
+  # started it, so the caller's `github.sha` still points at the pre-bump commit.
+  # Building that commit would publish a v0.4.1 tag holding binaries that report
+  # 0.4.0 — exactly the split #88 closed. Every checkout here takes this ref.
+  RELEASE_REF: ${{ inputs.ref || github.ref }}
 
 jobs:
   # Gate: a tag must pass fmt + the full workspace test suite before any binary
@@ -44,6 +63,8 @@ jobs:
           fi
           echo "all six signing secrets are present"
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -82,6 +103,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
@@ -245,8 +268,6 @@ jobs:
           done
 
       - name: Package (Linux/macOS)
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           cd target/${{ matrix.target }}/release
           BINS=(byoridb-server byoridb-cli)
@@ -267,7 +288,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: byoridb-${{ matrix.target }}
-          path: byoridb-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          path: byoridb-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
 
   release:
     name: Create Release
@@ -277,6 +298,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -289,8 +312,13 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
+          # On a tag push, `tag_name` restates the tag that triggered the run and
+          # `target_commitish` is empty, which leaves the existing tag alone. On a
+          # workflow_call the pair is what creates the tag, at the built commit.
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ inputs.ref }}
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           generate_release_notes: true
           files: |
             artifacts/**/*.tar.gz

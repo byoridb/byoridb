@@ -1,0 +1,159 @@
+name: Auto-release
+
+# Every push to main publishes the next patch release.
+#
+# The tag alone is not enough. `src/version.rs` builds `--version` from
+# CARGO_PKG_VERSION, so what a binary reports comes from `[workspace.package]`
+# in Cargo.toml, not from the tag it was cut at. Tagging v0.4.1 without bumping
+# that line ships binaries that call themselves 0.4.0 — the split #88 closed.
+# So the bump lands on main first, and the release is built from that commit.
+on:
+  push:
+    branches: [main]
+
+# Two merges landing minutes apart must not both claim the same patch number,
+# and a bump that has been pushed but not yet released must not be cancelled
+# halfway: serialize, never cancel.
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Bump patch version
+    runs-on: ubuntu-latest
+    # The bump commit is itself a push to main. It carries [skip ci], which
+    # already stops GitHub from starting a run for it; this guard is what keeps
+    # the loop closed without depending on that behaviour.
+    # Quoted: the expression contains ": ", which a plain YAML scalar may not.
+    if: "${{ !startsWith(github.event.head_commit.message, 'chore(release): v') }}"
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.next.outputs.tag }}
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Tags are how the last released version is found, and the push below
+          # has to be able to fast-forward main.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.90"
+
+      - name: Resolve the next version
+        id: next
+        run: |
+          set -euo pipefail
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import pathlib
+          import re
+          import subprocess
+
+          WORKSPACE_VERSION = (
+              r'(?ms)^\[workspace\.package\]\n(?:(?!^\[).*\n)*?^version = "([^"]+)"'
+          )
+
+          match = re.search(WORKSPACE_VERSION, pathlib.Path("Cargo.toml").read_text())
+          assert match, "no version under [workspace.package]"
+          current = tuple(int(part) for part in match.group(1).split("."))
+
+          tags = subprocess.run(
+              ["git", "tag", "--list", "v*"],
+              capture_output=True, text=True, check=True,
+          ).stdout.split()
+
+          def semver(tag):
+              found = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", tag)
+              return tuple(int(part) for part in found.groups()) if found else None
+
+          released = sorted(filter(None, (semver(tag) for tag in tags)))
+          highest = released[-1] if released else (0, 0, 0)
+
+          # A hand-written version on main is a deliberate minor or major
+          # decision. Honour it rather than turning a pending 0.5.0 into 0.4.6.
+          if current > highest:
+              nxt, bump = current, False
+          else:
+              nxt, bump = (highest[0], highest[1], highest[2] + 1), True
+
+          version = "{}.{}.{}".format(*nxt)
+          print(f"version={version}")
+          print(f"tag=v{version}")
+          print(f"bump={str(bump).lower()}")
+          PY
+          cat "$GITHUB_OUTPUT"
+
+      - name: Write the version to main
+        id: commit
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+          BUMP: ${{ steps.next.outputs.bump }}
+        run: |
+          set -euo pipefail
+          if [ "$BUMP" != "true" ]; then
+            echo "Cargo.toml already reports $VERSION; releasing this commit as it stands"
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 - "$VERSION" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          version = sys.argv[1]
+          path = pathlib.Path("Cargo.toml")
+          # Scoped to the [workspace.package] table: all ten crates inherit from
+          # that one line, and it is not the only `version =` in the file.
+          patched, count = re.subn(
+              r'(?ms)(^\[workspace\.package\]\n(?:(?!^\[).*\n)*?^version = ")[^"]+(")',
+              rf"\g<1>{version}\g<2>",
+              path.read_text(),
+              count=1,
+          )
+          assert count == 1, f"expected one version to patch, patched {count}"
+          path.write_text(patched)
+          PY
+
+          # Cargo.lock holds a version entry per workspace member, and both CI
+          # and the release gate build with --locked. `--workspace` rewrites
+          # exactly those entries and leaves every dependency pinned as it was.
+          cargo update --workspace
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): v$VERSION [skip ci]"
+
+          # main can move while this job runs. Rebasing a commit that touches
+          # only these two files is safe.
+          pushed=false
+          for _ in 1 2 3; do
+            if git push origin HEAD:main; then pushed=true; break; fi
+            git fetch origin main
+            git rebase origin/main
+          done
+          if [ "$pushed" != true ]; then
+            echo "::error::could not fast-forward main after three attempts."
+            echo "::error::No release was cut; the push that overtook this run gets its own."
+            exit 1
+          fi
+
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Publish ${{ needs.bump.outputs.tag }}
+    needs: bump
+    permissions:
+      contents: write
+    # The same gate, signing, notarization, and packaging a hand-pushed tag
+    # gets: this only supplies the tag and the commit to cut it from.
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.bump.outputs.tag }}
+      ref: ${{ needs.bump.outputs.sha }}
+    secrets: inherit

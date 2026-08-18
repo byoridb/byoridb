@@ -42,7 +42,7 @@ multi-node launcher remains a roadmap item.
 | Area | Current state |
 |---|---|
 | Toolchain | Rust 1.90, edition 2021, protobuf compiler required for gRPC code generation |
-| Package metadata | Workspace root reports `0.3.3`; deployments are identified by commit SHA rather than a maintained semver release line |
+| Package metadata | `[workspace.package]` in the root `Cargo.toml` is the one version all ten crates inherit and every binary reports. `.github/workflows/autorelease.yml` bumps its patch on every push to `main`, commits that to `main`, and publishes the matching tag, so a released binary's `--version` and its tag always agree. Each binary also carries the commit SHA it was built from, which identifies the build more precisely than the tag does |
 | Server | One `byoridb-server` process exposes gRPC and HTTP over a shared `GraphService` and redb store |
 | Default listeners | gRPC `0.0.0.0:9669`, HTTP `0.0.0.0:19669`; neither listener provides native TLS |
 | Storage | redb current view plus a separate history table in the same database |
