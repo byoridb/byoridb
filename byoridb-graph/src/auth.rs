@@ -808,6 +808,16 @@ impl AuthManager {
         }
     }
 
+    /// The sliding TTL this manager grants a bearer session.
+    ///
+    /// Exposed so the graph-side session store can be built from the same
+    /// value. Two stores must agree on expiry: they are reconciled on every
+    /// access and the shorter one silently becomes the effective lifetime, so
+    /// the TTL has to have one source rather than two defaults.
+    pub fn session_ttl(&self) -> Duration {
+        self.session_ttl
+    }
+
     /// Check liveness without refreshing the sliding TTL. Background
     /// reconciliation uses this so maintenance itself cannot keep sessions
     /// alive forever.

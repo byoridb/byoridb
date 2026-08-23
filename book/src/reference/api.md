@@ -30,8 +30,22 @@ the affected user's existing sessions.
 
 Session IDs are cryptographically random positive 63-bit integers. Session
 state is process-local: sessions do not survive a restart and are not shared
-across replicas. The default TTL is 24 hours. Treat a session ID as a bearer
-credential and never place it in logs or telemetry.
+across replicas. Treat a session ID as a bearer credential and never place it
+in logs or telemetry.
+
+The TTL defaults to 24 hours and is set by `auth.session_ttl_secs`
+([Login throttling](../getting-started/configuration.md#login-throttling)). It
+**slides**: every use of a session renews it for the full TTL, so the setting
+bounds how long a session may sit *idle*, not how long it may live. A session
+in continuous use does not expire, which is why shortening the TTL is only part
+of limiting bearer exposure — `DELETE /api/v1/session` is what ends one.
+
+A session exists in two stores that are reconciled on every access: the
+authentication store, which owns identity and roles, and the graph store, which
+owns the selected space. The authentication store is authoritative — if either
+side is missing or expired the other is revoked, so a bearer cannot keep a
+half-live session alive in one store alone. Both take their TTL from the same
+setting, because the shorter of the two would otherwise be the real lifetime.
 
 ### Login throttling
 

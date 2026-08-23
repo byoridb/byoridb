@@ -27,8 +27,21 @@ ByoriDB는 시작 시 `root` 슈퍼유저를 생성합니다. network server는 
 
 영속 사용자는 redb에 저장되고 서버 시작 시 authentication cache에 적재됩니다.
 사용자, role, 비밀번호 변경은 cache에 동기화되며 해당 사용자의 local session을
-폐기합니다. Session은 기본 24시간 수명의 암호학적으로 무작위인 양의 63-bit bearer
-credential이며, 프로세스를 재시작하거나 다른 replica로 이동해 유지되지 않습니다.
+폐기합니다. Session은 암호학적으로 무작위인 양의 63-bit bearer credential이며,
+프로세스를 재시작하거나 다른 replica로 이동해 유지되지 않습니다.
+
+TTL은 기본 24시간이고 `auth.session_ttl_secs`로 설정합니다([로그인 throttling](../getting-started/configuration.md#로그인-throttling)).
+이 TTL은 **sliding**입니다 — session을 사용할 때마다 전체 TTL만큼 갱신되므로, 이
+설정은 session이 얼마나 오래 *유휴* 상태로 있을 수 있는지를 제한하며 총 수명을
+제한하지 않습니다. 계속 사용되는 session은 만료되지 않습니다. TTL을 줄이는 것만으로
+bearer 노출을 제한할 수 없고, session을 실제로 끝내는 것은
+`DELETE /api/v1/session`입니다.
+
+Session은 접근마다 재조정되는 두 저장소에 존재합니다 — 신원과 role을 소유하는
+authentication 저장소, 그리고 선택된 space를 소유하는 graph 저장소입니다.
+authentication 저장소가 authoritative이며, 한쪽이 없거나 만료되면 다른 쪽도 폐기되므로
+bearer가 한 저장소에만 반쯤 살아 있는 session을 유지할 수 없습니다. 두 저장소는 같은
+설정에서 TTL을 가져옵니다 — 그러지 않으면 둘 중 짧은 쪽이 실제 수명이 됩니다.
 
 ### Login throttling
 

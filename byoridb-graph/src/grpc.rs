@@ -399,6 +399,49 @@ mod tests {
         assert!(!response.error_msg.contains(&session.to_string()));
     }
 
+    /// The configured session TTL must bind on the gRPC query path, not only on
+    /// HTTP (#80): both protocols share one service, so a TTL that expired
+    /// sessions on one surface and not the other would be a hole.
+    #[tokio::test]
+    async fn a_configured_session_ttl_expires_grpc_queries() {
+        const ROOT_PASSWORD: &str = "root-password";
+        const TTL: Duration = Duration::from_millis(400);
+        let internal = Arc::new(InternalGraphService::with_auth(
+            Arc::new(MemoryKVStore::new()),
+            AuthManager::with_config(ROOT_PASSWORD, TTL),
+        ));
+        let session = internal
+            .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
+            .await
+            .unwrap();
+        let service = GrpcService::new(internal);
+
+        let query = || {
+            GraphService::execute(
+                &service,
+                Request::new(ExecuteRequest {
+                    session_id: session,
+                    statement: "SHOW SPACES".to_string(),
+                    read_only: false,
+                }),
+            )
+        };
+
+        let live = query().await.unwrap().into_inner();
+        assert_eq!(live.error_code, 0, "{}", live.error_msg);
+
+        // Past the TTL the last query refreshed it to.
+        tokio::time::sleep(TTL + Duration::from_millis(200)).await;
+
+        let expired = query().await.unwrap().into_inner();
+        assert_eq!(
+            expired.error_code, 2,
+            "an expired session must be a session error, got: {}",
+            expired.error_msg
+        );
+        assert!(!expired.error_msg.contains(&session.to_string()));
+    }
+
     #[test]
     fn elapsed_us_never_negative() {
         let start = std::time::Instant::now();

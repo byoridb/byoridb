@@ -112,9 +112,11 @@ pub struct GraphService {
 impl GraphService {
     pub fn new(kvstore: Arc<dyn KVStore>) -> Self {
         let auth_manager = Arc::new(AuthManager::new());
+        // Same single source of truth as `with_auth`.
+        let session_manager = Arc::new(SessionManager::with_ttl(auth_manager.session_ttl()));
 
         GraphService {
-            session_manager: Arc::new(SessionManager::new()),
+            session_manager,
             auth_manager,
             kvstore,
             active_queries: Arc::new(DashMap::new()),
@@ -134,8 +136,14 @@ impl GraphService {
     /// service with the resulting manager, and share its [`Arc`] across every
     /// protocol.
     pub fn with_auth(kvstore: Arc<dyn KVStore>, auth_manager: AuthManager) -> Self {
+        // The graph store takes its TTL from the bearer's, so one configured
+        // value governs expiry. A bearer and its graph session are reconciled
+        // on every access, and whichever expires first ends both — so two
+        // independent defaults would make the shorter one the real lifetime
+        // and silently cap a longer configured TTL.
+        let session_manager = Arc::new(SessionManager::with_ttl(auth_manager.session_ttl()));
         GraphService {
-            session_manager: Arc::new(SessionManager::new()),
+            session_manager,
             auth_manager: Arc::new(auth_manager),
             kvstore,
             active_queries: Arc::new(DashMap::new()),
@@ -150,6 +158,19 @@ impl GraphService {
     /// drain counter covers every in-flight query).
     pub fn with_shutdown_state(mut self, shutdown: Arc<crate::shutdown::ShutdownState>) -> Self {
         self.shutdown = shutdown;
+        self
+    }
+
+    /// Give the graph session store a TTL of its own, diverging from the
+    /// bearer's.
+    ///
+    /// This exists to construct the divergent state on purpose — a graph
+    /// session outliving its bearer, or the reverse — so the reconciliation in
+    /// [`Self::live_session`] can be tested. Production has no use for it:
+    /// [`Self::with_auth`] already derives this from the bearer TTL, and
+    /// setting the two apart means the shorter one is the effective lifetime.
+    pub fn with_session_ttl(mut self, session_ttl: std::time::Duration) -> Self {
+        self.session_manager = Arc::new(SessionManager::with_ttl(session_ttl));
         self
     }
 
@@ -1459,12 +1480,53 @@ mod tests {
         assert!(service.validate_session(new_session).await.is_ok());
     }
 
+    /// One configured lifetime must govern both session stores (#80).
+    ///
+    /// A bearer and its graph session are reconciled on every access and
+    /// whichever expires first ends both, so a graph store keeping its own 24h
+    /// default would silently cap any configured TTL longer than that — the
+    /// setting would appear to work while being ignored above 24h.
+    #[tokio::test]
+    async fn one_configured_ttl_governs_both_session_stores() {
+        // Longer than the former hardcoded default, which is the direction that
+        // used to be silently capped.
+        const TTL: Duration = Duration::from_secs(48 * 60 * 60);
+        let service = GraphService::with_auth(
+            Arc::new(MemoryKVStore::new()),
+            AuthManager::with_config(ROOT_PASSWORD, TTL),
+        );
+        assert_eq!(service.auth_manager.session_ttl(), TTL);
+
+        let session = root_session(&service).await;
+        let asked_at = SystemTime::now();
+        let granted = service
+            .session_manager
+            .get_session(session)
+            .await
+            .expect("the graph session must exist")
+            .expires_at
+            .duration_since(asked_at)
+            .expect("a live session must expire in the future");
+
+        // Compared with a tolerance rather than exactly, and in both
+        // directions: the store stamps the expiry from its own clock read,
+        // which is not the one this assertion measures from.
+        assert!(
+            granted.abs_diff(TTL) < Duration::from_secs(60),
+            "the graph store granted {granted:?}, not the configured {TTL:?}"
+        );
+    }
+
     #[tokio::test]
     async fn expired_auth_token_cannot_extend_graph_session() {
+        // Deliberately divergent: the graph session is set to outlive the
+        // bearer, which is the state this reconciliation exists for. It used to
+        // arise implicitly from the store's independent 24h default.
         let service = GraphService::with_auth(
             Arc::new(MemoryKVStore::new()),
             AuthManager::with_config(ROOT_PASSWORD, Duration::from_millis(50)),
-        );
+        )
+        .with_session_ttl(Duration::from_secs(3600));
         let session = root_session(&service).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 

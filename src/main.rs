@@ -205,9 +205,12 @@ async fn main() -> anyhow::Result<()> {
     let graph_service = std::sync::Arc::new(
         byoridb_graph::GraphService::with_auth(
             kvstore.clone(),
+            // `with_auth` derives the graph session store's TTL from this one,
+            // so a configured lifetime governs both stores instead of being
+            // capped by the other's default.
             byoridb_graph::AuthManager::try_with_throttle(
                 &root_password,
-                std::time::Duration::from_secs(byoridb_graph::auth::DEFAULT_SESSION_TTL_SECS),
+                config.auth.session_ttl(),
                 config.auth.to_throttle(),
             )?,
         )
