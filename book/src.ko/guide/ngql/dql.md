@@ -122,6 +122,65 @@ ontology-aware membership는 `is_a`를 사용합니다.
 MATCH (n:dog) WHERE is_a(n, "animal") RETURN id(n) AS vid;
 ```
 
+## 함수
+
+엔진이 구현하지 않은 함수를 호출하면 `NULL`이 아니라 **함수 이름을 명시한 query
+오류**가 됩니다. `WHERE`에서 특히 중요합니다 — null 술어는 모든 행에 대해 false이므로,
+미지원 함수가 결과 0건을 보고하면 "아무것도 매치되지 않음"과 구분할 수 없습니다.
+
+```
+nebula> MATCH (n:doc) WHERE frobnicate(n.doc.body) RETURN n;
+[ERROR] Unknown function: frobnicate
+```
+
+### 그래프 함수
+
+`MATCH` 안에서 인자 값이 아니라 그래프 상태를 읽습니다.
+
+| 함수 | 반환 |
+| --- | --- |
+| `id(v)` | bound vertex의 VID |
+| `src(e)`, `dst(e)` | 저장된 방향 기준 edge 양 끝점 |
+| `type(e)` | edge type 이름 |
+| `rank(e)`, `ranking(e)` | edge rank |
+| `properties(v)`, `properties(e)` | 모든 property의 flat map |
+| `tags(v)`, `labels(v)` | vertex의 tag 이름들 |
+| `is_a(v, "Class")` | `SUBCLASS OF` 상위 클래스를 포함한 클래스 소속 여부 |
+
+### 집계
+
+`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COLLECT`.
+
+### 스칼라 함수
+
+표현식이 평가되는 모든 위치에서 사용할 수 있습니다.
+
+| 분류 | 함수 |
+| --- | --- |
+| 대소문자 | `lower` / `toLower`, `upper` / `toUpper` |
+| 크기 | `length` / `size` |
+| 텍스트 | `contains`, `starts_with` / `startsWith`, `ends_with` / `endsWith` |
+| 수치 | `abs`, `floor`, `ceil`, `round` |
+| Null | `is_null` / `isNull`, `is_not_null` / `isNotNull`, `coalesce` |
+
+함수 이름은 대소문자를 구분하지 않으므로 `toLower`, `TOLOWER`, `tolower`는 같은
+함수입니다. 지원되는 함수에 잘못된 타입의 인자를 주면 query가 실패하는 대신 typed
+null이 되고, **이름을 모르는 경우에만** 거부됩니다.
+
+### 텍스트 매칭은 대소문자를 구분합니다
+
+`CONTAINS`, `STARTS WITH`, `ENDS WITH`는 **정확히** 비교하므로
+`CONTAINS 'worktrees'`는 `Worktrees`에 매치되지 않습니다. 철자별로 여러 query를
+보내는 대신 양쪽을 접으세요.
+
+```sql
+MATCH (n:doc) WHERE toLower(n.doc.body) CONTAINS 'worktrees'
+RETURN n.doc.body AS body;
+```
+
+대소문자를 무시하는 비교 연산자는 없습니다. `toLower`로 접는 것이 지원되는
+방법입니다.
+
 ## LOOKUP
 
 현재 `LOOKUP`은 tag를 대상으로 합니다.

@@ -448,6 +448,78 @@ pub struct PropertyDef {
 /// Build execution plan from parsed statement
 pub struct ExecutionPlanBuilder;
 
+/// Functions the MATCH executor answers from graph state rather than from
+/// argument values: bound VIDs, edge endpoints, stored properties, tag sets,
+/// and ontology class membership.
+const MATCH_GRAPH_FUNCTIONS: &[&str] = &[
+    "ID",
+    "SRC",
+    "DST",
+    "TYPE",
+    "RANK",
+    "RANKING",
+    "PROPERTIES",
+    "TAGS",
+    "LABELS",
+    "IS_A",
+    "ISA",
+];
+
+/// Aggregates, which MATCH computes over all binding rows at once rather than
+/// per row.
+const MATCH_AGGREGATES: &[&str] = &["COUNT", "SUM", "AVG", "MAX", "MIN", "COLLECT"];
+
+/// Reject a MATCH expression that calls a function the engine does not
+/// implement, naming the function.
+///
+/// This is a planning error on purpose (#102). The MATCH evaluator produces a
+/// `Value` with no error channel, so an unrecognised call used to become `NULL`:
+/// merely confusing in `RETURN`, but in `WHERE` it made the predicate false for
+/// every row, so an unsupported function reported "0 rows" and a caller could
+/// not tell that from "nothing matched". Refusing the query up front means no
+/// such result is ever produced.
+fn reject_unknown_functions(expr: &Expression) -> Result<()> {
+    match expr {
+        Expression::FunctionCall { name, args } => {
+            let upper = name.to_uppercase();
+            let known = MATCH_GRAPH_FUNCTIONS.contains(&upper.as_str())
+                || MATCH_AGGREGATES.contains(&upper.as_str())
+                || crate::evaluator::SCALAR_FUNCTIONS.contains(&upper.as_str());
+            if !known {
+                return Err(crate::error::ExecutionError::InvalidOperation(format!(
+                    "Unknown function: {name}"
+                )));
+            }
+            for arg in args {
+                reject_unknown_functions(arg)?;
+            }
+            Ok(())
+        }
+        Expression::BinaryOp { left, right, .. } => {
+            reject_unknown_functions(left)?;
+            reject_unknown_functions(right)
+        }
+        Expression::UnaryOp { operand, .. } => reject_unknown_functions(operand),
+        Expression::List(items) => {
+            for item in items {
+                reject_unknown_functions(item)?;
+            }
+            Ok(())
+        }
+        Expression::Map(entries) => {
+            for value in entries.values() {
+                reject_unknown_functions(value)?;
+            }
+            Ok(())
+        }
+        // Leaves: nothing to inspect.
+        Expression::Literal(_)
+        | Expression::Identifier(_)
+        | Expression::PropRef { .. }
+        | Expression::DstVertexProp { .. } => Ok(()),
+    }
+}
+
 impl ExecutionPlanBuilder {
     pub fn build(stmt: Statement) -> Result<ExecutionPlan> {
         match stmt {
@@ -954,17 +1026,28 @@ impl ExecutionPlanBuilder {
             })),
             Statement::Match(match_stmt) => Ok(ExecutionPlan::Match(MatchPlan {
                 pattern: match_stmt.pattern,
-                where_clause: match_stmt.where_clause,
+                where_clause: {
+                    if let Some(filter) = &match_stmt.where_clause {
+                        reject_unknown_functions(filter)?;
+                    }
+                    match_stmt.where_clause
+                },
                 optional_patterns: match_stmt.optional_patterns,
-                return_clause: match_stmt.return_clause.map(|c| {
-                    c.columns
-                        .into_iter()
-                        .map(|col| MatchReturnColumn {
-                            expression: col.expression,
-                            alias: col.alias,
-                        })
-                        .collect()
-                }),
+                return_clause: match_stmt
+                    .return_clause
+                    .map(|c| {
+                        c.columns
+                            .into_iter()
+                            .map(|col| {
+                                reject_unknown_functions(&col.expression)?;
+                                Ok(MatchReturnColumn {
+                                    expression: col.expression,
+                                    alias: col.alias,
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?,
                 group_by: match_stmt.group_by,
                 order_by: match_stmt.order_by,
                 limit: match_stmt.limit,

@@ -17,6 +17,37 @@ use byoridb_common::Value;
 use byoridb_parser::ast::{BinaryOperator, Expression, Literal, UnaryOperator};
 use std::collections::HashMap;
 
+/// Every scalar function name [`Evaluator::apply_scalar_function`] accepts.
+///
+/// It exists because a caller sometimes has to know whether a name is supported
+/// *before* evaluating it: the MATCH planner rejects an unknown function up
+/// front rather than letting it evaluate to `NULL` and look like empty data
+/// (#102). Without this list that caller would keep a second copy of the
+/// dispatcher's names, and the two would drift — the test
+/// `every_listed_scalar_function_is_dispatched` is what keeps them honest.
+pub const SCALAR_FUNCTIONS: &[&str] = &[
+    "LOWER",
+    "TOLOWER",
+    "UPPER",
+    "TOUPPER",
+    "LENGTH",
+    "SIZE",
+    "CONTAINS",
+    "STARTS_WITH",
+    "STARTSWITH",
+    "ENDS_WITH",
+    "ENDSWITH",
+    "ABS",
+    "FLOOR",
+    "CEIL",
+    "ROUND",
+    "IS_NULL",
+    "ISNULL",
+    "IS_NOT_NULL",
+    "ISNOTNULL",
+    "COALESCE",
+];
+
 /// Evaluation context containing variable bindings
 #[derive(Debug, Clone, Default)]
 pub struct EvalContext {
@@ -311,6 +342,10 @@ impl Evaluator {
             // vertex's class set (`__isa__`, its tags ∪ transitive superclasses,
             // injected by the caller) contains the named class. Lets a RECOMMEND
             // WHERE express subclass-aware filters like `is_a("animal")`.
+            //
+            // This one stays here rather than moving to the shared scalar
+            // library below, because it reads from the evaluation context and
+            // not only from its arguments.
             "IS_A" | "ISA" => {
                 let target = match args.first() {
                     Some(Value::String(s)) => s,
@@ -325,6 +360,19 @@ impl Evaluator {
                     if l.values.iter().any(|v| matches!(v, Value::String(s) if s == target)));
                 Ok(Value::Bool(member))
             }
+            _ => Self::apply_scalar_function(name, &args),
+        }
+    }
+
+    /// Apply a function that depends only on its argument *values*.
+    ///
+    /// Separated from [`Self::eval_function`] so the MATCH executor, which
+    /// resolves arguments against graph bindings rather than an `EvalContext`,
+    /// can use these implementations instead of maintaining its own. Before
+    /// this existed, MATCH silently returned `NULL` for every function it did
+    /// not recognise, including `toLower` (#102).
+    pub fn apply_scalar_function(name: &str, args: &[Value]) -> Result<Value> {
+        match name.to_uppercase().as_str() {
             // String functions
             "LOWER" | "TOLOWER" => match args.first() {
                 Some(Value::String(s)) => Ok(Value::String(s.to_lowercase())),
@@ -428,7 +476,7 @@ impl Evaluator {
 
             // Coalesce
             "COALESCE" => {
-                for arg in &args {
+                for arg in args {
                     if !matches!(arg, Value::Null(_)) {
                         return Ok(arg.clone());
                     }
@@ -895,5 +943,43 @@ mod tests {
             Evaluator::evaluate_with_context(&expr, &EvalContext::new()).unwrap(),
             Value::Bool(false)
         );
+    }
+
+    /// `SCALAR_FUNCTIONS` exists so callers can ask whether a name is supported
+    /// without evaluating it. That is only true while it matches what the
+    /// dispatcher actually accepts, so assert it rather than trust it: every
+    /// listed name must resolve to something other than "unknown function".
+    #[test]
+    fn every_listed_scalar_function_is_dispatched() {
+        for name in SCALAR_FUNCTIONS {
+            // One string argument satisfies most of them; the ones it does not
+            // fit still fail on the argument rather than on the name, which is
+            // what this test distinguishes.
+            let outcome = Evaluator::apply_scalar_function(
+                name,
+                &[
+                    Value::String("value".to_string()),
+                    Value::String("v".to_string()),
+                ],
+            );
+            if let Err(error) = &outcome {
+                assert!(
+                    !error.to_string().contains("Unknown function"),
+                    "{name} is listed in SCALAR_FUNCTIONS but the dispatcher does not know it"
+                );
+            }
+        }
+    }
+
+    /// The complement: an unlisted name must be reported as unknown, naming
+    /// itself, because that error is what the MATCH planner turns into a query
+    /// error instead of a silent NULL (#102).
+    #[test]
+    fn an_unlisted_function_is_reported_as_unknown_by_name() {
+        let error = Evaluator::apply_scalar_function("frobnicate", &[Value::Int(1)])
+            .expect_err("an unimplemented function must not produce a value");
+        assert!(error.to_string().contains("Unknown function"), "{error}");
+        assert!(error.to_string().contains("frobnicate"), "{error}");
+        assert!(!SCALAR_FUNCTIONS.contains(&"FROBNICATE"));
     }
 }
