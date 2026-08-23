@@ -918,6 +918,7 @@ mod tests {
                 updates: HashMap::new(),
                 conditions: Some(Expression::Literal(Literal::Bool(false))),
                 yield_clause: None,
+                edge: None,
             })
             .await
             .unwrap();
@@ -1063,6 +1064,7 @@ mod tests {
                 updates: HashMap::new(),
                 conditions: None,
                 yield_clause: None,
+                edge: None,
             })
             .await;
         assert!(integer_update

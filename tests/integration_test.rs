@@ -2657,3 +2657,169 @@ async fn unknown_functions_fail_instead_of_evaluating_to_null() {
 
     service.sign_out(session_id, session_id).await.unwrap();
 }
+
+/// Regression for #77. `UPDATE EDGE` parsed and was then planned as a vertex
+/// update with no tag, so it failed with "Tag name required for UPDATE" — an
+/// error naming a concept the statement never mentions. It now updates the edge.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_edge_writes_the_edge_it_names() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE edge_update").await;
+    execute(&service, session_id, "USE edge_update").await;
+    execute(&service, session_id, "CREATE TAG person(name STRING)").await;
+    execute(&service, session_id, "CREATE EDGE knows(since INT64)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX person(name) VALUES 1:("Alice"), 2:("Bob")"#,
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE knows(since) VALUES 1->2:(2020)",
+    )
+    .await;
+
+    let updated = execute(
+        &service,
+        session_id,
+        "UPDATE EDGE ON knows 1->2 SET since = 2021",
+    )
+    .await;
+    assert_eq!(updated.rows, vec![vec![Value::Int(1)]]);
+
+    // The forward read sees the new value.
+    let forward = execute(
+        &service,
+        session_id,
+        "GO FROM 1 OVER knows YIELD knows.since AS since",
+    )
+    .await;
+    assert_eq!(forward.rows, vec![vec![Value::Int(2021)]]);
+
+    // So does the reverse read, which is served by a second copy of the payload
+    // under an `in-edge` key. Refreshing only the forward key would leave the
+    // two disagreeing.
+    let reverse = execute(
+        &service,
+        session_id,
+        "GO FROM 2 OVER knows REVERSELY YIELD knows.since AS since",
+    )
+    .await;
+    assert_eq!(reverse.rows, vec![vec![Value::Int(2021)]]);
+
+    // An edge that does not exist is a no-op, not an upsert: fabricating one
+    // here would skip the degree counters and ontology triples INSERT maintains.
+    let missing = execute(
+        &service,
+        session_id,
+        "UPDATE EDGE ON knows 2->1 SET since = 1999",
+    )
+    .await;
+    assert_eq!(missing.rows, vec![vec![Value::Int(0)]]);
+    let not_created = execute(
+        &service,
+        session_id,
+        "GO FROM 2 OVER knows YIELD knows.since AS since",
+    )
+    .await;
+    assert!(
+        not_created.rows.is_empty(),
+        "UPDATE must not create an edge, got {:?}",
+        not_created.rows
+    );
+
+    // Ranking is part of the edge's identity, so an update addressed to a
+    // different rank must not touch rank 0.
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE knows(since) VALUES 1->2@7:(1990)",
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        "UPDATE EDGE ON knows 1->2@7 SET since = 1991",
+    )
+    .await;
+    // Both ranks are read back from one FETCH: rank 7 took the new value and
+    // rank 0 kept the earlier one. (`FETCH PROP` does not filter on `@rank`;
+    // that is a separate limitation and not what this asserts.)
+    let ranked = execute(&service, session_id, "FETCH PROP ON knows 1->2").await;
+    let mut ranks: Vec<(i64, i64)> = ranked
+        .rows
+        .iter()
+        .filter_map(|row| {
+            row.iter().find_map(|value| match value {
+                // FETCH PROP renders an edge as a JSON object.
+                Value::String(json) => {
+                    let edge: serde_json::Value = serde_json::from_str(json).ok()?;
+                    Some((edge["ranking"].as_i64()?, edge["props"]["since"].as_i64()?))
+                }
+                _ => None,
+            })
+        })
+        .collect();
+    ranks.sort();
+    ranks.dedup();
+    assert_eq!(
+        ranks,
+        vec![(0, 2021), (7, 1991)],
+        "each rank must keep its own properties, got {:?}",
+        ranked.rows
+    );
+
+    // `WHEN` gates an edge update the way it gates a vertex update: a false
+    // condition is a no-op, and a true one applies.
+    let refused = execute(
+        &service,
+        session_id,
+        "UPDATE EDGE ON knows 1->2 SET since = 3000 WHEN knows.since == 1900",
+    )
+    .await;
+    assert_eq!(refused.rows, vec![vec![Value::Int(0)]]);
+    let accepted = execute(
+        &service,
+        session_id,
+        "UPDATE EDGE ON knows 1->2 SET since = 2022 WHEN knows.since == 2021",
+    )
+    .await;
+    assert_eq!(accepted.rows, vec![vec![Value::Int(1)]]);
+    let gated = execute(
+        &service,
+        session_id,
+        "GO FROM 1 OVER knows YIELD knows.since AS since",
+    )
+    .await;
+    assert!(
+        gated
+            .rows
+            .iter()
+            .any(|row| row.first() == Some(&Value::Int(2022))),
+        "a satisfied WHEN must apply, got {:?}",
+        gated.rows
+    );
+
+    // An unknown property is rejected against the edge schema rather than
+    // written, matching INSERT EDGE.
+    let unknown_field = service
+        .execute(
+            session_id,
+            "UPDATE EDGE ON knows 1->2 SET nonexistent = 1".to_string(),
+        )
+        .await
+        .expect_err("an unknown edge field must be refused");
+    assert!(
+        unknown_field.to_string().contains("nonexistent"),
+        "the error must name the field, got: {unknown_field}"
+    );
+
+    service.sign_out(session_id, session_id).await.unwrap();
+}

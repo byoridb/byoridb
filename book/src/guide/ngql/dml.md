@@ -92,9 +92,30 @@ Without `WHEN`, `UPDATE VERTEX` behaves as an upsert and creates the vertex/tag
 when the VID does not exist. If your application requires update-only behavior,
 check existence first or use a true `WHEN` predicate tied to current data.
 
-`UPDATE EDGE` is parsed but its execution plan currently discards the edge
-identity and fails. Replace an edge by deleting and reinserting it until a
-dedicated edge-update executor is implemented.
+## Update edges
+
+```sql
+UPDATE EDGE ON knows 1->2 SET since = 2021;
+UPDATE EDGE ON knows 1->2@7 SET since = 1991;
+UPDATE EDGE ON knows 1->2 SET since = 2022 WHEN knows.since == 2021;
+```
+
+The rank defaults to `0` when omitted, and it is part of the edge's identity, so
+`1->2` and `1->2@7` are different edges and an update touches only the one it
+names. Source, destination, type, and rank cannot be assigned — an update changes
+properties, never which edge it is.
+
+`WHEN` is evaluated against the edge's current properties, which are visible
+both bare and qualified by edge type (`since` and `knows.since`).
+
+**Unlike `UPDATE VERTEX`, this is not an upsert.** Updating an edge that does not
+exist returns `0` and creates nothing, because creating one here would have to
+maintain the degree counters and asserted ontology triples that `INSERT EDGE`
+does. Use `INSERT EDGE` to create.
+
+Both directions see the change: the reverse-traversal copy of the edge is
+rewritten in the same transaction as the forward one, and edge indexes are moved
+off the old property values onto the new ones.
 
 ## Delete vertices
 

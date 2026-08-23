@@ -1172,6 +1172,7 @@ mod tests {
             )]),
             conditions: None,
             yield_clause: None,
+            edge: None,
         };
 
         executor

@@ -87,8 +87,28 @@ UPDATE VERTEX ON person 1 SET age = 33 WHEN age == 32;
 update-only가 필요하면 먼저 존재를 확인하거나 현재 데이터에 묶인 참인 `WHEN` 조건을
 사용하세요.
 
-`UPDATE EDGE`는 parser가 받지만 현재 plan은 edge identity를 보존하지 못해 실행에
-실패합니다. 전용 edge-update executor가 구현되기 전에는 삭제 후 다시 삽입하세요.
+## Edge 갱신
+
+```sql
+UPDATE EDGE ON knows 1->2 SET since = 2021;
+UPDATE EDGE ON knows 1->2@7 SET since = 1991;
+UPDATE EDGE ON knows 1->2 SET since = 2022 WHEN knows.since == 2021;
+```
+
+rank를 생략하면 `0`이고, rank는 edge identity의 일부이므로 `1->2`와 `1->2@7`은 서로
+다른 edge입니다. 갱신은 명시한 edge 하나만 건드립니다. source·destination·type·rank는
+assignment 대상이 아닙니다 — 갱신은 property를 바꾸고, 어떤 edge인지는 바꾸지 않습니다.
+
+`WHEN`은 edge의 현재 property에 대해 평가되며, property는 이름 그대로와 edge type으로
+수식한 형태 둘 다로 보입니다(`since`와 `knows.since`).
+
+**`UPDATE VERTEX`와 달리 upsert가 아닙니다.** 존재하지 않는 edge를 갱신하면 `0`을
+반환하고 아무것도 만들지 않습니다. 여기서 edge를 만들면 `INSERT EDGE`가 유지하는 차수
+counter와 ontology triple까지 함께 유지해야 하기 때문입니다. 생성은 `INSERT EDGE`를
+사용하세요.
+
+양방향 모두 변경을 봅니다 — 역방향 조회용 사본이 정방향과 같은 트랜잭션에서 다시
+쓰이고, edge index도 이전 property 값에서 새 값으로 옮겨집니다.
 
 ## Vertex 삭제
 

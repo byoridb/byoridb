@@ -522,6 +522,174 @@ impl Executor {
         &self,
         plan: crate::plan::UpdatePlan,
     ) -> Result<ExecutorResult> {
+        if plan.edge.is_some() {
+            return self.execute_update_edge(plan).await;
+        }
+        self.execute_update_vertex(plan).await
+    }
+
+    /// `UPDATE EDGE src -> dst [@rank] OF type SET ...`
+    ///
+    /// A missing edge is a no-op returning 0 rather than an upsert, which is
+    /// where this deliberately differs from vertex UPDATE. Creating an edge here
+    /// would have to maintain the degree counters and assert the ontology
+    /// triples that `INSERT EDGE` does; skipping either would corrupt a
+    /// precomputed `COUNT` or leave inference stale, and an UPDATE that
+    /// fabricates an edge is a surprising way to acquire one.
+    ///
+    /// Because src, dst, type, and rank are the edge's identity and none of them
+    /// is assignable, an update never moves an edge: degree counters and
+    /// asserted triples are unchanged by construction, so neither is touched.
+    async fn execute_update_edge(&self, plan: crate::plan::UpdatePlan) -> Result<ExecutorResult> {
+        let target = plan
+            .edge
+            .as_ref()
+            .expect("execute_update_edge is only reached with an edge target");
+        let effective_space = if plan.space.is_empty() {
+            self.ctx
+                .space
+                .as_ref()
+                .ok_or_else(|| ExecutionError::InvalidOperation("No space selected".to_string()))?
+                .clone()
+        } else {
+            plan.space.clone()
+        };
+        let vid_type = crate::vid::space_vid_type(&self.ctx, &effective_space).await?;
+
+        // Reject unwritable VID forms and unknown fields before touching storage,
+        // matching INSERT EDGE.
+        crate::vid::validate_write_vid(&effective_space, vid_type, &plan.vid)?;
+        crate::vid::validate_write_vid(&effective_space, vid_type, &target.dst)?;
+        self.validate_edge_props(&effective_space, &target.edge_name, &plan.updates)
+            .await?;
+
+        let no_op = || {
+            Ok(ExecutorResult {
+                columns: vec!["Updated".to_string()],
+                rows: vec![vec![byoridb_common::Value::Int(0)]],
+                latency_ms: 0,
+            })
+        };
+
+        // Read-only VID resolution: an unmapped string endpoint means no such
+        // edge, and must not mint a mapping for one.
+        let (Some(src), Some(dst)) = (
+            crate::vid::resolve_vid(&self.ctx, &effective_space, vid_type, &plan.vid, false)
+                .await?,
+            crate::vid::resolve_vid(&self.ctx, &effective_space, vid_type, &target.dst, false)
+                .await?,
+        ) else {
+            return no_op();
+        };
+
+        let key = format!(
+            "{}:edge:{}:{}:{}:{}",
+            effective_space, src, target.edge_name, dst, target.ranking
+        );
+        let key_bytes = key.into_bytes();
+        let Some(existing) = self.ctx.kvstore.get(&key_bytes).await? else {
+            return no_op();
+        };
+        let mut edge_data = VertexCodec::decode_edge(&existing)
+            .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
+        let old_props = edge_data.properties.clone();
+
+        // WHEN is evaluated against the edge's CURRENT properties, exposed both
+        // bare and qualified by edge type, the way vertex UPDATE exposes tags.
+        if let Some(cond) = &plan.conditions {
+            let mut current: std::collections::HashMap<String, byoridb_common::Value> =
+                std::collections::HashMap::new();
+            for (k, v) in &old_props {
+                current.insert(format!("{}.{}", target.edge_name, k), v.clone());
+                current.insert(k.clone(), v.clone());
+            }
+            let ectx = crate::evaluator::EvalContext::new().with_current(current);
+            if !crate::evaluator::Evaluator::evaluate_condition(cond, &ectx)? {
+                return no_op();
+            }
+        }
+
+        for (field, value) in &plan.updates {
+            edge_data.properties.insert(field.clone(), value.clone());
+        }
+        let encoded = VertexCodec::encode_edge(&edge_data)
+            .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
+
+        // Both current-view keys carry the same payload — reverse traversal reads
+        // the `in-edge` copy — so an update that refreshed only one would leave
+        // incoming and outgoing reads disagreeing.
+        let in_edge_key = SchemaKey::in_edge_data(
+            &effective_space,
+            dst,
+            &target.edge_name,
+            src,
+            target.ranking,
+        );
+        self.ctx
+            .kvstore
+            .batch_apply(
+                vec![
+                    (key_bytes.clone(), encoded.clone()),
+                    (in_edge_key, encoded.clone()),
+                ],
+                Vec::new(),
+                Self::build_versions(vec![(key_bytes, encoded)]),
+            )
+            .await?;
+
+        // Edge secondary indexes point at property values, so an update has to
+        // retract the old entry and assert the new one; otherwise LOOKUP keeps
+        // answering with the pre-update value.
+        if let Some(im) = self.ctx.index_manager.as_ref() {
+            let space_id = self.ctx.resolve_space_id().await;
+            for index in im
+                .list_edge_indexes(space_id)
+                .await
+                .iter()
+                .filter(|index| index.schema_name == target.edge_name)
+            {
+                let values_of =
+                    |props: &std::collections::HashMap<String, byoridb_common::Value>| {
+                        index
+                            .fields
+                            .iter()
+                            .map(|field| {
+                                self.byoridb_value_to_index_value(
+                                    props.get(field).unwrap_or(&byoridb_common::Value::null()),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                let old_values = values_of(&old_props);
+                let new_values = values_of(&edge_data.properties);
+                if old_values == new_values {
+                    continue;
+                }
+                im.delete_edge_index(1, index.id, &old_values, src, target.ranking, dst)
+                    .await
+                    .map_err(|e| {
+                        ExecutionError::InvalidOperation(format!(
+                            "edge index update (delete old) failed: {e}"
+                        ))
+                    })?;
+                im.insert_edge_index(1, index.id, &new_values, src, target.ranking, dst)
+                    .await
+                    .map_err(|e| {
+                        ExecutionError::InvalidOperation(format!(
+                            "edge index update (insert new) failed: {e}"
+                        ))
+                    })?;
+            }
+        }
+
+        Ok(ExecutorResult {
+            columns: vec!["Updated".to_string()],
+            rows: vec![vec![byoridb_common::Value::Int(1)]],
+            latency_ms: 0,
+        })
+    }
+
+    async fn execute_update_vertex(&self, plan: crate::plan::UpdatePlan) -> Result<ExecutorResult> {
         // Use plan.space or fallback to ctx.space (same as INSERT)
         let effective_space = if plan.space.is_empty() {
             self.ctx
