@@ -12,7 +12,7 @@ path = "src/bin/byoridb-cli.rs"
 tokio = { workspace = true }
 anyhow = "1.0"
 clap = { version = "4.5.54", features = ["derive", "env"] }
-rustyline = "14.0"
+rustyline = "18.0"
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }
