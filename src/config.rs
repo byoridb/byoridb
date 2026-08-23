@@ -50,7 +50,7 @@ impl Default for ClusterConfig {
     }
 }
 
-/// Brute-force login protection.
+/// Authentication: session lifetime and brute-force login protection.
 ///
 /// The defaults are the values the engine compiles in and are the right choice
 /// for an exposed listener. They are settable because they are wrong for a
@@ -62,6 +62,10 @@ impl Default for ClusterConfig {
 /// the trust decision belongs to the operator and is recorded here.
 #[derive(Debug, Deserialize)]
 pub struct AuthConfig {
+    /// Bearer session lifetime in seconds. The TTL slides: any use of a session
+    /// renews it, so this bounds idle lifetime rather than total lifetime.
+    /// Env: `BYORIDB__AUTH__SESSION_TTL_SECS`
+    pub session_ttl_secs: u64,
     /// Sliding window over which login *failures* are counted, in seconds.
     /// Env: `BYORIDB__AUTH__LOGIN_WINDOW_SECS`
     pub login_window_secs: u64,
@@ -89,6 +93,7 @@ impl Default for AuthConfig {
     fn default() -> Self {
         let engine = byoridb_graph::auth::LoginThrottleConfig::default();
         AuthConfig {
+            session_ttl_secs: byoridb_graph::auth::DEFAULT_SESSION_TTL_SECS,
             login_window_secs: engine.window.as_secs(),
             max_account_failures_per_window: engine.max_account_failures_per_window,
             max_source_failures_per_window: engine.max_source_failures_per_window,
@@ -99,7 +104,41 @@ impl Default for AuthConfig {
     }
 }
 
+/// Upper bound on a configured session TTL: one year.
+///
+/// Session IDs are bearer credentials and neither listener offers native TLS,
+/// so an effectively immortal session is not a lifetime an operator should be
+/// able to ask for by accident. The bound also catches the likeliest mistake —
+/// supplying milliseconds, where `86400000` would otherwise mean 2.7 years.
+const MAX_SESSION_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+
 impl AuthConfig {
+    /// The configured bearer session lifetime.
+    pub fn session_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.session_ttl_secs)
+    }
+
+    /// Reject values that cannot mean what they say.
+    ///
+    /// A zero TTL expires every session at the instant it is issued, which is
+    /// indistinguishable from refusing to serve; it is not a way to disable
+    /// sessions, because there is no unauthenticated path to disable them for.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.session_ttl_secs == 0 {
+            return Err("session_ttl_secs must be at least 1; a zero TTL expires \
+                 every session as it is issued"
+                .to_string());
+        }
+        if self.session_ttl_secs > MAX_SESSION_TTL_SECS {
+            return Err(format!(
+                "session_ttl_secs must be at most {MAX_SESSION_TTL_SECS} (one year), got {}; \
+                 note the unit is seconds",
+                self.session_ttl_secs
+            ));
+        }
+        self.to_throttle().validate()
+    }
+
     /// Translate into the engine's policy type.
     ///
     /// Validation lives on that type, so a value that would degenerate a
@@ -144,6 +183,7 @@ impl AppConfig {
             .set_default("cluster.advertise_addr", "127.0.0.1:9559")?
             .set_default("cluster.bootstrap", false)?
             .set_default("cluster.meta_addr", "0.0.0.0:9559")?
+            .set_default("auth.session_ttl_secs", auth_defaults.session_ttl_secs)?
             .set_default("auth.login_window_secs", auth_defaults.login_window_secs)?
             .set_default(
                 "auth.max_account_failures_per_window",
@@ -184,13 +224,12 @@ impl AppConfig {
             );
 
         let config: Self = builder.build()?.try_deserialize()?;
-        // Reject a degenerate throttle here rather than at first login. A zero
+        // Reject a degenerate policy here rather than at first login. A zero
         // window or a zero budget refuses every login including a correct one,
         // so it must fail at startup where an operator sees it, not silently
         // become the lockout it was meant to prevent.
         config
             .auth
-            .to_throttle()
             .validate()
             .map_err(|problem| config::ConfigError::Message(format!("[auth] {problem}")))?;
         Ok(config)
@@ -288,6 +327,11 @@ mod tests {
         // Defaults must not drift from the engine's compiled-in policy: making
         // these settable is not an occasion to change what they are.
         assert_eq!(cfg.auth.to_throttle(), engine);
+        assert_eq!(
+            cfg.auth.session_ttl_secs,
+            byoridb_graph::auth::DEFAULT_SESSION_TTL_SECS
+        );
+        assert_eq!(cfg.auth.session_ttl_secs, 24 * 60 * 60);
         assert_eq!(cfg.auth.login_window_secs, 60);
         assert_eq!(cfg.auth.max_account_failures_per_window, 20);
         assert_eq!(cfg.auth.max_source_failures_per_window, 60);
@@ -317,6 +361,56 @@ mod tests {
                 assert_eq!(throttle.max_concurrent_verifications, 8);
                 assert_eq!(throttle.max_failed_attempts, 50);
                 assert_eq!(throttle.lockout_duration, std::time::Duration::ZERO);
+            },
+        );
+    }
+
+    #[test]
+    fn session_ttl_is_settable_from_the_environment() {
+        // Shorter than the default is the case that matters for a deployment
+        // terminating TLS at a proxy; longer exercises the direction the graph
+        // store used to cap silently.
+        for (value, expected_secs) in [("900", 900), ("172800", 172_800)] {
+            with_env(&[("BYORIDB__AUTH__SESSION_TTL_SECS", value)], || {
+                let cfg = AppConfig::load().expect("a configured session TTL must load");
+                assert_eq!(cfg.auth.session_ttl_secs, expected_secs);
+                assert_eq!(
+                    cfg.auth.session_ttl(),
+                    std::time::Duration::from_secs(expected_secs)
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn a_degenerate_session_ttl_is_rejected_at_startup() {
+        // Zero expires every session as it is issued, which is indistinguishable
+        // from refusing to serve.
+        with_env(&[("BYORIDB__AUTH__SESSION_TTL_SECS", "0")], || {
+            let error = AppConfig::load()
+                .expect_err("a zero TTL must not load")
+                .to_string();
+            assert!(error.contains("[auth]"), "{error}");
+            assert!(error.contains("session_ttl_secs"), "{error}");
+        });
+
+        // The likeliest mistake is supplying milliseconds. The error says the
+        // unit rather than clamping to something the operator did not ask for.
+        with_env(&[("BYORIDB__AUTH__SESSION_TTL_SECS", "86400000")], || {
+            let error = AppConfig::load()
+                .expect_err("a TTL beyond the bound must not load")
+                .to_string();
+            assert!(error.contains("seconds"), "{error}");
+        });
+
+        // The bound itself is allowed.
+        with_env(
+            &[(
+                "BYORIDB__AUTH__SESSION_TTL_SECS",
+                &MAX_SESSION_TTL_SECS.to_string(),
+            )],
+            || {
+                AppConfig::load().expect("the documented maximum must be accepted");
             },
         );
     }

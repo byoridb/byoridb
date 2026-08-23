@@ -72,8 +72,9 @@ data_paths = ["/var/lib/byoridb/storage"]
 `BYORIDB_ROOT_PASSWORD`가 없거나 빈 값이면 시작을 거부합니다. credential은 로그에
 출력되지 않으므로 secret manager에서 주입하세요.
 
-## 로그인 throttling
+## 세션과 로그인 throttling
 
+`[auth]`는 bearer session의 수명과 실패한 로그인의 throttle 방식을 설정합니다.
 실패한 로그인은 계정별·출처 주소별 budget과 lockout으로 제한됩니다. 성공한 로그인은
 throttle되지 않고 동시 로그인 수에도 상한이 없습니다 — wire 계약은
 [Login throttling](../reference/api.md#login-throttling)을 참고하세요. 기본값은
@@ -81,6 +82,7 @@ throttle되지 않고 동시 로그인 수에도 상한이 없습니다 — wire
 
 ```toml
 [auth]
+session_ttl_secs = 86400
 login_window_secs = 60
 max_account_failures_per_window = 20
 max_source_failures_per_window = 60
@@ -91,6 +93,7 @@ lockout_duration_secs = 300
 
 | 키 | 환경변수 | 기본값 | 의미 |
 |---|---|---|---|
+| `auth.session_ttl_secs` | `BYORIDB__AUTH__SESSION_TTL_SECS` | `86400` | bearer session 수명; 사용할 때마다 갱신됨 |
 | `auth.login_window_secs` | `BYORIDB__AUTH__LOGIN_WINDOW_SECS` | `60` | 실패를 집계하는 sliding window |
 | `auth.max_account_failures_per_window` | `BYORIDB__AUTH__MAX_ACCOUNT_FAILURES_PER_WINDOW` | `20` | username당 window 내 허용 실패 수 |
 | `auth.max_source_failures_per_window` | `BYORIDB__AUTH__MAX_SOURCE_FAILURES_PER_WINDOW` | `60` | peer 주소당 window 내 허용 실패 수 |
@@ -113,14 +116,37 @@ export BYORIDB__AUTH__LOCKOUT_DURATION_SECS=0
 ```
 
 모든 로그인을 거부하게 만드는 값은 조용히 clamp하지 않고 **시작 시 거부**합니다.
-window가 0, 계정·출처 budget이 0, 검증 permit이 0, lockout 임계값이 0인 경우 모두
-`[auth]`를 명시한 오류와 함께 로드에 실패합니다. lockout을 끄려면
+window가 0, 계정·출처 budget이 0, 검증 permit이 0, lockout 임계값이 0, session TTL이
+0인 경우 모두 `[auth]`를 명시한 오류와 함께 로드에 실패합니다. lockout을 끄려면
 `lockout_duration_secs = 0`을 쓰세요. `max_failed_attempts = 0`은 그 표현이 아니라
 오류입니다.
 
 `max_concurrent_verifications`는 세션 수가 아니라 CPU 비용을 제한합니다. 초과한
 로그인은 거부되지 않고 permit을 기다리므로, 값을 낮추면 burst가 느려질 뿐 정상
 비밀번호가 실패로 바뀌지 않습니다.
+
+### 세션 수명
+
+`session_ttl_secs`는 **sliding**입니다 — session을 사용할 때마다 전체 TTL만큼
+갱신되므로, session이 얼마나 오래 *유휴* 상태로 있을 수 있는지를 제한하며 총 수명을
+제한하지 않습니다. 계속 사용되는 session은 스스로 만료되지 않습니다. 즉 TTL을 줄이는
+것은 버려진 session의 노출을 제한하는 것이고, 활성 session을 끝내는 것은
+`DELETE /api/v1/session`의 역할입니다.
+
+session ID는 bearer credential이고 두 listener 모두 native TLS를 제공하지 않으므로,
+TLS를 proxy에서 종료하는 배포에서는 TTL을 줄이는 것이 의미 있는 통제입니다:
+
+```bash
+export BYORIDB__AUTH__SESSION_TTL_SECS=3600
+```
+
+허용 범위는 1초에서 1년입니다. 상한이 있는 이유는 사실상 영구적인 bearer credential이
+실수로 만들어지지 않게 하려는 것이고, 가장 흔한 실수를 잡기 위한 것입니다 — 단위는
+**초**이므로 `86400000`은 조용히 2.7년이 되지 않고 거부됩니다.
+
+session이 존재하는 두 저장소를 하나의 설정이 지배합니다 —
+[인증](../reference/api.md#인증) 참고. 두 저장소는 접근마다 재조정되므로, 각자 다른
+수명을 가지면 짧은 쪽이 조용히 실제 TTL이 됩니다.
 
 ## 디렉터리 구조
 

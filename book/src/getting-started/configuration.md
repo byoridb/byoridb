@@ -79,15 +79,18 @@ The CLI uses separate variables:
 | `BYORIDB_USER` | Required CLI username |
 | `BYORIDB_PASSWORD` | Required CLI password |
 
-## Login throttling
+## Sessions and login throttling
 
-Failed logins are throttled per account, per source address, and by a lockout.
-Successful logins are never throttled and there is no ceiling on concurrent
-logins — see [Login throttling](../reference/api.md#login-throttling) for the
-wire contract. The defaults are the right choice for an exposed listener:
+`[auth]` sets how long a bearer session lives and how failed logins are
+throttled. Failed logins are limited per account, per source address, and by a
+lockout; successful logins are never throttled and there is no ceiling on
+concurrent logins — see [Login throttling](../reference/api.md#login-throttling)
+for the wire contract. The defaults are the right choice for an exposed
+listener:
 
 ```toml
 [auth]
+session_ttl_secs = 86400
 login_window_secs = 60
 max_account_failures_per_window = 20
 max_source_failures_per_window = 60
@@ -98,6 +101,7 @@ lockout_duration_secs = 300
 
 | Key | Environment variable | Default | Meaning |
 | --- | --- | --- | --- |
+| `auth.session_ttl_secs` | `BYORIDB__AUTH__SESSION_TTL_SECS` | `86400` | Bearer session lifetime; renewed on every use |
 | `auth.login_window_secs` | `BYORIDB__AUTH__LOGIN_WINDOW_SECS` | `60` | Sliding window over which failures are counted |
 | `auth.max_account_failures_per_window` | `BYORIDB__AUTH__MAX_ACCOUNT_FAILURES_PER_WINDOW` | `20` | Failures allowed per username per window |
 | `auth.max_source_failures_per_window` | `BYORIDB__AUTH__MAX_SOURCE_FAILURES_PER_WINDOW` | `60` | Failures allowed per peer address per window |
@@ -122,13 +126,39 @@ export BYORIDB__AUTH__LOCKOUT_DURATION_SECS=0
 
 Startup **rejects** a value that would refuse every login rather than clamping
 it silently: a zero window, a zero per-account or per-source budget, zero
-verification permits, or a zero lockout threshold all fail to load with an
-error naming `[auth]`. Use `lockout_duration_secs = 0` to disable the lockout;
-`max_failed_attempts = 0` is an error, not a way to express that.
+verification permits, a zero lockout threshold, or a zero session TTL all fail
+to load with an error naming `[auth]`. Use `lockout_duration_secs = 0` to
+disable the lockout; `max_failed_attempts = 0` is an error, not a way to express
+that.
 
 `max_concurrent_verifications` bounds CPU cost, not sessions. Logins beyond it
 wait for a permit instead of being refused, so lowering it makes a burst slower
 and never turns a correct password into a failure.
+
+### Session lifetime
+
+`session_ttl_secs` **slides**: every use of a session renews it for the full
+TTL, so it bounds how long a session may sit *idle*, not how long it may live. A
+session in continuous use never expires on its own, so shortening the TTL limits
+exposure from abandoned sessions rather than from active ones — ending a session
+is what `DELETE /api/v1/session` is for.
+
+Shortening it is a meaningful control when TLS terminates at a proxy, because a
+session ID is a bearer credential and neither listener offers native TLS:
+
+```bash
+export BYORIDB__AUTH__SESSION_TTL_SECS=3600
+```
+
+The accepted range is 1 second to one year. The upper bound exists because an
+effectively immortal bearer credential should not be reachable by accident, and
+because it catches the likeliest mistake: the unit is **seconds**, so `86400000`
+is rejected rather than quietly meaning 2.7 years.
+
+One setting governs both stores a session lives in — see
+[Authentication and sessions](../reference/api.md#authentication-and-sessions).
+They are reconciled on every access, so if they held separate lifetimes the
+shorter one would silently become the real TTL.
 
 ## Runtime tuning
 
