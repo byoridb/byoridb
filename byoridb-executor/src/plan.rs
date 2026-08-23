@@ -307,11 +307,25 @@ pub struct EdgeInsert {
 
 pub struct UpdatePlan {
     pub space: String,
+    /// The vertex being updated, or the edge's source vertex when [`Self::edge`]
+    /// is set.
     pub vid: Vid,
     pub tag_name: Option<String>,
     pub updates: std::collections::HashMap<String, byoridb_common::Value>,
     pub conditions: Option<Expression>,
     pub yield_clause: Option<String>,
+    /// Present iff this is `UPDATE EDGE`. The planner used to drop the parsed
+    /// edge target, which turned the statement into a vertex update missing its
+    /// tag and produced "Tag name required for UPDATE" for a statement that
+    /// names no tag (#77).
+    pub edge: Option<EdgeUpdateTarget>,
+}
+
+/// The edge `UPDATE EDGE` addresses, alongside `UpdatePlan::vid` as its source.
+pub struct EdgeUpdateTarget {
+    pub dst: Vid,
+    pub edge_name: String,
+    pub ranking: i64,
 }
 
 pub struct DeletePlan {
@@ -841,11 +855,41 @@ impl ExecutionPlanBuilder {
             }
             Statement::Update(update) => {
                 let space = update.space.unwrap_or_default();
-                let vid = Self::expr_to_vid(update.vid, "Vertex ID")?;
+                let is_edge = matches!(update.update_type, byoridb_parser::ast::UpdateType::Edge);
+                let vid = Self::expr_to_vid(
+                    update.vid,
+                    if is_edge {
+                        "Source vertex ID"
+                    } else {
+                        "Vertex ID"
+                    },
+                )?;
                 let mut updates = std::collections::HashMap::new();
                 for (k, v_expr) in update.updates {
                     updates.insert(k, Self::expr_to_value(v_expr)?);
                 }
+                // Carry the edge target through instead of dropping it, which is
+                // what silently degraded UPDATE EDGE into a tagless vertex
+                // update (#77).
+                let edge = if is_edge {
+                    let dst = update.dst_vid.ok_or_else(|| {
+                        crate::error::ExecutionError::InvalidOperation(
+                            "UPDATE EDGE requires a destination vertex".to_string(),
+                        )
+                    })?;
+                    let edge_name = update.edge_name.ok_or_else(|| {
+                        crate::error::ExecutionError::InvalidOperation(
+                            "UPDATE EDGE requires an edge type".to_string(),
+                        )
+                    })?;
+                    Some(EdgeUpdateTarget {
+                        dst: Self::expr_to_vid(dst, "Destination vertex ID")?,
+                        edge_name,
+                        ranking: update.ranking.unwrap_or(0),
+                    })
+                } else {
+                    None
+                };
                 Ok(ExecutionPlan::Update(UpdatePlan {
                     space,
                     vid,
@@ -853,6 +897,7 @@ impl ExecutionPlanBuilder {
                     updates,
                     conditions: update.conditions,
                     yield_clause: update.yield_clause.map(|c| format!("{:?}", c)),
+                    edge,
                 }))
             }
             Statement::Delete(delete) => {
