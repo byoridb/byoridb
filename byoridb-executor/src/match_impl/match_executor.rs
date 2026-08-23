@@ -1358,6 +1358,27 @@ impl MatchExecutor {
                 byoridb_common::Value::List(byoridb_common::datatypes::list::List { values })
             }
 
+            // Any other function is a scalar one. Its arguments are resolved
+            // here, because they may reference bound variables and stored
+            // properties, and the values are then handed to the shared function
+            // library rather than reimplemented — a second copy is how MATCH
+            // came to lack `toLower` while the other evaluators had it (#102).
+            //
+            // The name is already known to be implemented: the planner rejects
+            // an unknown function before execution, so reaching this arm with
+            // one is impossible. A `BadType` null is what remains for an
+            // argument of the wrong type, which is what this evaluator returns
+            // for that everywhere else.
+            Expression::FunctionCall { name, args } => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(Box::pin(self.eval_return_expr(arg, bindings, space)).await);
+                }
+                crate::evaluator::Evaluator::apply_scalar_function(name, &values).unwrap_or(
+                    byoridb_common::Value::Null(byoridb_common::NullType::BadType),
+                )
+            }
+
             _ => byoridb_common::Value::Null(byoridb_common::NullType::Null),
         }
     }

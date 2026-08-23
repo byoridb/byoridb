@@ -124,6 +124,67 @@ For ontology-aware membership, use `is_a`:
 MATCH (n:dog) WHERE is_a(n, "animal") RETURN id(n) AS vid;
 ```
 
+## Functions
+
+Calling a function the engine does not implement is a **query error naming the
+function**, not a `NULL`. That matters most in `WHERE`: a null predicate is
+false for every row, so an unsupported function would report zero results and be
+indistinguishable from "nothing matched".
+
+```
+nebula> MATCH (n:doc) WHERE frobnicate(n.doc.body) RETURN n;
+[ERROR] Unknown function: frobnicate
+```
+
+### Graph functions
+
+Available inside `MATCH`, where they read graph state rather than argument
+values:
+
+| Function | Returns |
+| --- | --- |
+| `id(v)` | the VID of a bound vertex |
+| `src(e)`, `dst(e)` | edge endpoints, in stored orientation |
+| `type(e)` | edge type name |
+| `rank(e)`, `ranking(e)` | edge rank |
+| `properties(v)`, `properties(e)` | flat map of all properties |
+| `tags(v)`, `labels(v)` | the vertex's tag names |
+| `is_a(v, "Class")` | class membership, including `SUBCLASS OF` ancestors |
+
+### Aggregates
+
+`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COLLECT`.
+
+### Scalar functions
+
+Available wherever an expression is evaluated:
+
+| Group | Functions |
+| --- | --- |
+| Case | `lower` / `toLower`, `upper` / `toUpper` |
+| Size | `length` / `size` |
+| Text | `contains`, `starts_with` / `startsWith`, `ends_with` / `endsWith` |
+| Numeric | `abs`, `floor`, `ceil`, `round` |
+| Null | `is_null` / `isNull`, `is_not_null` / `isNotNull`, `coalesce` |
+
+Names are case-insensitive, so `toLower`, `TOLOWER`, and `tolower` are the same
+function. A supported function given an argument of the wrong type yields a
+typed null rather than failing the query; only an unknown *name* is refused.
+
+### Case-sensitive text matching
+
+`CONTAINS`, `STARTS WITH`, and `ENDS WITH` compare **exactly**, so
+`CONTAINS 'worktrees'` does not match `Worktrees`. Fold both sides instead of
+issuing one query per spelling:
+
+```sql
+MATCH (n:doc) WHERE toLower(n.doc.body) CONTAINS 'worktrees'
+RETURN n.doc.body AS body;
+```
+
+There is no case-insensitive comparison operator; folding with `toLower` is the
+supported approach.
+
 ## LOOKUP
 
 Current `LOOKUP` targets tags:

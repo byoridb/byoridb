@@ -2550,3 +2550,110 @@ async fn test_lookup_supports_in_predicate() {
 
     service.sign_out(session_id, session_id).await.unwrap();
 }
+
+/// Regression for #102. An unknown function used to evaluate to `NULL` inside
+/// `MATCH`, so an unsupported feature was indistinguishable from empty data:
+/// in `RETURN` it produced a row of nulls, and in `WHERE` it made the predicate
+/// false for every row and reported "0 rows" for a query that never ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_functions_fail_instead_of_evaluating_to_null() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE fn_errors").await;
+    execute(&service, session_id, "USE fn_errors").await;
+    execute(&service, session_id, "CREATE TAG doc(body STRING)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX doc(body) VALUES 1:("Worktrees are isolated")"#,
+    )
+    .await;
+
+    // A projected unknown function must name itself rather than return a row.
+    let error = service
+        .execute(
+            session_id,
+            "MATCH (n:doc) RETURN frobnicate(n.doc.body) AS nonsense".to_string(),
+        )
+        .await
+        .expect_err("an unknown function must not project a row");
+    assert!(
+        error.to_string().to_lowercase().contains("frobnicate"),
+        "the error must name the function, got: {error}"
+    );
+
+    // In a filter it is worse than confusing: silently matching nothing reads
+    // as "no such data".
+    let error = service
+        .execute(
+            session_id,
+            "MATCH (n:doc) WHERE frobnicate(n.doc.body) RETURN n.doc.body".to_string(),
+        )
+        .await
+        .expect_err("an unknown function in WHERE must not silently match nothing");
+    assert!(
+        error.to_string().to_lowercase().contains("frobnicate"),
+        "the error must name the function, got: {error}"
+    );
+
+    // Case folding is the need behind the report, and it must work rather than
+    // be another silent null: `CONTAINS` matches case exactly.
+    let folded = execute(
+        &service,
+        session_id,
+        "MATCH (n:doc) WHERE toLower(n.doc.body) CONTAINS 'worktrees' RETURN n.doc.body AS body",
+    )
+    .await;
+    assert_eq!(
+        folded.rows,
+        vec![vec![Value::String("Worktrees are isolated".to_string())]],
+        "toLower must fold case in a filter"
+    );
+
+    let projected = execute(
+        &service,
+        session_id,
+        "MATCH (n:doc) RETURN toLower(n.doc.body) AS lowered, toUpper(n.doc.body) AS uppered",
+    )
+    .await;
+    assert_eq!(
+        projected.rows,
+        vec![vec![
+            Value::String("worktrees are isolated".to_string()),
+            Value::String("WORKTREES ARE ISOLATED".to_string()),
+        ]]
+    );
+
+    // A MATCH nested in a compound statement, or wrapped in PROFILE (which
+    // executes its inner statement), must be validated too — those are the two
+    // shapes a per-statement check is most likely to miss.
+    for statement in [
+        "SHOW SPACES; MATCH (n:doc) RETURN frobnicate(n.doc.body)",
+        "PROFILE MATCH (n:doc) RETURN frobnicate(n.doc.body)",
+    ] {
+        let error = service
+            .execute(session_id, statement.to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("frobnicate"),
+            "`{statement}` must be refused by name, got: {error}"
+        );
+    }
+
+    // A supported function used wrongly is not the same thing as an unknown
+    // one: it stays a value-level outcome rather than refusing the query.
+    let wrong_type = execute(
+        &service,
+        session_id,
+        "MATCH (n:doc) RETURN toLower(42) AS folded",
+    )
+    .await;
+    assert_eq!(wrong_type.rows.len(), 1);
+
+    service.sign_out(session_id, session_id).await.unwrap();
+}
