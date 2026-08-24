@@ -55,6 +55,8 @@ impl Parser {
 
         // If a `;` follows with more content, escalate to compound.
         if self.match_token(Token::SemiColon) {
+            // Note: the lexer discards comments, so `Token::Comment` here is
+            // `peek_token`'s end-of-input placeholder rather than a real token.
             // Allow trailing `;` with nothing after — return the single stmt.
             if self.is_at_end() || matches!(self.peek_token(), Ok(Token::Comment)) {
                 return Ok(stmt);
@@ -73,10 +75,40 @@ impl Parser {
                     break;
                 }
             }
+            self.expect_end_of_input()?;
             return Ok(Statement::Compound(clauses));
         }
 
+        self.expect_end_of_input()?;
         Ok(stmt)
+    }
+
+    /// Refuse input left over after a complete statement.
+    ///
+    /// Without this the parser returned the statement it had managed to read and
+    /// discarded the rest, so a clause the engine does not implement looked
+    /// supported, and a truncated statement executed its prefix and reported
+    /// success (#110). `FETCH PROP ON knows 1->2@7` silently losing its rank was
+    /// one instance (#108).
+    ///
+    /// The token is rendered through [`Self::diagnostic_token`], which redacts
+    /// payloads: a trailing token can be a literal, and an error message is not
+    /// a place to echo one.
+    fn expect_end_of_input(&mut self) -> Result<()> {
+        if self.is_at_end() {
+            return Ok(());
+        }
+        // A trailing `;` terminates the statement rather than continuing it.
+        if self.match_token(Token::SemiColon) && self.is_at_end() {
+            return Ok(());
+        }
+        let token = self.peek_token()?;
+        Err(ParseError::UnexpectedToken(format!(
+            "unexpected {} after a complete statement at {}; \
+             separate multiple statements with `;`",
+            Self::diagnostic_token(&token),
+            self.err_location()
+        )))
     }
 
     fn parse_compound(&mut self) -> ParseResult {

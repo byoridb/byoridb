@@ -27,8 +27,11 @@ and `LOOKUP` currently operates on tags rather than edge types.
 - User-defined identifiers retain their spelling and are case-sensitive in
   stored schema and user lookups.
 - Both single-quoted and double-quoted string literals are accepted.
-- `--` starts a line comment.
+- Comments are `//` to end of line and `/* ... */` block comments. **`--` is
+  not a comment** — it lexes as two minus signs and is rejected.
 - A trailing semicolon is optional.
+- Nothing may follow a complete statement except `;` or a comment. Trailing
+  input is an error naming the unexpected token, rather than being ignored.
 
 Multiple semicolon-separated statements sent in one request form a compound
 statement and run in order. There is no transaction-control syntax, so separate

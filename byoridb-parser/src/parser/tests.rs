@@ -1689,3 +1689,73 @@ fn test_in_remains_usable_as_a_property_name() {
         "expected an equality on a property named `in`, got {expr:?}"
     );
 }
+
+/// Regression for #110. The parser used to return the statement it had read and
+/// discard whatever followed, so a clause the engine does not implement looked
+/// supported and a truncated statement executed its prefix while reporting
+/// success. `FETCH PROP ON knows 1->2@7` losing its rank was one instance (#108).
+#[test]
+fn input_left_after_a_complete_statement_is_rejected() {
+    for query in [
+        "SHOW SPACES bogus trailing tokens",
+        "FETCH PROP ON knows 1->2 GARBAGE",
+        "MATCH (n) RETURN n EXTRA",
+        "SHOW TAGS 42",
+    ] {
+        let error = parse(query)
+            .expect_err("trailing input must not be silently discarded")
+            .to_string();
+        assert!(
+            error.contains("after a complete statement"),
+            "`{query}` must say what was wrong, got: {error}"
+        );
+    }
+}
+
+/// A trailing token can be a literal, and an error message is not a place to
+/// echo one — the same property `parse_errors_do_not_expose_token_payloads`
+/// guards for other diagnostics.
+#[test]
+fn trailing_token_errors_do_not_expose_payloads() {
+    const SENTINEL: &str = "supersecret123";
+    for query in [
+        "SHOW SPACES 'supersecret123'",
+        "SHOW SPACES \"supersecret123\"",
+        "SHOW SPACES supersecret123",
+    ] {
+        let error = parse(query).unwrap_err().to_string();
+        assert!(
+            !error.contains(SENTINEL),
+            "the trailing token's payload leaked: {error}"
+        );
+    }
+}
+
+/// What the strictness must not break. Comments are `//` and `/* */` and the
+/// lexer discards them, a trailing `;` terminates a statement, and `;` between
+/// statements makes a compound.
+#[test]
+fn statement_terminators_and_comments_still_parse() {
+    for query in [
+        "SHOW SPACES",
+        "SHOW SPACES;",
+        "SHOW SPACES ;   ",
+        "SHOW SPACES; SHOW TAGS",
+        "SHOW SPACES; SHOW TAGS;",
+        "$a = SHOW SPACES; SHOW TAGS",
+        "// leading comment\nSHOW SPACES",
+        "SHOW SPACES // trailing comment",
+        "SHOW SPACES /* trailing block */",
+        "/* leading block */ SHOW SPACES",
+        "SHOW SPACES; // trailing comment after semicolon",
+        "SHOW SPACES /* mid */ ; SHOW TAGS",
+        "FETCH PROP ON knows 1->2@7",
+        "FETCH PROP ON knows 1->2 AS OF 1785283200000",
+    ] {
+        assert!(
+            parse(query).is_ok(),
+            "`{query}` must still parse: {:?}",
+            parse(query).err()
+        );
+    }
+}
