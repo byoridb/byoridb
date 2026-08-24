@@ -2903,3 +2903,200 @@ async fn fetch_prop_on_an_edge_honors_its_rank() {
 
     service.sign_out(session_id, session_id).await.unwrap();
 }
+
+/// The FIXED_STRING migration path, established by execution rather than
+/// asserted from the design (#82).
+///
+/// Each block below answers one question the docs could not, and the book's
+/// "Migrating from client-hashed integer VIDs" section states what this proves.
+#[tokio::test(flavor = "multi_thread")]
+async fn fixed_string_vid_migration_path_from_client_hashed_int64() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    // A client that hashed names into i64 itself, which is what byoridb/byori
+    // does and what predates FIXED_STRING support.
+    execute(
+        &service,
+        session_id,
+        "CREATE SPACE legacy_int (vid_type=INT64)",
+    )
+    .await;
+    execute(&service, session_id, "USE legacy_int").await;
+    execute(
+        &service,
+        session_id,
+        "CREATE TAG note(name STRING, body STRING)",
+    )
+    .await;
+    execute(&service, session_id, "CREATE EDGE rel(kind STRING)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX note(name, body) VALUES 111:("decision:use-redb", "adopt redb"), 222:("module:kvstore", "redb KV")"#,
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT EDGE rel(kind) VALUES 111->222:("affects")"#,
+    )
+    .await;
+    let before_migration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // (1) A space's vid_type is fixed at CREATE SPACE: ALTER has no SPACE form,
+    // so there is no in-place conversion and migration is space-to-space.
+    let alter = service
+        .execute(
+            session_id,
+            "ALTER SPACE legacy_int (vid_type=FIXED_STRING(64))".to_string(),
+        )
+        .await
+        .expect_err("vid_type must not be alterable in place");
+    assert!(
+        alter.to_string().to_lowercase().contains("parse")
+            || alter.to_string().to_lowercase().contains("unexpected"),
+        "ALTER SPACE should not parse, got: {alter}"
+    );
+
+    // (2) Writing an integer VID into a FIXED_STRING space is refused, naming
+    // the legacy read/delete-only status rather than silently creating a vertex.
+    execute(
+        &service,
+        session_id,
+        "CREATE SPACE migrated_str (vid_type=FIXED_STRING(64))",
+    )
+    .await;
+    execute(&service, session_id, "USE migrated_str").await;
+    execute(
+        &service,
+        session_id,
+        "CREATE TAG note(name STRING, body STRING)",
+    )
+    .await;
+    execute(&service, session_id, "CREATE EDGE rel(kind STRING)").await;
+
+    let int_write = service
+        .execute(
+            session_id,
+            r#"INSERT VERTEX note(name, body) VALUES 111:("x", "y")"#.to_string(),
+        )
+        .await
+        .expect_err("an integer VID must not be writable in a FIXED_STRING space");
+    let message = int_write.to_string();
+    assert!(
+        message.contains("read/delete-only") && message.contains("111"),
+        "the refusal must explain itself and name the VID, got: {message}"
+    );
+
+    // (3) The internal surrogate namespace is not addressable either. On a write
+    // the integer guard fires first, so every integer VID — negative included —
+    // is refused as legacy; the surrogate-specific refusal appears on the
+    // read/delete paths, which are the only ones an integer can reach.
+    let surrogate_write = service
+        .execute(
+            session_id,
+            r#"INSERT VERTEX note(name, body) VALUES -1:("x", "y")"#.to_string(),
+        )
+        .await
+        .expect_err("a raw internal surrogate must not be writable");
+    assert!(
+        surrogate_write.to_string().contains("read/delete-only"),
+        "got: {surrogate_write}"
+    );
+    let surrogate_read = service
+        .execute(session_id, "FETCH PROP ON note -1".to_string())
+        .await
+        .expect_err("a raw internal surrogate must not be readable");
+    assert!(
+        surrogate_read.to_string().contains("negative"),
+        "the surrogate namespace must be refused by name, got: {surrogate_read}"
+    );
+
+    // (4) The migration itself: re-insert under string VIDs. Reads return the
+    // string, not the internal surrogate.
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX note(name, body) VALUES "decision:use-redb":("decision:use-redb", "adopt redb"), "module:kvstore":("module:kvstore", "redb KV")"#,
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT EDGE rel(kind) VALUES "decision:use-redb"->"module:kvstore":("affects")"#,
+    )
+    .await;
+    let migrated = execute(
+        &service,
+        session_id,
+        r#"MATCH (n:note) WHERE id(n) == "decision:use-redb" RETURN id(n) AS vid, n.note.body AS body"#,
+    )
+    .await;
+    assert_eq!(
+        migrated.rows,
+        vec![vec![
+            Value::String("decision:use-redb".to_string()),
+            Value::String("adopt redb".to_string()),
+        ]]
+    );
+    let traversed = execute(
+        &service,
+        session_id,
+        r#"GO FROM "decision:use-redb" OVER rel YIELD rel.kind AS kind"#,
+    )
+    .await;
+    assert_eq!(
+        traversed.rows,
+        vec![vec![Value::String("affects".to_string())]]
+    );
+
+    // (5) History does not follow a re-key. It is keyed by space and VID, so
+    // the migrated vertex has no history before its insert...
+    let new_vid_history = execute(
+        &service,
+        session_id,
+        &format!(r#"FETCH PROP ON note "decision:use-redb" AS OF {before_migration}"#),
+    )
+    .await;
+    assert!(
+        new_vid_history.rows.is_empty(),
+        "a re-keyed vertex must not inherit history, got {:?}",
+        new_vid_history.rows
+    );
+
+    // ...while the original remains readable at that timestamp under its old
+    // space and VID, which is what makes the old space the archive of record.
+    execute(&service, session_id, "USE legacy_int").await;
+    let old_vid_history = execute(
+        &service,
+        session_id,
+        &format!("FETCH PROP ON note 111 AS OF {before_migration}"),
+    )
+    .await;
+    assert!(
+        !old_vid_history.rows.is_empty(),
+        "the pre-migration history must stay with the original space and VID"
+    );
+
+    // (6) RECOMMEND is INT64-only and says so, naming the space, rather than
+    // returning results computed over internal surrogates.
+    execute(&service, session_id, "USE migrated_str").await;
+    let recommend = service
+        .execute(session_id, r#"RECOMMEND SIMILAR TO 1 OVER rel"#.to_string())
+        .await
+        .expect_err("RECOMMEND must be refused in a FIXED_STRING space");
+    let recommend_message = recommend.to_string();
+    assert!(
+        recommend_message.contains("INT64-only") && recommend_message.contains("migrated_str"),
+        "got: {recommend_message}"
+    );
+
+    service.sign_out(session_id, session_id).await.unwrap();
+}
