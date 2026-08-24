@@ -147,6 +147,7 @@ impl Parser {
                 vids: Vec::new(),
                 tags,
                 yield_clause,
+                edge_refs: Vec::new(),
                 src_var: Some(qualified),
                 as_of,
             }));
@@ -155,23 +156,32 @@ impl Parser {
         // Detect edge fetch: peek for `<integer|string> ->` pattern.
         let is_edge = self.peek_is_edge_ref();
 
-        let (fetch_type, vids) = if is_edge {
-            // Parse `src->dst [, src->dst ...]`
-            let mut edge_exprs: Vec<Expression> = Vec::new();
+        let (fetch_type, vids, edge_refs) = if is_edge {
+            // Parse `src->dst[@rank] [, src->dst[@rank] ...]`
+            let mut refs: Vec<crate::ast::EdgeRef> = Vec::new();
             loop {
-                let src = self.parse_expression()?;
+                let src_vid = self.parse_expression()?;
                 self.consume_token(Token::Arrow)?;
-                let dst = self.parse_expression()?;
-                // Encode as two consecutive VID expressions; the plan builder pairs them.
-                edge_exprs.push(src);
-                edge_exprs.push(dst);
+                let dst_vid = self.parse_expression()?;
+                // An explicit rank names one edge, the way it does for INSERT,
+                // DELETE, and UPDATE. Omitted means "every rank of this pair".
+                let ranking = if self.match_token(Token::At) {
+                    Some(self.consume_integer()?)
+                } else {
+                    None
+                };
+                refs.push(crate::ast::EdgeRef {
+                    src_vid,
+                    dst_vid,
+                    ranking,
+                });
                 if !self.match_token(Token::Comma) {
                     break;
                 }
             }
-            (FetchType::EdgeProp, edge_exprs)
+            (FetchType::EdgeProp, Vec::new(), refs)
         } else {
-            (FetchType::Vertex, self.parse_expression_list()?)
+            (FetchType::Vertex, self.parse_expression_list()?, Vec::new())
         };
 
         let yield_clause = if self.match_token(Token::Yield) {
@@ -185,6 +195,7 @@ impl Parser {
             fetch_type,
             space: None,
             vids,
+            edge_refs,
             tags,
             yield_clause,
             src_var: None,

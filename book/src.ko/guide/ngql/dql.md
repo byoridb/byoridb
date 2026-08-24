@@ -21,13 +21,20 @@ HTTP query 1 MiB 제한 안에서 사용하고 실제 workload의 응답 크기�
 batch 정확성·성능 검증은 [이슈 #10](https://github.com/byoridb/byoridb/issues/10)에서
 추적합니다.
 
-endpoint pair로 edge를 조회합니다.
+endpoint pair로 edge를 조회하며, rank를 명시할 수 있습니다.
 
 ```sql
-FETCH PROP ON knows 1->2;
+FETCH PROP ON knows 1->2;         -- 이 pair의 모든 rank
+FETCH PROP ON knows 1->2@7;       -- rank 7만
+FETCH PROP ON knows 1->2@7, 3->4; -- 참조마다 각자의 rank
 FETCH PROP ON * 1->2;
 FETCH PROP ON knows "alice"->"bob";
 ```
+
+**rank를 생략하면 그 pair의 모든 rank에 매치됩니다.** 결과에 `ranking` 필드가 포함되는
+이유입니다. `INSERT EDGE`·`DELETE EDGE`·`UPDATE EDGE`에서 rank 생략이 rank `0`을
+의미하는 것과 다릅니다 — 그 문장들은 edge 하나를 지목하지만, rank 없는 fetch는 pair에
+대한 조회입니다. edge 하나만 원하면 rank를 명시하세요.
 
 현재 temporal read는 vertex와 edge 모두 epoch-millisecond timestamp를 받습니다.
 

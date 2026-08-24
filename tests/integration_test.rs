@@ -2749,9 +2749,8 @@ async fn update_edge_writes_the_edge_it_names() {
         "UPDATE EDGE ON knows 1->2@7 SET since = 1991",
     )
     .await;
-    // Both ranks are read back from one FETCH: rank 7 took the new value and
-    // rank 0 kept the earlier one. (`FETCH PROP` does not filter on `@rank`;
-    // that is a separate limitation and not what this asserts.)
+    // Rank 7 took the new value and rank 0 kept the earlier one. Addressed by
+    // rank now that `FETCH PROP` honours it (#108).
     let ranked = execute(&service, session_id, "FETCH PROP ON knows 1->2").await;
     let mut ranks: Vec<(i64, i64)> = ranked
         .rows
@@ -2820,6 +2819,87 @@ async fn update_edge_writes_the_edge_it_names() {
         unknown_field.to_string().contains("nonexistent"),
         "the error must name the field, got: {unknown_field}"
     );
+
+    service.sign_out(session_id, session_id).await.unwrap();
+}
+
+/// Regression for #108. `FETCH PROP ON <edge> src->dst@rank` parsed the rank and
+/// then discarded it, so the reference matched every rank of the pair and could
+/// not address the edge it named — the outlier among INSERT, DELETE, and UPDATE,
+/// where a rank identifies exactly one edge.
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_prop_on_an_edge_honors_its_rank() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE fetch_rank").await;
+    execute(&service, session_id, "USE fetch_rank").await;
+    execute(&service, session_id, "CREATE TAG p(name STRING)").await;
+    execute(&service, session_id, "CREATE EDGE knows(since INT64)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX p(name) VALUES 1:("A"), 2:("B")"#,
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE knows(since) VALUES 1->2:(2020), 1->2@7:(1990)",
+    )
+    .await;
+
+    /// Collect `(ranking, since)` from a FETCH result. An edge is rendered as a
+    /// JSON object in the row.
+    fn ranks(result: &byoridb_common::DataSet) -> Vec<(i64, i64)> {
+        let mut pairs: Vec<(i64, i64)> = result
+            .rows
+            .iter()
+            .filter_map(|row| {
+                row.iter().find_map(|value| match value {
+                    Value::String(json) => {
+                        let edge: serde_json::Value = serde_json::from_str(json).ok()?;
+                        Some((edge["ranking"].as_i64()?, edge["props"]["since"].as_i64()?))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        pairs.sort();
+        pairs.dedup();
+        pairs
+    }
+
+    // An explicit rank addresses exactly one edge.
+    let ranked = execute(&service, session_id, "FETCH PROP ON knows 1->2@7").await;
+    assert_eq!(
+        ranks(&ranked),
+        vec![(7, 1990)],
+        "@7 must return only rank 7, got {:?}",
+        ranked.rows
+    );
+
+    let rank_zero = execute(&service, session_id, "FETCH PROP ON knows 1->2@0").await;
+    assert_eq!(ranks(&rank_zero), vec![(0, 2020)]);
+
+    // An omitted rank keeps its long-standing meaning: every rank of the pair.
+    let all_ranks = execute(&service, session_id, "FETCH PROP ON knows 1->2").await;
+    assert_eq!(ranks(&all_ranks), vec![(0, 2020), (7, 1990)]);
+
+    // A rank with no edge is empty rather than falling back to another rank.
+    let absent = execute(&service, session_id, "FETCH PROP ON knows 1->2@99").await;
+    assert!(
+        ranks(&absent).is_empty(),
+        "a rank with no edge must return nothing, got {:?}",
+        absent.rows
+    );
+
+    // Each reference in a list carries its own rank.
+    let mixed = execute(&service, session_id, "FETCH PROP ON knows 1->2@7, 1->2@0").await;
+    assert_eq!(ranks(&mixed), vec![(0, 2020), (7, 1990)]);
 
     service.sign_out(session_id, session_id).await.unwrap();
 }

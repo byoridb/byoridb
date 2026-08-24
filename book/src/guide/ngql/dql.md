@@ -21,13 +21,21 @@ of IDs. Keep HTTP requests below the 1 MiB query limit and measure the response
 size for your workload. Large-batch correctness and performance remain tracked
 in [issue #10](https://github.com/byoridb/byoridb/issues/10).
 
-Fetch edges by endpoint pair:
+Fetch edges by endpoint pair, optionally naming a rank:
 
 ```sql
-FETCH PROP ON knows 1->2;
+FETCH PROP ON knows 1->2;         -- every rank of this pair
+FETCH PROP ON knows 1->2@7;       -- only rank 7
+FETCH PROP ON knows 1->2@7, 3->4; -- each reference carries its own rank
 FETCH PROP ON * 1->2;
 FETCH PROP ON knows "alice"->"bob";
 ```
+
+An **omitted rank matches every rank** of the pair, which is why the result
+includes a `ranking` field. This differs from `INSERT EDGE`, `DELETE EDGE`, and
+`UPDATE EDGE`, where an omitted rank means rank `0` — those statements address
+one edge, while a fetch without a rank is a query over the pair. Name the rank
+when you want exactly one edge.
 
 The current temporal read surface accepts an epoch-millisecond timestamp for
 both vertices and edges:
