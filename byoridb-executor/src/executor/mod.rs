@@ -2977,7 +2977,11 @@ mod tests {
                 vids: vec![],
                 tags: vec!["follows".to_string()],
                 yield_clause: None,
-                edge_refs: vec![(1.into(), 2.into())],
+                edge_refs: vec![crate::plan::FetchEdgeRef {
+                    src: 1.into(),
+                    dst: 2.into(),
+                    ranking: None,
+                }],
                 is_edge_fetch: true,
                 src_var: None,
                 as_of: None,

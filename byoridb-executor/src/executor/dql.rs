@@ -450,15 +450,15 @@ impl Executor {
         let fetch_start = std::time::Instant::now();
         let vid_type = crate::vid::space_vid_type(&self.ctx, effective_space).await?;
 
-        for (external_src, external_dst) in &plan.edge_refs {
+        for edge_ref in &plan.edge_refs {
             let Some(src) =
-                crate::vid::resolve_vid(&self.ctx, effective_space, vid_type, external_src, false)
+                crate::vid::resolve_vid(&self.ctx, effective_space, vid_type, &edge_ref.src, false)
                     .await?
             else {
                 continue;
             };
             let Some(dst) =
-                crate::vid::resolve_vid(&self.ctx, effective_space, vid_type, external_dst, false)
+                crate::vid::resolve_vid(&self.ctx, effective_space, vid_type, &edge_ref.dst, false)
                     .await?
             else {
                 continue;
@@ -500,7 +500,15 @@ impl Executor {
 
             for value in values {
                 match VertexCodec::decode_edge(&value) {
-                    Ok(edge) if edge.dst_vid == dst => {
+                    // The prefix scan covers every rank of `src`, so an explicit
+                    // `@rank` has to be applied here. Without it the reference
+                    // silently meant "every rank of this pair" (#108).
+                    Ok(edge)
+                        if edge.dst_vid == dst
+                            && edge_ref
+                                .ranking
+                                .is_none_or(|ranking| edge.ranking == ranking) =>
+                    {
                         let src_value = crate::vid::display_vid(
                             &self.ctx,
                             effective_space,

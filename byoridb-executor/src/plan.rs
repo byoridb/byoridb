@@ -347,14 +347,24 @@ pub struct FetchPlan {
     pub vids: Vec<Vid>,
     pub tags: Vec<String>,
     pub yield_clause: Option<String>,
-    /// Edge refs `(src, dst)` for `FETCH PROP ON edge_type src->dst`
-    pub edge_refs: Vec<(Vid, Vid)>,
+    /// Edge refs for `FETCH PROP ON edge_type src->dst[@rank]`
+    pub edge_refs: Vec<FetchEdgeRef>,
     /// When true the plan fetches edge data; otherwise vertex data
     pub is_edge_fetch: bool,
     /// `$var.col` variable reference — resolved at runtime from ctx.vars
     pub src_var: Option<String>,
     /// `AS OF <ts>` (T-트랙): resolve as-of this transaction time (epoch millis).
     pub as_of: Option<i64>,
+}
+
+/// One `src->dst[@rank]` reference in a `FETCH PROP` over edges.
+pub struct FetchEdgeRef {
+    pub src: Vid,
+    pub dst: Vid,
+    /// `Some(rank)` addresses exactly that edge. `None` — an omitted `@rank` —
+    /// matches every rank of the pair, which is the long-standing behaviour and
+    /// stays so a reader that relies on it is not broken.
+    pub ranking: Option<i64>,
 }
 
 pub struct FindPlan {
@@ -942,19 +952,15 @@ impl ExecutionPlanBuilder {
                 );
 
                 let mut vids: Vec<Vid> = Vec::new();
-                let mut edge_refs: Vec<(Vid, Vid)> = Vec::new();
+                let mut edge_refs: Vec<FetchEdgeRef> = Vec::new();
 
                 if is_edge_fetch {
-                    // Edge fetch: parser encodes src->dst as two consecutive Int literals
-                    let endpoint_vids: Vec<Vid> = fetch
-                        .vids
-                        .into_iter()
-                        .map(|v| Self::expr_to_vid(v, "Edge VID"))
-                        .collect::<Result<Vec<_>>>()?;
-                    for pair in endpoint_vids.chunks(2) {
-                        if pair.len() == 2 {
-                            edge_refs.push((pair[0].clone(), pair[1].clone()));
-                        }
+                    for edge_ref in fetch.edge_refs {
+                        edge_refs.push(FetchEdgeRef {
+                            src: Self::expr_to_vid(edge_ref.src_vid, "Edge VID")?,
+                            dst: Self::expr_to_vid(edge_ref.dst_vid, "Edge VID")?,
+                            ranking: edge_ref.ranking,
+                        });
                     }
                 } else {
                     vids = fetch

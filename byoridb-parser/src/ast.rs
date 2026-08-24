@@ -661,7 +661,14 @@ pub struct EdgeRef {
 pub struct FetchStatement {
     pub fetch_type: FetchType,
     pub space: Option<String>,
+    /// Vertex VIDs for the vertex form. Empty for an edge fetch, which uses
+    /// [`Self::edge_refs`].
     pub vids: Vec<Expression>,
+    /// `src->dst[@rank]` references for the edge form. Previously the endpoints
+    /// were flattened into `vids` as consecutive expressions, which had nowhere
+    /// to put a rank — so `@rank` was dropped and the fetch matched every rank
+    /// of the pair (#108).
+    pub edge_refs: Vec<EdgeRef>,
     pub tags: Vec<String>,
     pub yield_clause: Option<YieldClause>,
     /// `$var.col` variable reference as VID source (compound statement support)

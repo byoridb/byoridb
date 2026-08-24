@@ -147,16 +147,35 @@ fn test_parse_fetch_string_vids_and_edge_ref() {
         other => panic!("Expected vertex Fetch, got {other:?}"),
     }
 
+    // Edge endpoints live in `edge_refs`, not flattened into `vids`, so a rank
+    // has somewhere to go (#108).
     match parse(r#"FETCH PROP ON knows "alice"->'bob'"#).unwrap() {
         Statement::Fetch(stmt) => {
             assert_eq!(stmt.fetch_type, FetchType::EdgeProp);
+            assert!(stmt.vids.is_empty());
+            assert_eq!(stmt.edge_refs.len(), 1);
             assert_eq!(
-                stmt.vids,
-                vec![
-                    Expression::Literal(Literal::String("alice".to_string())),
-                    Expression::Literal(Literal::String("bob".to_string())),
-                ]
+                stmt.edge_refs[0].src_vid,
+                Expression::Literal(Literal::String("alice".to_string()))
             );
+            assert_eq!(
+                stmt.edge_refs[0].dst_vid,
+                Expression::Literal(Literal::String("bob".to_string()))
+            );
+            assert_eq!(
+                stmt.edge_refs[0].ranking, None,
+                "an omitted rank must stay unset rather than defaulting to 0, \
+                 because it matches every rank"
+            );
+        }
+        other => panic!("Expected edge Fetch, got {other:?}"),
+    }
+
+    // An explicit rank is carried, and each reference keeps its own.
+    match parse("FETCH PROP ON knows 1->2@7, 3->4").unwrap() {
+        Statement::Fetch(stmt) => {
+            let ranks: Vec<Option<i64>> = stmt.edge_refs.iter().map(|edge| edge.ranking).collect();
+            assert_eq!(ranks, vec![Some(7), None]);
         }
         other => panic!("Expected edge Fetch, got {other:?}"),
     }
