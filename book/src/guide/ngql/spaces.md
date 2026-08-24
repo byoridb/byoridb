@@ -75,10 +75,88 @@ space is write-frozen for those legacy IDs: INSERT, UPDATE, and new edge writes
 with integer endpoints are rejected, and a raw negative internal surrogate is
 always rejected.
 
-Do not use this bridge as a mixed-VID operating mode. Export the legacy graph,
-recreate the `FIXED_STRING` space, and import it with quoted string VIDs. An
+The bridge is a **transition, not a steady state**: it exists so an upgraded
+space stays readable long enough to be migrated, and it warns once per space
+when used. Mixing the two namespaces is not a supported operating mode. An
 unmapped integer with no live vertex or incident-edge evidence remains a normal
 point miss.
+
+### Migrating from client-hashed integer VIDs
+
+Before `FIXED_STRING` spaces existed, a client keying entities by name had to
+hash the name into an `i64` itself. Such a space is an ordinary `INT64` space,
+so the legacy bridge above does not apply to it — the bridge is for a space
+whose descriptor already says `FIXED_STRING`.
+
+**A space's VID type is fixed when it is created.** `ALTER` has `TAG`, `EDGE`,
+and `USER` forms only; there is no `ALTER SPACE`, and `vid_type` comes from the
+space descriptor written by `CREATE SPACE`. So migration is a copy into a new
+space, never a conversion in place:
+
+```sql
+-- 1. Create the destination. N must fit your longest identifier in bytes.
+CREATE SPACE memory_v2 (vid_type = FIXED_STRING(128));
+USE memory_v2;
+
+-- 2. Recreate the schema. Tags, edges, indexes, classes, and shapes do not
+--    come along with the data.
+CREATE TAG note(name STRING, body STRING);
+CREATE EDGE rel(kind STRING);
+
+-- 3. Read each vertex and edge from the old space and insert it here under its
+--    string identifier, which is the name the client was hashing.
+INSERT VERTEX note(name, body) VALUES "decision:use-redb":("decision:use-redb", "adopt redb");
+INSERT EDGE rel(kind) VALUES "decision:use-redb"->"module:kvstore":("affects");
+```
+
+Reads then return the string, and traversal works from it:
+
+```sql
+MATCH (n:note) WHERE id(n) == "decision:use-redb" RETURN id(n) AS vid;
+GO FROM "decision:use-redb" OVER rel YIELD rel.kind AS kind;
+```
+
+Writing an integer VID into the new space is refused rather than silently
+creating a second identity for the same entity:
+
+```
+INSERT VERTEX note(name, body) VALUES 111:("x", "y");
+[ERROR] space 'memory_v2' uses FIXED_STRING VIDs; integer VID 111 is
+        read/delete-only legacy data and cannot be written
+```
+
+The internal surrogates are not addressable either. On a write the integer rule
+above applies to every integer, negative included; on a read or delete, a raw
+negative VID is refused as an internal surrogate.
+
+#### History does not follow a migration
+
+This is the consequence to plan around. History is keyed by space and VID, so
+re-inserting an entity under a new identifier creates a **new** history that
+begins at the insert:
+
+```sql
+-- In the new space, before the insert: no rows.
+FETCH PROP ON note "decision:use-redb" AS OF 1785283200000;
+
+-- In the old space, the pre-migration state is still there, under the old VID.
+USE memory_v1;
+FETCH PROP ON note 111 AS OF 1785283200000;
+```
+
+So a migration is not a rename — it is a re-assertion of current facts. Keep the
+old space as the archive of record if past states matter, and do not `DROP` it
+expecting `AS OF` to keep working in the new one. There is no supported way to
+carry history across a re-key.
+
+#### Before you migrate
+
+- `RECOMMEND` is INT64-only and is refused in a `FIXED_STRING` space, naming the
+  space. If a workload depends on it, keep that data in an `INT64` space; see
+  [Data queries](./dql.md#recommend).
+- Mapping-backed `FIXED_STRING` execution is standalone-only, as above.
+- Identifiers are limited to `N` **bytes**, not characters, so non-ASCII names
+  need headroom.
 
 ## Select a space
 

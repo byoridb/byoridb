@@ -67,9 +67,83 @@ VID만 임시 read/delete compatibility bridge로 노출합니다. 결과는 정
 warning을 남깁니다. 해당 legacy ID는 write-frozen 상태입니다. 정수 endpoint를 사용한
 INSERT, UPDATE, 새 edge write는 거부하며 raw 음수 internal surrogate도 항상 거부합니다.
 
-이 bridge를 mixed-VID 운영 mode로 사용하지 마세요. Legacy graph를 export하고
-`FIXED_STRING` space를 다시 만든 뒤 따옴표 문자열 VID로 import해야 합니다. Live
+이 bridge는 **정상 운영 상태가 아니라 전환 장치**입니다. 업그레이드된 space를
+마이그레이션할 수 있을 만큼만 읽히게 유지하는 것이 목적이고, 사용되면 space당 한 번
+warning을 남깁니다. 두 namespace를 섞어 쓰는 것은 지원되는 운영 mode가 아닙니다. Live
 vertex나 incident-edge 근거가 없는 unmapped 정수는 일반 point miss입니다.
+
+### 클라이언트가 해싱한 정수 VID에서 마이그레이션
+
+`FIXED_STRING` space가 없던 시절에는 이름으로 entity를 키잉하는 클라이언트가 이름을
+직접 `i64`로 해싱해야 했습니다. 그런 space는 평범한 `INT64` space이므로 **위의 legacy
+bridge가 적용되지 않습니다** — bridge는 descriptor가 이미 `FIXED_STRING`인 space를
+위한 것입니다.
+
+**space의 VID 타입은 생성 시점에 고정됩니다.** `ALTER`에는 `TAG`·`EDGE`·`USER` 형태만
+있고 `ALTER SPACE`는 없으며, `vid_type`은 `CREATE SPACE`가 기록한 space descriptor에서
+읽습니다. 따라서 마이그레이션은 in-place 변환이 아니라 **새 space로의 복사**입니다.
+
+```sql
+-- 1. 대상 space 생성. N은 가장 긴 식별자를 바이트 단위로 담을 수 있어야 합니다.
+CREATE SPACE memory_v2 (vid_type = FIXED_STRING(128));
+USE memory_v2;
+
+-- 2. schema를 다시 만듭니다. tag·edge·index·class·shape는 데이터와 함께
+--    옮겨오지 않습니다.
+CREATE TAG note(name STRING, body STRING);
+CREATE EDGE rel(kind STRING);
+
+-- 3. 이전 space에서 vertex와 edge를 읽어, 클라이언트가 해싱하던 그 이름을
+--    문자열 식별자로 써서 삽입합니다.
+INSERT VERTEX note(name, body) VALUES "decision:use-redb":("decision:use-redb", "adopt redb");
+INSERT EDGE rel(kind) VALUES "decision:use-redb"->"module:kvstore":("affects");
+```
+
+이후 조회는 문자열을 반환하고 traversal도 문자열에서 출발합니다.
+
+```sql
+MATCH (n:note) WHERE id(n) == "decision:use-redb" RETURN id(n) AS vid;
+GO FROM "decision:use-redb" OVER rel YIELD rel.kind AS kind;
+```
+
+새 space에 정수 VID를 쓰는 것은 거부됩니다 — 같은 entity에 두 번째 신원이 조용히
+생기지 않습니다.
+
+```
+INSERT VERTEX note(name, body) VALUES 111:("x", "y");
+[ERROR] space 'memory_v2' uses FIXED_STRING VIDs; integer VID 111 is
+        read/delete-only legacy data and cannot be written
+```
+
+internal surrogate도 지정할 수 없습니다. 쓰기에서는 위의 정수 규칙이 음수를 포함한 모든
+정수에 적용되고, 읽기·삭제에서는 raw 음수 VID가 internal surrogate로서 거부됩니다.
+
+#### 이력은 마이그레이션을 따라오지 않습니다
+
+이것이 계획에 반영해야 할 결과입니다. 이력은 space와 VID로 키잉되므로, 새 식별자로 다시
+삽입하면 그 삽입 시점에서 시작하는 **새 이력**이 생깁니다.
+
+```sql
+-- 새 space에서 삽입 이전 시점: 0건.
+FETCH PROP ON note "decision:use-redb" AS OF 1785283200000;
+
+-- 이전 space에는 마이그레이션 전 상태가 이전 VID 아래 그대로 남아 있습니다.
+USE memory_v1;
+FETCH PROP ON note 111 AS OF 1785283200000;
+```
+
+즉 마이그레이션은 rename이 아니라 **현재 사실의 재단정**입니다. 과거 상태가 필요하면
+이전 space를 기록 보관소로 유지하고, 새 space에서 `AS OF`가 계속 동작하리라 기대하며
+`DROP`하지 마세요. 재키를 넘어 이력을 옮기는 방법은 지원되지 않습니다.
+
+#### 마이그레이션 전에 확인할 것
+
+- `RECOMMEND`는 INT64 전용이며 `FIXED_STRING` space에서는 space 이름을 명시해 거부됩니다.
+  이 기능에 의존하는 workload라면 해당 데이터는 `INT64` space에 두세요
+  ([데이터 조회](./dql.md#recommend) 참고).
+- mapping 기반 `FIXED_STRING` 실행은 위와 같이 standalone 전용입니다.
+- 식별자 길이 제한은 문자 수가 아니라 `N` **바이트**이므로 비ASCII 이름은 여유가
+  필요합니다.
 
 ## 스페이스 선택
 
