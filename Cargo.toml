@@ -59,7 +59,7 @@ distributed = ["byoridb-executor/distributed", "byoridb-storage/distributed"]
 # from. Members were pinned at 0.1.0 while the root package moved to 0.3.3,
 # which meant a v0.3.3 archive shipped a CLI that called itself 0.1.0.
 [workspace.package]
-version = "0.4.10"
+version = "0.4.11"
 
 [workspace]
 members = [
