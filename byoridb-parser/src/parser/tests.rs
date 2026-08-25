@@ -1759,3 +1759,61 @@ fn statement_terminators_and_comments_still_parse() {
         );
     }
 }
+
+/// Regression for #78. Multiple edge types were spelled `[e:a:b]`, an
+/// undocumented form with no test, while `[e:a|b]` — what nGQL, Cypher, and
+/// portable tooling emit — did not lex at all.
+#[test]
+fn edge_pattern_accepts_pipe_alternation_between_types() {
+    fn edge_types(query: &str) -> Vec<String> {
+        match parse(query).unwrap_or_else(|error| panic!("`{query}` must parse: {error}")) {
+            Statement::Match(stmt) => match &stmt.pattern {
+                Pattern::Path(path) => path
+                    .edges
+                    .first()
+                    .map(|edge| edge.edge_types.clone())
+                    .unwrap_or_default(),
+                other => panic!("expected a path pattern, got {other:?}"),
+            },
+            other => panic!("expected MATCH, got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        edge_types("MATCH (a)-[e:knows|follows]->(b) RETURN e"),
+        vec!["knows".to_string(), "follows".to_string()]
+    );
+    // Three, and with no edge variable.
+    assert_eq!(
+        edge_types("MATCH (a)-[:knows|follows|blocks]->(b) RETURN a"),
+        vec![
+            "knows".to_string(),
+            "follows".to_string(),
+            "blocks".to_string()
+        ]
+    );
+    // The colon form still parses to the same set: it was the only spelling that
+    // worked before, so queries may rely on it.
+    assert_eq!(
+        edge_types("MATCH (a)-[e:knows:follows]->(b) RETURN e"),
+        edge_types("MATCH (a)-[e:knows|follows]->(b) RETURN e")
+    );
+    // A single type and no type are unchanged; empty means every type.
+    assert_eq!(
+        edge_types("MATCH (a)-[e:knows]->(b) RETURN e"),
+        vec!["knows".to_string()]
+    );
+    assert!(edge_types("MATCH (a)-[e]->(b) RETURN e").is_empty());
+
+    // Alternation composes with a variable-length range.
+    assert_eq!(
+        edge_types("MATCH (a)-[:knows|follows*1..3]->(b) RETURN b"),
+        vec!["knows".to_string(), "follows".to_string()]
+    );
+
+    // A dangling separator is an error, not a silently dropped type.
+    assert!(parse("MATCH (a)-[e:knows|]->(b) RETURN e").is_err());
+
+    // `|` must not disturb `||`, which is `OR`.
+    assert!(parse("MATCH (a) WHERE a.x == 1 || a.y == 2 RETURN a").is_ok());
+}

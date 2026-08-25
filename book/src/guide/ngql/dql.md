@@ -106,6 +106,26 @@ MATCH (p:person {name: "Alice"}) RETURN p;
 MATCH (a:person)-[:knows*1..3]->(b:person) RETURN id(b) AS vid;
 ```
 
+### Matching more than one edge type
+
+Separate types with `|`. The pattern matches an edge of **any** listed type — it
+is a union, not an intersection:
+
+```sql
+MATCH (a:person)-[e:knows|follows]->(b:person) RETURN id(b) AS vid;
+MATCH (a:person)-[:knows|follows|blocks*1..2]->(b:person) RETURN id(b) AS vid;
+```
+
+Naming no type at all matches every edge type:
+
+```sql
+MATCH (a:person)-[e]->(b) RETURN type(e) AS kind;
+```
+
+A repeated colon (`[e:knows:follows]`) means the same thing and still parses,
+because it was the only spelling that worked before `|` was accepted. Prefer `|`:
+it is what nGQL and Cypher use, so those queries port unchanged.
+
 Multiple comma-separated patterns join on shared variables. `OPTIONAL MATCH`,
 `GROUP BY`, `ORDER BY`, `LIMIT`, and `OFFSET` are also available in the current
 MATCH path.

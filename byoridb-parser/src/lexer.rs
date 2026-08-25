@@ -333,6 +333,12 @@ pub enum Token {
     #[token("||")]
     #[token("OR", ignore(case))]
     Or,
+    /// Alternation between edge types in a MATCH pattern: `[e:t1|t2]`.
+    ///
+    /// Declared after `||` so the longer token still wins — logos prefers the
+    /// longest match, so `a || b` remains one `Or` rather than two of these.
+    #[token("|")]
+    Pipe,
     #[token("!")]
     NotOp,
 

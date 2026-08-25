@@ -672,9 +672,18 @@ impl Parser {
             variable = Some(name);
         }
 
-        // Parse edge types after colon
-        while self.match_token(Token::Colon) {
+        // Edge types: `:t1`, then further types separated by `|` — the spelling
+        // nGQL and Cypher use, and the one portable tooling emits (#78). A
+        // repeated `:` is also accepted, because it was the only form that
+        // parsed before and queries may already rely on it.
+        //
+        // More than one type means "any of these": the executor treats a
+        // non-empty set as a membership filter, and an empty one as every type.
+        if self.match_token(Token::Colon) {
             edge_types.push(self.consume_identifier()?);
+            while self.match_token(Token::Pipe) || self.match_token(Token::Colon) {
+                edge_types.push(self.consume_identifier()?);
+            }
         }
 
         // Parse range *1..3
