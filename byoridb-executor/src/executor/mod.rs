@@ -2651,6 +2651,119 @@ mod tests {
         assert_eq!(indexes[0].index_name, "knows_since_idx");
     }
 
+    /// `DELETE EDGE` used to leave the edge's secondary index entries behind.
+    /// That was invisible because nothing read edge indexes yet; edge LOOKUP
+    /// (#79) would have surfaced them as hits on deleted edges, and the index
+    /// would have grown monotonically under a delete-heavy workload.
+    #[tokio::test]
+    async fn delete_edge_retracts_its_secondary_index_entries() {
+        let executor = create_executor();
+        executor
+            .ctx
+            .kvstore
+            .put(
+                &crate::key::SchemaKey::edge("default", "knows"),
+                &serde_json::to_vec(&serde_json::json!({
+                    "name": "knows",
+                    "properties": [{"name": "since", "data_type": "Int64"}]
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute_create(CreatePlan::EdgeIndex {
+                name: "knows_since_idx".to_string(),
+                edge_name: "knows".to_string(),
+                props: vec!["since".to_string()],
+            })
+            .await
+            .unwrap();
+        let index = executor
+            .ctx
+            .index_manager
+            .as_ref()
+            .unwrap()
+            .list_edge_indexes(1)
+            .await
+            .into_iter()
+            .find(|index| index.index_name == "knows_since_idx")
+            .expect("the edge index must exist");
+
+        executor
+            .execute_insert(crate::plan::InsertPlan::Edge {
+                space: "default".to_string(),
+                edges: vec![crate::plan::EdgeInsert {
+                    src: 1.into(),
+                    dst: 2.into(),
+                    edge_type: "knows".to_string(),
+                    ranking: 0,
+                    props: HashMap::from([("since".to_string(), byoridb_common::Value::Int(2020))]),
+                }],
+            })
+            .await
+            .unwrap();
+
+        let index_key = byoridb_storage::KeyUtils::edge_index_key(
+            1,
+            index.id,
+            &[byoridb_storage::IndexValue::Int(2020)],
+            1,
+            0,
+            2,
+        );
+        assert!(
+            executor
+                .ctx
+                .kvstore
+                .get(&index_key)
+                .await
+                .unwrap()
+                .is_some(),
+            "INSERT EDGE must write the index entry this test then deletes"
+        );
+
+        let deleted = executor
+            .execute_delete_edge(crate::plan::DeleteEdgePlan {
+                space: "default".to_string(),
+                edge_name: "knows".to_string(),
+                edge_refs: vec![(1.into(), 2.into(), 0)],
+            })
+            .await
+            .unwrap();
+        assert_eq!(deleted.rows, vec![vec![byoridb_common::Value::Int(1)]]);
+
+        assert!(
+            executor
+                .ctx
+                .kvstore
+                .get(&index_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "the index entry must be retracted with the edge, not left pointing at it"
+        );
+        // The edge itself and its reverse copy are gone too, in the same batch.
+        assert!(executor
+            .ctx
+            .kvstore
+            .get(&crate::key::SchemaKey::edge_data(
+                "default", 1, "knows", 2, 0
+            ))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(executor
+            .ctx
+            .kvstore
+            .get(&crate::key::SchemaKey::in_edge_data(
+                "default", 2, "knows", 1, 0
+            ))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     #[tokio::test]
     async fn test_drop_tag_index_without_meta_client_if_exists_is_ok() {
         let executor = create_executor();

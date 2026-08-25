@@ -1123,6 +1123,20 @@ impl Executor {
             ));
         }
 
+        // Fetched once rather than per row, like INSERT EDGE does, and filtered
+        // to this statement's edge type so the per-row work is only the values.
+        let edge_indexes = match self.ctx.index_manager.as_ref() {
+            Some(im) => {
+                let space_id = self.ctx.resolve_space_id().await;
+                im.list_edge_indexes(space_id)
+                    .await
+                    .into_iter()
+                    .filter(|index| index.schema_name == plan.edge_name)
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+
         let mut deleted = 0i64;
         // Asserted edges actually removed — seed set for incremental retraction.
         let mut deleted_edges: Vec<(i64, String, i64)> = Vec::new();
@@ -1156,15 +1170,57 @@ impl Executor {
                 "{}:edge:{}:{}:{}:{}",
                 effective_space, src, plan.edge_name, dst, ranking
             );
-            if seen_refs.insert(key.as_bytes().to_vec())
-                && self.ctx.kvstore.get(key.as_bytes()).await?.is_some()
-            {
+            // The blob is needed, not just its existence: an edge index entry is
+            // keyed by the edge's property values, so removing it requires the
+            // properties this edge held.
+            let existing = if seen_refs.insert(key.as_bytes().to_vec()) {
+                self.ctx.kvstore.get(key.as_bytes()).await?
+            } else {
+                None
+            };
+            if let Some(blob) = existing {
                 del_keys.push(key.as_bytes().to_vec());
                 tombstones.push(key.as_bytes().to_vec());
                 // Keep the reverse-edge index in sync (written by INSERT EDGE).
                 let in_edge_key =
                     SchemaKey::in_edge_data(&effective_space, dst, &plan.edge_name, src, *ranking);
                 del_keys.push(in_edge_key);
+                // Retract the edge's secondary index entries in the same
+                // transaction. INSERT EDGE writes them and UPDATE EDGE moves
+                // them, but delete used to leave them behind — harmless only
+                // because nothing read them yet. Edge LOOKUP would surface them
+                // as hits on deleted edges (#79).
+                if !edge_indexes.is_empty() {
+                    match VertexCodec::decode_edge(&blob) {
+                        Ok(edge) => {
+                            for index in &edge_indexes {
+                                let values = index
+                                    .fields
+                                    .iter()
+                                    .map(|field| {
+                                        self.byoridb_value_to_index_value(
+                                            edge.properties
+                                                .get(field)
+                                                .unwrap_or(&byoridb_common::Value::null()),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                del_keys.push(byoridb_storage::KeyUtils::edge_index_key(
+                                    1, index.id, &values, src, *ranking, dst,
+                                ));
+                            }
+                        }
+                        // A blob that cannot be decoded still has its edge keys
+                        // removed; its index entries are unreachable by value, so
+                        // failing the delete over them would strand the edge.
+                        Err(error) => tracing::warn!(
+                            space = %effective_space,
+                            edge_type = %plan.edge_name,
+                            err = %error,
+                            "edge blob did not decode; its index entries were left in place"
+                        ),
+                    }
+                }
                 *deg_in.entry((plan.edge_name.clone(), dst)).or_insert(0) -= 1;
                 *deg_out.entry((plan.edge_name.clone(), src)).or_insert(0) -= 1;
                 deleted += 1;
