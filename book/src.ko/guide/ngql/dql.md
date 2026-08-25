@@ -190,20 +190,46 @@ RETURN n.doc.body AS body;
 
 ## LOOKUP
 
-현재 `LOOKUP`은 tag를 대상으로 합니다.
+`LOOKUP`은 tag와 edge type을 모두 대상으로 합니다. 어느 쪽인지는 이름을 schema에
+조회해 결정하므로 별도 키워드가 없습니다.
 
 ```sql
 LOOKUP ON person WHERE person.name == "Alice";
 LOOKUP ON person WHERE person.age >= 21 YIELD person.name, person.age LIMIT 20;
+
+LOOKUP ON knows WHERE knows.since == 2020;
+LOOKUP ON knows WHERE since == 2020 LIMIT 20;
 ```
 
-indexed tag 속성의 동등 조건은 secondary index를 사용할 수 있습니다. 그러나 `>`,
-`>=`, `<`, `<=` 범위 조건은 해당 속성에 index가 있어도 bounded full scan으로
-fallback합니다. index range scan은
-[이슈 #1](https://github.com/byoridb/byoridb/issues/1)에서 추적합니다. 기본 fallback
-scan 상한은 100,000행이며 설정으로 바꿀 수 있습니다. edge type `LOOKUP`은 현재
-조회하지 않고 명시적 오류를 반환합니다. 실제 access path는 `EXPLAIN` 또는 `PROFILE`로
-확인하세요.
+tag `LOOKUP`은 `<tag>.vid`와 tag 속성을 반환합니다. edge `LOOKUP`은
+**`<edge>.src`·`<edge>.dst`·`<edge>.rank`** 를 반환합니다 — rank가 edge identity의
+일부이므로 이 셋이 함께 edge 하나를 지목합니다. 속성은 tag와 마찬가지로 이름 그대로와
+수식한 형태 둘 다로 매칭됩니다(`since`와 `knows.since`).
+
+indexed 속성의 동등 조건은 tag와 edge type 모두 secondary index를 사용할 수 있습니다.
+그 밖의 조건은 술어를 pushdown한 bounded scan으로 fallback하며, 정확하지만 index를
+쓰지 않습니다.
+
+- **tag**의 범위 조건(`>`, `>=`, `<`, `<=`)은 속성에 index가 있어도 scan으로
+  fallback합니다. index range scan은 [이슈 #1](https://github.com/byoridb/byoridb/issues/1)에서
+  추적합니다.
+- **edge type**의 범위 조건도 fallback합니다 — edge index에 bounded-range scan 형태가
+  없기 때문이며, [이슈 #79](https://github.com/byoridb/byoridb/issues/79)에서 추적합니다.
+- pushdown이 표현할 수 없는 조건(`CONTAINS`, `STARTS WITH`, 필드 간 비교)은 조용히 전체를
+  매칭하지 않고 **거부**됩니다.
+
+기본 fallback scan 상한은 100,000행이며 설정으로 바꿀 수 있습니다.
+
+index 후보는 항상 저장된 vertex·edge와 대조해 재검증하므로, 낡은 index 항목이 결과가
+될 수 없습니다. 실제 access path는 `EXPLAIN` 또는 `PROFILE`로 확인하세요.
+
+```
+EXPLAIN LOOKUP ON knows WHERE knows.since == 2020;
+-- IndexScan  on Edge knows where knows.since == 2020   index: knows_since_idx
+
+EXPLAIN LOOKUP ON knows WHERE knows.since > 2019;
+-- EdgeScan   on Edge knows where knows.since > 2019    ⚠ FULL SCAN
+```
 
 ## FIND path
 

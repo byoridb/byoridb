@@ -203,10 +203,20 @@ fn build_go(p: &crate::plan::GoPlan) -> PlanNode {
 }
 
 async fn build_lookup(ctx: &ExecutionContext, p: &LookupPlan) -> PlanNode {
-    let (kind, name) = match &p.lookup_type {
-        LookupType::Tag(t) => ("Tag", t.clone()),
-        LookupType::Edge(e) => ("Edge", e.clone()),
+    let name = match &p.lookup_type {
+        LookupType::Tag(t) => t.clone(),
+        LookupType::Edge(e) => e.clone(),
     };
+    // The plan always says `Tag` for `LOOKUP ON <name>` — the parser has no
+    // schema — so resolve it the way the executor does. Otherwise an edge
+    // LOOKUP is described as a tag scan while it runs an edge index (#79).
+    let is_edge = match ctx.space.as_deref() {
+        Some(space) => crate::executor::lookup_targets_edge(ctx, space, &p.lookup_type, &name)
+            .await
+            .unwrap_or(false),
+        None => matches!(p.lookup_type, LookupType::Edge(_)),
+    };
+    let kind = if is_edge { "Edge" } else { "Tag" };
     let access = lookup_access(ctx, p).await;
     let where_str = p
         .where_clause
@@ -214,10 +224,11 @@ async fn build_lookup(ctx: &ExecutionContext, p: &LookupPlan) -> PlanNode {
         .map(expr_to_string)
         .unwrap_or_else(|| "(all)".to_string());
 
-    let (op, scan_op) = match &access {
-        AccessPath::Index(_) => ("IndexScan", ProfileOp::IndexScan),
-        AccessPath::Unsupported(_) => ("Unsupported", ProfileOp::FullScan),
-        _ => ("TagScan", ProfileOp::FullScan),
+    let (op, scan_op) = match (&access, is_edge) {
+        (AccessPath::Index(_), _) => ("IndexScan", ProfileOp::IndexScan),
+        (AccessPath::Unsupported(_), _) => ("Unsupported", ProfileOp::FullScan),
+        (_, true) => ("EdgeScan", ProfileOp::FullScan),
+        (_, false) => ("TagScan", ProfileOp::FullScan),
     };
     let scan = PlanNode::new(
         op,
@@ -233,9 +244,10 @@ async fn build_lookup(ctx: &ExecutionContext, p: &LookupPlan) -> PlanNode {
     if let Some(limit) = p.limit {
         node = PlanNode::new("Limit", limit.to_string(), AccessPath::None).child(node);
     }
-    let cols = match &p.lookup_type {
-        LookupType::Tag(t) => format!("{}.vid", t),
-        LookupType::Edge(e) => format!("{}.src,{}.dst", e, e),
+    let cols = if is_edge {
+        format!("{name}.src,{name}.dst,{name}.rank")
+    } else {
+        format!("{name}.vid")
     };
     PlanNode::new("Project", cols, AccessPath::None).child(node)
 }
@@ -465,7 +477,38 @@ async fn lookup_access_for_mode(
     p: &LookupPlan,
     distributed: bool,
 ) -> AccessPath {
-    // Only tag lookups currently have an index path in the executor.
+    // An edge LOOKUP uses its index only for a single-field equality: there is
+    // no bounded-range form of the edge index scan, so a range predicate takes
+    // the scan and must be reported as one (#79).
+    let name = match &p.lookup_type {
+        LookupType::Tag(t) => t.clone(),
+        LookupType::Edge(e) => e.clone(),
+    };
+    if let Some(space) = ctx.space.as_deref() {
+        if crate::executor::lookup_targets_edge(ctx, space, &p.lookup_type, &name)
+            .await
+            .unwrap_or(false)
+        {
+            if let (Some(im), Some(expr)) = (ctx.index_manager.as_ref(), p.where_clause.as_ref()) {
+                if let Some(access) = distributed_lookup_guard(distributed, expr) {
+                    return access;
+                }
+                if range_lookup_literal(expr).is_none() {
+                    if let Some(field) = lookup_index_field(expr) {
+                        let space_id = ctx.resolve_space_id().await;
+                        if let Some(index) = im.list_edge_indexes(space_id).await.iter().find(|i| {
+                            i.schema_name.eq_ignore_ascii_case(&name)
+                                && i.fields.len() == 1
+                                && i.fields[0] == field
+                        }) {
+                            return AccessPath::Index(index.index_name.clone());
+                        }
+                    }
+                }
+            }
+            return lookup_full_scan_access(distributed);
+        }
+    }
     if let LookupType::Tag(tag) = &p.lookup_type {
         if let Some(expr) = p.where_clause.as_ref() {
             if let Some(access) = distributed_lookup_guard(distributed, expr) {

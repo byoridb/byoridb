@@ -195,20 +195,50 @@ supported approach.
 
 ## LOOKUP
 
-Current `LOOKUP` targets tags:
+`LOOKUP` targets a tag or an edge type. The name decides which — it is resolved
+against the schema, so there is no separate keyword:
 
 ```sql
 LOOKUP ON person WHERE person.name == "Alice";
 LOOKUP ON person WHERE person.age >= 21 YIELD person.name, person.age LIMIT 20;
+
+LOOKUP ON knows WHERE knows.since == 2020;
+LOOKUP ON knows WHERE since == 2020 LIMIT 20;
 ```
 
-An equality predicate on an indexed tag property can use the secondary index.
-Range predicates (`>`, `>=`, `<`, and `<=`) currently fall back to a bounded
-full scan even when that property has an index; index range scans are tracked
-in [issue #1](https://github.com/byoridb/byoridb/issues/1). The default fallback
-scan limit is 100,000 rows and is configurable. `LOOKUP` on an edge type
-currently returns an error rather than performing an edge lookup. Use
-`EXPLAIN` or `PROFILE` to verify the selected access path.
+A tag `LOOKUP` returns `<tag>.vid` and the tag's properties. An edge `LOOKUP`
+returns **`<edge>.src`, `<edge>.dst`, and `<edge>.rank`** — the three together
+identify one edge, since rank is part of an edge's identity. Properties are
+matched bare or qualified by name (`since` and `knows.since` both resolve),
+as they are for tags.
+
+An equality predicate on an indexed property can use the secondary index, for
+both tags and edge types. Everything else falls back to a bounded scan with the
+predicate pushed down, which is correct but unindexed:
+
+- Range predicates (`>`, `>=`, `<`, `<=`) on a **tag** fall back to a scan even
+  when the property is indexed; index range scans are tracked in
+  [issue #1](https://github.com/byoridb/byoridb/issues/1).
+- Range predicates on an **edge type** likewise fall back, because the edge
+  index has no bounded-range scan form; tracked in
+  [issue #79](https://github.com/byoridb/byoridb/issues/79).
+- A predicate the pushdown cannot express (`CONTAINS`, `STARTS WITH`, or a
+  field-to-field comparison) is **rejected** rather than silently matching
+  everything.
+
+The default fallback scan limit is 100,000 rows and is configurable.
+
+Index candidates are always revalidated against the stored vertex or edge, so a
+stale index entry cannot become a result. Use `EXPLAIN` or `PROFILE` to see
+which access path ran:
+
+```
+EXPLAIN LOOKUP ON knows WHERE knows.since == 2020;
+-- IndexScan  on Edge knows where knows.since == 2020   index: knows_since_idx
+
+EXPLAIN LOOKUP ON knows WHERE knows.since > 2019;
+-- EdgeScan   on Edge knows where knows.since > 2019    ⚠ FULL SCAN
+```
 
 ## FIND paths
 
