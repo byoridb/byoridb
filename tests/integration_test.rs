@@ -1634,7 +1634,7 @@ async fn test_drop_index_removes_stale_entries() {
 /// so the executor detects an edge name and rejects it (edge LOOKUP is a
 /// not-yet-implemented feature; the previous behaviour returned misleading rows).
 #[tokio::test]
-async fn test_edge_lookup_errors_clearly() {
+async fn edge_lookup_with_no_match_is_empty_not_an_error() {
     let (service, _temp_dir) = create_test_service();
     let session_id = service
         .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
@@ -1647,15 +1647,17 @@ async fn test_edge_lookup_errors_clearly() {
     execute(&service, session_id, "CREATE EDGE e(w INT64)").await;
     execute(&service, session_id, "INSERT VERTEX t(n) VALUES 1:(1)").await;
 
-    // LOOKUP on the edge type must error, not silently return empty.
-    let edge_lookup = service
-        .execute(session_id, "LOOKUP ON e WHERE e.w == 1".to_string())
-        .await;
-    assert!(
-        edge_lookup.is_err(),
-        "LOOKUP on an edge type must error clearly: {:?}",
-        edge_lookup.map(|d| d.row_count())
-    );
+    // LOOKUP on an edge type is implemented (#79). With no matching edge it is
+    // an empty result — which is now a true answer rather than the refusal this
+    // test originally asserted, and distinguishable from an error.
+    let empty = execute(&service, session_id, "LOOKUP ON e WHERE e.w == 1").await;
+    assert_eq!(empty.row_count(), 0);
+    assert_eq!(empty.column_names, vec!["e.src", "e.dst", "e.rank"]);
+
+    // A name that is neither a tag nor an edge stays on the tag path and is
+    // likewise empty rather than an error.
+    let unknown = execute(&service, session_id, "LOOKUP ON nonexistent WHERE x == 1").await;
+    assert_eq!(unknown.row_count(), 0);
 
     // Tag LOOKUP still works.
     let tag_lookup = execute(&service, session_id, "LOOKUP ON t WHERE t.n == 1").await;
@@ -3096,6 +3098,207 @@ async fn fixed_string_vid_migration_path_from_client_hashed_int64() {
     assert!(
         recommend_message.contains("INT64-only") && recommend_message.contains("migrated_str"),
         "got: {recommend_message}"
+    );
+
+    service.sign_out(session_id, session_id).await.unwrap();
+}
+
+/// Regression for #79. `LOOKUP ON <edge type>` was refused outright, leaving no
+/// indexed entry point into the edge set — selecting edges by property meant
+/// traversing from endpoints you already knew.
+#[tokio::test(flavor = "multi_thread")]
+async fn lookup_on_an_edge_type_returns_matching_edges() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE edge_lookup").await;
+    execute(&service, session_id, "USE edge_lookup").await;
+    execute(&service, session_id, "CREATE TAG p(name STRING)").await;
+    execute(&service, session_id, "CREATE EDGE knows(since INT64)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX p(name) VALUES 1:("A"), 2:("B"), 3:("C")"#,
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE knows(since) VALUES 1->2:(2020), 1->3:(2021), 2->3:(2020)",
+    )
+    .await;
+
+    /// `(src, dst, rank)` triples from a LOOKUP result, sorted for comparison.
+    fn edges(result: &byoridb_common::DataSet) -> Vec<(i64, i64, i64)> {
+        let mut found: Vec<(i64, i64, i64)> = result
+            .rows
+            .iter()
+            .filter_map(|row| match (row.first(), row.get(1), row.get(2)) {
+                (Some(Value::Int(src)), Some(Value::Int(dst)), Some(Value::Int(rank))) => {
+                    Some((*src, *dst, *rank))
+                }
+                _ => None,
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    // Without an index this takes the predicate scan, which must still be
+    // correct — that is what makes the index an optimisation rather than the
+    // feature.
+    let scanned = execute(
+        &service,
+        session_id,
+        "LOOKUP ON knows WHERE knows.since == 2020",
+    )
+    .await;
+    assert_eq!(
+        scanned.column_names,
+        vec!["knows.src", "knows.dst", "knows.rank"],
+        "rank is part of an edge's identity and is projected with the endpoints"
+    );
+    assert_eq!(edges(&scanned), vec![(1, 2, 0), (2, 3, 0)]);
+
+    // The same answer through the index.
+    execute(
+        &service,
+        session_id,
+        "CREATE EDGE INDEX knows_since_idx ON knows(since)",
+    )
+    .await;
+    let indexed = execute(
+        &service,
+        session_id,
+        "LOOKUP ON knows WHERE knows.since == 2020",
+    )
+    .await;
+    assert_eq!(
+        edges(&indexed),
+        vec![(1, 2, 0), (2, 3, 0)],
+        "the index must agree with the scan"
+    );
+
+    // An unqualified field resolves too, as it does for tags.
+    let unqualified = execute(&service, session_id, "LOOKUP ON knows WHERE since == 2021").await;
+    assert_eq!(edges(&unqualified), vec![(1, 3, 0)]);
+
+    // A range predicate has no bounded edge-index form, so it takes the scan and
+    // must still be right.
+    let ranged = execute(&service, session_id, "LOOKUP ON knows WHERE since > 2020").await;
+    assert_eq!(edges(&ranged), vec![(1, 3, 0)]);
+
+    // OFFSET/LIMIT window the result.
+    let limited = execute(
+        &service,
+        session_id,
+        "LOOKUP ON knows WHERE knows.since == 2020 LIMIT 1",
+    )
+    .await;
+    assert_eq!(limited.rows.len(), 1, "LIMIT must bound the result");
+
+    // An updated property moves the edge between result sets, and the stale
+    // index entry must not resurrect the old value.
+    execute(
+        &service,
+        session_id,
+        "UPDATE EDGE ON knows 1->2 SET since = 2099",
+    )
+    .await;
+    let after_update = execute(
+        &service,
+        session_id,
+        "LOOKUP ON knows WHERE knows.since == 2020",
+    )
+    .await;
+    assert_eq!(
+        edges(&after_update),
+        vec![(2, 3, 0)],
+        "an updated edge must leave the old value's result set"
+    );
+    let moved = execute(
+        &service,
+        session_id,
+        "LOOKUP ON knows WHERE knows.since == 2099",
+    )
+    .await;
+    assert_eq!(edges(&moved), vec![(1, 2, 0)]);
+
+    // A deleted edge must not be a hit, whether or not its index entry survived.
+    execute(&service, session_id, "DELETE EDGE knows 2->3").await;
+    let after_delete = execute(
+        &service,
+        session_id,
+        "LOOKUP ON knows WHERE knows.since == 2020",
+    )
+    .await;
+    assert!(
+        edges(&after_delete).is_empty(),
+        "a deleted edge must not be returned, got {:?}",
+        after_delete.rows
+    );
+
+    // EXPLAIN must say which access path ran, and must not describe an edge
+    // LOOKUP as a tag scan.
+    let plan_text = |result: &byoridb_common::DataSet| -> String {
+        result
+            .rows
+            .iter()
+            .flatten()
+            .map(|value| match value {
+                Value::String(text) => text.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let explained_index = execute(
+        &service,
+        session_id,
+        "EXPLAIN LOOKUP ON knows WHERE knows.since == 2099",
+    )
+    .await;
+    let indexed_plan = plan_text(&explained_index);
+    assert!(
+        indexed_plan.contains("IndexScan")
+            && indexed_plan.contains("knows_since_idx")
+            && indexed_plan.contains("on Edge knows"),
+        "an indexed edge LOOKUP must be reported as such, got: {indexed_plan}"
+    );
+    assert!(
+        indexed_plan.contains("knows.src,knows.dst,knows.rank"),
+        "the projection must match what the executor returns, got: {indexed_plan}"
+    );
+
+    // A range predicate has no bounded edge-index form, so it must be reported
+    // as a scan rather than claiming an index.
+    let explained_range = execute(
+        &service,
+        session_id,
+        "EXPLAIN LOOKUP ON knows WHERE knows.since > 2020",
+    )
+    .await;
+    let range_plan = plan_text(&explained_range);
+    assert!(
+        range_plan.contains("EdgeScan") && range_plan.contains("FULL SCAN"),
+        "an unindexed edge predicate must be reported as a scan, got: {range_plan}"
+    );
+
+    // A tag LOOKUP in the same space is unaffected.
+    let tag_lookup = execute(&service, session_id, r#"LOOKUP ON p WHERE p.name == "A""#).await;
+    assert_eq!(tag_lookup.rows.len(), 1);
+    let explained_tag = execute(
+        &service,
+        session_id,
+        r#"EXPLAIN LOOKUP ON p WHERE p.name == "A""#,
+    )
+    .await;
+    assert!(
+        plan_text(&explained_tag).contains("on Tag p"),
+        "a tag LOOKUP must still be described as a tag"
     );
 
     service.sign_out(session_id, session_id).await.unwrap();

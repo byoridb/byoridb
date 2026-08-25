@@ -272,6 +272,9 @@ mod dml;
 #[cfg(test)]
 mod dogfood_regression;
 mod dql;
+// Re-exported so `EXPLAIN` resolves tag-vs-edge with the same rule the executor
+// uses, rather than keeping a second copy that could drift (#79).
+pub(crate) use dql::lookup_targets_edge;
 mod inference;
 mod provenance;
 mod recommend;

@@ -81,6 +81,67 @@ fn vid_value_to_json(value: byoridb_common::Value) -> serde_json::Value {
     }
 }
 
+/// Whether `LOOKUP ON <name>` names an edge type rather than a tag.
+///
+/// The parser cannot tell them apart — it has no schema — so it always emits
+/// `LookupType::Tag` and the distinction is resolved here, against the persisted
+/// schema. Shared with `EXPLAIN`, which must describe the same plan the executor
+/// runs; two copies of this rule would drift, and a plan that says `TagScan`
+/// while an edge index is used is a diagnostic that misleads.
+pub(crate) async fn lookup_targets_edge(
+    ctx: &crate::context::ExecutionContext,
+    space: &str,
+    lookup_type: &crate::plan::LookupType,
+    name: &str,
+) -> Result<bool> {
+    match lookup_type {
+        crate::plan::LookupType::Edge(_) => Ok(true),
+        crate::plan::LookupType::Tag(_) => {
+            if ctx
+                .kvstore
+                .get(&crate::key::SchemaKey::tag(space, name))
+                .await?
+                .is_some()
+            {
+                return Ok(false);
+            }
+            Ok(ctx
+                .kvstore
+                .get(&crate::key::SchemaKey::edge(space, name))
+                .await?
+                .is_some())
+        }
+    }
+}
+
+/// Whether a stored edge is of `edge_type` and satisfies `filter_expr`.
+///
+/// Properties are offered bare and qualified by edge type, matching how the tag
+/// path exposes tag properties, so `WHERE since == 2020` and
+/// `WHERE knows.since == 2020` both resolve.
+fn edge_matches(edge: &byoridb_codec::EdgeData, edge_type: &str, filter_expr: &FilterExpr) -> bool {
+    if !edge.edge_type.eq_ignore_ascii_case(edge_type) {
+        return false;
+    }
+    let get_field = |field: &str| -> Option<byoridb_common::Value> {
+        edge.properties
+            .get(field)
+            .or_else(|| {
+                let qualified = format!("{}.{}", edge.edge_type, field);
+                edge.properties.get(&qualified)
+            })
+            .cloned()
+    };
+    filter_expr.evaluate(&get_field)
+}
+
+/// Order-preserving dedupe of `(src, rank, dst)` candidates, mirroring
+/// [`stable_dedupe_vids`]. Partitions can return the same edge more than once.
+fn stable_dedupe_edge_refs(refs: Vec<(i64, i64, i64)>) -> Vec<(i64, i64, i64)> {
+    let mut seen = std::collections::HashSet::with_capacity(refs.len());
+    refs.into_iter().filter(|r| seen.insert(*r)).collect()
+}
+
 fn json_vertex_matches_tag(
     vertex_data: &serde_json::Value,
     tag_name: &str,
@@ -1225,44 +1286,32 @@ impl Executor {
             .ok_or_else(|| ExecutionError::InvalidOperation("No space selected".to_string()))?;
         let vid_type = crate::vid::space_vid_type(&self.ctx, space).await?;
 
-        let (tag_or_edge_name, result_columns) = match &plan.lookup_type {
-            crate::plan::LookupType::Tag(tag) => (
-                tag.clone(),
-                vec![format!("{}.vid", tag), format!("{}.*", tag)],
-            ),
-            crate::plan::LookupType::Edge(edge) => (
-                edge.clone(),
-                vec![format!("{}.src", edge), format!("{}.dst", edge)],
-            ),
+        let tag_or_edge_name = match &plan.lookup_type {
+            crate::plan::LookupType::Tag(tag) => tag.clone(),
+            crate::plan::LookupType::Edge(edge) => edge.clone(),
         };
 
-        // The parser emits `LookupType::Tag` for `LOOKUP ON <name>` (it has no
-        // schema to tell tag from edge). If <name> is actually an edge type, the
-        // tag-only path below would silently return an empty/tag-filtered result.
-        // Reject it clearly — full edge LOOKUP is not implemented yet.
-        if matches!(plan.lookup_type, crate::plan::LookupType::Tag(_)) {
-            let is_tag = self
-                .ctx
-                .kvstore
-                .get(&crate::key::SchemaKey::tag(space, &tag_or_edge_name))
-                .await?
-                .is_some();
-            if !is_tag {
-                let is_edge = self
-                    .ctx
-                    .kvstore
-                    .get(&crate::key::SchemaKey::edge(space, &tag_or_edge_name))
-                    .await?
-                    .is_some();
-                if is_edge {
-                    return Err(ExecutionError::InvalidOperation(format!(
-                        "LOOKUP ON edge type '{}' is not supported yet — only tag LOOKUP is \
-                         implemented",
-                        tag_or_edge_name
-                    )));
-                }
-            }
-        }
+        // The parser emits `LookupType::Tag` for `LOOKUP ON <name>` — it has no
+        // schema to tell a tag from an edge type — so the distinction is made
+        // here, against the persisted schema. A name that is neither stays on
+        // the tag path, where it is a normal empty result.
+        let is_edge_lookup =
+            lookup_targets_edge(&self.ctx, space, &plan.lookup_type, &tag_or_edge_name).await?;
+
+        let result_columns = if is_edge_lookup {
+            // Rank is part of an edge's identity (#108), so it is projected
+            // alongside the endpoints — the three together name one edge.
+            vec![
+                format!("{tag_or_edge_name}.src"),
+                format!("{tag_or_edge_name}.dst"),
+                format!("{tag_or_edge_name}.rank"),
+            ]
+        } else {
+            vec![
+                format!("{tag_or_edge_name}.vid"),
+                format!("{tag_or_edge_name}.*"),
+            ]
+        };
 
         let lookup_window = self.lookup_window(plan.offset, plan.limit)?;
         if lookup_window.limit == Some(0) {
@@ -1271,6 +1320,18 @@ impl Executor {
                 rows: vec![],
                 latency_ms: 0,
             });
+        }
+        if is_edge_lookup {
+            return self
+                .execute_lookup_edge(
+                    &plan,
+                    space,
+                    vid_type,
+                    &tag_or_edge_name,
+                    result_columns,
+                    lookup_window,
+                )
+                .await;
         }
         #[cfg(feature = "distributed")]
         if self.ctx.is_distributed()
@@ -1547,6 +1608,318 @@ impl Executor {
     /// LOOKUP fallback when no usable local or distributed index produced a
     /// result. Keeping scan decoding and result shaping here also keeps the
     /// index-selection path small enough to audit independently.
+    /// `LOOKUP ON <edge type> [WHERE ...]` (#79).
+    ///
+    /// Mirrors the tag path: a single-field equality predicate uses the edge
+    /// index, anything else falls back to a predicate scan over the edge
+    /// keyspace. Index candidates are always revalidated against the stored
+    /// edge, because an index entry is a claim about a value that the edge may
+    /// no longer hold.
+    ///
+    /// Ordered range predicates (`>`, `>=`, `<`, `<=`) are correct here but not
+    /// indexed: `scan_edge_index` has no bounded-range form, unlike its tag
+    /// counterpart, so they take the scan. Extending it is the remaining half of
+    /// the issue's proposal.
+    async fn execute_lookup_edge(
+        &self,
+        plan: &crate::plan::LookupPlan,
+        space: &str,
+        vid_type: crate::vid::SpaceVidType,
+        edge_type: &str,
+        result_columns: Vec<String>,
+        lookup_window: LookupWindow,
+    ) -> Result<ExecutorResult> {
+        if let (Some(index_manager), Some(where_expr)) =
+            (self.ctx.index_manager.as_ref(), plan.where_clause.as_ref())
+        {
+            if let Some((field, value)) = self.extract_eq_condition(where_expr) {
+                let space_id = self.ctx.resolve_space_id().await;
+                let index_def = index_manager
+                    .list_edge_indexes(space_id)
+                    .await
+                    .into_iter()
+                    .find(|index| {
+                        index.schema_name.eq_ignore_ascii_case(edge_type)
+                            && index.fields.len() == 1
+                            && index.fields[0] == field
+                    });
+                if let Some(index_def) = index_def {
+                    let index_value = self.byoridb_value_to_index_value(&value);
+                    let filter_expr = FilterExpr::eq(field.clone(), value.clone());
+
+                    #[cfg(feature = "distributed")]
+                    if self.ctx.is_distributed() {
+                        let Some(distributed_executor) = self.ctx.get_distributed_executor() else {
+                            return Err(ExecutionError::InvalidOperation(
+                                "Distributed LOOKUP index executor is unavailable".to_string(),
+                            ));
+                        };
+                        let partition_num = self.ctx.get_partition_num().unwrap_or(1);
+                        let edges = distributed_executor
+                            .execute_lookup_edge_index(
+                                space_id,
+                                partition_num,
+                                index_def.id,
+                                &index_def.index_name,
+                                vec![self.byoridb_value_to_proto_index_value(&value)],
+                                lookup_window.index_limit_u32()?,
+                            )
+                            .await
+                            .map_err(|error| {
+                                ExecutionError::InvalidOperation(format!(
+                                    "distributed edge index lookup failed: {error}"
+                                ))
+                            })?;
+                        let candidate_cap_reached = lookup_window
+                            .index_limit
+                            .is_some_and(|limit| edges.len() >= limit);
+                        let refs = stable_dedupe_edge_refs(
+                            edges
+                                .into_iter()
+                                .map(|edge| (edge.src_vid, edge.ranking, edge.dst_vid))
+                                .collect(),
+                        );
+                        return self
+                            .build_local_edge_index_result(
+                                space,
+                                vid_type,
+                                edge_type,
+                                &filter_expr,
+                                refs,
+                                result_columns,
+                                lookup_window,
+                                candidate_cap_reached,
+                            )
+                            .await;
+                    }
+
+                    let partition_num = self.resolve_local_partition_num(space).await;
+                    let profiling = self.ctx.profiling();
+                    let start = std::time::Instant::now();
+                    let mut refs: Vec<(i64, i64, i64)> = Vec::new();
+                    let mut candidate_cap_reached = false;
+                    let mut index_usable = true;
+                    for part_id in 1..=partition_num {
+                        match index_manager
+                            .lookup_edge(
+                                part_id,
+                                &index_def,
+                                std::slice::from_ref(&index_value),
+                                lookup_window.index_limit.unwrap_or(usize::MAX),
+                            )
+                            .await
+                        {
+                            Ok(part_refs) => {
+                                candidate_cap_reached |= lookup_window
+                                    .index_limit
+                                    .is_some_and(|limit| part_refs.len() >= limit);
+                                refs.extend(part_refs);
+                            }
+                            Err(error) => {
+                                // Partial index results would under-report, so
+                                // discard them and take the scan instead.
+                                tracing::warn!(
+                                    part_id,
+                                    err = %error,
+                                    "local edge index lookup failed; falling back to a scan"
+                                );
+                                index_usable = false;
+                                break;
+                            }
+                        }
+                    }
+                    if index_usable {
+                        let refs = stable_dedupe_edge_refs(refs);
+                        if profiling {
+                            self.ctx.record_profile(
+                                ProfileOp::IndexScan,
+                                format!("edge index '{}'", index_def.index_name),
+                                refs.len() as u64,
+                                start.elapsed().as_micros() as u64,
+                                false,
+                            );
+                        }
+                        return self
+                            .build_local_edge_index_result(
+                                space,
+                                vid_type,
+                                edge_type,
+                                &filter_expr,
+                                refs,
+                                result_columns,
+                                lookup_window,
+                                candidate_cap_reached,
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+
+        self.execute_lookup_edge_scan(
+            plan,
+            space,
+            vid_type,
+            edge_type,
+            result_columns,
+            lookup_window,
+        )
+        .await
+    }
+
+    /// Fetch each candidate edge and re-check the predicate against what is
+    /// stored, so an index entry left behind by a change to the indexed property
+    /// cannot become a result.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_local_edge_index_result(
+        &self,
+        space: &str,
+        vid_type: crate::vid::SpaceVidType,
+        edge_type: &str,
+        filter_expr: &FilterExpr,
+        refs: Vec<(i64, i64, i64)>,
+        result_columns: Vec<String>,
+        lookup_window: LookupWindow,
+        candidate_cap_reached: bool,
+    ) -> Result<ExecutorResult> {
+        if refs.is_empty() {
+            return Ok(ExecutorResult {
+                columns: result_columns,
+                rows: vec![],
+                latency_ms: 0,
+            });
+        }
+
+        let mut rows = Vec::new();
+        'fetch_chunks: for chunk in refs.chunks(INDEX_VERTEX_FETCH_CHUNK_SIZE) {
+            let keys: Vec<Vec<u8>> = chunk
+                .iter()
+                .map(|(src, rank, dst)| {
+                    crate::key::SchemaKey::edge_data(space, *src, edge_type, *dst, *rank)
+                })
+                .collect();
+            let blobs = self.ctx.kvstore.batch_get(&keys).await?;
+            for ((src, rank, dst), blob) in chunk.iter().zip(blobs.iter()) {
+                // A missing blob is a deleted edge whose index entry outlived
+                // it; a decode failure is unusable either way.
+                let Some(blob) = blob else { continue };
+                let Ok(edge) = VertexCodec::decode_edge(blob) else {
+                    continue;
+                };
+                if !edge_matches(&edge, edge_type, filter_expr) {
+                    continue;
+                }
+                rows.push(vec![
+                    crate::vid::display_vid(&self.ctx, space, vid_type, *src).await?,
+                    crate::vid::display_vid(&self.ctx, space, vid_type, *dst).await?,
+                    byoridb_common::Value::Int(*rank),
+                ]);
+                if lookup_window.is_satisfied(rows.len()) {
+                    break 'fetch_chunks;
+                }
+            }
+        }
+
+        self.ensure_index_window_satisfied(lookup_window, candidate_cap_reached, rows.len())?;
+        let rows = lookup_window.apply(rows);
+        Ok(ExecutorResult {
+            columns: result_columns,
+            rows,
+            latency_ms: 0,
+        })
+    }
+
+    /// Predicate scan over the edge keyspace, used when no single-field equality
+    /// index covers the predicate.
+    async fn execute_lookup_edge_scan(
+        &self,
+        plan: &crate::plan::LookupPlan,
+        space: &str,
+        vid_type: crate::vid::SpaceVidType,
+        edge_type: &str,
+        result_columns: Vec<String>,
+        lookup_window: LookupWindow,
+    ) -> Result<ExecutorResult> {
+        #[cfg(feature = "distributed")]
+        if self.ctx.is_distributed() {
+            return Err(ExecutionError::InvalidOperation(
+                super::DISTRIBUTED_LOOKUP_FULL_SCAN_UNSUPPORTED.to_string(),
+            ));
+        }
+        self.ctx.mark_full_scan();
+        let profiling = self.ctx.profiling();
+        let start = std::time::Instant::now();
+
+        // A predicate the pushdown cannot express must not silently become
+        // `True`, which would return every edge of the type.
+        let filter_expr = match plan.where_clause.as_ref() {
+            None => FilterExpr::True,
+            Some(expr) => self.expr_to_filter_expr(expr).ok_or_else(|| {
+                ExecutionError::InvalidOperation(format!(
+                    "unsupported LOOKUP predicate — only ==, !=, <, <=, >, >=, AND, OR, NOT \
+                     over a field and a literal are supported here: {:?}",
+                    expr
+                ))
+            })?,
+        };
+
+        // Edge data keys are `{space}:edge:{src}:{type}:{dst}:{rank}`; the edge
+        // *schema* lives under `space:{space}:edge:{name}`, a different prefix,
+        // so this scan sees only data. The type is not a prefix of the key —
+        // `src` precedes it — so it is filtered per row.
+        let prefix = format!("{space}:edge:");
+        let owned_edge_type = edge_type.to_string();
+        let scan_filter = filter_expr.clone();
+        let filter_fn: byoridb_kvstore::FilterFn =
+            Box::new(
+                move |_key: &[u8], value: &[u8]| match VertexCodec::decode_edge(value) {
+                    Ok(edge) => edge_matches(&edge, &owned_edge_type, &scan_filter),
+                    Err(_) => false,
+                },
+            );
+        let matched = self
+            .ctx
+            .kvstore
+            .scan_with_filter(prefix.as_bytes(), filter_fn, lookup_window.fetch_limit)
+            .await?;
+
+        if profiling {
+            self.ctx.record_profile(
+                ProfileOp::FullScan,
+                format!("scan {prefix} (predicate pushdown)"),
+                matched.len() as u64,
+                start.elapsed().as_micros() as u64,
+                true,
+            );
+        }
+
+        let mut rows = Vec::new();
+        let mut result_bytes = 0usize;
+        for (_key, value) in matched {
+            let Ok(edge) = VertexCodec::decode_edge(&value) else {
+                continue;
+            };
+            let row = vec![
+                crate::vid::display_vid(&self.ctx, space, vid_type, edge.src_vid).await?,
+                crate::vid::display_vid(&self.ctx, space, vid_type, edge.dst_vid).await?,
+                byoridb_common::Value::Int(edge.ranking),
+            ];
+            result_bytes += crate::context::estimate_row_bytes(&row);
+            rows.push(row);
+            if rows.len().is_multiple_of(16384) {
+                self.ctx.check_result_budget(result_bytes)?;
+            }
+        }
+        self.ctx.check_result_budget(result_bytes)?;
+
+        let rows = lookup_window.apply(rows);
+        Ok(ExecutorResult {
+            columns: result_columns,
+            rows,
+            latency_ms: 0,
+        })
+    }
+
     async fn execute_lookup_scan(
         &self,
         plan: &crate::plan::LookupPlan,
