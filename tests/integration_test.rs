@@ -3303,3 +3303,125 @@ async fn lookup_on_an_edge_type_returns_matching_edges() {
 
     service.sign_out(session_id, session_id).await.unwrap();
 }
+
+/// Regression for #78. `[e:t1|t2]` — what nGQL, Cypher, and portable tooling
+/// emit — did not lex, and the only form that worked (`[e:t1:t2]`) was
+/// undocumented and untested, so its union semantics were unspecified from a
+/// user's point of view even though the executor implemented them.
+#[tokio::test(flavor = "multi_thread")]
+async fn match_edge_pattern_alternation_returns_the_union_of_types() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE alternation").await;
+    execute(&service, session_id, "USE alternation").await;
+    execute(&service, session_id, "CREATE TAG p(name STRING)").await;
+    execute(&service, session_id, "CREATE EDGE knows(since INT64)").await;
+    execute(&service, session_id, "CREATE EDGE follows(since INT64)").await;
+    execute(&service, session_id, "CREATE EDGE blocks(since INT64)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX p(name) VALUES 1:("A"), 2:("B"), 3:("C"), 4:("D")"#,
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE knows(since) VALUES 1->2:(2020)",
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE follows(since) VALUES 1->3:(2021)",
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE blocks(since) VALUES 1->4:(2022)",
+    )
+    .await;
+
+    async fn destinations(service: &GraphService, session_id: i64, pattern: &str) -> Vec<i64> {
+        let result = execute(
+            service,
+            session_id,
+            &format!("MATCH (a)-{pattern}->(b) WHERE id(a) == 1 RETURN id(b) AS dst"),
+        )
+        .await;
+        let mut vids: Vec<i64> = result
+            .rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(Value::Int(vid)) => Some(*vid),
+                _ => None,
+            })
+            .collect();
+        vids.sort();
+        vids.dedup();
+        vids
+    }
+
+    // Each single type on its own, to establish what the union must equal.
+    let knows = destinations(&service, session_id, "[e:knows]").await;
+    let follows = destinations(&service, session_id, "[e:follows]").await;
+    assert_eq!(knows, vec![2]);
+    assert_eq!(follows, vec![3]);
+
+    // Alternation is exactly their union — asserted against the singles rather
+    // than a hardcoded list.
+    let union = destinations(&service, session_id, "[e:knows|follows]").await;
+    let mut expected = [knows.clone(), follows.clone()].concat();
+    expected.sort();
+    expected.dedup();
+    assert_eq!(
+        union, expected,
+        "alternation must be the union of its types"
+    );
+    assert_eq!(union, vec![2, 3]);
+
+    // A third type extends the union, and `blocks` is excluded when unnamed.
+    assert_eq!(
+        destinations(&service, session_id, "[e:knows|follows|blocks]").await,
+        vec![2, 3, 4]
+    );
+    assert!(!union.contains(&4), "an unnamed type must not be traversed");
+
+    // The colon spelling still means the same thing.
+    assert_eq!(
+        destinations(&service, session_id, "[e:knows:follows]").await,
+        union
+    );
+
+    // No type at all is every type, which is the documented empty-set meaning.
+    assert_eq!(
+        destinations(&service, session_id, "[e]").await,
+        vec![2, 3, 4]
+    );
+
+    // Alternation without an edge variable, and with a range.
+    assert_eq!(
+        destinations(&service, session_id, "[:knows|follows]").await,
+        vec![2, 3]
+    );
+    assert_eq!(
+        destinations(&service, session_id, "[:knows|follows*1..2]").await,
+        vec![2, 3]
+    );
+
+    // `||` is still OR in a predicate, not two alternation separators.
+    let either = execute(
+        &service,
+        session_id,
+        r#"MATCH (a) WHERE a.p.name == "A" || a.p.name == "B" RETURN id(a) AS vid"#,
+    )
+    .await;
+    assert_eq!(either.rows.len(), 2);
+
+    service.sign_out(session_id, session_id).await.unwrap();
+}

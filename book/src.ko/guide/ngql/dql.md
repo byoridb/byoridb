@@ -104,6 +104,26 @@ MATCH (p:person {name: "Alice"}) RETURN p;
 MATCH (a:person)-[:knows*1..3]->(b:person) RETURN id(b) AS vid;
 ```
 
+### 여러 edge type 매칭
+
+`|`로 타입을 구분합니다. 패턴은 나열한 타입 중 **아무거나** 매칭합니다 — 교집합이
+아니라 합집합입니다.
+
+```sql
+MATCH (a:person)-[e:knows|follows]->(b:person) RETURN id(b) AS vid;
+MATCH (a:person)-[:knows|follows|blocks*1..2]->(b:person) RETURN id(b) AS vid;
+```
+
+타입을 아예 쓰지 않으면 모든 edge type을 매칭합니다.
+
+```sql
+MATCH (a:person)-[e]->(b) RETURN type(e) AS kind;
+```
+
+콜론 반복(`[e:knows:follows]`)도 같은 의미이고 여전히 파싱됩니다 — `|`를 받기 전에는
+그것이 유일하게 동작하는 표기였기 때문입니다. `|`를 쓰세요. nGQL과 Cypher가 쓰는
+표기이므로 그쪽 쿼리를 그대로 옮길 수 있습니다.
+
 comma-separated pattern은 공유 variable로 join합니다. 현재 MATCH path는
 `OPTIONAL MATCH`, `GROUP BY`, `ORDER BY`, `LIMIT`, `OFFSET`도 지원합니다.
 
