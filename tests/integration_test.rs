@@ -3425,3 +3425,164 @@ async fn match_edge_pattern_alternation_returns_the_union_of_types() {
 
     service.sign_out(session_id, session_id).await.unwrap();
 }
+
+/// Regression for #121. `GO` deduplicated rows by destination VID alone, so a
+/// second edge to the same vertex — another type under `OVER a,b`, or another
+/// rank — was silently dropped. `FETCH`, `MATCH`, and `LOOKUP` all disagreed
+/// with it on the same data.
+#[tokio::test(flavor = "multi_thread")]
+async fn go_reports_every_edge_to_the_same_destination() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE go_edges").await;
+    execute(&service, session_id, "USE go_edges").await;
+    execute(&service, session_id, "CREATE TAG p(name STRING)").await;
+    execute(&service, session_id, "CREATE EDGE knows(since INT64)").await;
+    execute(&service, session_id, "CREATE EDGE follows(since INT64)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX p(name) VALUES 1:("A"), 2:("B"), 3:("C")"#,
+    )
+    .await;
+
+    // Two types between the same pair — the case `OVER a,b` and `[e:a|b]` exist
+    // for.
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE knows(since) VALUES 1->2:(2020)",
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE follows(since) VALUES 1->2:(2021)",
+    )
+    .await;
+
+    let mut types: Vec<String> = execute(
+        &service,
+        session_id,
+        "GO FROM 1 OVER knows,follows YIELD type(edge) AS t",
+    )
+    .await
+    .rows
+    .iter()
+    .filter_map(|row| match row.first() {
+        Some(Value::String(t)) => Some(t.clone()),
+        _ => None,
+    })
+    .collect();
+    types.sort();
+    assert_eq!(
+        types,
+        vec!["follows".to_string(), "knows".to_string()],
+        "both edge types must be reported, not whichever was scanned first"
+    );
+
+    // GO must agree with MATCH on how many edges exist.
+    let matched = execute(
+        &service,
+        session_id,
+        "MATCH (a)-[e]->(b) WHERE id(a) == 1 RETURN type(e) AS t",
+    )
+    .await;
+    assert_eq!(
+        matched.rows.len(),
+        types.len(),
+        "GO and MATCH must not disagree about the edge count"
+    );
+
+    // Two ranks of one type, which is what rank exists for (#108).
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE knows(since) VALUES 1->3:(2020), 1->3@7:(1990)",
+    )
+    .await;
+    let mut ranked: Vec<i64> = execute(
+        &service,
+        session_id,
+        "GO FROM 1 OVER knows YIELD knows.since AS since",
+    )
+    .await
+    .rows
+    .iter()
+    .filter_map(|row| match row.first() {
+        Some(Value::Int(since)) => Some(*since),
+        _ => None,
+    })
+    .collect();
+    ranked.sort();
+    assert_eq!(
+        ranked,
+        vec![1990, 2020, 2020],
+        "each ranked edge must produce its own row, got {ranked:?}"
+    );
+
+    service.sign_out(session_id, session_id).await.unwrap();
+}
+
+/// The behaviour #121's fix deliberately preserved: a destination reached by
+/// several paths over the *same* edge type and rank is still reported once, so
+/// the fix narrowed the dedupe key rather than removing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn go_still_reports_a_converging_destination_once() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE go_diamond").await;
+    execute(&service, session_id, "USE go_diamond").await;
+    execute(&service, session_id, "CREATE TAG p(name STRING)").await;
+    execute(&service, session_id, "CREATE EDGE follow()").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX p(name) VALUES 1:("A"), 2:("B"), 3:("C"), 4:("D")"#,
+    )
+    .await;
+    // A diamond: 1→2→4 and 1→3→4.
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE follow() VALUES 1->2:(), 1->3:(), 2->4:(), 3->4:()",
+    )
+    .await;
+
+    let two_hops = execute(
+        &service,
+        session_id,
+        "GO 2 STEPS FROM 1 OVER follow YIELD follow._dst AS dst",
+    )
+    .await;
+    assert_eq!(
+        two_hops.rows,
+        vec![vec![Value::Int(4)]],
+        "a destination reached by two same-type paths stays one row, got {:?}",
+        two_hops.rows
+    );
+
+    // A cycle must still terminate rather than expanding forever.
+    execute(&service, session_id, "INSERT EDGE follow() VALUES 4->1:()").await;
+    let cyclic = execute(
+        &service,
+        session_id,
+        "GO 3 STEPS FROM 1 OVER follow YIELD follow._dst AS dst",
+    )
+    .await;
+    assert!(
+        cyclic.rows.len() <= 4,
+        "a cycle must not blow up the frontier, got {} rows",
+        cyclic.rows.len()
+    );
+
+    service.sign_out(session_id, session_id).await.unwrap();
+}
