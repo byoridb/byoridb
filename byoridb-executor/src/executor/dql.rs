@@ -867,6 +867,18 @@ impl Executor {
 
         for src_vid in from_vids.iter() {
             let mut visited = std::collections::HashSet::new();
+            // Rows already emitted for this start vertex, keyed on
+            // `(dst, edge_type, rank)`.
+            //
+            // Narrower than `visited` (destination only), which dropped a second
+            // edge to the same vertex (#121), and wider than the edge's full
+            // identity, which would also split the two arms of a diamond —
+            // `GO` deliberately reports a destination reached by several paths
+            // once, and `test_go_reports_each_destination_edge_once` covers that.
+            // Type and rank are what make a *different* edge observable through
+            // `YIELD`, so they belong in the key and the source does not.
+            let mut reported_rows: std::collections::HashSet<(i64, String, i64)> =
+                std::collections::HashSet::new();
             // frontier: (current_vid, last_edge_on_path_to_current)
             let mut frontier: Vec<(i64, Option<CodecEdgeData>)> = vec![(*src_vid, None)];
             visited.insert(*src_vid);
@@ -922,10 +934,22 @@ impl Executor {
                     scanned_neighbors += neighbors.len() as u64;
                     for neighbor in neighbors {
                         let dst = neighbor.dst;
+                        // Which rows to report and which vertices to expand are
+                        // separate questions. Gating both on the destination VID
+                        // meant a second edge to the same vertex — another type
+                        // under `OVER a,b`, or another rank — was silently
+                        // dropped from the result (#121).
+                        //
+                        // Rows carry the type and rank that distinguish one edge
+                        // from another, so those join the destination in the key.
+                        let row_identity =
+                            (dst, neighbor.edge.edge_type.clone(), neighbor.edge.ranking);
+                        if hop >= min_steps && reported_rows.insert(row_identity) {
+                            traversal.push((*src_vid, dst, Some(neighbor.edge.clone())));
+                        }
+                        // Expansion stays keyed on the destination: that is what
+                        // stops a cycle and bounds the frontier.
                         if visited.insert(dst) {
-                            if hop >= min_steps {
-                                traversal.push((*src_vid, dst, Some(neighbor.edge.clone())));
-                            }
                             next_frontier.push((dst, Some(neighbor.edge)));
                         }
                     }
