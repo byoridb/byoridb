@@ -625,21 +625,18 @@ impl Executor {
             src,
             target.ranking,
         );
-        self.ctx
-            .kvstore
-            .batch_apply(
-                vec![
-                    (key_bytes.clone(), encoded.clone()),
-                    (in_edge_key, encoded.clone()),
-                ],
-                Vec::new(),
-                Self::build_versions(vec![(key_bytes, encoded)]),
-            )
-            .await?;
-
         // Edge secondary indexes point at property values, so an update has to
         // retract the old entry and assert the new one; otherwise LOOKUP keeps
         // answering with the pre-update value.
+        //
+        // These go into the same transaction as the edge (#123). Doing them
+        // afterwards left three windows in which a crash could leave the index
+        // disagreeing with the data — pointing at the old value, or holding
+        // neither entry — with no repair path short of rebuilding the index.
+        // INSERT EDGE and DELETE EDGE both build their index keys into the same
+        // batch; this is now the third.
+        let mut index_puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut index_deletes: Vec<Vec<u8>> = Vec::new();
         if let Some(im) = self.ctx.index_manager.as_ref() {
             let space_id = self.ctx.resolve_space_id().await;
             for index in im
@@ -665,22 +662,41 @@ impl Executor {
                 if old_values == new_values {
                     continue;
                 }
-                im.delete_edge_index(1, index.id, &old_values, src, target.ranking, dst)
-                    .await
-                    .map_err(|e| {
-                        ExecutionError::InvalidOperation(format!(
-                            "edge index update (delete old) failed: {e}"
-                        ))
-                    })?;
-                im.insert_edge_index(1, index.id, &new_values, src, target.ranking, dst)
-                    .await
-                    .map_err(|e| {
-                        ExecutionError::InvalidOperation(format!(
-                            "edge index update (insert new) failed: {e}"
-                        ))
-                    })?;
+                index_deletes.push(byoridb_storage::KeyUtils::edge_index_key(
+                    1,
+                    index.id,
+                    &old_values,
+                    src,
+                    target.ranking,
+                    dst,
+                ));
+                index_puts.push((
+                    byoridb_storage::KeyUtils::edge_index_key(
+                        1,
+                        index.id,
+                        &new_values,
+                        src,
+                        target.ranking,
+                        dst,
+                    ),
+                    Vec::new(),
+                ));
             }
         }
+
+        let mut puts = vec![
+            (key_bytes.clone(), encoded.clone()),
+            (in_edge_key, encoded.clone()),
+        ];
+        puts.extend(index_puts);
+        self.ctx
+            .kvstore
+            .batch_apply(
+                puts,
+                index_deletes,
+                Self::build_versions(vec![(key_bytes, encoded)]),
+            )
+            .await?;
 
         Ok(ExecutorResult {
             columns: vec!["Updated".to_string()],
