@@ -210,8 +210,8 @@ RETURN n.doc.body AS body;
 
 ## LOOKUP
 
-`LOOKUP`은 tag와 edge type을 모두 대상으로 합니다. 어느 쪽인지는 이름을 schema에
-조회해 결정하므로 별도 키워드가 없습니다.
+`LOOKUP`은 tag와 edge type을 모두 대상으로 합니다. 이름만 쓰면 schema에 조회해
+어느 쪽인지 결정합니다.
 
 ```sql
 LOOKUP ON person WHERE person.name == "Alice";
@@ -220,6 +220,22 @@ LOOKUP ON person WHERE person.age >= 21 YIELD person.name, person.age LIMIT 20;
 LOOKUP ON knows WHERE knows.since == 2020;
 LOOKUP ON knows WHERE since == 2020 LIMIT 20;
 ```
+
+한 space에 **같은 이름**의 tag와 edge type이 함께 있을 수 있고, 이름만 쓰면 그런
+이름은 **tag**로 해석됩니다. edge를 지목하려면 `LOOKUP ON EDGE`를 쓰세요 — 그러지
+않으면 그 edge에 도달할 방법이 없고, edge 속성에 대한 조건이 tag에 걸려 아무것도
+반환하지 않습니다.
+
+```sql
+CREATE TAG dup(x INT64);
+CREATE EDGE dup(y INT64);
+
+LOOKUP ON dup WHERE dup.x == 7;        -- tag
+LOOKUP ON EDGE dup WHERE dup.y == 9;   -- edge
+```
+
+`LOOKUP ON TAG`는 없습니다. 이름만 쓰는 형태가 이미 tag를 우선하며, 명시적으로 썼는데도
+해당 tag가 없을 때 edge로 fallback하면 오해를 부르기 때문입니다.
 
 tag `LOOKUP`은 `<tag>.vid`와 tag 속성을 반환합니다. edge `LOOKUP`은
 **`<edge>.src`·`<edge>.dst`·`<edge>.rank`** 를 반환합니다 — rank가 edge identity의

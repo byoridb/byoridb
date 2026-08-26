@@ -866,10 +866,22 @@ impl Parser {
         self.consume_token(Token::Lookup)?;
         self.consume_token(Token::On)?;
 
-        let name = self.consume_identifier()?;
-
-        // Determine if it's a tag or edge lookup (we assume tag by default)
-        let lookup_type = LookupType::Tag(name);
+        // `LOOKUP ON EDGE <name>` names an edge type explicitly. It exists
+        // because a space may hold a tag and an edge type of the same name, and
+        // the bare form resolves such a name to the tag — leaving the edge
+        // unreachable (#125).
+        //
+        // There is deliberately no `LOOKUP ON TAG <name>`: without a third
+        // "unspecified" state it would behave exactly like the bare form,
+        // including its fall back to an edge when no such tag exists, which is
+        // not what an explicit request should do.
+        let lookup_type = if self.match_token(Token::Edge) {
+            LookupType::Edge(self.consume_identifier()?)
+        } else {
+            // Bare: the executor resolves tag-versus-edge against the schema,
+            // preferring a tag when both exist.
+            LookupType::Tag(self.consume_identifier()?)
+        };
 
         // Optional WHERE clause
         let where_clause = if self.match_token(Token::Where) {

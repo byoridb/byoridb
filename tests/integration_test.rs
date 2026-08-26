@@ -3586,3 +3586,79 @@ async fn go_still_reports_a_converging_destination_once() {
 
     service.sign_out(session_id, session_id).await.unwrap();
 }
+
+/// Regression for #125. A space may hold a tag and an edge type of the same
+/// name, and `LOOKUP ON <name>` resolves such a name to the tag — which left the
+/// edge unreachable, and a predicate over its properties silently returning
+/// nothing. `LOOKUP ON EDGE <name>` addresses it, which also makes
+/// `LookupType::Edge` reachable from a query rather than dead breadth.
+#[tokio::test(flavor = "multi_thread")]
+async fn lookup_on_edge_addresses_a_name_shared_with_a_tag() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE shared_name").await;
+    execute(&service, session_id, "USE shared_name").await;
+    // The same name as both a tag and an edge type is accepted, so the
+    // ambiguity is reachable rather than hypothetical.
+    execute(&service, session_id, "CREATE TAG dup(x INT64)").await;
+    execute(&service, session_id, "CREATE EDGE dup(y INT64)").await;
+    execute(
+        &service,
+        session_id,
+        "INSERT VERTEX dup(x) VALUES 1:(7), 2:(8)",
+    )
+    .await;
+    execute(&service, session_id, "INSERT EDGE dup(y) VALUES 1->2:(9)").await;
+
+    // Bare: the tag wins, which is the documented precedence.
+    let bare = execute(&service, session_id, "LOOKUP ON dup WHERE dup.x == 7").await;
+    assert_eq!(bare.column_names, vec!["dup.vid", "dup.*"]);
+    assert_eq!(bare.rows.len(), 1);
+
+    // Explicit: the edge is now addressable, and its property predicate works.
+    let explicit = execute(&service, session_id, "LOOKUP ON EDGE dup WHERE dup.y == 9").await;
+    assert_eq!(
+        explicit.column_names,
+        vec!["dup.src", "dup.dst", "dup.rank"],
+        "an explicit edge LOOKUP must project edge columns"
+    );
+    assert_eq!(
+        explicit.rows,
+        vec![vec![Value::Int(1), Value::Int(2), Value::Int(0)]]
+    );
+
+    // Without the explicit form that edge is invisible: the tag has no `y`, so
+    // the bare spelling reports nothing rather than an error.
+    let shadowed = execute(&service, session_id, "LOOKUP ON dup WHERE dup.y == 9").await;
+    assert!(
+        shadowed.rows.is_empty(),
+        "the bare form still resolves to the tag, got {:?}",
+        shadowed.rows
+    );
+
+    // `LOOKUP ON EDGE` also works for a name that is only an edge type.
+    execute(&service, session_id, "CREATE EDGE only_edge(z INT64)").await;
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE only_edge(z) VALUES 2->1:(5)",
+    )
+    .await;
+    for query in [
+        "LOOKUP ON only_edge WHERE only_edge.z == 5",
+        "LOOKUP ON EDGE only_edge WHERE only_edge.z == 5",
+    ] {
+        let found = execute(&service, session_id, query).await;
+        assert_eq!(
+            found.rows,
+            vec![vec![Value::Int(2), Value::Int(1), Value::Int(0)]],
+            "`{query}` must find the edge"
+        );
+    }
+
+    service.sign_out(session_id, session_id).await.unwrap();
+}
