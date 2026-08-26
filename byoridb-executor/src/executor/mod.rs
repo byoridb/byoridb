@@ -2767,6 +2767,142 @@ mod tests {
             .is_none());
     }
 
+    /// `UPDATE EDGE` moves its index entries inside the same transaction as the
+    /// edge (#123). Previously they were separate calls afterwards, leaving
+    /// windows where a crash could point the index at the old value or drop both
+    /// entries.
+    #[tokio::test]
+    async fn update_edge_moves_its_index_entries_within_one_batch() {
+        let executor = create_executor();
+        executor
+            .ctx
+            .kvstore
+            .put(
+                &crate::key::SchemaKey::edge("default", "knows"),
+                &serde_json::to_vec(&serde_json::json!({
+                    "name": "knows",
+                    "properties": [{"name": "since", "data_type": "Int64"}]
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute_create(CreatePlan::EdgeIndex {
+                name: "knows_since_idx".to_string(),
+                edge_name: "knows".to_string(),
+                props: vec!["since".to_string()],
+            })
+            .await
+            .unwrap();
+        let index = executor
+            .ctx
+            .index_manager
+            .as_ref()
+            .unwrap()
+            .list_edge_indexes(1)
+            .await
+            .into_iter()
+            .find(|index| index.index_name == "knows_since_idx")
+            .expect("the edge index must exist");
+        let key_for = |value: i64| {
+            byoridb_storage::KeyUtils::edge_index_key(
+                1,
+                index.id,
+                &[byoridb_storage::IndexValue::Int(value)],
+                1,
+                0,
+                2,
+            )
+        };
+
+        executor
+            .execute_insert(crate::plan::InsertPlan::Edge {
+                space: "default".to_string(),
+                edges: vec![crate::plan::EdgeInsert {
+                    src: 1.into(),
+                    dst: 2.into(),
+                    edge_type: "knows".to_string(),
+                    ranking: 0,
+                    props: HashMap::from([("since".to_string(), byoridb_common::Value::Int(2020))]),
+                }],
+            })
+            .await
+            .unwrap();
+        assert!(executor
+            .ctx
+            .kvstore
+            .get(&key_for(2020))
+            .await
+            .unwrap()
+            .is_some());
+
+        let updated = executor
+            .execute_update(crate::plan::UpdatePlan {
+                space: "default".to_string(),
+                vid: 1.into(),
+                tag_name: None,
+                updates: HashMap::from([("since".to_string(), byoridb_common::Value::Int(2099))]),
+                conditions: None,
+                yield_clause: None,
+                edge: Some(crate::plan::EdgeUpdateTarget {
+                    dst: 2.into(),
+                    edge_name: "knows".to_string(),
+                    ranking: 0,
+                }),
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated.rows, vec![vec![byoridb_common::Value::Int(1)]]);
+
+        assert!(
+            executor
+                .ctx
+                .kvstore
+                .get(&key_for(2020))
+                .await
+                .unwrap()
+                .is_none(),
+            "the entry for the old value must be retracted"
+        );
+        assert!(
+            executor
+                .ctx
+                .kvstore
+                .get(&key_for(2099))
+                .await
+                .unwrap()
+                .is_some(),
+            "the entry for the new value must be asserted"
+        );
+
+        // An update that does not change the indexed value leaves the entry
+        // alone rather than churning a delete/insert pair.
+        executor
+            .execute_update(crate::plan::UpdatePlan {
+                space: "default".to_string(),
+                vid: 1.into(),
+                tag_name: None,
+                updates: HashMap::from([("since".to_string(), byoridb_common::Value::Int(2099))]),
+                conditions: None,
+                yield_clause: None,
+                edge: Some(crate::plan::EdgeUpdateTarget {
+                    dst: 2.into(),
+                    edge_name: "knows".to_string(),
+                    ranking: 0,
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(executor
+            .ctx
+            .kvstore
+            .get(&key_for(2099))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     #[tokio::test]
     async fn test_drop_tag_index_without_meta_client_if_exists_is_ok() {
         let executor = create_executor();
