@@ -3273,8 +3273,7 @@ async fn lookup_on_an_edge_type_returns_matching_edges() {
         "the projection must match what the executor returns, got: {indexed_plan}"
     );
 
-    // A range predicate has no bounded edge-index form, so it must be reported
-    // as a scan rather than claiming an index.
+    // An ordered range on an indexed edge property uses the index too (#122).
     let explained_range = execute(
         &service,
         session_id,
@@ -3283,8 +3282,8 @@ async fn lookup_on_an_edge_type_returns_matching_edges() {
     .await;
     let range_plan = plan_text(&explained_range);
     assert!(
-        range_plan.contains("EdgeScan") && range_plan.contains("FULL SCAN"),
-        "an unindexed edge predicate must be reported as a scan, got: {range_plan}"
+        range_plan.contains("IndexScan") && range_plan.contains("knows_since_idx"),
+        "an ordered range on an indexed edge property must use the index, got: {range_plan}"
     );
 
     // A tag LOOKUP in the same space is unaffected.
@@ -3659,6 +3658,168 @@ async fn lookup_on_edge_addresses_a_name_shared_with_a_tag() {
             "`{query}` must find the edge"
         );
     }
+
+    service.sign_out(session_id, session_id).await.unwrap();
+}
+
+/// Regression for #122. `scan_edge_index` honoured only `limit` and ignored
+/// `ScanOptions` bounds, so there was no bounded form for `lookup_edge_range` to
+/// build on and ordered predicates on an indexed edge property took a full scan.
+#[tokio::test(flavor = "multi_thread")]
+async fn edge_lookup_uses_the_index_for_ordered_ranges() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE edge_range").await;
+    execute(&service, session_id, "USE edge_range").await;
+    execute(&service, session_id, "CREATE TAG p(name STRING)").await;
+    execute(&service, session_id, "CREATE EDGE knows(since INT64)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX p(name) VALUES 1:("A"), 2:("B"), 3:("C"), 4:("D")"#,
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        "INSERT EDGE knows(since) VALUES 1->2:(2019), 1->3:(2020), 1->4:(2021)",
+    )
+    .await;
+
+    fn edges(result: &byoridb_common::DataSet) -> Vec<(i64, i64)> {
+        let mut found: Vec<(i64, i64)> = result
+            .rows
+            .iter()
+            .filter_map(|row| match (row.first(), row.get(1)) {
+                (Some(Value::Int(src)), Some(Value::Int(dst))) => Some((*src, *dst)),
+                _ => None,
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    // Answers established by the predicate scan, before any index exists.
+    let mut expected = Vec::new();
+    for (predicate, _) in [
+        ("knows.since > 2019", ()),
+        ("knows.since >= 2020", ()),
+        ("knows.since < 2021", ()),
+        ("knows.since <= 2019", ()),
+    ] {
+        let scanned = execute(
+            &service,
+            session_id,
+            &format!("LOOKUP ON knows WHERE {predicate}"),
+        )
+        .await;
+        expected.push((predicate, edges(&scanned)));
+    }
+
+    execute(
+        &service,
+        session_id,
+        "CREATE EDGE INDEX knows_since_idx ON knows(since)",
+    )
+    .await;
+
+    // The index must agree with the scan on every operator, compared against
+    // those answers rather than a hardcoded list.
+    for (predicate, scan_answer) in &expected {
+        let indexed = execute(
+            &service,
+            session_id,
+            &format!("LOOKUP ON knows WHERE {predicate}"),
+        )
+        .await;
+        assert_eq!(
+            &edges(&indexed),
+            scan_answer,
+            "`{predicate}` must return the same edges through the index as through the scan"
+        );
+        let plan = execute(
+            &service,
+            session_id,
+            &format!("EXPLAIN LOOKUP ON knows WHERE {predicate}"),
+        )
+        .await;
+        let plan_text: String = plan
+            .rows
+            .iter()
+            .flatten()
+            .map(|value| match value {
+                Value::String(text) => text.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan_text.contains("IndexScan") && plan_text.contains("knows_since_idx"),
+            "`{predicate}` must report the index, got: {plan_text}"
+        );
+    }
+
+    // Sanity: the boundaries are exclusive/inclusive as written.
+    assert_eq!(
+        edges(
+            &execute(
+                &service,
+                session_id,
+                "LOOKUP ON knows WHERE knows.since > 2019"
+            )
+            .await
+        ),
+        vec![(1, 3), (1, 4)]
+    );
+    assert_eq!(
+        edges(
+            &execute(
+                &service,
+                session_id,
+                "LOOKUP ON knows WHERE knows.since >= 2019"
+            )
+            .await
+        ),
+        vec![(1, 2), (1, 3), (1, 4)]
+    );
+    assert_eq!(
+        edges(
+            &execute(
+                &service,
+                session_id,
+                "LOOKUP ON knows WHERE knows.since < 2020"
+            )
+            .await
+        ),
+        vec![(1, 2)]
+    );
+
+    // A string boundary is not an ordered key domain, so it must fall back to the
+    // scan and still be correct rather than claiming the index.
+    execute(&service, session_id, "CREATE EDGE tagged(label STRING)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT EDGE tagged(label) VALUES 1->2:("b")"#,
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        "CREATE EDGE INDEX tagged_label_idx ON tagged(label)",
+    )
+    .await;
+    let string_range = execute(
+        &service,
+        session_id,
+        r#"LOOKUP ON tagged WHERE tagged.label > "a""#,
+    )
+    .await;
+    assert_eq!(edges(&string_range), vec![(1, 2)]);
 
     service.sign_out(session_id, session_id).await.unwrap();
 }

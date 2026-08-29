@@ -745,12 +745,47 @@ impl IndexManager {
 
         // Calculate property value length for parsing
         let prop_len: usize = prefix_values.iter().map(|v| v.encoded_len()).sum();
+        let limit = (options.limit > 0).then_some(options.limit);
 
-        let entries = self
-            .kvstore
-            .scan_prefix(&prefix)
-            .await
-            .map_err(|e| IndexError::Storage(e.to_string()))?;
+        // Bounded ranges, mirroring `scan_tag_index`. Ignoring `ScanOptions`
+        // here is what left ordered predicates on an edge property unindexed
+        // (#122): there was no bounded form to build `lookup_edge_range` on.
+        let entries = if options.start_values.is_none() && options.end_values.is_none() {
+            self.kvstore.scan_prefix_limited(&prefix, limit).await
+        } else {
+            let prefix_end = prefix_successor(&prefix).ok_or_else(|| {
+                IndexError::InvalidValue("index prefix has no upper bound".to_string())
+            })?;
+            let boundary_for = |values: &[IndexValue]| {
+                let mut all_values = prefix_values.to_vec();
+                all_values.extend(values.iter().cloned());
+                KeyUtils::edge_index_prefix_with_values(part_id, index_def.id, &all_values)
+            };
+            let start = match options.start_values.as_ref() {
+                Some(values) => {
+                    let boundary = boundary_for(values);
+                    if options.include_start {
+                        boundary
+                    } else {
+                        prefix_successor(&boundary).unwrap_or_else(|| prefix_end.clone())
+                    }
+                }
+                None => prefix.clone(),
+            };
+            let end = match options.end_values.as_ref() {
+                Some(values) => {
+                    let boundary = boundary_for(values);
+                    if options.include_end {
+                        prefix_successor(&boundary).unwrap_or_else(|| prefix_end.clone())
+                    } else {
+                        boundary
+                    }
+                }
+                None => prefix_end,
+            };
+            self.kvstore.scan_range(&start, &end, limit).await
+        }
+        .map_err(|e| IndexError::Storage(e.to_string()))?;
 
         let mut results: Vec<EdgeIndexScanResult> = entries
             .iter()
@@ -817,6 +852,76 @@ impl IndexManager {
         Ok(results
             .into_iter()
             .map(|r| (r.src_vid, r.rank, r.dst_vid))
+            .collect())
+    }
+
+    /// Lookup edges by an ordered range on a single indexed property.
+    ///
+    /// Mirrors [`Self::lookup_tag_range`], including its boundary guard: the
+    /// string encoding is length-prefixed and therefore not globally lexical, so
+    /// only bool, int, and non-zero non-NaN float boundaries are ordered.
+    pub async fn lookup_edge_range(
+        &self,
+        part_id: u32,
+        index_def: &IndexDef,
+        value: IndexValue,
+        operator: RangeOperator,
+        limit: usize,
+    ) -> Result<Vec<(i64, i64, i64)>, IndexError> {
+        if index_def.fields.len() != 1 {
+            return Err(IndexError::InvalidValue(
+                "range lookup requires a single-field index".to_string(),
+            ));
+        }
+        if matches!(value, IndexValue::Null | IndexValue::String(_))
+            || matches!(value, IndexValue::Float(number) if number.is_nan() || number == 0.0)
+        {
+            return Err(IndexError::InvalidValue(
+                "ordered range lookup requires bool, int, or a non-zero non-NaN float boundary"
+                    .to_string(),
+            ));
+        }
+
+        let (type_min, type_max) = match &value {
+            IndexValue::Bool(_) => (IndexValue::Bool(false), IndexValue::Bool(true)),
+            IndexValue::Int(_) => (IndexValue::Int(i64::MIN), IndexValue::Int(i64::MAX)),
+            IndexValue::Float(_) => (
+                IndexValue::Float(f64::NEG_INFINITY),
+                IndexValue::Float(f64::INFINITY),
+            ),
+            IndexValue::Null | IndexValue::String(_) => unreachable!(),
+        };
+        let mut options = ScanOptions {
+            limit,
+            start_values: Some(vec![type_min]),
+            end_values: Some(vec![type_max]),
+            include_start: true,
+            include_end: true,
+        };
+        match operator {
+            RangeOperator::GreaterThan => {
+                options.start_values = Some(vec![value]);
+                options.include_start = false;
+            }
+            RangeOperator::GreaterThanOrEqual => {
+                options.start_values = Some(vec![value]);
+                options.include_start = true;
+            }
+            RangeOperator::LessThan => {
+                options.end_values = Some(vec![value]);
+                options.include_end = false;
+            }
+            RangeOperator::LessThanOrEqual => {
+                options.end_values = Some(vec![value]);
+                options.include_end = true;
+            }
+        }
+
+        Ok(self
+            .scan_edge_index(part_id, index_def, &[], &options)
+            .await?
+            .into_iter()
+            .map(|result| (result.src_vid, result.rank, result.dst_vid))
             .collect())
     }
 
@@ -1555,5 +1660,105 @@ mod tests {
         let prefix2 = KeyUtils::tag_index_prefix(2, index_id);
         let entries2 = kvstore.scan_prefix(&prefix2).await.unwrap();
         assert!(entries2.is_empty(), "Partition 2 entries should be deleted");
+    }
+    /// Regression for #122. `scan_edge_index` honoured only `limit` and ignored
+    /// `ScanOptions` bounds, so `lookup_edge_range` had no bounded form to build
+    /// on. Asserted at this layer because the executor revalidates every
+    /// candidate against the stored edge — an unbounded scan there still yields
+    /// the right answer, so only a storage-level test can tell whether the range
+    /// was actually applied.
+    #[tokio::test]
+    async fn edge_index_range_scan_honours_its_bounds() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let manager = IndexManager::new(kvstore);
+        let index_id = manager
+            .create_edge_index(
+                1,
+                "knows_since_idx".to_string(),
+                1,
+                "knows".to_string(),
+                vec!["since".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        let index_def = manager.get_index(1, "knows_since_idx").await.unwrap();
+        assert_eq!(index_def.id, index_id);
+
+        // (since, src, dst) — rank 0 throughout.
+        for (since, src, dst) in [(2019, 1, 2), (2020, 1, 3), (2021, 1, 4)] {
+            manager
+                .insert_edge_index(1, index_id, &[IndexValue::Int(since)], src, 0, dst)
+                .await
+                .unwrap();
+        }
+
+        let range = |operator, boundary| {
+            let def = index_def.clone();
+            let manager = &manager;
+            async move {
+                let mut found = manager
+                    .lookup_edge_range(1, &def, IndexValue::Int(boundary), operator, 100)
+                    .await
+                    .unwrap();
+                found.sort();
+                found
+            }
+        };
+
+        assert_eq!(
+            range(RangeOperator::GreaterThan, 2019).await,
+            vec![(1, 0, 3), (1, 0, 4)],
+            "an exclusive lower bound must drop the boundary entry"
+        );
+        assert_eq!(
+            range(RangeOperator::GreaterThanOrEqual, 2020).await,
+            vec![(1, 0, 3), (1, 0, 4)]
+        );
+        assert_eq!(
+            range(RangeOperator::LessThan, 2020).await,
+            vec![(1, 0, 2)],
+            "an exclusive upper bound must drop the boundary entry"
+        );
+        assert_eq!(
+            range(RangeOperator::LessThanOrEqual, 2020).await,
+            vec![(1, 0, 2), (1, 0, 3)]
+        );
+        assert!(
+            range(RangeOperator::GreaterThan, 2021).await.is_empty(),
+            "a bound above every entry must return nothing, not everything"
+        );
+
+        // Same guards as the tag path: an unordered boundary is refused rather
+        // than scanned as if the encoding were lexical.
+        assert!(manager
+            .lookup_edge_range(
+                1,
+                &index_def,
+                IndexValue::String("a".to_string()),
+                RangeOperator::GreaterThan,
+                100,
+            )
+            .await
+            .is_err());
+        assert!(manager
+            .lookup_edge_range(
+                1,
+                &index_def,
+                IndexValue::Float(0.0),
+                RangeOperator::GreaterThan,
+                100,
+            )
+            .await
+            .is_err());
+
+        // Equality still works through the same scan.
+        assert_eq!(
+            manager
+                .lookup_edge(1, &index_def, &[IndexValue::Int(2020)], 100)
+                .await
+                .unwrap(),
+            vec![(1, 0, 3)]
+        );
     }
 }
