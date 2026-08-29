@@ -45,15 +45,23 @@ impl PatternMatcher {
             Err(_) => return Ok(false),
         };
 
-        // Label filter: at least one tag on the vertex must match.
+        // Label filter. `(n:A:B)` requires every listed tag; `(n:A|B)` requires at
+        // least one (#124). Before this the matcher always accepted "at least
+        // one" while candidate selection used only the first label, so a
+        // multi-label pattern silently meant its first label — and changing the
+        // order changed the answer.
         if !pattern.labels.is_empty() {
-            let has_matching_tag = vertex.tags.iter().any(|tag| {
-                pattern
-                    .labels
+            let carries = |label: &String| {
+                vertex
+                    .tags
                     .iter()
-                    .any(|l| l.eq_ignore_ascii_case(&tag.name))
-            });
-            if !has_matching_tag {
+                    .any(|tag| label.eq_ignore_ascii_case(&tag.name))
+            };
+            let matched = match pattern.label_match {
+                byoridb_parser::ast::LabelMatch::All => pattern.labels.iter().all(carries),
+                byoridb_parser::ast::LabelMatch::Any => pattern.labels.iter().any(carries),
+            };
+            if !matched {
                 return Ok(false);
             }
         }

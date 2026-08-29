@@ -3823,3 +3823,129 @@ async fn edge_lookup_uses_the_index_for_ordered_ranges() {
 
     service.sign_out(session_id, session_id).await.unwrap();
 }
+
+/// #124. A node pattern's labels now combine explicitly: `(n:A:B)` requires
+/// every tag, `(n:A|B)` requires at least one.
+///
+/// Before this, the matcher accepted "at least one" while candidate selection
+/// used only `labels.first()`, so a multi-label pattern silently meant its first
+/// label — and swapping the order changed the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn node_pattern_labels_combine_as_written() {
+    let (service, _temp_dir) = create_test_service();
+    let session_id = service
+        .authenticate("root".to_string(), DEFAULT_PASSWORD.to_string())
+        .await
+        .expect("Authentication failed");
+
+    execute(&service, session_id, "CREATE SPACE labels").await;
+    execute(&service, session_id, "USE labels").await;
+    execute(&service, session_id, "CREATE TAG animal(n STRING)").await;
+    execute(&service, session_id, "CREATE TAG pet(n STRING)").await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX animal(n) VALUES 1:("wolf"), 3:("dog")"#,
+    )
+    .await;
+    execute(
+        &service,
+        session_id,
+        r#"INSERT VERTEX pet(n) VALUES 2:("goldfish")"#,
+    )
+    .await;
+    // A vertex carries a set of tags; UPDATE adds one that is absent, which is
+    // how vertex 3 comes to be both.
+    execute(
+        &service,
+        session_id,
+        r#"UPDATE VERTEX ON pet 3 SET n = "dog""#,
+    )
+    .await;
+
+    async fn vids(service: &GraphService, session_id: i64, pattern: &str) -> Vec<i64> {
+        let result = execute(
+            service,
+            session_id,
+            &format!("MATCH {pattern} RETURN id(a) AS vid"),
+        )
+        .await;
+        let mut found: Vec<i64> = result
+            .rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(Value::Int(vid)) => Some(*vid),
+                _ => None,
+            })
+            .collect();
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    // Establish the single-label answers the combinations are measured against.
+    let animals = vids(&service, session_id, "(a:animal)").await;
+    let pets = vids(&service, session_id, "(a:pet)").await;
+    assert_eq!(animals, vec![1, 3], "vertex 3 carries both tags");
+    assert_eq!(pets, vec![2, 3]);
+
+    // `|` is the union of those two answers.
+    let union = vids(&service, session_id, "(a:animal|pet)").await;
+    let mut expected_union = [animals.clone(), pets.clone()].concat();
+    expected_union.sort();
+    expected_union.dedup();
+    assert_eq!(
+        union, expected_union,
+        "`|` must be the union of the single-label answers"
+    );
+    assert_eq!(union, vec![1, 2, 3]);
+
+    // `:` is their intersection.
+    let intersection = vids(&service, session_id, "(a:animal:pet)").await;
+    let expected_intersection: Vec<i64> = animals
+        .iter()
+        .filter(|vid| pets.contains(vid))
+        .copied()
+        .collect();
+    assert_eq!(
+        intersection, expected_intersection,
+        "`:` must be the intersection of the single-label answers"
+    );
+    assert_eq!(intersection, vec![3]);
+
+    // Both are order-independent, which the old first-label-wins behaviour was
+    // not.
+    assert_eq!(
+        vids(&service, session_id, "(a:pet:animal)").await,
+        intersection
+    );
+    assert_eq!(vids(&service, session_id, "(a:pet|animal)").await, union);
+
+    // A single label and no label are unchanged.
+    assert_eq!(vids(&service, session_id, "(a:animal)").await, animals);
+    assert_eq!(vids(&service, session_id, "(a)").await, vec![1, 2, 3]);
+
+    // An intersection with a tag nothing carries is empty, not "the first label".
+    execute(&service, session_id, "CREATE TAG mineral(n STRING)").await;
+    assert!(
+        vids(&service, session_id, "(a:animal:mineral)")
+            .await
+            .is_empty(),
+        "an unsatisfiable intersection must be empty"
+    );
+
+    // Mixing the separators has no obvious precedence and is refused.
+    let mixed = service
+        .execute(
+            session_id,
+            "MATCH (a:animal:pet|mineral) RETURN id(a) AS vid".to_string(),
+        )
+        .await
+        .expect_err("mixing `:` and `|` must be refused");
+    assert!(
+        mixed.to_string().contains("not both"),
+        "the error must explain the restriction, got: {mixed}"
+    );
+
+    service.sign_out(session_id, session_id).await.unwrap();
+}

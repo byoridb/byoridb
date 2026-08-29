@@ -103,6 +103,7 @@ mod tests {
         ast::NodePattern {
             variable: Some("n".to_string()),
             labels: labels.into_iter().map(|s| s.to_string()).collect(),
+            label_match: ast::LabelMatch::All,
             props: props.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
         }
     }

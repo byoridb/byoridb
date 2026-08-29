@@ -106,6 +106,26 @@ MATCH (p:person {name: "Alice"}) RETURN p;
 MATCH (a:person)-[:knows*1..3]->(b:person) RETURN id(b) AS vid;
 ```
 
+### Matching more than one node label
+
+A vertex carries a **set** of tags, so the separator says how several labels
+combine:
+
+```sql
+MATCH (a:animal:pet) RETURN id(a) AS vid;   -- every listed tag
+MATCH (a:animal|pet) RETURN id(a) AS vid;   -- at least one of them
+```
+
+`:` is an intersection and `|` is a union. Both are order-independent, and an
+intersection nothing satisfies is empty. Naming no label matches every vertex.
+
+Mixing the two separators in one pattern (`(a:A:B|C)`) has no obvious precedence
+and is refused.
+
+This is deliberately **not** symmetric with edge patterns below, because the data
+model is not: an edge has exactly one type, so `[e:a|b]` can only mean union,
+while a vertex can hold several tags at once.
+
 ### Matching more than one edge type
 
 Separate types with `|`. The pattern matches an edge of **any** listed type — it
