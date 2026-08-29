@@ -215,8 +215,8 @@ supported approach.
 
 ## LOOKUP
 
-`LOOKUP` targets a tag or an edge type. The name decides which — it is resolved
-against the schema, so there is no separate keyword:
+`LOOKUP` targets a tag or an edge type. The bare form resolves the name against
+the schema:
 
 ```sql
 LOOKUP ON person WHERE person.name == "Alice";
@@ -225,6 +225,23 @@ LOOKUP ON person WHERE person.age >= 21 YIELD person.name, person.age LIMIT 20;
 LOOKUP ON knows WHERE knows.since == 2020;
 LOOKUP ON knows WHERE since == 2020 LIMIT 20;
 ```
+
+A space may hold a tag and an edge type of the **same name**, and the bare form
+resolves such a name to the **tag**. Use `LOOKUP ON EDGE` to address the edge,
+which is otherwise unreachable — a predicate over its properties would match the
+tag and report nothing:
+
+```sql
+CREATE TAG dup(x INT64);
+CREATE EDGE dup(y INT64);
+
+LOOKUP ON dup WHERE dup.x == 7;        -- the tag
+LOOKUP ON EDGE dup WHERE dup.y == 9;   -- the edge
+```
+
+There is no `LOOKUP ON TAG`: the bare form already prefers a tag, and an explicit
+spelling that still fell back to an edge when no such tag existed would be
+misleading.
 
 A tag `LOOKUP` returns `<tag>.vid` and the tag's properties. An edge `LOOKUP`
 returns **`<edge>.src`, `<edge>.dst`, and `<edge>.rank`** — the three together
