@@ -253,12 +253,13 @@ An equality predicate on an indexed property can use the secondary index, for
 both tags and edge types. Everything else falls back to a bounded scan with the
 predicate pushed down, which is correct but unindexed:
 
-- Range predicates (`>`, `>=`, `<`, `<=`) on a **tag** fall back to a scan even
-  when the property is indexed; index range scans are tracked in
+- Ordered range predicates (`>`, `>=`, `<`, `<=`) on an **edge type** use the
+  index when the boundary is a bool, an integer, or a non-zero non-NaN float.
+  A string boundary falls back to a scan, because the string index encoding is
+  length-prefixed and therefore not ordered.
+- Range predicates on a **tag** still fall back to a scan even when the property
+  is indexed; that half is tracked in
   [issue #1](https://github.com/byoridb/byoridb/issues/1).
-- Range predicates on an **edge type** likewise fall back, because the edge
-  index has no bounded-range scan form; tracked in
-  [issue #79](https://github.com/byoridb/byoridb/issues/79).
 - A predicate the pushdown cannot express (`CONTAINS`, `STARTS WITH`, or a
   field-to-field comparison) is **rejected** rather than silently matching
   everything.
@@ -274,7 +275,10 @@ EXPLAIN LOOKUP ON knows WHERE knows.since == 2020;
 -- IndexScan  on Edge knows where knows.since == 2020   index: knows_since_idx
 
 EXPLAIN LOOKUP ON knows WHERE knows.since > 2019;
--- EdgeScan   on Edge knows where knows.since > 2019    ⚠ FULL SCAN
+-- IndexScan  on Edge knows where knows.since > 2019    index: knows_since_idx
+
+EXPLAIN LOOKUP ON tagged WHERE tagged.label > 'a';
+-- EdgeScan   on Edge tagged where tagged.label > "a"   ⚠ FULL SCAN
 ```
 
 ## FIND paths

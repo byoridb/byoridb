@@ -1656,6 +1656,20 @@ impl Executor {
         if let (Some(index_manager), Some(where_expr)) =
             (self.ctx.index_manager.as_ref(), plan.where_clause.as_ref())
         {
+            if let Some(result) = self
+                .try_execute_edge_range_index_lookup(
+                    index_manager,
+                    where_expr,
+                    space,
+                    vid_type,
+                    edge_type,
+                    &result_columns,
+                    lookup_window,
+                )
+                .await?
+            {
+                return Ok(result);
+            }
             if let Some((field, value)) = self.extract_eq_condition(where_expr) {
                 let space_id = self.ctx.resolve_space_id().await;
                 let index_def = index_manager
@@ -1789,6 +1803,112 @@ impl Executor {
             lookup_window,
         )
         .await
+    }
+
+    /// Ordered range on a single indexed edge property, through the index (#122).
+    ///
+    /// Returns `None` when the predicate is not an ordered comparison, when no
+    /// single-field index covers it, or when the boundary is not an ordered key
+    /// domain — each of which keeps the correctness-preserving predicate scan.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_execute_edge_range_index_lookup(
+        &self,
+        index_manager: &byoridb_storage::IndexManager,
+        where_expr: &Expression,
+        space: &str,
+        vid_type: crate::vid::SpaceVidType,
+        edge_type: &str,
+        result_columns: &[String],
+        lookup_window: LookupWindow,
+    ) -> Result<Option<ExecutorResult>> {
+        let Some((field, value, operator)) = self.extract_range_condition(where_expr) else {
+            return Ok(None);
+        };
+        let filter_expr = match operator {
+            RangeOperator::GreaterThan => FilterExpr::gt(field.clone(), value.clone()),
+            RangeOperator::GreaterThanOrEqual => FilterExpr::ge(field.clone(), value.clone()),
+            RangeOperator::LessThan => FilterExpr::lt(field.clone(), value.clone()),
+            RangeOperator::LessThanOrEqual => FilterExpr::le(field.clone(), value.clone()),
+        };
+        // The tag path refuses ordered ranges in distributed mode; the edge path
+        // must not quietly differ.
+        #[cfg(feature = "distributed")]
+        if self.ctx.is_distributed() {
+            return Err(ExecutionError::InvalidOperation(
+                super::DISTRIBUTED_LOOKUP_RANGE_UNSUPPORTED.to_string(),
+            ));
+        }
+        let space_id = self.ctx.resolve_space_id().await;
+        let Some(index_def) = index_manager
+            .list_edge_indexes(space_id)
+            .await
+            .into_iter()
+            .find(|index| {
+                index.schema_name.eq_ignore_ascii_case(edge_type)
+                    && index.fields.len() == 1
+                    && index.fields[0] == field
+            })
+        else {
+            return Ok(None);
+        };
+        let index_value = self.byoridb_value_to_index_value(&value);
+
+        let partition_num = self.resolve_local_partition_num(space).await;
+        let profiling = self.ctx.profiling();
+        let start = std::time::Instant::now();
+        let mut refs: Vec<(i64, i64, i64)> = Vec::new();
+        let mut candidate_cap_reached = false;
+        for part_id in 1..=partition_num {
+            match index_manager
+                .lookup_edge_range(
+                    part_id,
+                    &index_def,
+                    index_value.clone(),
+                    operator,
+                    lookup_window.index_limit.unwrap_or(usize::MAX),
+                )
+                .await
+            {
+                Ok(part_refs) => {
+                    candidate_cap_reached |= lookup_window
+                        .index_limit
+                        .is_some_and(|limit| part_refs.len() >= limit);
+                    refs.extend(part_refs);
+                }
+                Err(error) => {
+                    // Partial results would under-report, and an unordered
+                    // boundary lands here too, so discard and take the scan.
+                    tracing::warn!(
+                        part_id,
+                        err = %error,
+                        "edge range index lookup unavailable; falling back to a scan"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+        let refs = stable_dedupe_edge_refs(refs);
+        if profiling {
+            self.ctx.record_profile(
+                ProfileOp::IndexScan,
+                format!("edge range index '{}'", index_def.index_name),
+                refs.len() as u64,
+                start.elapsed().as_micros() as u64,
+                false,
+            );
+        }
+        self.build_local_edge_index_result(
+            space,
+            vid_type,
+            edge_type,
+            &filter_expr,
+            refs,
+            result_columns.to_vec(),
+            lookup_window,
+            candidate_cap_reached,
+        )
+        .await
+        .map(Some)
     }
 
     /// Fetch each candidate edge and re-check the predicate against what is

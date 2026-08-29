@@ -493,8 +493,21 @@ async fn lookup_access_for_mode(
                 if let Some(access) = distributed_lookup_guard(distributed, expr) {
                     return access;
                 }
-                if range_lookup_literal(expr).is_none() {
-                    if let Some(field) = lookup_index_field(expr) {
+                if let Some(field) = lookup_index_field(expr) {
+                    // Equality and ordered ranges both use the edge index now
+                    // (#122); an unordered boundary still takes the scan, the
+                    // same rule the tag path applies.
+                    let ordered_boundary = match range_lookup_literal(expr) {
+                        None => true,
+                        Some(value) => {
+                            matches!(
+                                value,
+                                byoridb_common::Value::Bool(_) | byoridb_common::Value::Int(_)
+                            ) || matches!(value, byoridb_common::Value::Float(number)
+                                if !number.is_nan() && number != 0.0)
+                        }
+                    };
+                    if ordered_boundary {
                         let space_id = ctx.resolve_space_id().await;
                         if let Some(index) = im.list_edge_indexes(space_id).await.iter().find(|i| {
                             i.schema_name.eq_ignore_ascii_case(&name)

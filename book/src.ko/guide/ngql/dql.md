@@ -246,11 +246,11 @@ indexed 속성의 동등 조건은 tag와 edge type 모두 secondary index를 �
 그 밖의 조건은 술어를 pushdown한 bounded scan으로 fallback하며, 정확하지만 index를
 쓰지 않습니다.
 
-- **tag**의 범위 조건(`>`, `>=`, `<`, `<=`)은 속성에 index가 있어도 scan으로
-  fallback합니다. index range scan은 [이슈 #1](https://github.com/byoridb/byoridb/issues/1)에서
-  추적합니다.
-- **edge type**의 범위 조건도 fallback합니다 — edge index에 bounded-range scan 형태가
-  없기 때문이며, [이슈 #79](https://github.com/byoridb/byoridb/issues/79)에서 추적합니다.
+- **edge type**의 순서 비교 조건(`>`, `>=`, `<`, `<=`)은 경계가 bool·정수·0이 아닌
+  non-NaN float일 때 index를 사용합니다. 문자열 경계는 scan으로 fallback합니다 —
+  문자열 index 인코딩이 length-prefixed라 순서가 보장되지 않기 때문입니다.
+- **tag**의 범위 조건은 속성에 index가 있어도 여전히 scan으로 fallback합니다. 그 절반은
+  [이슈 #1](https://github.com/byoridb/byoridb/issues/1)에서 추적합니다.
 - pushdown이 표현할 수 없는 조건(`CONTAINS`, `STARTS WITH`, 필드 간 비교)은 조용히 전체를
   매칭하지 않고 **거부**됩니다.
 
@@ -264,7 +264,10 @@ EXPLAIN LOOKUP ON knows WHERE knows.since == 2020;
 -- IndexScan  on Edge knows where knows.since == 2020   index: knows_since_idx
 
 EXPLAIN LOOKUP ON knows WHERE knows.since > 2019;
--- EdgeScan   on Edge knows where knows.since > 2019    ⚠ FULL SCAN
+-- IndexScan  on Edge knows where knows.since > 2019    index: knows_since_idx
+
+EXPLAIN LOOKUP ON tagged WHERE tagged.label > 'a';
+-- EdgeScan   on Edge tagged where tagged.label > "a"   ⚠ FULL SCAN
 ```
 
 ## FIND path
