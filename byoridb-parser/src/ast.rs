@@ -755,7 +755,24 @@ pub struct PathPattern {
 pub struct NodePattern {
     pub variable: Option<String>,
     pub labels: Vec<String>,
+    /// How several labels combine. Irrelevant for zero or one label.
+    pub label_match: LabelMatch,
     pub props: HashMap<String, Expression>,
+}
+
+/// How a node pattern's labels combine (#124).
+///
+/// A vertex carries a *set* of tags, so both readings are meaningful, and the
+/// spelling picks one. This is where nodes differ from edges deliberately: an
+/// edge has exactly one type, so `[e:a|b]` can only mean union and `[e:a:b]` is
+/// accepted as a synonym for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LabelMatch {
+    /// `(n:A:B)` — the vertex must carry every listed tag.
+    #[default]
+    All,
+    /// `(n:A|B)` — the vertex must carry at least one of them.
+    Any,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

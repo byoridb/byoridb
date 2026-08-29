@@ -1947,6 +1947,10 @@ impl MatchExecutor {
         {
             return Ok(candidates);
         }
+        // A single-label index answers `(n:A:B)` — every A is a superset of the
+        // A-and-B set, and the matcher narrows it — but not `(n:A|B)`, where
+        // indexing on A alone would miss every B-only vertex. Union therefore
+        // takes the scan below (#124).
 
         let label = node.labels.first().map(|s| s.as_str()).unwrap_or("");
         let has_property_filter = !node.props.is_empty();
@@ -2039,6 +2043,14 @@ impl MatchExecutor {
             Some(manager) => manager,
             None => return Ok(None),
         };
+
+        // Indexing on the first label yields a superset for `All` (narrowed by
+        // the matcher) but a *subset* for `Any`, which would drop every vertex
+        // carrying only a later label (#124).
+        if node.labels.len() > 1 && matches!(node.label_match, byoridb_parser::ast::LabelMatch::Any)
+        {
+            return Ok(None);
+        }
 
         let label = match node.labels.first() {
             Some(label) => label,

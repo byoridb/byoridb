@@ -537,9 +537,35 @@ impl Parser {
             variable = Some(name);
         }
 
-        // Parse labels after colon
-        while self.match_token(Token::Colon) {
+        // Labels: `:A:B` requires every tag, `:A|B` requires at least one (#124).
+        // A vertex carries a set of tags, so both readings are meaningful and the
+        // separator picks one. Mixing them in a single pattern has no obvious
+        // precedence, so it is refused rather than resolved arbitrarily.
+        let mut label_match = LabelMatch::All;
+        if self.match_token(Token::Colon) {
             labels.push(self.consume_identifier()?);
+            let mut saw_colon = false;
+            let mut saw_pipe = false;
+            loop {
+                if self.match_token(Token::Pipe) {
+                    saw_pipe = true;
+                } else if self.match_token(Token::Colon) {
+                    saw_colon = true;
+                } else {
+                    break;
+                }
+                if saw_colon && saw_pipe {
+                    return Err(ParseError::UnexpectedToken(
+                        "a node pattern may separate labels with `:` (all of them) or `|` \
+                         (any of them), not both"
+                            .to_string(),
+                    ));
+                }
+                labels.push(self.consume_identifier()?);
+            }
+            if saw_pipe {
+                label_match = LabelMatch::Any;
+            }
         }
 
         // Parse optional property filter: { key: literal, ... }
@@ -554,6 +580,7 @@ impl Parser {
         Ok(NodePattern {
             variable,
             labels,
+            label_match,
             props,
         })
     }
