@@ -90,12 +90,18 @@ The release workflow now audits its exact release ref after signing-secret
 preflight and before building or publishing. Auto-release audits before changing
 the version and each candidate before pushing, including after a rebase. These
 checks close the earlier gap where only the separate CI release-build waited
-for audit. Workflow edits are local until integrated; a local audit does not
-prove a GitHub Actions run or release succeeded.
+for audit. The workflow changes are integrated into `main`; a local audit does
+not prove a GitHub Actions run or release succeeded.
 
 `bincode` 1.3.3's unmaintained warning remains a separate storage-format migration
 constraint (#105), not an ignored vulnerability. DEP-1 passes its local acceptance: final workspace, compression and audit
-checks are recorded below. Integration and hosted release execution remain separate.
+checks are recorded below. Hosted CI and release execution must still be verified.
+
+The preceding [CI run #342](https://github.com/byoridb/byoridb/actions/runs/41050549029)
+failed on `79430a1` because Dependency Audit found those 10 vulnerabilities.
+Check, Format, Clippy, Test and the Linux arm64 build passed; the gated release
+build was skipped. The separate Auto-release run succeeded, confirming the
+release-gate gap addressed by DEP-1. New runs must verify the patched lockfile.
 
 ### Stage 1 — correctness and machine contracts
 
@@ -112,8 +118,8 @@ checks are recorded below. Integration and hosted release execution remain separ
 | EVAL-1 / IN PROGRESS | Reproducible agent workflow harness | Baseline fixtures now; version each capability as implemented | Discover, traverse, explain, retract, retry after timeout, race writes and deny access. Verify exact final state, evidence and denied side effects before cost. Pin model/version/date, prompts/settings, data/seed, repetitions and budgets; declare success targets before runs. Record unsupported baseline tasks; compare calls/tokens/latency only for equivalent successful work. |
 
 QRY-1 is implemented and verified on `main` in commit `10a7811`; release
-publication has not been verified. The foundations slice on
-`codex/agent-foundations` advances DEP-1, MATCH candidate/variable-length
+publication has not been verified here. The foundations commits through
+`20d464b` are integrated into `main` and advance DEP-1, MATCH candidate/variable-length
 completeness in QRY-2, discovery v1 in API-2/AGT-1, and deterministic EVAL-1 fixtures.
 QRY-2 still needs LOOKUP/path, projection/decode-error and optimized count audits.
 API-2 and AGT-1 remain IN PROGRESS: discovery does not implement typed query
@@ -215,7 +221,8 @@ acceptance boundaries rather than duplicating the historical issue diary.
 
 ### Foundations implementation — 2026-10-30
 
-Local work on `codex/agent-foundations` adds four independently reviewable slices:
+The foundations commits through `20d464b`, integrated into `main`, add four
+independently reviewable slices:
 
 - **DEP-1:** compatible dependency patches and mandatory audit in automatic
   version-bump/release paths. Compression remains enabled; actual gzip/zstd/plain

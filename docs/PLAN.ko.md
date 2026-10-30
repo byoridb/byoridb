@@ -81,12 +81,18 @@ Gzip·zstd·무압축 요청/응답은 실제 gRPC 왕복 테스트로 검증합
 릴리스 워크플로는 서명 비밀값 preflight 다음에 정확한 release ref를 감사한 뒤
 빌드·발행합니다. Auto-release는 버전 변경 전과 각 push 후보에서 audit하며 rebase
 이후 후보도 재검사합니다. 별도 CI의 release-build만 audit를 기다리던 공백을
-해소하는 변경입니다. 통합 전까지 워크플로 수정은 로컬 상태이며, 로컬 audit만으로
+해소하는 변경입니다. 워크플로 수정은 `main`에 통합했으며, 로컬 audit만으로
 GitHub Actions 실행·릴리스 성공을 입증하지 않습니다.
 
 `bincode` 1.3.3의 unmaintained 경고는 별도 저장 형식 마이그레이션 제약(#105)으로
 유지하며 취약점을 무시한 것이 아닙니다. 최종 workspace·압축·audit 로컬 수용
-검증을 모두 통과했으며 아래에 기록합니다. 통합과 호스팅된 릴리스 실행은 별도입니다.
+검증을 모두 통과했으며 아래에 기록합니다. 호스팅된 CI·릴리스 실행은 별도로 확인해야 합니다.
+
+직전 [CI #342](https://github.com/byoridb/byoridb/actions/runs/41050549029)는
+`79430a1`의 Dependency Audit에서 위 취약점 10건을 발견해 실패했습니다.
+Check·Format·Clippy·Test·Linux arm64 빌드는 통과했고, 감사에 의존하는 release
+빌드는 건너뛰었습니다. 별도 Auto-release는 성공해 DEP-1이 보완하는 릴리스 검사
+공백을 확인했습니다. 수정된 lockfile의 통과 여부는 새 실행으로 검증해야 합니다.
 
 ### 1단계 — 정확성과 기계 계약
 
@@ -102,8 +108,8 @@ GitHub Actions 실행·릴리스 성공을 입증하지 않습니다.
 | AGT-2 / PLANNED | 범위가 제한된 결과·근거 envelope | API-2 설계, QRY-2; 해당 보장은 QRY-3/4와 TXN-1 | 쿼리 완전성·페이지 완료·추론 상태 구분. snapshot/revision 지원 또는 부재 명시. 행·바이트·근거·실행 예산 제한과 이어 읽기 일관성·출처 범위 정의. 잘림을 완전한 성공으로 바꾸지 않으며 예산 거부·미지원 모드 명시. |
 | EVAL-1 / IN PROGRESS | 재현 가능한 Agent 작업 하네스 | 기준선 fixture 즉시; 구현한 capability별 버전 관리 | 탐색·관계 조회·설명·철회·timeout 후 재시도·동시 쓰기·접근 거부 평가. 비용보다 최종 상태·근거의 정확성과 거부된 변경의 부재를 먼저 검증. 모델/버전/날짜·prompt/settings·데이터/seed·반복 횟수·예산 고정, 실행 전 성공 기준 선언. 기준선의 미지원 작업을 기록하고 동등하게 성공한 작업끼리 호출·토큰·지연 비교. |
 
-QRY-1은 `main`의 커밋 `10a7811`에 구현·검증했으며 릴리스 발행은 확인하지
-않았습니다. `codex/agent-foundations`의 foundations 변경은 DEP-1, QRY-2의
+QRY-1은 `main`의 커밋 `10a7811`에 구현·검증했으며 여기서 릴리스 발행은 확인하지
+않았습니다. `20d464b`까지의 foundations 커밋을 `main`에 통합해 DEP-1, QRY-2의
 MATCH 후보·가변 길이 완전성, API-2/AGT-1의 discovery v1, 결정적 EVAL-1 fixture를
 진행합니다. QRY-2에는 LOOKUP/path, projection/decode 오류, 최적화 count 감사가
 남습니다. Discovery가 타입 있는 query 파라미터·일반 연산 envelope·space별 권한을
@@ -203,7 +209,7 @@ functional/inverse-functional property(SEM-1)와 일반 chain(SEM-2)은 구체�
 
 ### Foundations 구현 — 2026-10-30
 
-`codex/agent-foundations`의 로컬 변경은 다음 네 단위로 나눠 검토할 수 있습니다.
+`main`에 통합한 `20d464b`까지의 foundations 커밋은 다음 네 단위로 나눠 검토할 수 있습니다.
 
 - **DEP-1:** 호환 의존성 패치와 자동 버전 갱신·릴리스 경로의 audit 필수화.
   압축은 유지하며 실제 gzip/zstd/무압축 gRPC 요청·응답의 UTF-8 값 일치를 검사합니다.
