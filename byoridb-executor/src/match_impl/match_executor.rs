@@ -298,6 +298,8 @@ impl MatchExecutor {
         // OPTIONAL MATCH — for each row from the main MATCH, try each optional
         // pattern. If the optional yields results, merge bindings; otherwise
         // keep the original row with NULL values for optional variables.
+        // Execution failures are not empty matches: propagate them even if
+        // earlier branches have already collected some optional rows.
         let binding_rows = if !plan.optional_patterns.is_empty() {
             let opt_profiling = self.ctx.profiling();
             let opt_start = std::time::Instant::now();
@@ -305,10 +307,7 @@ impl MatchExecutor {
             for row in binding_rows {
                 let mut current_rows = vec![row];
                 for opt_pattern in &plan.optional_patterns {
-                    let opt_flat = match flatten_pattern(opt_pattern) {
-                        Ok(f) => f,
-                        Err(_) => break,
-                    };
+                    let opt_flat = flatten_pattern(opt_pattern)?;
                     let mut next_rows = Vec::new();
                     for base_row in current_rows {
                         let mut opt_rows: Vec<MatchBindings> = Vec::new();
@@ -328,31 +327,29 @@ impl MatchExecutor {
                             let start_var = opt_flat.start.variable.as_ref().unwrap().clone();
                             let mut opt_bindings = base_row.clone();
                             opt_bindings.insert(start_var, byoridb_common::Value::Int(start_vid));
-                            let _ = self
-                                .match_edges(
-                                    &space,
-                                    &opt_flat.edges,
-                                    &opt_flat.nodes,
-                                    0,
-                                    start_vid,
-                                    &matcher,
-                                    &mut opt_bindings,
-                                    &mut opt_rows,
-                                )
-                                .await;
+                            self.match_edges(
+                                &space,
+                                &opt_flat.edges,
+                                &opt_flat.nodes,
+                                0,
+                                start_vid,
+                                &matcher,
+                                &mut opt_bindings,
+                                &mut opt_rows,
+                            )
+                            .await?;
                         } else {
                             // Start variable not bound — scan all candidates
                             let mut opt_bindings = base_row.clone();
-                            let _ = self
-                                .match_flat_pattern(
-                                    &opt_flat,
-                                    &matcher,
-                                    &mut opt_bindings,
-                                    &mut opt_rows,
-                                    None,
-                                    None,
-                                )
-                                .await;
+                            self.match_flat_pattern(
+                                &opt_flat,
+                                &matcher,
+                                &mut opt_bindings,
+                                &mut opt_rows,
+                                None,
+                                None,
+                            )
+                            .await?;
                         }
 
                         if opt_rows.is_empty() {

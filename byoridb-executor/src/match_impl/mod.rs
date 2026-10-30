@@ -12,6 +12,9 @@ mod match_executor;
 mod pattern_matcher;
 mod var_length;
 
+#[cfg(test)]
+mod optional_match_tests;
+
 pub use match_executor::MatchExecutor;
 pub use pattern_matcher::PatternMatcher;
 
