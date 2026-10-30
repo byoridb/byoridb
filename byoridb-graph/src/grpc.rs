@@ -54,6 +54,81 @@ fn dataset_to_proto(ds: &byoridb_common::DataSet) -> graph_proto::DataSet {
     }
 }
 
+fn discovery_status(error: crate::discovery::DiscoveryError) -> Status {
+    use crate::discovery::DiscoveryError::*;
+    let code = match error {
+        AuthRequired | SessionExpired => tonic::Code::Unauthenticated,
+        PermissionDenied => tonic::Code::PermissionDenied,
+        InvalidRequest | UnsupportedContract => tonic::Code::InvalidArgument,
+        SpaceNotFound => tonic::Code::NotFound,
+        ResourceExhausted => tonic::Code::ResourceExhausted,
+        StorageError | InvalidMetadata => tonic::Code::Internal,
+        ServiceUnavailable => tonic::Code::Unavailable,
+    };
+    let mut status = Status::new(code, error.to_string());
+    status.metadata_mut().insert(
+        "byoridb-error-code",
+        error.code().parse().expect("static ASCII error code"),
+    );
+    status.metadata_mut().insert(
+        "byoridb-contract-version",
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+    status
+}
+
+fn discovery_to_proto(value: crate::discovery::DiscoveryResponse) -> graph_proto::DiscoverResponse {
+    fn schema_type(value: crate::discovery::DiscoveredType) -> graph_proto::DiscoveredType {
+        graph_proto::DiscoveredType {
+            name: value.name,
+            properties: value
+                .properties
+                .into_iter()
+                .map(|p| graph_proto::DiscoveredProperty {
+                    name: p.name,
+                    data_type: p.data_type,
+                    nullable: p.nullable,
+                    has_default: p.has_default,
+                    max_utf8_bytes: p.max_utf8_bytes,
+                })
+                .collect(),
+        }
+    }
+    graph_proto::DiscoverResponse {
+        contract_version: value.contract_version,
+        server_version: value.server_version,
+        authorization_model: value.authorization_model,
+        permissions: value.permissions,
+        capabilities: value
+            .capabilities
+            .into_iter()
+            .map(|c| graph_proto::DiscoveryCapability {
+                name: c.name,
+                status: c.status,
+            })
+            .collect(),
+        schema_state: value.schema_state,
+        consistency: value.consistency,
+        schema_snapshot: value.schema_snapshot,
+        schema_revision: value.schema_revision,
+        limits: Some(graph_proto::DiscoveryLimits {
+            max_tags: value.limits.max_tags,
+            max_edges: value.limits.max_edges,
+            max_properties_per_type: value.limits.max_properties_per_type,
+            max_metadata_bytes: value.limits.max_metadata_bytes,
+        }),
+        schema: value.schema.map(|schema| graph_proto::DiscoveredSchema {
+            space: schema.space,
+            vid: Some(graph_proto::DiscoveredVid {
+                kind: schema.vid.kind,
+                max_utf8_bytes: schema.vid.max_utf8_bytes,
+            }),
+            tags: schema.tags.into_iter().map(schema_type).collect(),
+            edges: schema.edges.into_iter().map(schema_type).collect(),
+        }),
+    }
+}
+
 pub struct GrpcService {
     internal_service: Arc<InternalGraphService>,
 }
@@ -66,6 +141,25 @@ impl GrpcService {
 
 #[tonic::async_trait]
 impl GraphService for GrpcService {
+    async fn discover(
+        &self,
+        request: Request<graph_proto::DiscoverRequest>,
+    ) -> Result<Response<graph_proto::DiscoverResponse>, Status> {
+        let request = request.into_inner();
+        self.internal_service
+            .discover(
+                request.session_id,
+                crate::discovery::DiscoveryRequest {
+                    contract_version: request.contract_version,
+                    space: request.space,
+                },
+            )
+            .await
+            .map(discovery_to_proto)
+            .map(Response::new)
+            .map_err(discovery_status)
+    }
+
     async fn authenticate(
         &self,
         request: Request<AuthenticateRequest>,

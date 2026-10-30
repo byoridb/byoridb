@@ -13,6 +13,7 @@
 pub mod adapter;
 pub mod auth;
 pub mod context;
+pub mod discovery;
 pub mod error;
 pub mod evaluator;
 pub mod executor;
@@ -30,6 +31,7 @@ pub mod session;
 pub mod shutdown;
 
 pub use auth::{AuthManager, Permission, PermissionEntry, Role, Session, User};
+pub use discovery::{DiscoveryError, DiscoveryRequest, DiscoveryResponse};
 pub use error::{GraphError, Result};
 #[cfg(feature = "server")]
 pub use logging::init_logging;

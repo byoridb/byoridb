@@ -4,6 +4,9 @@ package graph;
 
 // The Graph Service definition
 service GraphService {
+  // Read-only versioned capability and schema discovery.
+  rpc Discover (DiscoverRequest) returns (DiscoverResponse);
+
   // Authenticate user
   rpc Authenticate (AuthenticateRequest) returns (AuthenticateResponse);
   
@@ -109,4 +112,49 @@ message Value {
 
 enum NullValue {
   NULL_VALUE = 0;
+}
+
+// No implicit USE/default space; absent space uses the session selection only.
+message DiscoverRequest {
+  int64 session_id = 1;
+  string contract_version = 2;
+  optional string space = 3;
+}
+
+// Errors are gRPC Status with fixed byoridb-error-code and
+// byoridb-contract-version ASCII metadata (the same codes as HTTP).
+message DiscoverResponse {
+  string contract_version = 1;
+  string server_version = 2;
+  string authorization_model = 3;
+  repeated string permissions = 4;
+  repeated DiscoveryCapability capabilities = 5;
+  string schema_state = 6;
+  string consistency = 7;
+  bool schema_snapshot = 8;
+  bool schema_revision = 9;
+  DiscoveryLimits limits = 10;
+  DiscoveredSchema schema = 11;
+}
+message DiscoveryCapability { string name = 1; string status = 2; }
+message DiscoveryLimits {
+  uint32 max_tags = 1;
+  uint32 max_edges = 2;
+  uint32 max_properties_per_type = 3;
+  uint32 max_metadata_bytes = 4;
+}
+message DiscoveredSchema {
+  string space = 1;
+  DiscoveredVid vid = 2;
+  repeated DiscoveredType tags = 3;
+  repeated DiscoveredType edges = 4;
+}
+message DiscoveredVid { string kind = 1; optional uint32 max_utf8_bytes = 2; }
+message DiscoveredType { string name = 1; repeated DiscoveredProperty properties = 2; }
+message DiscoveredProperty {
+  string name = 1;
+  string data_type = 2;
+  bool nullable = 3;
+  bool has_default = 4;
+  optional uint32 max_utf8_bytes = 5;
 }

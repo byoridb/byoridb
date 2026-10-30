@@ -266,6 +266,76 @@ impl GraphService {
         self.live_session(session_id).await.map(|_| ())
     }
 
+    /// Discover supported operations and the explicit or selected space schema.
+    /// The session selection is never changed and no space inventory is exposed.
+    pub async fn discover(
+        &self,
+        session_id: i64,
+        request: crate::discovery::DiscoveryRequest,
+    ) -> std::result::Result<crate::discovery::DiscoveryResponse, crate::discovery::DiscoveryError>
+    {
+        use crate::auth::Permission;
+        use crate::discovery::{DiscoveryError as Error, DiscoveryLimits, DiscoveryResponse};
+        if !self.shutdown.is_accepting() {
+            return Err(Error::ServiceUnavailable);
+        }
+        if session_id <= 0 {
+            return Err(Error::AuthRequired);
+        }
+        let (_, session) = self
+            .live_session(session_id)
+            .await
+            .map_err(|_| Error::SessionExpired)?;
+        if request.contract_version != crate::discovery::DISCOVERY_CONTRACT_VERSION {
+            return Err(Error::UnsupportedContract);
+        }
+        let space = request.space.or(session.space);
+        if space
+            .as_deref()
+            .is_some_and(|name| !crate::discovery::valid_name(name))
+        {
+            return Err(Error::InvalidRequest);
+        }
+        let target = space.as_deref().unwrap_or("");
+        // Authorization must precede even the existence check in the KV store.
+        let mut permissions = Vec::new();
+        for (permission, name) in [
+            (Permission::Read, "read"),
+            (Permission::Write, "write"),
+            (Permission::Create, "create"),
+            (Permission::Delete, "delete"),
+            (Permission::Alter, "alter"),
+            (Permission::Drop, "drop"),
+        ] {
+            let allowed = self
+                .auth_manager
+                .check_permission(session_id, target, permission)
+                .await
+                .map_err(|_| Error::SessionExpired)?;
+            if permission == Permission::Read && !allowed {
+                return Err(Error::PermissionDenied);
+            }
+            if allowed {
+                permissions.push(name.to_string());
+            }
+        }
+        permissions.sort();
+        // Include metadata reads in shutdown draining without retaining a bearer.
+        let _active = self.register_active_query(QueryType::Show, 0, target);
+        let schema = match space {
+            Some(space) => Some(
+                crate::discovery::read_schema(
+                    self.kvstore.as_ref(),
+                    &space,
+                    &DiscoveryLimits::default(),
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        Ok(DiscoveryResponse::new(permissions, schema))
+    }
+
     /// Check diagnostics/admin API access for a live bearer session.
     pub async fn is_admin_session(&self, session_id: i64) -> Result<bool> {
         let (roles, _) = self.live_session(session_id).await?;
@@ -1910,3 +1980,7 @@ mod tests {
             .expect("an unconstrained request must behave as before");
     }
 }
+
+#[cfg(test)]
+#[path = "discovery_tests.rs"]
+mod discovery_tests;

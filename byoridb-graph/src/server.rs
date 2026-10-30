@@ -161,6 +161,7 @@ impl HttpServer {
                 "/api/v1/session",
                 post(create_session).delete(delete_session),
             )
+            .route("/api/v1/discover", post(discover))
             .route("/api/v1/query", post(execute_query))
             .route("/api/v1/query/json", post(execute_query_json))
             .with_state(state);
@@ -176,6 +177,50 @@ impl HttpServer {
 
         Ok(())
     }
+}
+
+type DiscoveryHttpError = (StatusCode, Json<crate::discovery::DiscoveryError>);
+
+fn discovery_http_error(error: crate::discovery::DiscoveryError) -> DiscoveryHttpError {
+    use crate::discovery::DiscoveryError::*;
+    let status = match error {
+        AuthRequired | SessionExpired => StatusCode::UNAUTHORIZED,
+        PermissionDenied => StatusCode::FORBIDDEN,
+        InvalidRequest | UnsupportedContract => StatusCode::BAD_REQUEST,
+        SpaceNotFound => StatusCode::NOT_FOUND,
+        ResourceExhausted => StatusCode::PAYLOAD_TOO_LARGE,
+        StorageError | InvalidMetadata => StatusCode::INTERNAL_SERVER_ERROR,
+        ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, Json(error))
+}
+
+async fn discover(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<crate::discovery::DiscoveryRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<crate::discovery::DiscoveryResponse>, DiscoveryHttpError> {
+    use crate::discovery::DiscoveryError;
+    let mut values = headers.get_all(SESSION_ID_HEADER).iter();
+    let session = values
+        .next()
+        .ok_or_else(|| discovery_http_error(DiscoveryError::AuthRequired))?;
+    if values.next().is_some() {
+        return Err(discovery_http_error(DiscoveryError::InvalidRequest));
+    }
+    let session_id = session
+        .to_str()
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(|| discovery_http_error(DiscoveryError::AuthRequired))?;
+    let Json(request) = body.map_err(|_| discovery_http_error(DiscoveryError::InvalidRequest))?;
+    state
+        .service
+        .discover(session_id, request)
+        .await
+        .map(Json)
+        .map_err(discovery_http_error)
 }
 
 /// Health check endpoint
@@ -1275,5 +1320,203 @@ mod tests {
             serde_json::from_str(r#"{"session_id": 7, "query": "SHOW SPACES", "read_only": true}"#)
                 .unwrap();
         assert!(explicit.read_only);
+    }
+}
+
+#[cfg(test)]
+mod discovery_protocol_tests {
+    use super::*;
+    use crate::discovery::{DiscoveryError, DiscoveryRequest};
+    use crate::grpc::graph_proto::{self, graph_service_server::GraphService as GrpcApi};
+    use crate::grpc::GrpcService;
+    use axum::extract::FromRequest;
+    use byoridb_kvstore::MemoryKVStore;
+    use std::time::Duration;
+
+    async fn fixture() -> (AppState, i64, HeaderMap) {
+        let service = Arc::new(GraphService::with_auth(
+            Arc::new(MemoryKVStore::new()),
+            crate::auth::AuthManager::with_config("discovery-test", Duration::from_secs(60)),
+        ));
+        let session = service
+            .authenticate("root".into(), "discovery-test".into())
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_ID_HEADER, session.to_string().parse().unwrap());
+        (AppState { service }, session, headers)
+    }
+    fn request(space: Option<&str>) -> DiscoveryRequest {
+        DiscoveryRequest {
+            contract_version: "1".into(),
+            space: space.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_http_and_grpc_success_have_the_same_typed_contract() {
+        use prost::Message;
+        let (state, session, headers) = fixture().await;
+        for query in [
+            "CREATE SPACE protocol (vid_type=FIXED_STRING(64))",
+            "USE protocol",
+            "CREATE TAG person (name string, age int DEFAULT 7)",
+            "CREATE EDGE knows (since int)",
+        ] {
+            state.service.execute(session, query.into()).await.unwrap();
+        }
+        let Json(http) = discover(State(state.clone()), headers, Ok(Json(request(None))))
+            .await
+            .unwrap();
+        let grpc = GrpcService::new(state.service.clone())
+            .discover(tonic::Request::new(graph_proto::DiscoverRequest {
+                session_id: session,
+                contract_version: "1".into(),
+                space: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        // Exercise the wire representation, including optional scalar presence.
+        let grpc = graph_proto::DiscoverResponse::decode(grpc.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(grpc.contract_version, http.contract_version);
+        assert_eq!(grpc.server_version, http.server_version);
+        assert_eq!(grpc.authorization_model, http.authorization_model);
+        assert_eq!(grpc.permissions, http.permissions);
+        assert_eq!(grpc.schema_state, http.schema_state);
+        assert_eq!(grpc.consistency, http.consistency);
+        assert_eq!(grpc.schema_snapshot, http.schema_snapshot);
+        assert_eq!(grpc.schema_revision, http.schema_revision);
+        let limits = grpc.limits.unwrap();
+        assert_eq!(limits.max_tags, http.limits.max_tags);
+        assert_eq!(limits.max_edges, http.limits.max_edges);
+        assert_eq!(
+            limits.max_properties_per_type,
+            http.limits.max_properties_per_type
+        );
+        assert_eq!(limits.max_metadata_bytes, http.limits.max_metadata_bytes);
+        assert_eq!(grpc.capabilities.len(), http.capabilities.len());
+        for (g, h) in grpc.capabilities.iter().zip(&http.capabilities) {
+            assert_eq!((&g.name, &g.status), (&h.name, &h.status));
+        }
+        let gs = grpc.schema.unwrap();
+        let hs = http.schema.as_ref().unwrap();
+        assert_eq!(gs.space, hs.space);
+        let gv = gs.vid.unwrap();
+        assert_eq!(gv.kind, hs.vid.kind);
+        assert_eq!(gv.max_utf8_bytes, Some(64));
+        for (gt, ht) in [(&gs.tags, &hs.tags), (&gs.edges, &hs.edges)] {
+            assert_eq!(gt.len(), ht.len());
+            for (g, h) in gt.iter().zip(ht) {
+                assert_eq!(g.name, h.name);
+                assert_eq!(g.properties.len(), h.properties.len());
+                for (gp, hp) in g.properties.iter().zip(&h.properties) {
+                    assert_eq!(gp.name, hp.name);
+                    assert_eq!(gp.data_type, hp.data_type);
+                    assert_eq!(gp.nullable, hp.nullable);
+                    assert_eq!(gp.has_default, hp.has_default);
+                    assert_eq!(gp.max_utf8_bytes, hp.max_utf8_bytes);
+                }
+            }
+        }
+        let json = serde_json::to_string(&http).unwrap();
+        assert!(!json.contains(&session.to_string()));
+        assert!(!json.contains("session_id"));
+        assert!(!json.contains("default_value"));
+    }
+
+    #[tokio::test]
+    async fn discovery_http_and_grpc_version_auth_errors_share_safe_codes() {
+        let (state, session, headers) = fixture().await;
+        let grpc = GrpcService::new(state.service.clone());
+        for (version, id, expected, http_status, grpc_code) in [
+            (
+                "future-secret",
+                session,
+                DiscoveryError::UnsupportedContract,
+                StatusCode::BAD_REQUEST,
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                "1",
+                0,
+                DiscoveryError::AuthRequired,
+                StatusCode::UNAUTHORIZED,
+                tonic::Code::Unauthenticated,
+            ),
+            (
+                "1",
+                123456789,
+                DiscoveryError::SessionExpired,
+                StatusCode::UNAUTHORIZED,
+                tonic::Code::Unauthenticated,
+            ),
+        ] {
+            let mut h = headers.clone();
+            h.insert(SESSION_ID_HEADER, id.to_string().parse().unwrap());
+            let (status, Json(error)) = discover(
+                State(state.clone()),
+                h,
+                Ok(Json(DiscoveryRequest {
+                    contract_version: version.into(),
+                    space: None,
+                })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status, http_status);
+            assert_eq!(error, expected);
+            let g = grpc
+                .discover(tonic::Request::new(graph_proto::DiscoverRequest {
+                    session_id: id,
+                    contract_version: version.into(),
+                    space: None,
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(g.code(), grpc_code);
+            assert_eq!(
+                g.metadata().get("byoridb-error-code").unwrap(),
+                expected.code()
+            );
+            assert_eq!(g.metadata().get("byoridb-contract-version").unwrap(), "1");
+            assert_eq!(g.message(), expected.to_string());
+            assert!(!g.message().contains("future-secret"));
+            assert!(!serde_json::to_string(&error)
+                .unwrap()
+                .contains(&session.to_string()));
+        }
+        let (_, Json(error)) = discover(State(state), HeaderMap::new(), Ok(Json(request(None))))
+            .await
+            .unwrap_err();
+        assert_eq!(error, DiscoveryError::AuthRequired);
+    }
+
+    #[tokio::test]
+    async fn discovery_http_malformed_json_and_duplicate_headers_use_fixed_errors() {
+        let (state, _, headers) = fixture().await;
+        for body in [
+            "not-json",
+            r#"{"contract_version":"1","unexpected":"secret"}"#,
+            r#"{"space":"secret"}"#,
+        ] {
+            let req = axum::http::Request::builder()
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            let parsed = Json::<DiscoveryRequest>::from_request(req, &state).await;
+            let (status, Json(error)) = discover(State(state.clone()), headers.clone(), parsed)
+                .await
+                .unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error, DiscoveryError::InvalidRequest);
+            assert!(!serde_json::to_string(&error).unwrap().contains("secret"));
+        }
+        let mut duplicate = headers;
+        duplicate.append(SESSION_ID_HEADER, HeaderValue::from_static("123"));
+        let (_, Json(error)) = discover(State(state), duplicate, Ok(Json(request(None))))
+            .await
+            .unwrap_err();
+        assert_eq!(error, DiscoveryError::InvalidRequest);
     }
 }
