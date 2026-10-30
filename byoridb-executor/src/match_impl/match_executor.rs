@@ -696,10 +696,10 @@ impl MatchExecutor {
             None => return Ok(None),
         };
         // Count via index scan (part_id 1 — INSERT writes all tag indexes there).
-        let counts = match index_manager.tag_index_group_counts(1, &index_def).await {
-            Ok(c) => c,
-            Err(_) => return Ok(None), // fall back to full scan
-        };
+        let counts = index_manager
+            .tag_index_group_counts(1, &index_def)
+            .await
+            .map_err(|error| byoridb_storage::StorageError::Index(error.to_string()))?;
         let col_names: Vec<String> = return_cols
             .iter()
             .map(|c| {
@@ -1827,9 +1827,8 @@ impl MatchExecutor {
     /// Walk the flattened pattern, binding variables and collecting rows.
     ///
     /// `row_limit` is an optional early-exit threshold: if we already have
-    /// this many rows we stop processing candidates. ORDER BY is currently
-    /// discarded by the parser (no-op), so stopping early is safe — results
-    /// are in storage order regardless.
+    /// this many rows we stop processing candidates. The caller only supplies
+    /// it when later filtering, ordering or joins cannot change the window.
     async fn match_flat_pattern(
         &self,
         flat: &FlatPattern<'_>,
@@ -1965,17 +1964,13 @@ impl MatchExecutor {
         let mut candidates = Vec::new();
 
         let prefix = format!("{}:vertex:", space);
-        let scan_limit = if self.ctx.config.max_scan_limit > 0 {
-            Some(self.ctx.config.max_scan_limit)
-        } else {
-            None
-        };
         let results = self
             .ctx
             .kvstore
-            .scan_prefix_limited(prefix.as_bytes(), scan_limit)
+            .scan_prefix_limited(prefix.as_bytes(), self.candidate_scan_limit())
             .await?;
         let scanned = results.len();
+        self.check_candidate_scan_size(scanned, "full vertex scan")?;
 
         for (key, value) in results {
             let key_str = String::from_utf8_lossy(&key);
@@ -2012,6 +2007,26 @@ impl MatchExecutor {
         );
 
         Ok(candidates)
+    }
+
+    /// Fetch one extra candidate to distinguish an exactly-full scan from a
+    /// truncated one. Zero disables the budget; usize::MAX cannot be exceeded
+    /// by a Vec, so an unbounded request also avoids overflowing the probe.
+    fn candidate_scan_limit(&self) -> Option<usize> {
+        match self.ctx.config.max_scan_limit {
+            0 => None,
+            cap => cap.checked_add(1),
+        }
+    }
+
+    fn check_candidate_scan_size(&self, scanned: usize, operation: &str) -> Result<()> {
+        let cap = self.ctx.config.max_scan_limit;
+        if cap > 0 && scanned > cap {
+            return Err(ExecutionError::ResourceExhausted(format!(
+                "MATCH {operation} exceeded max_scan_limit ({cap}); query result is incomplete"
+            )));
+        }
+        Ok(())
     }
 
     /// Try to satisfy the MATCH start-node from a tag index.
@@ -2071,18 +2086,14 @@ impl MatchExecutor {
             // from producing phantom rows for edge-free patterns.
             if let Some(label) = node.labels.first() {
                 let prefix = format!("{}:tagvid:{}:", space, label);
-                let scan_limit = if self.ctx.config.max_scan_limit > 0 {
-                    Some(self.ctx.config.max_scan_limit)
-                } else {
-                    None
-                };
                 let tagvid_profiling = self.ctx.profiling();
                 let tagvid_start = std::time::Instant::now();
                 let results = self
                     .ctx
                     .kvstore
-                    .scan_prefix_limited(prefix.as_bytes(), scan_limit)
+                    .scan_prefix_limited(prefix.as_bytes(), self.candidate_scan_limit())
                     .await?;
+                self.check_candidate_scan_size(results.len(), "tag-VID scan")?;
                 if !results.is_empty() {
                     if tagvid_profiling {
                         self.ctx.record_profile(
@@ -2153,35 +2164,17 @@ impl MatchExecutor {
         let idx_profiling = self.ctx.profiling();
         let idx_start = std::time::Instant::now();
         let mut vids = Vec::new();
-        let mut lookup_succeeded = false;
-
-        // Use the configured scan cap (default 100k, overridable via
-        // BYORIDB_MAX_SCAN_LIMIT; 0 = unbounded) instead of a hard-coded 1000
-        // that silently truncated indexed MATCH candidates and treated the
-        // truncated set as complete.
-        let scan_cap = self.ctx.config.max_scan_limit;
+        // Each partition scan must complete. A failed partition or an extra
+        // candidate beyond the scan budget cannot be treated as an empty
+        // partition or a complete result from the partitions that succeeded.
+        let scan_limit = self.candidate_scan_limit().unwrap_or(0);
         for part_id in 1..=partition_num {
-            match index_manager
-                .lookup_tag(part_id, index_def, &lookup_values, scan_cap)
+            let part_vids = index_manager
+                .lookup_tag(part_id, index_def, &lookup_values, scan_limit)
                 .await
-            {
-                Ok(part_vids) => {
-                    lookup_succeeded = true;
-                    vids.extend(part_vids);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "MATCH index lookup on part {} failed for index '{}': {}",
-                        part_id,
-                        index_def.index_name,
-                        e
-                    );
-                }
-            }
-        }
-
-        if !lookup_succeeded {
-            return Ok(None);
+                .map_err(|error| byoridb_storage::StorageError::Index(error.to_string()))?;
+            self.check_candidate_scan_size(part_vids.len(), "property-index partition scan")?;
+            vids.extend(part_vids);
         }
 
         if vids.is_empty() {

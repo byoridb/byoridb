@@ -53,8 +53,8 @@ pub(super) async fn neighbors_for_direction(
 ///
 /// DFS with an explicit stack; each entry carries its own path (vertices
 /// visited so far) for cycle prevention. `ctx.config.max_traversal_nodes`
-/// caps the number of expansions — when hit, the result so far is returned
-/// with a warning (terminals found are valid; coverage may be incomplete).
+/// caps the number of expansions. Needing an expansion beyond the cap fails
+/// the query; partial terminal coverage must not become successful MATCH rows.
 pub(super) async fn expand_var_length(
     ctx: &ExecutionContext,
     space: &str,
@@ -103,11 +103,9 @@ pub(super) async fn expand_var_length(
         }
         expansions += 1;
         if max_nodes > 0 && expansions > max_nodes {
-            tracing::warn!(
-                max_traversal_nodes = max_nodes,
-                "MATCH var-length expansion hit max_traversal_nodes; result may be incomplete"
-            );
-            break;
+            return Err(ExecutionError::ResourceExhausted(format!(
+                "MATCH variable-length expansion exceeded max_traversal_nodes ({max_nodes}); query result is incomplete"
+            )));
         }
 
         let neighbors =

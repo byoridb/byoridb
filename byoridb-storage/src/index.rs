@@ -652,12 +652,39 @@ impl IndexManager {
         }
         .map_err(|e| IndexError::Storage(e.to_string()))?;
 
+        let header_len = KeyUtils::tag_index_prefix(part_id, index_def.id).len();
         let mut results: Vec<TagIndexScanResult> = entries
             .iter()
-            .filter_map(|(key, _)| {
-                KeyUtils::parse_tag_index_vid(key, 0).map(|vid| TagIndexScanResult { vid })
+            .map(|(key, _)| {
+                let malformed = || {
+                    IndexError::Storage(format!(
+                        "malformed tag-index key for index '{}' in partition {}",
+                        index_def.index_name, part_id
+                    ))
+                };
+                // The storage scan is bounded before decoding. Silently
+                // dropping a malformed raw entry could hide the extra row
+                // used by callers to detect an incomplete capped scan.
+                // Validate the field layout separately from the trailing VID:
+                // a long property prefix alone can exceed the old 17-byte
+                // minimum without actually containing a VID at all.
+                let value_end = key
+                    .len()
+                    .checked_sub(8)
+                    .filter(|end| *end >= header_len)
+                    .ok_or_else(&malformed)?;
+                let mut values = &key[header_len..value_end];
+                for _ in &index_def.fields {
+                    let (_, consumed) = IndexValue::decode(values).ok_or_else(&malformed)?;
+                    values = &values[consumed..];
+                }
+                if !values.is_empty() {
+                    return Err(malformed());
+                }
+                let vid = KeyUtils::parse_tag_index_vid(key, 0).ok_or_else(malformed)?;
+                Ok(TagIndexScanResult { vid })
             })
-            .collect();
+            .collect::<Result<_, IndexError>>()?;
 
         // Apply limit
         if options.limit > 0 && results.len() > options.limit {
@@ -1108,6 +1135,70 @@ mod tests {
         assert_eq!(index.schema_id, 10);
         assert_eq!(index.schema_name, "person");
         assert_eq!(index.fields, vec!["name".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_tag_index_scan_rejects_keys_missing_vid() {
+        // An Int or long String prefix already exceeds the old 17-byte
+        // minimum. Its value bytes must not be mistaken for a trailing VID.
+        for value in [
+            IndexValue::Bool(true),
+            IndexValue::Int(10),
+            IndexValue::String("long index value".to_string()),
+        ] {
+            let kvstore = Arc::new(MemoryKVStore::new());
+            let manager = IndexManager::new(kvstore.clone());
+            let index_id = manager
+                .create_tag_index(
+                    1,
+                    "item_value_idx".to_string(),
+                    1,
+                    "item".to_string(),
+                    vec!["value".to_string()],
+                    vec![0],
+                )
+                .await
+                .unwrap();
+            let index = manager.get_index(1, "item_value_idx").await.unwrap();
+            let malformed =
+                KeyUtils::tag_index_prefix_with_values(1, index_id, std::slice::from_ref(&value));
+            kvstore.put(&malformed, &[]).await.unwrap();
+            let result = manager.lookup_tag(1, &index, &[value], 0).await;
+            assert!(
+                matches!(&result, Err(IndexError::Storage(message)) if message.contains("malformed tag-index key")),
+                "missing VID must be corruption, not an omitted or phantom candidate: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tag_index_scan_rejects_malformed_field_layout() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let manager = IndexManager::new(kvstore.clone());
+        let index_id = manager
+            .create_tag_index(
+                1,
+                "item_value_idx".to_string(),
+                1,
+                "item".to_string(),
+                vec!["value".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        let index = manager.get_index(1, "item_value_idx").await.unwrap();
+        for invalid_values in [vec![0xff], vec![0x01], vec![0x01, 0x01, 0x00]] {
+            let mut malformed = KeyUtils::tag_index_prefix(1, index_id);
+            malformed.extend(invalid_values);
+            malformed.extend(1i64.to_be_bytes());
+            kvstore.put(&malformed, &[]).await.unwrap();
+            let result = manager.lookup_tag(1, &index, &[], 0).await;
+            assert!(
+                matches!(&result, Err(IndexError::Storage(message)) if message.contains("malformed tag-index key")),
+                "invalid encoding or extra/missing field bytes must fail: {result:?}"
+            );
+            kvstore.delete(&malformed).await.unwrap();
+        }
     }
 
     #[tokio::test]

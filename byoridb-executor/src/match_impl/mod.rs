@@ -13,6 +13,8 @@ mod pattern_matcher;
 mod var_length;
 
 #[cfg(test)]
+mod candidate_scan_tests;
+#[cfg(test)]
 mod optional_match_tests;
 
 pub use match_executor::MatchExecutor;
