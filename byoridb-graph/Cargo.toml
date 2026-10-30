@@ -51,5 +51,8 @@ regex = { workspace = true }
 [build-dependencies]
 tonic-prost-build = "0.14"
 
+[dev-dependencies]
+tokio-stream = { workspace = true, features = ["net"] }
+
 [lints]
 workspace = true

@@ -52,6 +52,12 @@ jobs:
         with:
           toolchain: "1.90"
 
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit before version bump
+        run: cargo audit --file Cargo.lock
+
       - name: Resolve the next version
         id: next
         run: |
@@ -141,6 +147,9 @@ jobs:
           # only these two files is safe.
           pushed=false
           for _ in 1 2 3; do
+            # A rebase can introduce a different dependency graph. Audit every
+            # candidate again before pushing, not just the initial checkout.
+            cargo audit --file Cargo.lock
             if git push origin HEAD:main; then pushed=true; break; fi
             git fetch origin main
             git rebase origin/main

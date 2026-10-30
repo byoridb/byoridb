@@ -105,7 +105,7 @@ instant-distance = { version = "0.6", features = ["with-serde"] }
 redb = "4.1"
 
 # Networking
-tonic = { version = "0.14", features = ["gzip", "zstd"] }
+tonic = { version = "0.14.9", features = ["gzip", "zstd"] }
 tonic-prost = "0.14"
 prost = "0.14"
 axum = "0.8"
