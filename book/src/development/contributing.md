@@ -119,8 +119,9 @@ cargo test --locked --package byoridb-executor <test-name>
 
 The GitHub `CI` workflow also runs a pinned RustSec dependency audit. Its
 release-build job waits for check, format, Clippy, test, and audit jobs to pass.
-The separate Auto-release workflow runs on `main` pushes and does not currently
-require that audit before publishing; DEP-1 tracks this release-gate gap.
+The separate Auto-release workflow also audits before version changes and every
+push candidate, including after rebasing. The release workflow audits the exact
+release ref after signing-secret preflight and before building/publishing.
 
 ## High-risk areas
 

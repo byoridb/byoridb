@@ -78,8 +78,9 @@ the generic structured operation surface described here.
 
 ## How the product will be evaluated
 
-EVAL-1 is planned, not a benchmark already run. It will test discovery, bounded
-retrieval, derivation explanation, retraction, dropped-response retry,
+EVAL-1 has deterministic discovery/read/access-denial fixtures with exact
+answer and final-state assertions; no autonomous model evaluation has run.
+Remaining work includes bounded retrieval, derivation explanation, retraction, dropped-response retry,
 concurrent changes, and access denial on known fixtures. Grade the answer and
 the final database state, including unauthorized or duplicate writes.
 
@@ -90,9 +91,10 @@ do not establish agent task success by themselves.
 
 ## Current limits still apply
 
-Current HTTP/gRPC APIs primarily execute query text. `read_only` is enforced,
-but typed external parameters, generic capability discovery, durable request
-deduplication, and revision-bound preview/apply are not implemented contracts.
+HTTP/gRPC expose query text and discovery contract 1: authenticated, bounded
+tag/edge/property schemas, global-role permissions and explicit unsupported
+capabilities. `read_only` is enforced. Typed external parameters, durable request
+deduplication, and revision-bound preview/apply remain unimplemented.
 `WHY` accepts integer IDs and returns tabular explanations. Asserted-fact
 `FETCH ... AS OF` does not reconstruct historical inference. Compound
 statements may leave committed earlier clauses, and `sameAs` merges are

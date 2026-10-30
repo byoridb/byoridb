@@ -20,7 +20,7 @@ nGQL-style queries, write-time ontology materialization, inferred-edge
 explanations, and asserted-fact temporal reads in one standalone server process.
 The [product philosophy and design](docs/PRODUCT_DESIGN.md) defines the target
 agent contract; [the development plan](docs/PLAN.md) distinguishes implemented
-behavior from planned discovery, structured operations, and reliable retries.
+query/discovery behavior from planned structured operations and reliable retries.
 
 > [!NOTE]
 > Looking for the local knowledge graph and agent-memory product for Claude

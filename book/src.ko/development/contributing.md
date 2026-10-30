@@ -120,8 +120,9 @@ cargo test --locked --package byoridb-executor <test-name>
 
 GitHub `CI` 워크플로는 버전이 고정된 RustSec 의존성 감사도 실행합니다. 해당
 release-build 작업은 check·format·Clippy·test·audit가 모두 통과할 때까지 기다립니다.
-별도 Auto-release 워크플로는 `main` 푸시로 실행되며 현재 발행 전에 해당 audit를
-필수로 요구하지 않습니다. 이 릴리스 게이트 공백은 DEP-1에서 추적합니다.
+별도 Auto-release도 버전 변경 전과 rebase 이후를 포함한 모든 push 후보를
+감사합니다. 릴리스 워크플로는 서명 비밀값 preflight 다음에 정확한 release ref를
+감사하고 통과한 뒤 빌드·발행합니다.
 
 ## 주의가 필요한 영역
 

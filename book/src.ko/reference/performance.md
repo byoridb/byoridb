@@ -10,7 +10,7 @@ query shape, redb file, durability, cache warmth, filesystem, hardware에 따라
 ## Agent 작업 결과
 
 [Agent-first 설계](../architecture/agent-first.html)는 성공한 Agent 작업을 제품
-수준의 평가 기준으로 삼습니다. EVAL-1은 계획이며 이 페이지에 Agent 벤치마크 결과를
+수준의 평가 기준으로 삼습니다. EVAL-1에는 결정적 계약 fixture가 있으며 이 페이지에 Agent 벤치마크 결과를
 보고하는 것은 아닙니다. 이후 실행에서는 모델·prompt·도구·서버 버전, fixture, 예산,
 반복 횟수를 고정하고 호출·토큰·지연·비용을 비교하기 전에 답변·근거·최종 상태를
 검증해야 합니다. 실패한 실행, 중복 쓰기, 비인가 변경, 중단 뒤 복구도 포함합니다.

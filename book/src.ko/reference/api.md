@@ -6,10 +6,9 @@ ByoriDB는 동일한 프로세스 안의 `GraphService`에서 gRPC와 HTTP Graph
 제공합니다. 두 API는 사용자, 역할, session, 선택한 space, active-query diagnostics,
 종료 상태를 공유합니다.
 
-이 페이지는 구현된 query API를 설명합니다.
-[Agent-first 설계](../architecture/agent-first.html)는 계획 중인 스키마 discovery,
-타입 있는 연산, 제한된 근거 응답, 변경 결과 계약을 정의합니다. 그 계약이 이 페이지의
-현재 API에 새 필드나 endpoint가 추가됐다는 뜻은 아닙니다.
+이 페이지는 query 실행과 읽기 전용 discovery를 설명합니다.
+[Agent-first 설계](../architecture/agent-first.html)는 타입 있는 연산, 제한된 근거 응답,
+변경 결과 계약도 정의하지만 discovery가 그 후속 capability까지 구현하지는 않습니다.
 
 | 프로토콜 | 기본 listener | 전송 방식 |
 |---|---|---|
@@ -87,6 +86,77 @@ Credential을 **검증한 뒤** 거부한 경우 `Invalid credentials` 본문과
 [세션과 로그인 제한](../getting-started/configuration.md#sessions-and-login-throttling)을
 참고하세요.
 
+<a id="read-only-discovery-contract-1"></a>
+
+## 읽기 전용 discovery (계약 1)
+
+`POST /api/v1/discover`와 gRPC `Discover`는 같은 인증된 capability와 tag/edge/property
+스키마 계약을 제공합니다. 첫 AGT-1 구현 단위이며 다른 구조화 연산과 API-2의 일반
+query envelope는 계속 계획 상태입니다. Discovery는 그래프 데이터를 쓰거나 세션의
+선택 공간을 바꾸지 않으며 query와 같은 세션 만료·폐기 및 역할 검사를 사용합니다.
+
+```bash
+curl -X POST http://127.0.0.1:19669/api/v1/discover \
+  -H 'Content-Type: application/json' \
+  -H "x-byoridb-session-id: $SESSION_ID" \
+  -d '{"contract_version":"1","space":"social"}'
+```
+
+`contract_version`은 `"1"`이어야 합니다. 명시적인 `space`는 이 요청의 대상만 선택하고,
+생략하면 세션에 선택된 공간을 읽습니다. 둘 다 없으면 `schema_state`는 `not_selected`,
+`schema`는 null입니다. 암묵적인 `default` 선택이나 전체 공간 목록은 없습니다.
+잘못된 이름·알 수 없는 요청 필드·미지원 버전은 명시적인 오류입니다. gRPC 요청 필드는
+`session_id`(int64), `contract_version`(string), 선택적인 `space`(string)입니다.
+기존 RPC 필드와 query 응답은 유지됩니다.
+
+응답은 다음 필드를 포함합니다.
+
+| 필드 | 의미 |
+|---|---|
+| `contract_version`, `server_version` | Discovery 계약 버전과 패키지 버전 |
+| `authorization_model` | `built_in_global_roles`. tenant/space 격리를 뜻하지 않음 |
+| `permissions` | 현재 유효한 `read`, `write`, `create`, `delete`, `alter`, `drop` 권한. GUEST는 `read`만 받음 |
+| `capabilities` | 이름순 name/status 항목. `schema_discovery`, `text_query`, `request_read_only`는 `available`; `parameter_binding`, `snapshot_pagination`, `durable_idempotency`, `mutation_preview`, `revision_preconditions`, `space_scoped_grants`는 `unsupported` |
+| `schema_state`, `schema` | 대상 스키마가 있으면 `available`, 선택 공간이 없으면 `not_selected`와 null |
+| `consistency` | `live_reads_no_snapshot`. 동시 DDL로 읽기 사이에 metadata가 달라질 수 있음 |
+| `schema_snapshot`, `schema_revision` | 둘 다 false. snapshot이나 revision token을 제공하지 않음 |
+| `limits` | `max_tags=256`, `max_edges=256`, `max_properties_per_type=128`, `max_metadata_bytes=262144` |
+
+`schema`는 `space`, `vid`, 이름순 `tags`와 `edges`를 포함합니다. VID의 `kind`는
+`int64` 또는 `fixed_string`이며 고정 문자열에는 `max_utf8_bytes`가 있습니다.
+Tag/edge는 `name`과 property 목록을 포함하며 각 property는 `name`, `data_type`,
+`nullable`, `has_default`, 선택적인 `max_utf8_bytes`를 갖습니다. 기본값 식·값, 그래프
+레코드, 내부 문자열 ID 매핑, 온톨로지 규칙, 증명 데이터는 반환하지 않습니다.
+크기는 작은 범위의 정수로 나타내며 이 endpoint가 INT64 그래프 값을 손실 가능한
+JSON number로 인코딩하지는 않습니다.
+
+대상 존재 여부를 포함한 metadata를 읽기 전에 Read 권한을 검사합니다. Read가 없는
+사용자는 존재하는 공간과 없는 공간에서 같은 거부 응답을 받습니다. 현재 내장 역할은
+전역으로 적용되므로 GUEST는 모든 공간을 탐색할 수 있습니다. Capability metadata가
+후속 호출의 권한을 부여하는 것은 아닙니다.
+
+바이트 상한은 읽은 metadata key/value의 누적 크기입니다. 개수·바이트 상한 초과,
+손상 metadata, 저장소 오류는 discovery 전체를 실패시키며 잘리거나 빈 스키마를 성공으로
+반환하지 않습니다. 모든 KV 구현의 내부 메모리·시간을 제한한다는 보장은 아닙니다.
+Pagination이나 snapshot 이어 읽기는 없습니다.
+
+Discovery 오류는 별도의 안정적인 `{contract_version, code, message}` envelope를
+사용하며 message에 원본 저장소 상세·bearer ID·대상 이름을 넣지 않습니다. gRPC는
+표준 Status와 `byoridb-error-code`, `byoridb-contract-version` metadata를 반환합니다.
+Client는 message를 해석하지 않고 code를 사용합니다. 기존 query 오류 코드를 바꾸거나
+query 변경의 rollback을 약속하는 계약은 아닙니다.
+
+| Code | HTTP | gRPC Status |
+|---|---:|---|
+| `AUTH_REQUIRED`, `SESSION_EXPIRED` | 401 | `Unauthenticated` |
+| `PERMISSION_DENIED` | 403 | `PermissionDenied` |
+| `INVALID_REQUEST` | 400 | `InvalidArgument` |
+| `UNSUPPORTED_CONTRACT` | 400 | `Unimplemented` |
+| `SPACE_NOT_FOUND` | 404 | `NotFound` |
+| `RESOURCE_EXHAUSTED` | 413 | `ResourceExhausted` |
+| `STORAGE_ERROR`, `INVALID_METADATA` | 500 | `Internal` |
+| `SERVICE_UNAVAILABLE` | 503 | `Unavailable` |
+
 ## gRPC GraphService
 
 원본 정의는 `byoridb-graph/proto/graph.proto`에 있습니다.
@@ -97,6 +167,7 @@ service GraphService {
   rpc SignOut(SignOutRequest) returns (SignOutResponse);
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
   rpc ExecuteJson(ExecuteRequest) returns (ExecuteJsonResponse);
+  rpc Discover(DiscoverRequest) returns (DiscoverResponse);
 }
 
 message AuthenticateRequest {

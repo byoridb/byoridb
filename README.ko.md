@@ -18,7 +18,7 @@ ByoriDB의 주 호출자는 AI 에이전트입니다. 데이터 모델을 발견
 서버 프로세스에서 nGQL 스타일 쿼리, write-time ontology materialization, 추론 edge
 설명, asserted fact의 과거 시점 조회를 제공합니다.
 [제품 철학과 설계](docs/PRODUCT_DESIGN.ko.md)는 목표 Agent 계약을 정의하고,
-[개발 계획](docs/PLAN.ko.md)은 구현된 동작과 계획 중인 discovery·구조화 연산·안전한
+[개발 계획](docs/PLAN.ko.md)은 구현된 query/discovery와 계획 중인 구조화 연산·안전한
 재시도를 구분합니다.
 
 > [!NOTE]

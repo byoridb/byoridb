@@ -6,10 +6,10 @@ ByoriDB exposes Graph APIs over gRPC and HTTP from the same in-process
 `GraphService`. They share users, roles, sessions, the selected space, active
 query diagnostics, and shutdown state.
 
-This page describes the implemented query API. The
-[agent-first design](../architecture/agent-first.html) defines planned schema
-discovery, typed operations, bounded evidence, and mutation outcome contracts.
-Those contracts do not add fields or endpoints to the API documented here.
+This page describes query execution and read-only discovery. The
+[agent-first design](../architecture/agent-first.html) also defines planned typed
+operations, bounded evidence, and mutation outcome contracts; discovery does not
+implement those future capabilities.
 
 | Protocol | Default listener | Transport |
 |---|---|---|
@@ -89,6 +89,78 @@ defaults. See [Sessions and login throttling](../getting-started/configuration.m
 including how to disable the lockout for a single-user deployment and why doing
 so is only safe behind a restricted listener.
 
+## Read-only discovery (contract 1)
+
+`POST /api/v1/discover` and gRPC `Discover` expose the same authenticated
+capability and tag/edge/property schema contract. This is the first AGT-1 slice;
+other structured operations and the broader API-2 query envelope remain planned.
+The discovery operation never writes graph data or changes the session's selected
+space. It uses the same session expiry/revocation and role checks as query access.
+
+```bash
+curl -X POST http://127.0.0.1:19669/api/v1/discover \
+  -H 'Content-Type: application/json' \
+  -H "x-byoridb-session-id: $SESSION_ID" \
+  -d '{"contract_version":"1","space":"social"}'
+```
+
+`contract_version` must be `"1"`. An explicit `space` selects only this request's
+target; omitting it reads the session's selected space. When neither exists,
+`schema_state` is `not_selected` and `schema` is null. There is no implicit
+`default` space and no space inventory. Invalid names, unknown request fields,
+and unsupported versions fail explicitly. The gRPC request has `session_id`
+(int64), `contract_version` (string), and optional `space` (string); existing RPC
+fields and query responses are unchanged.
+
+The response includes:
+
+| Field | Meaning |
+|---|---|
+| `contract_version`, `server_version` | Discovery contract and package versions |
+| `authorization_model` | `built_in_global_roles`; this is not tenant/space isolation |
+| `permissions` | Current effective `read`, `write`, `create`, `delete`, `alter`, `drop` permissions; a GUEST receives only `read` |
+| `capabilities` | Sorted name/status entries: `schema_discovery`, `text_query`, `request_read_only` are `available`; `parameter_binding`, `snapshot_pagination`, `durable_idempotency`, `mutation_preview`, `revision_preconditions`, `space_scoped_grants` are `unsupported` |
+| `schema_state`, `schema` | `available` with the target schema, or `not_selected` with no schema |
+| `consistency` | `live_reads_no_snapshot`; concurrent DDL can change metadata between reads |
+| `schema_snapshot`, `schema_revision` | Both false; neither a snapshot nor a revision token is provided |
+| `limits` | `max_tags=256`, `max_edges=256`, `max_properties_per_type=128`, `max_metadata_bytes=262144` |
+
+`schema` contains `space`, `vid`, sorted `tags`, and sorted `edges`. VID `kind`
+is `int64` or `fixed_string`, with `max_utf8_bytes` for fixed strings. A tag/edge
+contains `name` and properties, each with `name`, `data_type`, `nullable`,
+`has_default`, and optional `max_utf8_bytes`. Default expressions/values, graph
+records, internal string-ID mappings, ontology rules and proof data are not
+returned. Small bounded integers describe sizes; no INT64 graph value is encoded
+as a potentially lossy JSON number by this endpoint.
+
+Read permission is checked before target metadata, including whether a target
+exists. A principal without Read receives the same denial for existing and
+missing spaces. Built-in roles currently apply globally, so a GUEST can discover
+any space. Capability metadata does not grant authority to future calls.
+
+The byte limit counts cumulative stored metadata key/value bytes. Count/byte
+limits, malformed metadata and storage failures fail the entire discovery;
+they never return a truncated or empty successful schema. This is not a promise
+of bounded internal allocation/time in every KV implementation. There is no
+pagination or snapshot continuation.
+
+Discovery errors use a separate stable envelope `{contract_version, code, message}`;
+messages contain no raw storage details, bearer IDs or target names. gRPC returns
+standard Status plus `byoridb-error-code` and `byoridb-contract-version` metadata.
+Clients use codes rather than parsing message text. This contract does not change
+legacy query error codes or promise rollback for query mutations.
+
+| Code | HTTP | gRPC Status |
+|---|---:|---|
+| `AUTH_REQUIRED`, `SESSION_EXPIRED` | 401 | `Unauthenticated` |
+| `PERMISSION_DENIED` | 403 | `PermissionDenied` |
+| `INVALID_REQUEST` | 400 | `InvalidArgument` |
+| `UNSUPPORTED_CONTRACT` | 400 | `Unimplemented` |
+| `SPACE_NOT_FOUND` | 404 | `NotFound` |
+| `RESOURCE_EXHAUSTED` | 413 | `ResourceExhausted` |
+| `STORAGE_ERROR`, `INVALID_METADATA` | 500 | `Internal` |
+| `SERVICE_UNAVAILABLE` | 503 | `Unavailable` |
+
 ## gRPC GraphService
 
 The source definition is `byoridb-graph/proto/graph.proto`:
@@ -99,6 +171,7 @@ service GraphService {
   rpc SignOut(SignOutRequest) returns (SignOutResponse);
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
   rpc ExecuteJson(ExecuteRequest) returns (ExecuteJsonResponse);
+  rpc Discover(DiscoverRequest) returns (DiscoverResponse);
 }
 
 message AuthenticateRequest {

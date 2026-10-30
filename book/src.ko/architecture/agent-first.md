@@ -71,8 +71,9 @@ asserted fact가 현실에서 참이라는 증거는 아닙니다. 출처와 논
 
 ## 제품 평가 방법
 
-EVAL-1은 계획이며 이미 실행한 벤치마크가 아닙니다. 알려진 fixture에서 discovery,
-제한된 조회, 도출 설명, 철회, 응답 유실 후 재시도, 동시 변경, 접근 거부를 검증합니다.
+EVAL-1에는 정확한 답과 최종 상태를 검사하는 결정적 discovery·조회·접근 거부
+fixture가 있으며 자율 모델 평가는 실행하지 않았습니다. 제한된 조회, 도출 설명,
+철회, 응답 유실 후 재시도, 동시 변경 평가가 남아 있습니다.
 비인가 쓰기·중복 쓰기를 포함해 답변과 최종 DB 상태를 함께 평가합니다.
 
 모델·prompt·도구·서버 revision·데이터·예산·실행 설정을 고정하고 반복 결과와 모든
@@ -81,9 +82,10 @@ EVAL-1은 계획이며 이미 실행한 벤치마크가 아닙니다. 알려진 
 
 ## 현재 제약은 계속 적용됩니다
 
-현재 HTTP/gRPC API는 주로 쿼리 텍스트를 실행합니다. `read_only`는 강제하지만 외부
-타입 파라미터, 범용 capability discovery, 영속 요청 중복 방지, revision에 묶인
-preview/apply는 구현된 계약이 아닙니다. `WHY`는 정수 ID를 받고 표 형태의 설명을
+HTTP/gRPC는 쿼리 텍스트와 discovery 계약 1을 제공합니다. 인증된 tag/edge/property
+스키마를 제한된 크기로 반환하고 전역 역할 권한·미지원 capability를 명시합니다.
+`read_only`는 강제하며 외부 타입 파라미터·영속 요청 중복 방지·revision에 묶인
+preview/apply는 계속 미구현입니다. `WHY`는 정수 ID를 받고 표 형태의 설명을
 반환합니다. Asserted fact의 `FETCH ... AS OF`는 과거 추론을 재구성하지 않습니다.
 Compound는 앞 문장의 변경을 남길 수 있고 `sameAs` 병합은 되돌릴 수 없습니다.
 연동 전 [실행 구조](overview.html)와 [API 레퍼런스](../reference/api.html)를 확인하세요.

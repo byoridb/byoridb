@@ -10,7 +10,7 @@ run against the intended build and workload.
 ## Agent task outcomes
 
 The [agent-first design](../architecture/agent-first.html) makes successful
-agent tasks the product-level measure. EVAL-1 is planned; this page does not
+agent tasks the product-level measure. EVAL-1 has deterministic contract fixtures; this page does not
 report agent benchmark results. A future run must pin model/prompt/tool/server
 versions, fixtures, budgets, and repetitions; verify answers, evidence, and
 final state before comparing calls, tokens, latency, or cost. Include failed

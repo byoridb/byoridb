@@ -2,7 +2,7 @@
 
 > **English** | [한국어](PLAN.ko.md)
 >
-> Updated: 2026-10-30. Released baseline: **v0.4.20**, `main` at `c9bd11c`.
+> Updated: 2026-10-30. Code baseline: `main` at `6d77d89` (version **v0.4.21**).
 > This is a source-based plan, not a live deployment report. Unreleased work and
 > checks performed during this revision are identified separately below.
 
@@ -37,13 +37,13 @@ truth of an external source. Selected nGQL and RDFS/OWL-style features do not
 imply complete nGQL, OWL, SHACL, RDF, or SPARQL conformance.
 
 The product direction is approved; the new machine contracts below are
-**PLANNED, not implemented or released**. The released baseline remains the
-following table. Do not publish proposed fields, tool names, idempotency,
+**PLANNED or IN PROGRESS** except the verified slices recorded below. The
+following table summarizes the pre-foundations baseline. Do not publish proposed fields, tool names, idempotency,
 revision checks, or snapshot guarantees as available API behavior.
 
-## Released baseline and boundaries
+## Code baseline and boundaries
 
-| Area | Available at v0.4.20 | Remaining boundary |
+| Area | Available at the code baseline | Remaining boundary |
 |---|---|---|
 | Runtime | Rust 1.90; a single server shares a graph service and redb store across HTTP/gRPC | Raft/routing components exist; a supported multi-node runtime and failover gate do not |
 | Queries | Vertex/edge CRUD, `FETCH`, `GO`, `MATCH`, tag/edge `LOOKUP`, path finding, `EXPLAIN`/`PROFILE` | Resource guards lack a uniform complete-or-error contract; compound statements are not transactions |
@@ -77,46 +77,49 @@ Security and correctness defects preempt feature work regardless of stage.
 
 | ID / status | Work | Acceptance |
 |---|---|---|
-| DEP-1 / PLANNED | Resolve the current dependency-audit failure in a separate compatibility-reviewed change | Investigate dependency paths and available fixes; update compatible dependencies/lockfile, pass the current audit and workspace checks, require the audit in the automatic release path, and document any unresolved advisory and release decision explicitly. |
+| DEP-1 / DONE (unreleased) | Resolve the current dependency-audit failure in a separate compatibility-reviewed change | Investigate dependency paths and available fixes; update compatible dependencies/lockfile, pass the current audit and workspace checks, require the audit in the automatic release path, and document any unresolved advisory and release decision explicitly. |
 
-On 2026-10-30, `cargo audit` against the unchanged baseline lockfile reported
-**10 vulnerabilities** across `pulldown-cmark`, `rustls`, `rustls-webpki`, `zstd`,
-`zstd-safe`, and `zstd-sys`. This does not meet the dependency release-readiness
-requirement and does not prove exploitability in ByoriDB. It supersedes old
-clean-audit statements in the archive.
-Current automation does not fully enforce this requirement: the `CI` workflow's
-release-build job waits for audit, but `autorelease.yml` starts on a `main` push,
-bumps the patch version, and invokes `release.yml` independently. That release
-gate checks signing credentials, formatting, and workspace tests, not audit.
-DEP-1 includes closing this automation gap; these changes do not modify workflows.
-Keep this upgrade investigation separate from QRY-1's error-propagation patch.
-Read-only compatibility inspection found that `pulldown-cmark >=0.13.5`,
-`rustls >=0.23.46` and `rustls-webpki >=0.103.16` fit the current semver ranges
-(six advisories). The remaining four need `zstd >=0.14.3`, `zstd-safe >=8.2`
-and `zstd-sys >=2.1.2`, while tonic 0.14.6 requires `zstd ^0.13`; a lockfile-only
-refresh cannot resolve that group. Investigate a compatible tonic upgrade and
-test client/server compression round trips. Compression is in use: removing it
-or ignoring advisories is not an equivalent fix. No upgrade has been performed.
+On 2026-10-30, the baseline lockfile audit reported **10 vulnerabilities**
+across `pulldown-cmark`, `rustls`, `rustls-webpki`, `zstd`, `zstd-safe`, and
+`zstd-sys`. The foundations change updates compatible dependencies, including
+tonic 0.14.9's patched zstd dependency, without disabling compression or ignoring
+advisories. The current candidate audit reports **zero vulnerabilities**.
+Gzip, zstd, and uncompressed requests/responses receive real gRPC round-trip tests.
+
+The release workflow now audits its exact release ref after signing-secret
+preflight and before building or publishing. Auto-release audits before changing
+the version and each candidate before pushing, including after a rebase. These
+checks close the earlier gap where only the separate CI release-build waited
+for audit. Workflow edits are local until integrated; a local audit does not
+prove a GitHub Actions run or release succeeded.
+
+`bincode` 1.3.3's unmaintained warning remains a separate storage-format migration
+constraint (#105), not an ignored vulnerability. DEP-1 passes its local acceptance: final workspace, compression and audit
+checks are recorded below. Integration and hosted release execution remain separate.
 
 ### Stage 1 — correctness and machine contracts
 
 | ID / status | Work | Dependencies | Acceptance |
 |---|---|---|---|
-| QRY-1 / DONE (unreleased) | Propagate `OPTIONAL MATCH` errors | None | Genuine no-match retains null-binding semantics. Errors returned by optional execution and pattern resolution propagate unchanged, with injected storage failures, partial-row failures and chained cases covered. Eight focused regressions and workspace/documentation checks pass; see the prior-slice verification record below. Lower-level paths that swallow their own errors remain QRY-2. DEP-1 remains a release-readiness requirement. |
-| QRY-2 / PLANNED | Uniform scan/traversal/result completeness | QRY-1; co-design API-2/AGT-2 result contract | Audit limiting paths and swallowed lower MATCH index/partition errors. Below/at/above a cap, return the complete query-defined result or an explicit error. User `LIMIT` is query semantics. Any partial mode needs separate design, explicit opt-in and a machine-readable reason; no partial mode is currently promised. |
+| QRY-1 / DONE (unreleased) | Propagate `OPTIONAL MATCH` errors | None | Genuine no-match retains null-binding semantics. Errors returned by optional execution and pattern resolution propagate unchanged, with injected storage failures, partial-row failures and chained cases covered. Eight focused regressions and workspace/documentation checks pass; see the prior-slice verification record below. The next MATCH candidate/partition slice is tracked in QRY-2. DEP-1 remains a release-readiness requirement. |
+| QRY-2 / IN PROGRESS | Uniform scan/traversal/result completeness | QRY-1; co-design API-2/AGT-2 result contract | Audit limiting paths and swallowed lower MATCH index/partition errors. Below/at/above a cap, return the complete query-defined result or an explicit error. User `LIMIT` is query semantics. Any partial mode needs separate design, explicit opt-in and a machine-readable reason; no partial mode is currently promised. |
 | QRY-3 / PLANNED | Inference completeness and recovery | QRY-2 error contract | Cap/error cannot report completed closure. Fault tests expose asserted/derived write state; retry/rebuild converges without duplicate or stale provenance. Specify rollback versus resumable recovery first: an error alone does not prove rollback. |
 | QRY-4 / PLANNED | Real server deadline and cancellation | QRY-2; QRY-3 for writes | Expensive execution stops at tested cancellation points, cleans up resources/diagnostics and returns stable HTTP/gRPC errors. Test write interruption and atomic boundaries; a setting or client disconnect alone is not proof of cancellation. |
 | API-1 / PLANNED | Typed query parameters | Design now; QRY-1–2 for execution acceptance | Pass IDs, Unicode, nulls and lists without interpolation over HTTP/gRPC; consistent missing/type errors; distinguish parameters from compound variables. |
-| API-2 / PLANNED | Stable errors, values and capabilities | Minimum envelope design now; full acceptance needs QRY-1–4 and TXN-1 | Fix error/retry/outcome meanings, integer precision, complex values and version compatibility. Define the discovery envelope before AGT-1 implementation. Admit capabilities only after their runtime checks; unknown mutation outcome is not a safe-to-retry success/failure claim. |
-| AGT-1 / PLANNED | Structured operations and authorized schema/capability discovery | Agreed API-2 discovery/error/value envelope; API-1 for parameterized execution; existing auth; SEC-3 before scoped-grant claims | Start with read-only discovery and contract fixtures. Return only authorized schema and implemented capabilities with version/limits and permission context. Test missing/denied/unsupported states, read-only restrictions and no schema leakage. Add typed operations incrementally; text query escape hatches retain the same authorization and result rules. |
+| API-2 / IN PROGRESS | Stable errors, values and capabilities | Minimum envelope design now; full acceptance needs QRY-1–4 and TXN-1 | Fix error/retry/outcome meanings, integer precision, complex values and version compatibility. Define the discovery envelope before AGT-1 implementation. Admit capabilities only after their runtime checks; unknown mutation outcome is not a safe-to-retry success/failure claim. |
+| AGT-1 / IN PROGRESS | Structured operations and authorized schema/capability discovery | Agreed API-2 discovery/error/value envelope; API-1 for parameterized execution; existing auth; SEC-3 before scoped-grant claims | Start with read-only discovery and contract fixtures. Return only authorized schema and implemented capabilities with version/limits and permission context. Test missing/denied/unsupported states, read-only restrictions and no schema leakage. Add typed operations incrementally; text query escape hatches retain the same authorization and result rules. |
 | AGT-2 / PLANNED | Bounded result and evidence envelope | API-2 design, QRY-2; QRY-3/4 and TXN-1 for respective claims | Distinguish query completeness, page completion and inference status; declare snapshot/revision support or its absence. Bound rows, bytes, evidence and execution; define continuation consistency and provenance scope. Truncation cannot become complete success; rejected budgets and unsupported modes are explicit. |
-| EVAL-1 / PLANNED | Reproducible agent workflow harness | Baseline fixtures now; version each capability as implemented | Discover, traverse, explain, retract, retry after timeout, race writes and deny access. Verify exact final state, evidence and denied side effects before cost. Pin model/version/date, prompts/settings, data/seed, repetitions and budgets; declare success targets before runs. Record unsupported baseline tasks; compare calls/tokens/latency only for equivalent successful work. |
+| EVAL-1 / IN PROGRESS | Reproducible agent workflow harness | Baseline fixtures now; version each capability as implemented | Discover, traverse, explain, retract, retry after timeout, race writes and deny access. Verify exact final state, evidence and denied side effects before cost. Pin model/version/date, prompts/settings, data/seed, repetitions and budgets; declare success targets before runs. Record unsupported baseline tasks; compare calls/tokens/latency only for equivalent successful work. |
 
 QRY-1 is implemented and verified on `main` in commit `10a7811`; release
-publication has not been verified. Immediate work is **DEP-1** for release readiness, plus **QRY-2**, **AGT-1
-read-only discovery contract/fixtures**, and **EVAL-1 baseline fixtures** in
-parallel. Agree the minimum API-2 envelope and authorization policy before AGT-1
-runtime implementation. QRY-3 failure/recovery design, OPS-1 restore fixtures and
+publication has not been verified. The foundations slice on
+`codex/agent-foundations` advances DEP-1, MATCH candidate/variable-length
+completeness in QRY-2, discovery v1 in API-2/AGT-1, and deterministic EVAL-1 fixtures.
+QRY-2 still needs LOOKUP/path, projection/decode-error and optimized count audits.
+API-2 and AGT-1 remain IN PROGRESS: discovery does not implement typed query
+parameters, general operation envelopes, or space-scoped grants. EVAL-1's
+[fixture protocol](../tests/fixtures/agent-workflows/README.md) covers exact
+answers, denied side effects and final state; no autonomous model run is claimed. QRY-3 failure/recovery design, OPS-1 restore fixtures and
 PERF-1 baseline collection can also start without waiting for the entire stage.
 Stage 1 is complete only when every listed task passes its acceptance; early
 contract work does not mark later write, security, or cancellation behavior done.
@@ -210,6 +213,56 @@ acceptance boundaries rather than duplicating the historical issue diary.
 
 ## Verification and maintenance
 
+### Foundations implementation — 2026-10-30
+
+Local work on `codex/agent-foundations` adds four independently reviewable slices:
+
+- **DEP-1:** compatible dependency patches and mandatory audit in automatic
+  version-bump/release paths. Compression remains enabled; actual gzip/zstd/plain
+  gRPC requests and responses retain exact UTF-8 values.
+- **QRY-2 partial:** MATCH full/tag-VID/property-index candidate scans probe cap+1;
+  over-budget scans and variable-length traversal fail explicitly. Index partition
+  and group-count errors propagate. Malformed tag-index encodings fail rather than
+  hide the cap sentinel or become phantom IDs. Zero budget remains unbounded;
+  query LIMIT/OFFSET semantics are preserved, without overriding scan budgets.
+- **AGT-1/API-2 partial:** read-only discovery contract 1 with a shared authenticated
+  service path, bounded schema, fixed errors and HTTP/gRPC parity. Effective roles
+  are global; snapshot/revision and proposed write contracts remain unsupported.
+- **EVAL-1 partial:** two versioned INT64/string-ID task fixtures check discovery,
+  exact answers, access denials and unchanged final person rows in fresh in-memory
+  databases. No model evaluation or performance advantage is claimed.
+
+Compression validation also exposed a long-literal lexer stack overflow with a
+213KB string before any network/compression processing. An iterative quoted-string
+scanner fixes that path while retaining escape, Unicode and location semantics.
+New tests process large literals on a 128KiB stack; transport tests now use 213KB
+individual strings and four result rows without increasing the test stack.
+This does not establish a bound for every parser nesting/depth shape.
+
+MATCH candidate/traversal regressions first produced 8 failures and 5 passing
+controls; the malformed index sentinel case independently reproduced a successful
+partial result before its fix. Final focused checks pass: MATCH 55, storage 59,
+discovery 15, parser 136, compression 3, and EVAL fixtures 2. Whole-workspace results
+are recorded below. The release workflow's
+failure simulation confirms an audit failure prevents the initial push and any
+post-rebase push; hosted GitHub Actions and release publication were not run here.
+
+
+| Final local gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `cargo check --locked --workspace --all-targets --all-features` | PASS |
+| `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` | PASS |
+| `cargo test --locked --workspace --all-features -- --test-threads=1` | PASS: 1,057 passed, 8 ignored across 36 suites; ignored cases were not run |
+| `cargo build --locked --workspace --release` | PASS |
+| `cargo audit --json` (local cargo-audit 0.22.1) | PASS: zero vulnerabilities, zero unsound/yanked warnings; bincode unmaintained warning retained |
+| `mdbook build book` and `mdbook build book/ko` | PASS |
+| Documentation parity and local links | PASS: 10 rendered pages, 204 links/anchors, 9 EN/KO code-example pairs and 34 task/status rows |
+| `git diff --check` | PASS |
+
+These are local acceptance results, not a hosted CI or release result. The
+workflow keeps its pinned cargo-audit 0.22.2; the local audit used 0.22.1.
+
 ### Agent-first design revision — 2026-10-30
 
 The product design, public entry points, architecture summary, contribution
@@ -218,8 +271,8 @@ Both mdBook builds, local file/rendered-link checks, EN/KO task and example
 parity, and `git diff --check` pass. This revision changes documentation and
 book metadata only; it does not implement the proposed agent contracts.
 No Rust gates or agent/model evaluations were rerun for this documentation
-revision. The earlier QRY-1 implementation evidence remains below; DEP-1 is
-still an unresolved release prerequisite.
+revision. The earlier QRY-1 implementation evidence remains below; DEP-1 was
+still unresolved at that checkpoint and is updated in the foundations record.
 
 ### QRY-1 branch verification — 2026-10-30
 

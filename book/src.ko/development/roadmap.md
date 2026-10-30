@@ -2,7 +2,7 @@
 
 [English](../../development/roadmap.html) | **한국어**
 
-2026-10-30, **v0.4.20**(`c9bd11c`) 기준입니다. ByoriDB는 **Agent를 직접 사용자로
+2026-10-30, 코드 기준선 **v0.4.21**(`6d77d89`)에서 갱신했습니다. ByoriDB는 **Agent를 직접 사용자로
 삼는 범용 그래프·온톨로지 DB**를 지향합니다. 사람은 배포를 운영·평가·통제하고 도입을
 결정합니다. Agent 메모리는 여러 사용례 중 하나입니다. 확인 가능한 근거와 신뢰할 수 있는
 상태 변경을 통해 작업을 정확하게 끝내는 것이 목표이며, Agent 비용·속도 우위는 앞으로
@@ -11,9 +11,10 @@
 [제품 철학과 디자인](https://github.com/byoridb/byoridb/blob/main/docs/PRODUCT_DESIGN.ko.md)은
 목표 계약을 정의하고, [docs/PLAN.ko.md](https://github.com/byoridb/byoridb/blob/main/docs/PLAN.ko.md)가
 구현 상태의 기준입니다. 승인된 방향·수용 계획이며 확정 릴리스 일정이 아닙니다.
-아래 새 Agent 계약은 **PLANNED**이며 현재 제공하는 API가 아닙니다.
+읽기 전용 discovery 계약 1은 foundations에서 구현하며 다른 Agent 계약은
+플랜에 기록한 PLANNED 또는 IN PROGRESS 상태입니다.
 
-## 릴리스 기준선에서 제공하는 기능
+## 코드 기준선에서 제공하는 기능
 
 - vertex/edge CRUD, `FETCH`, `GO`, `MATCH`, tag/edge `LOOKUP`, 경로 탐색,
   `EXPLAIN`·`PROFILE`. edge UPDATE와 지원되는 로컬 edge index range가 구현됐고,
@@ -38,7 +39,7 @@
 
 | 순서 | 목표 | 수용 기준의 중심 |
 |---|---|---|
-| 릴리스 선결 | 의존성 감사 해결(DEP-1) | 호환 가능한 dependency 갱신, 최신 audit·workspace gate 통과. 2026-10-30 audit는 기준선 취약점 10건으로 실패 |
+| 릴리스 선결 | 의존성 감사 해결(DEP-1) | 호환 버전 갱신으로 audit 취약점 10→0. 자동 버전 갱신·릴리스 경로에도 audit 필수화 |
 | 1 | 정확성과 기계 계약(QRY-1–4, API-1–2, AGT-1–2, EVAL-1) | 완전한 결과 또는 명시적 오류, 추론 복구·실제 취소. 타입 있는 파라미터·오류, 권한 내 탐색, 범위가 제한된 결과·근거, 초기 Agent 평가 기준선 |
 | 2 | 복구·신뢰할 수 있는 쓰기·접근 경계(OPS-1–2, TXN-1–2, SEC-3/1, AGT-3–4) | 복원 시험·저장 형식 버전. compound 결과 명시 후 DML 원자성. space 권한·TLS 조기 제공, 영속 멱등 결과·revision·preview/apply |
 | 3 | 온톨로지 일관성과 근거(SEM-6/3/4/7/8) | 문자열 VID, 정점 타입 설명, shape/추론·cardinality 정책, revision을 검사하는 `sameAs` preview·병합 기록, assertion 출처·명시적 전제 신뢰 정책 |
@@ -49,14 +50,25 @@
 첫 구현 단위인 **QRY-1**은 정상적인 매칭 없음의 null binding을 유지하면서
 `OPTIONAL MATCH` 실행·패턴 해석이 반환한 오류를 전파합니다.
 `main`의 커밋 `10a7811`에서 집중 회귀 8개와 이전 workspace·문서 검증을
-통과했으며 릴리스 발행은 확인하지 않았습니다. DEP-1은 출시 준비 요건이며 의존성 업그레이드는
-별도 호환성 검토 변경입니다. 하위 경로의 오류 무시와 자원 상한 의미는 QRY-2에 남습니다.
+통과했으며 릴리스 발행은 확인하지 않았습니다.
 
-다음 작업은 **DEP-1**, **QRY-2**, **AGT-1 read-only 탐색 계약·fixture**,
-**EVAL-1 기준선 fixture**의 병행입니다. AGT-1 runtime 작업 전에 최소 API-2의
-탐색·오류·값 envelope와 권한 정책을 합의합니다. 복원 시험·TLS 검증·벤치마크 기준선은
-즉시 시작할 수 있습니다. space 권한·TLS는 SDK 완료를 기다리지 않습니다. 설계 합의와
-구현 수용은 별개이며 runtime 동작이 수용 검증을 통과한 뒤에 지원한다고 알립니다.
+후속 foundations 변경은 MATCH 후보 스캔·가변 길이 탐색 상한을 명시적인 오류로
+반환하고 index partition 실패를 전파하며 손상된 tag-index key를 거부합니다.
+긴 문자열 lexer를 반복 스캐너로 바꿔 스택 초과도 수정합니다. 작은 query `LIMIT`이
+후보 scan budget을 우회하지는 않습니다. LOOKUP/path 상한, projection/decode 오류,
+count 최적화 수용 검증이 남아 QRY-2는 IN PROGRESS입니다.
+
+HTTP `POST /api/v1/discover`와 gRPC `Discover`가 discovery 계약 1을 제공합니다.
+인증된 tag/edge/property 스키마를 제한된 크기로 반환하고 전역 역할 권한, 미지원
+capability, 안정적인 discovery 오류를 명시합니다. 타입 있는 query 파라미터,
+snapshot/revision token, space별 권한을 뜻하지 않습니다.
+[API 레퍼런스](../reference/api.html#read-only-discovery-contract-1)를 참조하세요.
+결정적인 EVAL-1 fixture 두 개는 discovery, 정확한 INT64/문자열 ID 응답, 쓰기 거부,
+최종 상태 유지를 검증하며 자율 모델 실행은 아닙니다.
+
+다음 작업은 남은 QRY-2 감사와 API-1 타입 파라미터 바인딩이며, API-2의 일반 결과/오류
+의미와 추론·철회 fixture를 함께 진행합니다. 복원 시험·TLS도 병행할 수 있습니다.
+Capability를 공개하기 전에 runtime 수용 검증을 통과해야 합니다.
 
 EVAL-1은 탐색·관계 조회·설명·철회·timeout/재시도·동시 쓰기·접근 거부를 다룹니다.
 최종 상태·근거의 정확성과 거부된 변경의 부재를 먼저 검증합니다. 모델/버전/날짜,
@@ -66,7 +78,7 @@ prompt/settings, 데이터/seed, 반복 횟수·예산을 고정하고 실행 �
 ## 기계 계약의 경계
 
 현재 HTTP/gRPC 쿼리 실행은 `read_only`를 지원하고 edge `WHY`는 문자열 열을
-반환합니다. 타입 있는 쿼리 파라미터, 구조화된 탐색·proof envelope, 영속 멱등성,
+반환합니다. 타입 있는 쿼리 파라미터, 구조화된 proof envelope, 영속 멱등성,
 revision 검사와 preview/apply는 계획입니다. 별도 MCP 서버는 `byori`에 있을 수 있으며
 어댑터가 엔진 기능을 만들어내지는 않습니다. 어댑터는 권한·타입·완전성·예산·결과 상태를
 보존해야 합니다.

@@ -2,7 +2,7 @@
 
 **English** | [한국어](../ko/development/roadmap.html)
 
-Updated 2026-10-30 against **v0.4.20** (`c9bd11c`). ByoriDB is developing into an
+Updated 2026-10-30 from code baseline **v0.4.21** (`6d77d89`). ByoriDB is developing into an
 **agent-first, general-purpose graph and ontology database**. Agents are direct
 consumers; people operate, evaluate, govern and purchase deployments. Agent memory
 is one use case. The goal is correct task completion with inspectable evidence and
@@ -12,9 +12,10 @@ The [product philosophy and design](https://github.com/byoridb/byoridb/blob/main
 define the target contracts. The delivery source of truth is
 [docs/PLAN.md](https://github.com/byoridb/byoridb/blob/main/docs/PLAN.md).
 This is an approved direction and acceptance plan, not a release schedule.
-New agent contracts below remain **PLANNED**, not available APIs.
+Read-only discovery contract 1 is implemented in the foundations slice; other
+agent contracts remain PLANNED or IN PROGRESS as recorded in the plan.
 
-## Available in the released baseline
+## Available in the code baseline
 
 - Vertex and edge CRUD, `FETCH`, `GO`, `MATCH`, tag/edge `LOOKUP`, path finding,
   `EXPLAIN` and `PROFILE`. Edge updates and eligible local edge-index ranges are
@@ -40,7 +41,7 @@ Selected nGQL/OWL-style features do not imply full language/standard conformance
 
 | Order | Outcome | Acceptance focus |
 |---|---|---|
-| Release prerequisite | Resolve dependency audit findings (DEP-1) | Compatible dependency updates, current audit and workspace gates; the 2026-10-30 audit reported 10 baseline vulnerabilities and failed |
+| Release prerequisite | Resolve dependency audit findings (DEP-1) | Compatible updates reduce the audit from 10 vulnerabilities to zero; audit is required in automatic version bump and release paths |
 | 1 | Correctness and machine contracts (QRY-1–4, API-1–2, AGT-1–2, EVAL-1) | Complete results or explicit errors, inference recovery, actual cancellation; typed parameters/errors, authorized discovery, bounded results/evidence and an early agent evaluation baseline |
 | 2 | Recovery, reliable writes and access boundaries (OPS-1–2, TXN-1–2, SEC-3/1, AGT-3–4) | Restore drills and versioned storage; explicit compound outcomes then atomic DML; early space grants/TLS; durable idempotent outcomes, revisions and preview/apply |
 | 3 | Ontology consistency and evidence (SEM-6/3/4/7/8) | String VID parity, vertex-type explanations, shape/inference and cardinality policy, revision-checked `sameAs` preview/merge records, assertion origin and explicit premise-trust policy |
@@ -52,16 +53,27 @@ The first implementation slice, **QRY-1**, propagates errors returned by
 `OPTIONAL MATCH` execution and pattern resolution while preserving genuine
 no-match null bindings. It is implemented on `main` in commit `10a7811` with
 eight focused regressions and prior workspace/documentation checks passing;
-release publication has not been verified. DEP-1 remains a release-readiness requirement; dependency upgrades
-are a separate compatibility-reviewed change. Lower-level swallowed errors and
-resource-limit semantics remain in QRY-2.
+release publication has not been verified.
 
-Next, run **DEP-1**, **QRY-2**, **AGT-1 read-only discovery contract/fixtures**, and
-**EVAL-1 baseline fixtures** in parallel. Agree the minimum API-2 discovery/error/
-value envelope and authorization policy before AGT-1 runtime work. Restore drills,
-TLS validation and benchmark baselines can start now. Space grants and TLS do not
-wait for SDK delivery. Design agreement is distinct from implementation acceptance;
-a capability may be advertised only after its runtime behavior passes acceptance.
+The next foundations slice adds explicit errors for MATCH candidate-scan and
+variable-length traversal caps, propagates index partition failures, rejects
+malformed tag-index keys, and replaces recursive long-string lexing with an
+iterative scanner. A small query `LIMIT` does not bypass a candidate scan budget.
+QRY-2 remains IN PROGRESS: LOOKUP/path limits, projection/decode errors and count
+optimizations still need acceptance.
+
+HTTP `POST /api/v1/discover` and gRPC `Discover` now provide discovery contract 1:
+authenticated, bounded tag/edge/property schemas, global-role permissions,
+explicit unsupported capabilities, and stable discovery errors. No typed query
+parameters, snapshot/revision tokens or space grants are implied. See the
+[API reference](../reference/api.html#read-only-discovery-contract-1).
+Two deterministic EVAL-1 fixtures verify discovery, exact INT64/string-ID answers,
+denied writes and unchanged final state; they are not autonomous model runs.
+
+Next work is the remaining QRY-2 audit and API-1 typed parameter binding, with
+API-2 general result/error semantics and inference/retraction fixtures. Restore
+trials and TLS work can proceed in parallel. Runtime acceptance remains required
+before a capability is advertised.
 
 EVAL-1 covers discovery, traversal, explanation, retraction, timeout/retry,
 concurrent writes and access denial. Verify exact final state, evidence and denied
@@ -72,7 +84,7 @@ tasks. Compare calls, tokens and latency only for equivalent successful work.
 ## Machine-contract boundaries
 
 Current HTTP/gRPC query execution supports `read_only`; edge `WHY` returns string
-columns. Typed query parameters, structured discovery/proof envelopes, durable
+columns. Typed query parameters, structured proof envelopes, durable
 idempotency, revision checks and preview/apply are planned. A separate MCP server
 may belong to `byori`; adapter availability does not create engine capabilities.
 Adapters must preserve authorization, types, completeness, budgets and outcomes.

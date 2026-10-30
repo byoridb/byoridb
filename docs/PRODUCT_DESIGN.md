@@ -13,7 +13,7 @@ execution budget. These are evaluation goals, not measured competitive claims.
 
 This is the authoritative product and interaction design. [PLAN.md](PLAN.md)
 owns delivery order, task status, acceptance evidence, and release prerequisites.
-The released baseline is v0.4.20; subsequent implementation status is identified there.
+Code baselines and verified implementation slices are identified there.
 Update both language editions when changing a contract or product decision.
 
 ## Product boundary
@@ -75,9 +75,10 @@ human confirmation for every mutation: the caller's application chooses its
 approval policy. The database enforces the permissions and preconditions needed
 for any apply, whether the initiator is an agent, a person, or an automated job.
 
-The operation labels and fields discussed below are **proposed contracts**.
-They are not executable endpoints, current SDK methods, or an existing MCP server.
-Exact transport names and wire schemas are settled by their implementation tasks.
+The full workflow below remains a **target contract**. Discovery contract 1 is
+the first implemented slice; the [API reference](../book/src/reference/api.md)
+defines its exact HTTP/gRPC shape and limits. Other operation names and fields
+remain proposals until their implementation acceptance.
 
 ## Machine-facing contract
 
@@ -223,7 +224,7 @@ discovery, traces, fixtures, metrics, or evaluation artifacts. Human operations
 need authorized audit references, content-aware backup verification, restore
 drills, storage-version policy, and a supported secure deployment profile.
 The DEP-1 dependency audit remains a release-readiness requirement; PLAN records
-the current automatic-release enforcement gap.
+the audit enforcement added to the automatic release path.
 
 ## Architecture and migration
 
@@ -241,7 +242,9 @@ the current automatic-release enforcement gap.
 This is a responsibility map, not a claim that the target contracts are implemented.
 The existing HTTP/gRPC service, primitive protobuf result types, and request-level
 `read_only` checks are useful foundations. `SHOW`/`DESCRIBE` already provide
-query-based discovery; a dedicated versioned capability manifest is new work.
+query-based discovery. Discovery contract 1 now adds a bounded, authenticated
+tag/edge/property manifest with explicit unsupported capabilities, global-role
+permissions and no snapshot/revision claims.
 Complex protobuf values currently use JSON fallback. HTTP rows keyed by column
 name can lose duplicate names, and JSON INT64 numbers can lose client precision.
 Errors are coarse, and `execute_with_params` currently ignores its parameter map.

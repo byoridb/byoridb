@@ -1,0 +1,58 @@
+{
+  "fixture_version": 1,
+  "evaluation_kind": "deterministic_service_contract",
+  "model": null,
+  "seed": 0,
+  "repetitions": 1,
+  "task": "Read the declared person graph, preserve external IDs, refuse untrusted writes, and verify the final graph is unchanged.",
+  "space": "agent_eval",
+  "query": "MATCH (n:person) RETURN id(n) AS vid, n.person.name AS name ORDER BY name",
+  "expected_columns": [
+    "vid",
+    "name"
+  ],
+  "read_only_denied": [
+    "SHOW SPACES; DELETE VERTEX \"42\"",
+    "PROFILE INSERT VERTEX person(name) VALUES \"new\":(\"unexpected\")"
+  ],
+  "guest_denied": [
+    "INSERT VERTEX person(name) VALUES \"new\":(\"unexpected\")",
+    "DELETE VERTEX \"42\""
+  ],
+  "expected_side_effects": "none",
+  "evidence_expectation": "asserted rows only; this task makes no inference or external-source truth claim",
+  "unsupported_tasks": [
+    "durable timeout retry",
+    "revision-checked concurrent writes",
+    "snapshot continuation"
+  ],
+  "id": "discover_read_string_without_mutation",
+  "setup": [
+    "CREATE SPACE agent_eval (vid_type=FIXED_STRING(64))",
+    "USE agent_eval",
+    "CREATE TAG person(name STRING)",
+    "INSERT VERTEX person(name) VALUES \"42\":(\"Ada\"), \"사람:grace\":(\"Grace\")"
+  ],
+  "expected_rows": [
+    [
+      {
+        "type": "string",
+        "value": "42"
+      },
+      {
+        "type": "string",
+        "value": "Ada"
+      }
+    ],
+    [
+      {
+        "type": "string",
+        "value": "사람:grace"
+      },
+      {
+        "type": "string",
+        "value": "Grace"
+      }
+    ]
+  ]
+}

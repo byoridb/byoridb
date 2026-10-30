@@ -2,7 +2,7 @@
 
 > [English](PLAN.md) | **한국어**
 >
-> 갱신: 2026-10-30. 릴리스 기준선: **v0.4.20**, `main`의 `c9bd11c`.
+> 갱신: 2026-10-30. 코드 기준선: `main`의 `6d77d89` (버전 **v0.4.21**).
 > 소스 기준 계획이며 실시간 배포 상태 보고가 아닙니다. 이번 개편 중의 검증 결과와
 > 미출시 작업은 아래에서 별도로 구분합니다.
 
@@ -31,13 +31,13 @@ DB는 저장·조회·추론·설명·제약 평가·프로토콜 계약을 담�
 않습니다. 일부 nGQL 및 RDFS/OWL 계열 기능의 구현은 nGQL·OWL·SHACL·RDF·SPARQL
 전체 준수를 뜻하지 않습니다.
 
-제품 방향은 승인됐지만 아래의 새 기계 계약은 **PLANNED이며 구현·출시되지 않았습니다**.
-릴리스 기준선은 다음 표와 같습니다. 제안하는 필드·도구 이름·멱등성·revision 검사·snapshot
+제품 방향은 승인됐으며 아래 검증된 구현 단위를 제외한 새 기계 계약은
+**PLANNED 또는 IN PROGRESS**입니다. 다음 표는 foundations 이전 코드 기준선입니다. 제안하는 필드·도구 이름·멱등성·revision 검사·snapshot
 보장을 현재 API 기능으로 공개하지 않습니다.
 
-## 릴리스 기준선과 제약
+## 코드 기준선과 제약
 
-| 영역 | v0.4.20에서 제공 | 남은 제약 |
+| 영역 | 코드 기준선에서 제공 | 남은 제약 |
 |---|---|---|
 | 런타임 | Rust 1.90; 단일 서버가 graph service와 redb 저장소를 HTTP/gRPC에서 공유 | Raft·라우팅 구성요소는 존재하지만 지원되는 다중 노드 런타임·장애 수용 검증은 없음 |
 | 조회 | vertex/edge CRUD, `FETCH`, `GO`, `MATCH`, tag/edge `LOOKUP`, 경로 탐색, `EXPLAIN`/`PROFILE` | 자원 가드의 완전한 결과 또는 오류 계약이 통일되지 않음; compound는 트랜잭션이 아님 |
@@ -70,44 +70,46 @@ DB는 저장·조회·추론·설명·제약 평가·프로토콜 계약을 담�
 
 | ID / 상태 | 작업 | 수용 기준 |
 |---|---|---|
-| DEP-1 / PLANNED | 현재 의존성 감사 실패를 별도의 호환성 검토 변경으로 해결 | 의존 경로·수정 버전을 조사하고 호환 가능한 dependency/lockfile을 갱신. 최신 audit와 workspace 검증 통과 및 자동 릴리스 경로의 audit 필수화. 남은 advisory와 릴리스 판단은 명시적으로 기록. |
+| DEP-1 / DONE (unreleased) | 현재 의존성 감사 실패를 별도의 호환성 검토 변경으로 해결 | 의존 경로·수정 버전을 조사하고 호환 가능한 dependency/lockfile을 갱신. 최신 audit와 workspace 검증 통과 및 자동 릴리스 경로의 audit 필수화. 남은 advisory와 릴리스 판단은 명시적으로 기록. |
 
-2026-10-30에 기준선 lockfile을 변경하지 않고 실행한 `cargo audit`가 `pulldown-cmark`,
-`rustls`, `rustls-webpki`, `zstd`, `zstd-safe`, `zstd-sys`에서 **취약점 10건**을 보고했습니다.
-이는 의존성 출시 준비 요건 미충족이며, ByoriDB에서의 실제 악용 가능성을 입증한 결과는 아닙니다.
-보관 문서의 과거 clean-audit 기록보다 이 결과를 우선합니다.
-현재 자동화는 이 요건을 완전히 강제하지 않습니다. `CI`의 release-build 작업은 audit를
-기다리지만, `autorelease.yml`은 `main` 푸시로 patch 버전을 올리고 `release.yml`을
-독립적으로 호출합니다. 해당 릴리스 게이트는 서명 자격 증명·format·workspace test만
-검사하며 audit는 검사하지 않습니다. DEP-1에는 이 자동화 공백 해소도 포함하며,
-이번 변경에서 워크플로를 수정하지는 않습니다. 업그레이드 검토는 QRY-1의
-오류 전파 패치와 분리합니다.
-읽기 전용 호환성 검토에서 `pulldown-cmark >=0.13.5`, `rustls >=0.23.46`,
-`rustls-webpki >=0.103.16`은 현재 semver 범위 안에 있음을 확인했습니다(권고 6건).
-나머지 4건은 `zstd >=0.14.3`, `zstd-safe >=8.2`, `zstd-sys >=2.1.2`가 필요하지만
-현재 tonic 0.14.6은 `zstd ^0.13`을 요구하므로 lockfile 갱신만으로 해결되지 않습니다.
-호환되는 tonic 업그레이드를 조사하고 클라이언트·서버 압축 왕복을 검증해야 합니다.
-압축은 실제 사용 중이므로 기능 삭제나 권고 무시는 동등한 수정이 아닙니다.
-업그레이드는 아직 수행하지 않았습니다.
+2026-10-30 기준선 lockfile 감사는 `pulldown-cmark`, `rustls`, `rustls-webpki`,
+`zstd`, `zstd-safe`, `zstd-sys`에서 **취약점 10건**을 보고했습니다. foundations 변경은
+수정된 zstd 의존성을 사용하는 tonic 0.14.9를 포함해 호환 버전을 갱신합니다.
+압축을 끄거나 권고를 무시하지 않으며 현재 후보 audit는 **취약점 0건**입니다.
+Gzip·zstd·무압축 요청/응답은 실제 gRPC 왕복 테스트로 검증합니다.
+
+릴리스 워크플로는 서명 비밀값 preflight 다음에 정확한 release ref를 감사한 뒤
+빌드·발행합니다. Auto-release는 버전 변경 전과 각 push 후보에서 audit하며 rebase
+이후 후보도 재검사합니다. 별도 CI의 release-build만 audit를 기다리던 공백을
+해소하는 변경입니다. 통합 전까지 워크플로 수정은 로컬 상태이며, 로컬 audit만으로
+GitHub Actions 실행·릴리스 성공을 입증하지 않습니다.
+
+`bincode` 1.3.3의 unmaintained 경고는 별도 저장 형식 마이그레이션 제약(#105)으로
+유지하며 취약점을 무시한 것이 아닙니다. 최종 workspace·압축·audit 로컬 수용
+검증을 모두 통과했으며 아래에 기록합니다. 통합과 호스팅된 릴리스 실행은 별도입니다.
 
 ### 1단계 — 정확성과 기계 계약
 
 | ID / 상태 | 작업 | 의존성 | 수용 기준 |
 |---|---|---|---|
 | QRY-1 / DONE (unreleased) | `OPTIONAL MATCH` 오류 전파 | 없음 | 정상적인 매칭 없음은 null binding 유지. optional 호출의 실행 오류와 패턴 해석 오류를 그대로 전파. 저장소 오류·일부 행 처리 후 실패·연속 optional 경로를 검증. 집중 회귀 8개와 workspace·문서 검증 통과. 아래 이전 개발 단위의 검증 기록 참조. 하위 경로가 자체적으로 삼키는 오류는 QRY-2에 남고 DEP-1은 출시 준비 요건으로 남음. |
-| QRY-2 / PLANNED | scan·탐색·결과 완전성 계약 통일 | QRY-1; API-2/AGT-2 결과 계약 공동 설계 | 상한 경로와 하위 MATCH 인덱스/partition의 오류 무시를 감사. cap 미만·경계·초과에서 쿼리가 정의한 완전한 결과 또는 명시적 오류 반환. 사용자 `LIMIT`은 정상 쿼리 의미. 부분 결과 모드는 별도 설계·명시적 opt-in·기계 판독 가능한 사유가 필요하며 현재 제공을 약속하지 않음. |
+| QRY-2 / IN PROGRESS | scan·탐색·결과 완전성 계약 통일 | QRY-1; API-2/AGT-2 결과 계약 공동 설계 | 상한 경로와 하위 MATCH 인덱스/partition의 오류 무시를 감사. cap 미만·경계·초과에서 쿼리가 정의한 완전한 결과 또는 명시적 오류 반환. 사용자 `LIMIT`은 정상 쿼리 의미. 부분 결과 모드는 별도 설계·명시적 opt-in·기계 판독 가능한 사유가 필요하며 현재 제공을 약속하지 않음. |
 | QRY-3 / PLANNED | 추론 완전성과 복구 | QRY-2 오류 계약 | cap·오류가 추론 완료로 보고되지 않음. 실패 주입으로 asserted/derived 쓰기 상태를 확인하고 재시도·재구성이 중복·낡은 근거 없이 수렴. rollback 또는 재개 복구를 먼저 정의하며 오류 반환만으로 rollback을 보장하지 않음. |
 | QRY-4 / PLANNED | 실제 서버 deadline·취소 | QRY-2; 쓰기는 QRY-3 | 실행 중인 무거운 쿼리를 검증된 취소 지점에서 중단하고 자원·진단 상태를 정리하며 HTTP/gRPC에서 안정적인 오류 반환. 쓰기 중단·원자성 경계 검증. 설정값이나 클라이언트 연결 종료만으로 취소를 구현했다고 보지 않음. |
 | API-1 / PLANNED | 타입 있는 쿼리 파라미터 | 설계 즉시; 실행 수용은 QRY-1–2 | HTTP/gRPC로 ID·유니코드·null·list를 문자열 보간 없이 전달. 누락·타입 오류 일관성, 기존 compound 변수와 구분. |
-| API-2 / PLANNED | 오류·값 타입·capability 계약 | 최소 envelope 설계 즉시; 전체 수용은 QRY-1–4와 TXN-1 | 오류·재시도·결과 상태 의미, 정수 정밀도·복합값·버전 호환 정책 고정. AGT-1 구현 전에 discovery envelope 정의. runtime 검증을 통과한 capability만 제공. 쓰기 결과를 모른다는 상태를 안전한 재시도가 가능한 성공·실패로 표현하지 않음. |
-| AGT-1 / PLANNED | 구조화된 연산과 권한 내 schema/capability 탐색 | 합의한 API-2 discovery/오류/값 envelope; 파라미터 실행은 API-1; 기존 인증·권한 적용; space별 권한 주장은 SEC-3 이후 | read-only 탐색과 계약 fixture부터 시작. 권한 내 schema와 구현된 capability만 버전·상한·권한 맥락과 함께 반환. 없음·거부·미지원 상태, read-only 제한, schema 누출 방지 검증. 타입 있는 연산은 점진 추가하며 텍스트 쿼리도 동일한 권한·결과 규칙 적용. |
+| API-2 / IN PROGRESS | 오류·값 타입·capability 계약 | 최소 envelope 설계 즉시; 전체 수용은 QRY-1–4와 TXN-1 | 오류·재시도·결과 상태 의미, 정수 정밀도·복합값·버전 호환 정책 고정. AGT-1 구현 전에 discovery envelope 정의. runtime 검증을 통과한 capability만 제공. 쓰기 결과를 모른다는 상태를 안전한 재시도가 가능한 성공·실패로 표현하지 않음. |
+| AGT-1 / IN PROGRESS | 구조화된 연산과 권한 내 schema/capability 탐색 | 합의한 API-2 discovery/오류/값 envelope; 파라미터 실행은 API-1; 기존 인증·권한 적용; space별 권한 주장은 SEC-3 이후 | read-only 탐색과 계약 fixture부터 시작. 권한 내 schema와 구현된 capability만 버전·상한·권한 맥락과 함께 반환. 없음·거부·미지원 상태, read-only 제한, schema 누출 방지 검증. 타입 있는 연산은 점진 추가하며 텍스트 쿼리도 동일한 권한·결과 규칙 적용. |
 | AGT-2 / PLANNED | 범위가 제한된 결과·근거 envelope | API-2 설계, QRY-2; 해당 보장은 QRY-3/4와 TXN-1 | 쿼리 완전성·페이지 완료·추론 상태 구분. snapshot/revision 지원 또는 부재 명시. 행·바이트·근거·실행 예산 제한과 이어 읽기 일관성·출처 범위 정의. 잘림을 완전한 성공으로 바꾸지 않으며 예산 거부·미지원 모드 명시. |
-| EVAL-1 / PLANNED | 재현 가능한 Agent 작업 하네스 | 기준선 fixture 즉시; 구현한 capability별 버전 관리 | 탐색·관계 조회·설명·철회·timeout 후 재시도·동시 쓰기·접근 거부 평가. 비용보다 최종 상태·근거의 정확성과 거부된 변경의 부재를 먼저 검증. 모델/버전/날짜·prompt/settings·데이터/seed·반복 횟수·예산 고정, 실행 전 성공 기준 선언. 기준선의 미지원 작업을 기록하고 동등하게 성공한 작업끼리 호출·토큰·지연 비교. |
+| EVAL-1 / IN PROGRESS | 재현 가능한 Agent 작업 하네스 | 기준선 fixture 즉시; 구현한 capability별 버전 관리 | 탐색·관계 조회·설명·철회·timeout 후 재시도·동시 쓰기·접근 거부 평가. 비용보다 최종 상태·근거의 정확성과 거부된 변경의 부재를 먼저 검증. 모델/버전/날짜·prompt/settings·데이터/seed·반복 횟수·예산 고정, 실행 전 성공 기준 선언. 기준선의 미지원 작업을 기록하고 동등하게 성공한 작업끼리 호출·토큰·지연 비교. |
 
 QRY-1은 `main`의 커밋 `10a7811`에 구현·검증했으며 릴리스 발행은 확인하지
-않았습니다. 즉시 진행할 작업은 출시 준비를 위한 **DEP-1**과 병행하는 **QRY-2**,
-**AGT-1 read-only 탐색 계약·fixture**, **EVAL-1 기준선 fixture**입니다.
-AGT-1 runtime 구현 전에 최소 API-2 envelope와 권한 정책을 합의합니다.
+않았습니다. `codex/agent-foundations`의 foundations 변경은 DEP-1, QRY-2의
+MATCH 후보·가변 길이 완전성, API-2/AGT-1의 discovery v1, 결정적 EVAL-1 fixture를
+진행합니다. QRY-2에는 LOOKUP/path, projection/decode 오류, 최적화 count 감사가
+남습니다. Discovery가 타입 있는 query 파라미터·일반 연산 envelope·space별 권한을
+구현하는 것은 아니므로 API-2와 AGT-1은 IN PROGRESS입니다. EVAL-1의
+[fixture 절차](../tests/fixtures/agent-workflows/README.ko.md)는 정확한 답·거부된 부작용·
+최종 상태를 검사하며 자율 모델 실행을 주장하지 않습니다.
 QRY-3 실패·복구 설계, OPS-1 복원 fixture, PERF-1 기준선 수집도 전체 단계 완료를
 기다리지 않고 시작할 수 있습니다. 모든 표 항목의 수용 기준을 통과해야 1단계 완료이며,
 초기 계약 설계만으로 후속 쓰기·보안·취소 동작을 완료 처리하지 않습니다.
@@ -199,6 +201,52 @@ functional/inverse-functional property(SEM-1)와 일반 chain(SEM-2)은 구체�
 
 ## 검증과 유지 규칙
 
+### Foundations 구현 — 2026-10-30
+
+`codex/agent-foundations`의 로컬 변경은 다음 네 단위로 나눠 검토할 수 있습니다.
+
+- **DEP-1:** 호환 의존성 패치와 자동 버전 갱신·릴리스 경로의 audit 필수화.
+  압축은 유지하며 실제 gzip/zstd/무압축 gRPC 요청·응답의 UTF-8 값 일치를 검사합니다.
+- **QRY-2 일부:** MATCH full/tag-VID/property-index 후보 scan은 cap+1을 확인하고
+  scan·가변 길이 탐색 상한 초과를 오류로 반환합니다. Index partition·group-count
+  오류를 전파합니다. 손상된 tag-index 인코딩은 cap 판정을 숨기거나 가짜 ID가 되지
+  않고 실패합니다. 0은 무제한이며 query LIMIT/OFFSET는 scan budget을 우회하지 않습니다.
+- **AGT-1/API-2 일부:** 인증을 공유하는 읽기 전용 discovery 계약 1, 제한된 스키마,
+  고정 오류, HTTP/gRPC 일치. 현재 유효 역할은 전역이며 snapshot/revision과
+  제안한 쓰기 계약은 미지원입니다.
+- **EVAL-1 일부:** 버전이 있는 INT64/문자열 ID fixture 두 개가 새 메모리 DB에서
+  discovery·정확한 답·접근 거부·최종 person 행 유지를 검사합니다. 모델 평가나
+  성능 우위를 주장하지 않습니다.
+
+압축 검증 중 네트워크·압축 처리 전의 213KB 문자열에서 lexer 스택 초과를 발견했습니다.
+인용 문자열을 반복 스캐너로 읽어 해당 경로를 수정하고 escape·Unicode·위치 의미를
+유지했습니다. 새 테스트는 128KiB 스택에서 긴 문자열을 처리하며, 통신 테스트도
+스택을 늘리지 않고 개별 213KB 문자열·결과 4행을 검사합니다. 모든 parser 중첩·깊이의
+상한을 입증한 것은 아닙니다.
+
+MATCH 후보·탐색 회귀는 수정 전 8개 실패·정상 대조군 5개 통과를 확인했습니다.
+손상 index의 cap 판정 우회도 별도로 부분 결과 성공을 재현했습니다. 최종 집중 검증은
+MATCH 55개, storage 59개, discovery 15개, parser 136개, 압축 3개, EVAL fixture 2개가
+통과했습니다. 전체 workspace 결과는 아래에 기록합니다.
+릴리스 실패 시뮬레이션은 audit 실패가 최초 및 rebase 이후 push를 막음을 확인했습니다.
+호스팅된 GitHub Actions나 릴리스 발행을 여기서 실행한 것은 아닙니다.
+
+
+| 최종 로컬 검증 | 결과 |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `cargo check --locked --workspace --all-targets --all-features` | PASS |
+| `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` | PASS |
+| `cargo test --locked --workspace --all-features -- --test-threads=1` | PASS: 36개 suite에서 1,057개 통과, 8개 ignored. ignored 항목은 실행하지 않음 |
+| `cargo build --locked --workspace --release` | PASS |
+| `cargo audit --json` (로컬 cargo-audit 0.22.1) | PASS: 취약점·unsound·yanked 경고 0건, bincode unmaintained 경고 유지 |
+| `mdbook build book` 및 `mdbook build book/ko` | PASS |
+| 문서 일치와 로컬 링크 | PASS: 렌더링 페이지 10개, 링크·앵커 204개, 한·영 코드 예제 9쌍, 작업·상태 34행 |
+| `git diff --check` | PASS |
+
+이는 로컬 수용 검증이며 호스팅된 CI나 릴리스 결과가 아닙니다. 워크플로는 고정한
+cargo-audit 0.22.2를 유지하며 로컬 audit는 0.22.1을 사용했습니다.
+
 ### Agent-first 설계 개편 — 2026-10-30
 
 제품 설계, 공개 소개 문서, 아키텍처 요약, 기여 기준, 개발 우선순위를 한·영으로 함께
@@ -206,7 +254,7 @@ functional/inverse-functional property(SEM-1)와 일반 chain(SEM-2)은 구체�
 `git diff --check`를 통과했습니다. 이번 개편은 문서와 book metadata 변경이며
 제안한 Agent 계약을 구현한 것은 아닙니다. 이 문서 개편을 위해 Rust gate나
 Agent·모델 평가는 다시 실행하지 않았습니다. 앞서 실행한 QRY-1 구현 검증은 아래에
-보존하며 DEP-1은 계속 미해결 출시 선행 조건입니다.
+보존합니다. 당시 미해결이던 DEP-1은 foundations 기록에서 갱신합니다.
 
 ### QRY-1 브랜치 검증 — 2026-10-30
 
