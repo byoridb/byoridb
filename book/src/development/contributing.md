@@ -7,6 +7,19 @@ actually enforced by the repository. Read the root `CONTRIBUTING.md` as well.
 If your local checkout includes an `AGENTS.md`, follow those repository-local
 agent instructions for AI-assisted changes.
 
+## Agent-first acceptance
+
+Follow the [product design](../architecture/agent-first.html) and link behavioral
+changes to a [roadmap](roadmap.html) task. Evaluate discovery, lossless values,
+bounded/complete results, evidence, mutation outcomes, and authorization where
+the change affects them. HTTP/gRPC/SDK/MCP adapters share engine semantics.
+
+For an agent-facing change, record a reproducible task, expected answer and
+evidence, and expected final database state. Add the applicable EVAL-1 fixture
+when that planned harness exists; otherwise mark the agent evaluation unrun.
+Measure task correctness before calls, tokens, or latency. Operator-facing
+documentation and CLI changes remain subject to normal usability checks.
+
 ## Prerequisites
 
 - Git
@@ -104,8 +117,10 @@ cargo test --locked --package byoridb-parser
 cargo test --locked --package byoridb-executor <test-name>
 ```
 
-The GitHub workflow also runs a pinned RustSec dependency audit. Its release
-build waits for check, format, Clippy, test, and audit jobs to pass.
+The GitHub `CI` workflow also runs a pinned RustSec dependency audit. Its
+release-build job waits for check, format, Clippy, test, and audit jobs to pass.
+The separate Auto-release workflow runs on `main` pushes and does not currently
+require that audit before publishing; DEP-1 tracks this release-gate gap.
 
 ## High-risk areas
 

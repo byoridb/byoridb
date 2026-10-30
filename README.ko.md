@@ -6,17 +6,26 @@
   <img src="book/src/assets/byoridb-icon.png" alt="ByoriDB official icon" width="256">
 </p>
 
-> Rust로 작성된 시맨틱 그래프 데이터베이스로, 온톨로지 추론, provenance,
-> 시점 이력 조회를 제공합니다.
+> 에이전트가 근거를 확인하며 조회하고 상태를 신뢰할 수 있게 변경하도록 설계하는
+> Agent-first 그래프·온톨로지 데이터베이스입니다.
 
-ByoriDB는 property graph 코어와 semantic layer를 결합합니다. 하나의 standalone
-서버 프로세스에서 nGQL 스타일 쿼리, write-time ontology materialization, 추론
-edge 설명, 과거 시점 조회를 제공합니다.
+ByoriDB의 주 호출자는 AI 에이전트입니다. 데이터 모델을 발견하고, 관계를 조회하고,
+도출 근거를 확인하며, 변경 결과를 명확히 알 수 있게 하는 것이 제품 목표입니다.
+사람은 접근 권한을 설정하고 동작을 검토하며 서비스를 운영합니다. Agent memory,
+의존성 분석, 지식 기반 애플리케이션은 같은 범용 엔진을 사용합니다.
+
+현재 Rust 구현은 property graph와 semantic layer를 결합합니다. 하나의 standalone
+서버 프로세스에서 nGQL 스타일 쿼리, write-time ontology materialization, 추론 edge
+설명, asserted fact의 과거 시점 조회를 제공합니다.
+[제품 철학과 설계](docs/PRODUCT_DESIGN.ko.md)는 목표 Agent 계약을 정의하고,
+[개발 계획](docs/PLAN.ko.md)은 구현된 동작과 계획 중인 discovery·구조화 연산·안전한
+재시도를 구분합니다.
 
 > [!NOTE]
 > Claude Code, Codex 등 코딩 에이전트용 로컬 지식 그래프 및 agent-memory 제품을
-> 찾는다면 **[byoridb/byori](https://github.com/byoridb/byori)**를 참고하세요. 이
-> 저장소는 그 아래에서 사용하는 범용 데이터베이스 엔진입니다.
+> 찾는다면 **[byoridb/byori](https://github.com/byoridb/byori)**를 참고하세요. Byori는
+> 이 범용 엔진 위의 Agent memory 애플리케이션과 MCP 연동입니다. 그 도메인별 도구는
+> 엔진에서 계획하는 Agent 계약과 구분됩니다.
 
 > [!CAUTION]
 > standalone 단일 노드 launcher가 현재의 주 지원 경로입니다. 저장소에는 분산
@@ -26,7 +35,10 @@ edge 설명, 과거 시점 조회를 제공합니다.
 ## 기능
 
 - **Property graph와 nGQL 스타일 쿼리:** `MATCH`, `GO`, `FETCH`, `LOOKUP`,
-  `FIND PATH`, schema operation, data mutation.
+  `FIND PATH`, schema operation, edge `UPDATE`와 indexed edge `LOOKUP`을 포함한
+  vertex/edge 변경.
+- **Vertex ID:** standalone space는 `INT64`와 `FIXED_STRING(n)` ID를 지원합니다.
+  `RECOMMEND`는 아직 `INT64` 전용이고 `WHY`는 정수 ID를 받습니다.
 - **Ontology inference:** class hierarchy 및 transitive, symmetric, inverse,
   subproperty, equivalent-property, 2-link property-chain을 포함한 일부
   RDFS-Plus/OWL 2 RL 스타일 규칙을 write 시점에 materialize합니다.
@@ -85,14 +97,15 @@ listener를 시작합니다. Meta gRPC server는 `cluster.peers`를 설정했을
 
 ### 릴리스 아카이브
 
-현재 최신 공개 릴리스는
-[v0.3.3](https://github.com/byoridb/byoridb/releases/tag/v0.3.3)이며 Linux x86_64,
-macOS Intel 및 Apple Silicon용 archive를 제공합니다. 이 tag는 현재 `main`의 인증
-강화, HTTP/gRPC session state 공유, temporal v1.1 변경 및 edge `AS OF` 조회보다
-이전입니다. 아래 문서의 동작이 필요하면 `main`의 특정 commit을 고정해 source로
-빌드하고, 배포 artifact는 tag 또는 commit SHA로 식별하세요.
+문서의 릴리스 기준은 2026-08-30(KST)에 공개된
+[v0.4.20](https://github.com/byoridb/byoridb/releases/tag/v0.4.20)이며 Linux
+x86_64/arm64와 macOS x86_64/arm64용 archive를 제공합니다. macOS binary는 signing과
+notarization을 거쳤습니다. 이후 artifact는
+[최신 릴리스 페이지](https://github.com/byoridb/byoridb/releases/latest)에서 확인하고,
+배포 artifact는 tag 또는 commit SHA로 식별하세요. tag 이후 `main`의 변경은 해당
+릴리스에 포함되지 않습니다.
 
-ARM Linux, Windows, macOS signing 및 archive license 파일의 현재 제약은
+Windows는 현재 지원하지 않습니다. 지원 플랫폼, 서명 검증 및 이전 archive의 제약은
 [설치 문서](book/src.ko/getting-started/installation.md)를 참고하세요.
 
 ### 사전 요구사항
@@ -156,9 +169,12 @@ Pull Request를 열기 전에 [CONTRIBUTING.ko.md](CONTRIBUTING.ko.md)를 확인
 
 ## 보안 및 배포 경계
 
-ByoriDB는 현재 native TLS termination과 범용 login rate limiter를 제공하지
-않습니다. HTTP와 gRPC를 신뢰할 수 있는 TLS termination 뒤에 두고 network access를
-제한하며, listener를 외부에 노출하기 전에 rate limiting을 추가하세요.
+ByoriDB는 process-local 로그인 실패 제한, 계정 lockout 및 동시 실행 수가 제한된
+Argon2 검증 pool을 제공합니다. 로그인 제한 설정 6개와 sliding session TTL을
+`[auth]`에서 변경할 수 있습니다. Native TLS termination은 구현되지 않았으므로
+HTTP와 gRPC를 신뢰할 수 있는 TLS termination 뒤에 두고 network access를 제한하며,
+edge에서 connection 및 request limit을 적용하세요. 사용 가능한 설정은
+[설정 문서](book/src.ko/getting-started/configuration.md)를 참고하세요.
 
 기본 role은 권한을 `*`(모든 space)에 적용하고 현재 query language에는
 space-scoped `GRANT` 문법이 없습니다. 따라서 tenant isolation 경계로 사용할 수
@@ -169,6 +185,7 @@ space-scoped `GRANT` 문법이 없습니다. 따라서 tenant isolation 경계�
 
 ## 문서
 
+- [제품 철학과 Agent-first 설계](docs/PRODUCT_DESIGN.ko.md)
 - [빠른 시작](QUICKSTART.ko.md)
 - [사용자 및 운영 가이드](book/src.ko/SUMMARY.md)
 - [구현 상태, 제약 및 roadmap](docs/PLAN.ko.md)

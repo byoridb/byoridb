@@ -195,6 +195,9 @@ DROP INDEX TAG IF EXISTS person_name_idx;
 DROP INDEX EDGE IF EXISTS knows_since_idx;
 ```
 
-Tag indexes support `LOOKUP` acceleration and are maintained across current
-INSERT, UPDATE, and DELETE paths. Edge-type `LOOKUP` is not currently wired,
-even though edge index DDL exists.
+Tag and edge indexes accelerate `LOOKUP` equality and eligible single-field
+ordered-range predicates in standalone mode. INSERT, UPDATE, and DELETE
+maintain their entries, including edge `UPDATE`. Supported range key domains
+and scan fallbacks are described in
+[Performance](../../reference/performance.md#create-and-use-secondary-indexes).
+Ordered `LOOKUP` ranges are not supported in distributed execution.

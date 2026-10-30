@@ -1,109 +1,112 @@
 # ByoriDB
 
-[English](../introduction.html) | **한국어**
+[English](../introduction.html)
 
 <p align="center">
-  <img src="assets/byoridb-icon.png" alt="ByoriDB official icon" width="256">
+  <img src="../assets/byoridb-icon.png" alt="ByoriDB official icon" width="256">
 </p>
 
-nGQL 호환 쿼리 언어, 온톨로지 추론(RDFS-Plus)과 bitemporal history를 갖춘 Rust
-그래프 데이터베이스입니다. 분산은 설계와 라이브러리에 반영되어 있으나 다중 노드
-launcher는 아직 로드맵 단계이며, 운영 경로는 단일 노드입니다.
+ByoriDB는 **AI 에이전트를 주 호출자로 설계하는** Rust 그래프·온톨로지 데이터베이스입니다.
+스키마 발견, 관계 조회, 근거 확인, 변경 준비, 호출자 권한 안에서의 적용, 결과 확인으로
+이어지는 예측 가능한 실행 흐름이 제품 목표입니다. Agent memory는 이 범용 엔진의
+응용 사례 중 하나입니다.
 
-## 개요
+[Agent-first 설계](architecture/agent-first.html)는 채택한 방향과 계획 중인 계약을
+설명합니다. 현재 엔진은 nGQL에서 영감을 받은 쿼리 언어, 영속 property graph,
+RDFS-Plus 방식의 전방 추론, 추천 기능, asserted vertex와 edge의 과거 시점 조회를
+제공합니다. 구조화된 Agent 연산, 영속 요청 결과, revision에 묶인 변경 미리보기는
+계획 단계입니다. 구현된 인터페이스는 [API 레퍼런스](reference/api.html)에 명시합니다.
 
-ByoriDB는 다음과 같은 특징을 갖춘 독립적인 그래프 데이터베이스 구현입니다:
+현재 지원되는 배포는 **하나의 redb database를 사용하는 단일 ByoriDB 서버**입니다.
+저장소에는 partition routing, Meta/Storage RPC, custom Raft component도 있지만
+production-ready 다중 노드 launcher로 연결되지는 않았습니다. Cluster 배포를 계획하기
+전에 [분산 시스템](architecture/distributed.html)을 확인하세요.
 
-- **메모리 안전성**: 가비지 컬렉션 없이 Rust의 소유권 모델 사용
-- **두려움 없는 동시성**: 안전한 병렬 처리
-- **무비용 추상화**: 저수준 성능을 갖춘 고수준 API
-- **모던 Async/Await**: Tokio 런타임 기반
+## 구현된 기능
 
-## 아키텍처
+- **Property graph**: space, tag, edge type, vertex, edge, secondary index.
+  Edge update와 index를 사용하는 tag/edge `LOOKUP`도 포함합니다.
+- **Query**: `FETCH`, `GO`, `MATCH`, `LOOKUP`, `FIND PATH`, `EXPLAIN`, `PROFILE`.
+- **Ontology**: class hierarchy, semantic edge 선언, 전방 materialization,
+  `owl:sameAs`, `WHY`를 통한 추론 근거, consistency check, SHACL 방식의 shape 검증.
+- **추천**: 구조적 유사도, embedding 유사도, 큰 vector 집합을 위한 영속 HNSW index,
+  filter, 두 신호를 혼합한 reranking.
+- **시간 조회**: DML이 current view와 asserted-fact history를 유지합니다.
+  `FETCH PROP`으로 epoch-millisecond 시각의 vertex 또는 edge를 `AS OF` 조회합니다.
+- **인증과 권한**: 환경 변수의 root credential, 영속 non-root user, 기본 role,
+  session 기반 gRPC/HTTP 접근, query 권한 검사.
+- **운영**: Prometheus metrics, health/readiness endpoint, 정상 종료, snapshot
+  backup CLI, Docker 파일, single-replica AKS manifest.
 
-이 프로젝트는 여러 크레이트로 구성되어 있습니다:
+## 실행 구조
 
-| 크레이트 | 설명 |
-|-------|-------------|
-| `byoridb-common` | 핵심 데이터 타입 (Value, Vertex, Edge, DataSet) |
-| `byoridb-kvstore` | KV 스토리지 계층 (redb, 순수 Rust) |
-| `byoridb-codec` | 행(row) 인코딩/디코딩 |
-| `byoridb-storage` | 정점과 간선을 위한 스토리지 서비스 |
-| `byoridb-meta` | 메타데이터 관리 (space, 스키마) |
-| `byoridb-parser` | nGQL 쿼리 언어 파서 |
-| `byoridb-executor` | 쿼리 실행 엔진 |
-| `byoridb-graph` | 인증, session, query service, gRPC/HTTP, metrics |
-| `byoridb-client` | 클라이언트 라이브러리 및 CLI |
-| root `byoridb` package | `byoridb-server`, `byoridb-backup` binary |
+Standalone server는 한 프로세스에서 다음 crate를 구성합니다.
 
-## 주요 기능
+| Crate | 책임 |
+|---|---|
+| `byoridb-common` | 공통 graph value와 data set |
+| `byoridb-kvstore` | redb 기반 current 및 history keyspace |
+| `byoridb-codec` | Vertex, edge, value, row codec |
+| `byoridb-storage` | Storage environment, index, RPC, partition, Raft component |
+| `byoridb-meta` | Schema, host, partition, migration metadata component |
+| `byoridb-parser` | Lexer, AST, nGQL 기반 parser |
+| `byoridb-executor` | Plan, query 실행, ontology, temporal 및 recommendation 로직 |
+| `byoridb-graph` | 인증, session, query service, gRPC, HTTP, metrics |
+| `byoridb-client` | Rust client와 대화형 CLI |
+| `byoridb-bulkloader` | Offline CSV bulk loader |
 
-### 지원하는 nGQL
+Root의 `byoridb` package가 `byoridb-server`와 `byoridb-backup` binary를 빌드합니다.
 
-**DDL (데이터 정의 언어)**
-- `CREATE SPACE` / `DROP SPACE`
-- `CREATE TAG` / `DROP TAG` / `ALTER TAG`
-- `CREATE EDGE` / `DROP EDGE` / `ALTER EDGE`
-- `SHOW SPACES` / `SHOW TAGS` / `SHOW EDGES`
+## 첫 query
 
-**DML (데이터 조작 언어)**
-- `INSERT` / `UPDATE` / `DELETE VERTEX`
-- `INSERT` / `DELETE EDGE`
-- `UPDATE EDGE`는 parser가 받지만 현재 실행 경로는 동작하지 않음
+비어 있지 않은 root secret을 명시하고 서버를 시작합니다.
 
-**DQL (데이터 조회 언어)**
-- `FETCH PROP` - 정점 속성 조회
-- `GO` - 그래프 순회
-- `MATCH` - Cypher 스타일 패턴 매칭
-- `LOOKUP` - tag 동등 조건의 index 조회와 bounded scan fallback
-- `FIND PATH` - 최단 경로 쿼리
-- `RECOMMEND` - 유사 버텍스 추천 (구조적 / 임베딩 코사인 + WHERE 필터)
-- `FETCH ... AS OF <epoch-ms>` - asserted vertex/edge 시점 조회
+```bash
+export BYORIDB_ROOT_PASSWORD='replace-with-a-managed-secret'
+cargo run --locked --release -p byoridb --bin byoridb-server
+```
 
-**온톨로지 / 시맨틱**
-- `CREATE CLASS … SUBCLASS OF … [DISJOINT WITH …]` - 클래스 계층 (TBox)
-- `CREATE EDGE … TRANSITIVE/SYMMETRIC/INVERSE OF/SUBPROPERTY OF/DOMAIN/RANGE/CHAIN` - 시맨틱 관계
-- RDFS-Plus forward-chaining materialization + `owl:sameAs` 동치 + `WHY` 설명
-- `CREATE SHAPE … ON <class> (…)` / `CHECK SHAPE` - SHACL식 shape 검증 (required/datatype/값 술어)
-- `CHECK CONSISTENCY` / `is_a(v, "class")` - 일관성 검사 / 계층 인지 쿼리
+다른 terminal에서 연결합니다.
 
-### 분산 (설계 — 다중 노드 배포는 진행 중)
+```bash
+export BYORIDB_USER=root
+export BYORIDB_PASSWORD='same-secret-used-to-start-the-server'
+cargo run --locked -p byoridb-client --bin byoridb-cli
+```
 
-> ⚠️ 아래는 라이브러리 레이어의 분산 메커니즘이며, 실행 바이너리는 현재 단일 노드만 노출합니다. 진짜 다중 노드 배포는 launcher 통합(로드맵) 후 가능합니다.
-
-- **Raft 합의**: 리더 선출, 로그 복제, 스냅샷
-- **Meta 서비스**: `cluster.peers`를 설정한 launcher에서 시작 가능한 gRPC component
-- **파티셔닝**: VID 기반 consistent hashing
-- **복제 팩터(Replica Factor)**: 다중 노드 복제 (설계)
-
-### 성능 최적화
-- **Copy-on-write B-tree**: redb의 ACID/MVCC와 prefix range scan
-- **보조 인덱스**: tag VID와 reverse-edge 인덱스로 전체 스캔 회피
-- **벡터 검색**: 데이터 규모에 따라 exact cosine에서 persisted HNSW로 전환
-- **배치 연산**: current view와 history를 한 트랜잭션으로 적용
-- **Targeted RPC component**: source VID 기반 분산 GO 경로가 존재하지만 standalone
-  query path는 embedded storage를 사용하며 production multi-node wiring은 미완성
-
-## 빠른 예제
+작은 graph를 생성하고 조회합니다.
 
 ```sql
--- Create a space
-CREATE SPACE my_space(vid_type=INT64);
-USE my_space;
+CREATE SPACE example(vid_type = INT64);
+USE example;
 
--- Define schema
 CREATE TAG person(name STRING, age INT64);
+CREATE EDGE knows(since INT64);
 
--- Insert data
-INSERT VERTEX person(name, age) VALUES 1:('Alice', 30);
-INSERT VERTEX person(name, age) VALUES 2:('Bob', 25);
+INSERT VERTEX person(name, age) VALUES
+  1:("Alice", 30),
+  2:("Bob", 25);
+INSERT EDGE knows(since) VALUES 1->2:(2024);
 
--- Query data
 FETCH PROP ON person 1;
-MATCH (n:person) RETURN n;
-GO FROM 1 OVER * YIELD dst(edge) AS destination;
+GO FROM 1 OVER knows YIELD dst(edge) AS friend;
+MATCH (p:person) RETURN p LIMIT 10;
 ```
+
+[설치](getting-started/installation.html)와 [빠른 시작](getting-started/quickstart.html)에서
+계속 진행하세요.
+
+## 주요 제약
+
+- Native TLS는 구현되지 않았습니다. 신뢰할 수 있는 proxy/load balancer에서 TLS를
+  종료하고 network 경계에서 listener 접근을 제한하세요.
+- Session과 실행 중인 authentication cache는 process-local입니다. Session은
+  재시작 후 유지되지 않으며 replica 사이에 공유되지 않습니다.
+- `AS OF` history는 asserted vertex/edge 상태를 다룹니다. 과거 inferred fact를
+  재구성하지 않으며 temporal `MATCH`/`GO`는 구현되지 않았습니다.
+- 저장소의 Docker Compose service들은 독립적인 standalone database이며 3-node
+  cluster가 아닙니다.
 
 ## 라이선스
 
-이 프로젝트는 Apache 2.0 License로 라이선스됩니다.
+ByoriDB는 Apache License 2.0에 따라 제공됩니다.

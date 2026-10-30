@@ -20,6 +20,7 @@
 
 # Architecture
 
+- [Agent-first product design](./architecture/agent-first.md)
 - [Overview](./architecture/overview.md)
 - [Storage](./architecture/storage.md)
 - [Distribution status](./architecture/distributed.md)

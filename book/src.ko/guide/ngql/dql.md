@@ -24,9 +24,9 @@ batch 정확성·성능 검증은 [이슈 #10](https://github.com/byoridb/byorid
 endpoint pair로 edge를 조회하며, rank를 명시할 수 있습니다.
 
 ```sql
-FETCH PROP ON knows 1->2;         -- 이 pair의 모든 rank
-FETCH PROP ON knows 1->2@7;       -- rank 7만
-FETCH PROP ON knows 1->2@7, 3->4; -- 참조마다 각자의 rank
+FETCH PROP ON knows 1->2;         // every rank of this pair
+FETCH PROP ON knows 1->2@7;       // only rank 7
+FETCH PROP ON knows 1->2@7, 3->4; // each reference carries its own rank
 FETCH PROP ON * 1->2;
 FETCH PROP ON knows "alice"->"bob";
 ```
@@ -109,8 +109,8 @@ MATCH (a:person)-[:knows*1..3]->(b:person) RETURN id(b) AS vid;
 정점은 tag의 **집합**을 가지므로, 구분자가 여러 라벨을 어떻게 결합할지 정합니다.
 
 ```sql
-MATCH (a:animal:pet) RETURN id(a) AS vid;   -- 나열한 tag를 모두 가진 정점
-MATCH (a:animal|pet) RETURN id(a) AS vid;   -- 그중 하나 이상을 가진 정점
+MATCH (a:animal:pet) RETURN id(a) AS vid;   // every listed tag
+MATCH (a:animal|pet) RETURN id(a) AS vid;   // at least one of them
 ```
 
 `:`는 교집합이고 `|`는 합집합입니다. 둘 다 순서에 무관하며, 아무도 만족하지 않는
@@ -248,8 +248,8 @@ LOOKUP ON knows WHERE since == 2020 LIMIT 20;
 CREATE TAG dup(x INT64);
 CREATE EDGE dup(y INT64);
 
-LOOKUP ON dup WHERE dup.x == 7;        -- tag
-LOOKUP ON EDGE dup WHERE dup.y == 9;   -- edge
+LOOKUP ON dup WHERE dup.x == 7;        // the tag
+LOOKUP ON EDGE dup WHERE dup.y == 9;   // the edge
 ```
 
 `LOOKUP ON TAG`는 없습니다. 이름만 쓰는 형태가 이미 tag를 우선하며, 명시적으로 썼는데도
@@ -261,14 +261,16 @@ tag `LOOKUP`은 `<tag>.vid`와 tag 속성을 반환합니다. edge `LOOKUP`은
 수식한 형태 둘 다로 매칭됩니다(`since`와 `knows.since`).
 
 indexed 속성의 동등 조건은 tag와 edge type 모두 secondary index를 사용할 수 있습니다.
-그 밖의 조건은 술어를 pushdown한 bounded scan으로 fallback하며, 정확하지만 index를
-쓰지 않습니다.
+Standalone mode에서 지원되는 ordered range는 single-field index를 사용하며, 그 밖의
+지원되는 조건은 bounded predicate scan을 사용합니다.
 
 - **edge type**의 순서 비교 조건(`>`, `>=`, `<`, `<=`)은 경계가 bool·정수·0이 아닌
   non-NaN float일 때 index를 사용합니다. 문자열 경계는 scan으로 fallback합니다 —
   문자열 index 인코딩이 length-prefixed라 순서가 보장되지 않기 때문입니다.
-- **tag**의 범위 조건은 속성에 index가 있어도 여전히 scan으로 fallback합니다. 그 절반은
-  [이슈 #1](https://github.com/byoridb/byoridb/issues/1)에서 추적합니다.
+- **tag**의 순서 비교 조건은 Boolean 또는 정수 literal이 schema type과 일치할 때
+  single-field index를 사용합니다. Float/Double property는 정수와 실수가 서로 다른
+  index key 영역에 놓이므로 scan으로 fallback합니다.
+- Distributed 실행에서는 ordered `LOOKUP` range를 거부합니다.
 - pushdown이 표현할 수 없는 조건(`CONTAINS`, `STARTS WITH`, 필드 간 비교)은 조용히 전체를
   매칭하지 않고 **거부**됩니다.
 
@@ -279,13 +281,13 @@ index 후보는 항상 저장된 vertex·edge와 대조해 재검증하므로, �
 
 ```
 EXPLAIN LOOKUP ON knows WHERE knows.since == 2020;
--- IndexScan  on Edge knows where knows.since == 2020   index: knows_since_idx
+// IndexScan  on Edge knows where knows.since == 2020   index: knows_since_idx
 
 EXPLAIN LOOKUP ON knows WHERE knows.since > 2019;
--- IndexScan  on Edge knows where knows.since > 2019    index: knows_since_idx
+// IndexScan  on Edge knows where knows.since > 2019    index: knows_since_idx
 
 EXPLAIN LOOKUP ON tagged WHERE tagged.label > 'a';
--- EdgeScan   on Edge tagged where tagged.label > "a"   ⚠ FULL SCAN
+// EdgeScan   on Edge tagged where tagged.label > "a"   ⚠ FULL SCAN
 ```
 
 ## FIND path

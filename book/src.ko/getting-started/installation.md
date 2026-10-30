@@ -2,10 +2,14 @@
 
 # 설치
 
-태그된 [GitHub release](https://github.com/byoridb/byoridb/releases)는 Linux
-x86_64/arm64와 macOS x86_64/arm64 archive를 제공합니다. arm64 workflow 도입 전
-release에는 artifact가 소급 추가되지 않습니다. 저장소가 Rust 1.90을 고정하므로
-`rustup`을 사용하면 알맞은 컴파일러가 자동으로 선택됩니다.
+문서의 릴리스 기준인
+[v0.4.20](https://github.com/byoridb/byoridb/releases/tag/v0.4.20)
+(2026-08-30 KST)은 Linux x86_64/arm64와 macOS x86_64/arm64 archive를 제공합니다.
+이후 artifact는 [최신 릴리스 페이지](https://github.com/byoridb/byoridb/releases/latest)에서
+확인하세요. 이전 release에 새 플랫폼이나 서명이 소급 추가되지는 않습니다. tag는
+현재 `main`보다 이전일 수 있으며, 아래 source build는 현재 checkout을 빌드합니다.
+저장소가 Rust 1.90을 고정하므로 `rustup`을 사용하면 알맞은 컴파일러가 자동으로
+선택됩니다.
 
 ## 지원 운영체제
 
@@ -52,7 +56,7 @@ Ubuntu 또는 Debian에서는 다음과 같이 설치합니다.
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential protobuf-compiler
+sudo apt install -y build-essential pkg-config libssl-dev protobuf-compiler
 ```
 
 macOS에서는 다음과 같이 설치합니다.
@@ -88,7 +92,7 @@ cargo build --locked --workspace --release
 서버 또는 CLI만 빌드할 수도 있습니다.
 
 ```bash
-cargo build --locked --release --bin byoridb-server
+cargo build --locked --release -p byoridb --bin byoridb-server
 cargo build --locked --release -p byoridb-client --bin byoridb-cli
 ```
 

@@ -84,7 +84,7 @@ byoridb-backup verify \
 
 The current `verify` command checks that a backup can be found in the catalog;
 it does not walk every table, validate application records, compare row counts,
-or execute queries. A failed `create` can also leave a timestamp-named
+or execute queries; it does not open `data.redb`. A failed `create` can also leave a timestamp-named
 directory, so do not treat `verify` alone as proof of a usable snapshot.
 
 For each important backup:
@@ -115,6 +115,11 @@ export BYORIDB_ROOT_PASSWORD='managed-secret-for-this-environment'
 export BYORIDB__STORAGE__DATA_PATHS=/var/lib/byoridb/restored-data
 byoridb-server
 ```
+
+Snapshot restoration does not establish compatibility across server versions.
+There is no general upgrade/downgrade or storage-format compatibility guarantee.
+Keep the source build and configuration, and test the target version against a
+copy before replacing a working database.
 
 The root password is not restored from a user record; root is always defined by
 `BYORIDB_ROOT_PASSWORD` at server startup. Durable non-root user records are

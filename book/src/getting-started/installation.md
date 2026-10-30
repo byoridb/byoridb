@@ -2,12 +2,15 @@
 
 # Installation
 
-Tagged [GitHub releases](https://github.com/byoridb/byoridb/releases) publish
-prebuilt archives for Linux x86_64/arm64 and macOS x86_64/arm64. Releases made
-before the arm64 workflow landed do not retroactively gain that artifact. A
-tagged release can lag the current `main` branch; the instructions below build
-the exact checkout. The repository pins Rust 1.90, so a `rustup` installation
-will select the expected compiler automatically.
+The documented release baseline,
+[v0.4.20](https://github.com/byoridb/byoridb/releases/tag/v0.4.20)
+(2026-08-30 KST), provides prebuilt archives for Linux x86_64/arm64 and macOS
+x86_64/arm64. Check the
+[latest release page](https://github.com/byoridb/byoridb/releases/latest) for
+newer artifacts. Older releases do not retroactively gain new platforms or
+signatures. A tagged release can lag `main`; the source-build instructions below
+build the exact checkout. The repository pins Rust 1.90, so a `rustup`
+installation will select the expected compiler automatically.
 
 ## Supported systems
 

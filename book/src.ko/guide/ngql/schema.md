@@ -175,6 +175,8 @@ DROP INDEX TAG IF EXISTS person_name_idx;
 DROP INDEX EDGE IF EXISTS knows_since_idx;
 ```
 
-tag index는 `LOOKUP`의 동등 조건을 가속하며 현재 INSERT, UPDATE, DELETE에서 유지됩니다.
-range predicate는 아직 index range scan을 사용하지 않습니다. edge index DDL은 존재하지만
-edge type `LOOKUP`은 현재 연결되지 않았습니다.
+Tag와 edge index는 standalone mode에서 `LOOKUP`의 equality와 지원되는 single-field
+ordered-range predicate를 가속합니다. INSERT, UPDATE, DELETE가 index entry를
+유지하며 edge `UPDATE`도 포함됩니다. 지원하는 range key 영역과 scan fallback은
+[성능 문서](../../reference/performance.md)를 참고하세요. Distributed 실행에서는
+ordered `LOOKUP` range를 지원하지 않습니다.

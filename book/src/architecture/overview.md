@@ -6,6 +6,10 @@ ByoriDB is a Rust workspace whose default server composes query, metadata, and
 storage logic in one process. This is the architecture that the checked-in
 standalone binary and current deployment manifests actually run.
 
+Agents are the primary target callers. The [agent-first design](agent-first.html)
+adds a planned typed operation boundary over the same service and storage path.
+The diagram below describes the current runtime, not those future contracts.
+
 ```text
                     +-----------------------+
                     | Rust CLI / gRPC / HTTP|

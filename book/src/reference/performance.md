@@ -7,6 +7,16 @@ dataset, query shape, redb file, durability, cache warmth, filesystem, and
 hardware. Any number used for capacity planning should come from a reproducible
 run against the intended build and workload.
 
+## Agent task outcomes
+
+The [agent-first design](../architecture/agent-first.html) makes successful
+agent tasks the product-level measure. EVAL-1 is planned; this page does not
+report agent benchmark results. A future run must pin model/prompt/tool/server
+versions, fixtures, budgets, and repetitions; verify answers, evidence, and
+final state before comparing calls, tokens, latency, or cost. Include failed
+runs, duplicate writes, unauthorized effects, and recovery after interruption.
+Keep engine-only measurements separate from the full agent workflow.
+
 ## Benchmark tools in the repository
 
 ### Criterion microbenchmarks
@@ -100,10 +110,21 @@ Use `EXPLAIN` to confirm the access path. Label-only MATCH can use the
 automatically maintained tag-VID index; older data created before that index
 entry existed may fall back to a full scan until backfilled/reloaded.
 
-Only equality `LOOKUP` predicates currently route through a tag secondary
-index. Range predicates (`>`, `>=`, `<`, `<=`) use a bounded full scan even when
-an index exists; range index scans remain open in
-[issue #1](https://github.com/byoridb/byoridb/issues/1).
+Standalone `LOOKUP` supports equality and eligible ordered ranges (`>`, `>=`,
+`<`, `<=`) through single-field tag and edge indexes. Edge `UPDATE` maintains
+its index entries together with the edge changes.
+
+- Tag range access requires a matching Boolean or integer schema and literal.
+  Float/Double properties use predicate scans because stored integer and float
+  values occupy different index key domains.
+- The edge range helper supports Boolean, integer, and nonzero, non-NaN float
+  boundaries. String keys do not provide lexical range access; unsupported
+  boundaries fall back to predicate scans.
+- Ordered `LOOKUP` ranges are rejected in distributed execution. `!=` is not
+  an ordered range fast path.
+
+Check the actual `EXPLAIN`/`PROFILE` access path for each predicate and data type;
+an index's existence does not guarantee that a query uses it.
 
 ### Bound result sets
 

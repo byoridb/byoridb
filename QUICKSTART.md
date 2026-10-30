@@ -6,6 +6,10 @@ This guide builds a local standalone server, connects with the CLI, exercises
 the HTTP API, and creates a backup. Standalone single-node operation is the
 primary supported path; the current cluster launcher is not production-ready.
 
+These are operator setup and current API examples. For the adopted agent-first
+interaction model and planned contracts, read the
+[product design](docs/PRODUCT_DESIGN.md).
+
 ## 1. Prerequisites
 
 - Linux or macOS (native Windows is not currently supported)
@@ -18,11 +22,13 @@ required.
 
 ## 2. Build the workspace
 
-The latest published release,
-[v0.3.3](https://github.com/byoridb/byoridb/releases/tag/v0.3.3), predates the
-current `main` branch's authentication hardening, shared HTTP/gRPC session
-state, temporal v1.1 changes, and edge `AS OF` reads. The commands below build
-the current checkout; pin a commit SHA when reproducibility matters.
+The documented release baseline is
+[v0.4.20](https://github.com/byoridb/byoridb/releases/tag/v0.4.20)
+(2026-08-30 KST). Find newer artifacts on the
+[latest release page](https://github.com/byoridb/byoridb/releases/latest).
+The commands below build the current checkout; pin a tag or commit SHA when
+reproducibility matters. Changes on `main` after a tag are not included in that
+release.
 
 ```bash
 git clone https://github.com/byoridb/byoridb.git

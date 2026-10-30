@@ -16,6 +16,9 @@ reporting process in [SECURITY.md](SECURITY.md).
   behavior and compatibility impact.
 - Read [docs/PLAN.md](docs/PLAN.md) for current implementation constraints and
   known regression areas.
+- Use [docs/PRODUCT_DESIGN.md](docs/PRODUCT_DESIGN.md) for product principles
+  and target agent contracts. The plan owns delivery status; the API reference
+  describes implemented behavior.
 - Keep changes focused. Do not mix unrelated formatting, refactors, and feature
   work in one pull request.
 
@@ -90,6 +93,28 @@ commands, identifiers, paths, and query examples identical between languages.
 Document behavior that exists in the current code. Mark incomplete or
 experimental behavior explicitly; in particular, do not describe the current
 multi-node launcher as production-ready.
+
+## Agent contract review
+
+For a behavioral change, identify the agent task it enables and the relevant
+acceptance task in the plan. Review the applicable parts of the contract:
+
+- **Discovery and values:** authorized schema visibility, capability versions,
+  typed arguments, exact IDs, and lossless result representation.
+- **Queries and evidence:** complete-or-error behavior, budgets, pagination
+  consistency, proof versus source attribution, and unknown/missing evidence.
+- **Mutations:** atomic boundary, outcome after interruption, duplicate requests,
+  revision conflicts, and reauthorization of a prepared change.
+- **Adapters:** HTTP/gRPC/SDK/MCP parity and enforcement in the shared service;
+  tool hints do not grant access or replace server checks.
+
+Add a focused behavioral regression and, when an agent-facing contract changes,
+the applicable EVAL-1 fixture. EVAL-1 is planned: until its harness exists,
+record a reproducible task, expected answer/evidence, expected final state, and
+unrun evaluation explicitly. Check correctness before calls, tokens, and speed;
+never label a synthetic adapter test as a successful autonomous-agent run.
+Documentation-only changes need mirrored content, examples, and link/build
+checks rather than fabricated runtime or model results.
 
 ## Required checks
 

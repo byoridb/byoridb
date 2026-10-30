@@ -10,17 +10,17 @@ ByoriDB는 nGQL 호환 그래프 쿼리 언어를 구현합니다. ByoriDB 확�
 | 종류 | 현재 문 |
 | --- | --- |
 | 스페이스와 스키마 | `CREATE`, `ALTER`, `DROP`, `SHOW`, `DESCRIBE`, `USE` |
-| 데이터 변경 | `INSERT VERTEX`, `UPDATE VERTEX`, `DELETE VERTEX`, `INSERT EDGE`, `DELETE EDGE` |
+| 데이터 변경 | `INSERT VERTEX`, `UPDATE VERTEX`, `DELETE VERTEX`, `INSERT EDGE`, `UPDATE EDGE`, `DELETE EDGE` |
 | 조회 | `FETCH PROP`, `GO`, `MATCH`, `LOOKUP`, `FIND`, `RECOMMEND` |
 | 온톨로지 | `CREATE CLASS`, `CREATE SHAPE`, `CHECK CONSISTENCY`, `CHECK SHAPE`, `WHY` |
 | 관리 | `CREATE/ALTER/DROP USER`, `GRANT/REVOKE ROLE`, `SHOW USER/USERS`, `SHOW ROLE/ROLES`, `SHOW SESSIONS`, `BALANCE` |
 | 검사 | `EXPLAIN <statement>`, `PROFILE <statement>` |
 
-실행 제약은 각 가이드 페이지를 확인하세요. 예를 들어 `UPDATE EDGE`는 parser가
-받지만 동작하는 executor와 연결되지 않았고, `LOOKUP`은 현재 edge type이 아니라
-tag를 대상으로 동작합니다. Secondary index fast path는 단일 field equality 조건만
-사용합니다. `<`, `<=`, `>`, `>=`, `!=` 같은 조건은 지원되지만 tag scan 후
-predicate를 적용하므로 range index scan으로 해석하면 안 됩니다.
+`UPDATE EDGE`는 기존 edge와 해당 index를 갱신합니다. `LOOKUP`은 tag와 edge type을
+대상으로 하며 standalone mode에서 equality 또는 지원되는 ordered-range index
+경로를 사용합니다. 지원하는 range key 영역과 scan fallback은
+[성능 문서](../reference/performance.md)를, 그 밖의 실행 제약은 각 statement 가이드를
+확인하세요.
 
 ## 어휘 규칙
 

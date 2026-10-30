@@ -75,8 +75,9 @@ isolation boundary.
 ### Sessions and diagnostics
 
 Session IDs are cryptographically random positive 63-bit bearer credentials.
-The default sliding session lifetime is 24 hours. In the standalone server,
-HTTP and gRPC share authentication and session state within one process.
+The default sliding session lifetime is 24 hours, configurable with
+`auth.session_ttl_secs` or `BYORIDB__AUTH__SESSION_TTL_SECS`. In the standalone
+server, HTTP and gRPC share authentication and session state within one process.
 Password or role changes and user deletion revoke that user's local sessions.
 Session creation and revocation are not coordinated across separate processes.
 
@@ -96,12 +97,13 @@ availability or operational metadata is sensitive.
   TLS at a trusted ingress, proxy, or service mesh and protect the backend hop.
 - **In-process login throttling only:** failed logins are throttled per account
   (20 per 60 s), per source IP (60 per 60 s), and by a 300 s lockout after five
-  consecutive failures. Successful logins are never throttled, so there is no
-  ceiling on concurrent sessions. All of it is process-local and driven by the
-  peer address the server observes, so it neither survives a restart nor sees
-  through a proxy that does not preserve the client IP. Apply connection and
-  login limits at the network edge as well. Every threshold is settable under
-  `[auth]`, including disabling the lockout — relax them only for a listener
+  consecutive failures. Successful logins do not consume failure budgets. The
+  Argon2 pool runs at most four verifications at once by default; excess logins
+  queue, so this is not a concurrent-session ceiling. All controls are
+  process-local and reset on restart. Source limits use the observed peer
+  address; clients behind one proxy may share a budget. Apply connection and
+  request limits at the network edge as well. All six throttle settings are
+  configurable under `[auth]`, including disabling the lockout; relax them only for a listener
   restricted at the network boundary, because this is the engine's only
   defence against credential guessing.
 - **No per-space grant surface:** use separate trusted deployments when strong

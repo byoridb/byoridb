@@ -87,6 +87,10 @@ Session IDs are cryptographically random positive 63-bit values. HTTP represents
 decimal strings so JavaScript clients do not lose integer precision. Treat a
 session ID as a bearer secret.
 
+The default sliding session lifetime is 24 hours; successful session use renews
+the idle deadline. Configure `auth.session_ttl_secs` or
+`BYORIDB__AUTH__SESSION_TTL_SECS` to change it for both HTTP and gRPC.
+
 Password, role, enabled-state, and user changes invalidate that user's sessions
 in the same server process. HTTP and gRPC share one authentication state inside
 the standalone server. These guarantees do not extend across multiple server
@@ -102,6 +106,20 @@ Avoid logging:
 ByoriDB's query logs and active-query diagnostics retain bounded metadata rather
 than raw query text or session IDs. Reverse proxies and ingress logs still
 require separate configuration to exclude sensitive headers and bodies.
+
+## Login throttling
+
+Failed logins are limited per account (20 per 60 seconds) and observed source IP
+(60 per 60 seconds). Five consecutive failures lock an existing account for
+300 seconds. A bounded worker pool runs at most four Argon2 verifications at
+once by default; excess logins queue. Successful logins do not consume failure
+budgets, and the worker bound is not a session-count limit.
+
+The six throttle settings and session TTL are configurable under `[auth]`; see
+[Configuration](../getting-started/configuration.md#sessions-and-login-throttling).
+These controls are process-local and reset on restart. Source limits use the
+peer address visible to the server, so clients behind one proxy may share a
+budget. Keep connection and request limits at the edge as well.
 
 ## HTTP endpoint access
 
@@ -134,7 +152,8 @@ query text and bearer session IDs.
 ## Known security gaps
 
 - No native HTTP/gRPC TLS.
-- No effective per-IP/global login rate limit or bounded Argon2 worker pool.
+- No cluster-wide login throttle or general request rate limiter; login failure
+  budgets and the Argon2 verification pool apply within one process.
 - No space-scoped grants.
 - No cluster-wide session/cache coordination.
 - Metrics endpoints are unauthenticated.

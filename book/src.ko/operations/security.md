@@ -80,6 +80,10 @@ Session ID는 암호학적으로 무작위인 양의 63-bit 값입니다. HTTP�
 손실을 피하기 위해 이를 decimal string으로 표현합니다. Session ID는 bearer
 credential로 취급하세요.
 
+기본 sliding session 수명은 24시간이며, session 사용이 성공하면 idle 만료 시각을
+갱신합니다. `auth.session_ttl_secs` 또는 `BYORIDB__AUTH__SESSION_TTL_SECS`로 HTTP와
+gRPC에 공통으로 적용할 수명을 변경할 수 있습니다.
+
 비밀번호, role, enabled 상태 또는 사용자 삭제는 같은 서버 프로세스에 있는 해당
 사용자의 session을 폐기합니다. 스탠드얼론 서버의 HTTP와 gRPC는 한 authentication
 상태를 공유합니다. 별도 프로세스 사이에는 session 생성과 폐기가 조정되지 않습니다.
@@ -93,6 +97,19 @@ credential로 취급하세요.
 현재 ByoriDB의 query log와 active-query diagnostics는 raw query text나 session ID
 대신 제한된 metadata만 유지합니다. Reverse proxy와 ingress log도 민감한 header와
 body를 제외하도록 별도로 설정해야 합니다.
+
+## 로그인 제한
+
+실패한 로그인은 계정별 60초당 20회, 서버가 관측한 source IP별 60초당 60회로
+제한합니다. 기존 계정에서 연속 5회 실패하면 300초 동안 잠깁니다. Argon2 검증은
+기본적으로 최대 4개를 동시에 실행하며 초과 요청은 대기합니다. 성공한 로그인은 실패
+횟수를 소비하지 않으며, 검증 동시 실행 수는 session 개수 제한이 아닙니다.
+
+로그인 제한 설정 6개와 session TTL은 `[auth]`에서 변경할 수 있습니다.
+[설정 문서](../getting-started/configuration.md)를 참고하세요. 이 제한은 process-local이며
+재시작하면 초기화됩니다. Source 제한은 서버에 보이는 peer address를 사용하므로 하나의
+proxy 뒤에 있는 client가 같은 한도를 공유할 수 있습니다. Edge에서도 connection 및
+request limit을 적용하세요.
 
 ## HTTP endpoint 접근
 
@@ -124,7 +141,8 @@ Diagnostics 응답은 `id`, `query_type`, `query_length_bytes`, `space`,
 ## 알려진 보안 제한
 
 - Native HTTP/gRPC TLS 없음
-- 효과적인 per-IP/global 로그인 rate limit 또는 제한된 Argon2 worker pool 없음
+- Cluster 전체 로그인 제한이나 범용 request rate limiter 없음. 로그인 실패 제한과
+  Argon2 검증 pool은 한 프로세스 안에서 적용됨
 - Space별 grant 없음
 - Cluster 전체 session/cache 조정 없음
 - 인증되지 않은 metrics endpoint

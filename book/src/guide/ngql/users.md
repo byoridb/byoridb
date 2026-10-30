@@ -113,15 +113,21 @@ user/role listing rather than enumerating role definitions. The singular forms
 
 `SHOW SESSIONS` is implemented in the graph service and returns only user and
 selected-space columns. It deliberately omits bearer session IDs. Sessions use
-random positive 63-bit identifiers and expire after 24 hours by default.
+random positive 63-bit identifiers with a default sliding idle lifetime of
+24 hours, configurable through `auth.session_ttl_secs`.
+
+Embedding the executor directly without the Graph service provides no session
+source; that path returns an explicit unsupported error for `SHOW SESSIONS`
+instead of an empty list.
 
 Treat every session ID as a bearer credential. Do not put it in logs or expose
 it to another user.
 
 ## Deployment security
 
-The native gRPC and HTTP listeners do not terminate TLS, and ByoriDB does not
-provide a network-level authentication rate limiter. Put non-local deployments
-behind a trusted TLS endpoint, firewall or network policy, and edge rate
-limiting. Store root and user credentials in a secret manager rather than in
+The native gRPC and HTTP listeners do not terminate TLS. ByoriDB provides
+process-local failed-login throttling, account lockout, and bounded Argon2
+verification; these do not limit general connection or query traffic. Put
+non-local deployments behind a trusted TLS endpoint, firewall or network policy,
+and edge rate limiting. Store root and user credentials in a secret manager rather than in
 repository files or command-line arguments.

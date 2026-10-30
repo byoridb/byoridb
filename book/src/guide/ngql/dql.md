@@ -24,9 +24,9 @@ in [issue #10](https://github.com/byoridb/byoridb/issues/10).
 Fetch edges by endpoint pair, optionally naming a rank:
 
 ```sql
-FETCH PROP ON knows 1->2;         -- every rank of this pair
-FETCH PROP ON knows 1->2@7;       -- only rank 7
-FETCH PROP ON knows 1->2@7, 3->4; -- each reference carries its own rank
+FETCH PROP ON knows 1->2;         // every rank of this pair
+FETCH PROP ON knows 1->2@7;       // only rank 7
+FETCH PROP ON knows 1->2@7, 3->4; // each reference carries its own rank
 FETCH PROP ON * 1->2;
 FETCH PROP ON knows "alice"->"bob";
 ```
@@ -112,8 +112,8 @@ A vertex carries a **set** of tags, so the separator says how several labels
 combine:
 
 ```sql
-MATCH (a:animal:pet) RETURN id(a) AS vid;   -- every listed tag
-MATCH (a:animal|pet) RETURN id(a) AS vid;   -- at least one of them
+MATCH (a:animal:pet) RETURN id(a) AS vid;   // every listed tag
+MATCH (a:animal|pet) RETURN id(a) AS vid;   // at least one of them
 ```
 
 `:` is an intersection and `|` is a union. Both are order-independent, and an
@@ -255,8 +255,8 @@ tag and report nothing:
 CREATE TAG dup(x INT64);
 CREATE EDGE dup(y INT64);
 
-LOOKUP ON dup WHERE dup.x == 7;        -- the tag
-LOOKUP ON EDGE dup WHERE dup.y == 9;   -- the edge
+LOOKUP ON dup WHERE dup.x == 7;        // the tag
+LOOKUP ON EDGE dup WHERE dup.y == 9;   // the edge
 ```
 
 There is no `LOOKUP ON TAG`: the bare form already prefers a tag, and an explicit
@@ -270,16 +270,17 @@ matched bare or qualified by name (`since` and `knows.since` both resolve),
 as they are for tags.
 
 An equality predicate on an indexed property can use the secondary index, for
-both tags and edge types. Everything else falls back to a bounded scan with the
-predicate pushed down, which is correct but unindexed:
+both tags and edge types. Eligible ordered ranges use single-field indexes in
+standalone mode; other supported predicates use a bounded predicate scan:
 
 - Ordered range predicates (`>`, `>=`, `<`, `<=`) on an **edge type** use the
   index when the boundary is a bool, an integer, or a non-zero non-NaN float.
   A string boundary falls back to a scan, because the string index encoding is
   length-prefixed and therefore not ordered.
-- Range predicates on a **tag** still fall back to a scan even when the property
-  is indexed; that half is tracked in
-  [issue #1](https://github.com/byoridb/byoridb/issues/1).
+- Ordered range predicates on a **tag** use a single-field index when a Boolean
+  or integer literal matches the schema type. Float/Double properties fall back
+  to a scan because integer and float values occupy different index key domains.
+- Ordered `LOOKUP` ranges are rejected in distributed execution.
 - A predicate the pushdown cannot express (`CONTAINS`, `STARTS WITH`, or a
   field-to-field comparison) is **rejected** rather than silently matching
   everything.
@@ -292,13 +293,13 @@ which access path ran:
 
 ```
 EXPLAIN LOOKUP ON knows WHERE knows.since == 2020;
--- IndexScan  on Edge knows where knows.since == 2020   index: knows_since_idx
+// IndexScan  on Edge knows where knows.since == 2020   index: knows_since_idx
 
 EXPLAIN LOOKUP ON knows WHERE knows.since > 2019;
--- IndexScan  on Edge knows where knows.since > 2019    index: knows_since_idx
+// IndexScan  on Edge knows where knows.since > 2019    index: knows_since_idx
 
 EXPLAIN LOOKUP ON tagged WHERE tagged.label > 'a';
--- EdgeScan   on Edge tagged where tagged.label > "a"   ⚠ FULL SCAN
+// EdgeScan   on Edge tagged where tagged.label > "a"   ⚠ FULL SCAN
 ```
 
 ## FIND paths

@@ -70,7 +70,8 @@ space `*`를 사용하며 query language는 space 범위를 지정하는 `GRANT`
 ### Session과 diagnostics
 
 Session ID는 암호학적으로 무작위인 양의 63-bit bearer credential입니다. 기본 sliding
-session 수명은 24시간입니다. Standalone 서버의 HTTP와 gRPC는 한 프로세스 안에서
+session 수명은 24시간이며 `auth.session_ttl_secs` 또는
+`BYORIDB__AUTH__SESSION_TTL_SECS`로 변경할 수 있습니다. Standalone 서버의 HTTP와 gRPC는 한 프로세스 안에서
 authentication 및 session 상태를 공유합니다. 비밀번호나 role 변경과 사용자 삭제는
 그 사용자의 local session을 폐기합니다. 서로 다른 프로세스 사이에는 session 생성과
 폐기가 조정되지 않습니다.
@@ -90,11 +91,12 @@ Session ID를 로그, analytics, trace 또는 issue report에 넣지 마세요.
   있는 ingress, proxy 또는 service mesh에서 TLS를 종료하고 backend hop을 보호하세요.
 - **In-process login throttling만 제공:** 실패한 로그인은 계정별(60초당 20회),
   source IP별(60초당 60회), 그리고 연속 5회 실패 후 300초 lockout으로 throttle됩니다.
-  성공한 로그인은 throttle되지 않으므로 동시 session 수에는 상한이 없습니다. 전부
-  process-local이고 server가 관측한 peer address에 의존하므로, 재시작 후 유지되지 않고
-  client IP를 보존하지 않는 proxy 뒤에서는 동작하지 않습니다. Network edge에서도
-  connection 및 login limit을 적용하세요. 모든 임계값은 `[auth]` 아래에서 설정할 수
-  있고 lockout도 끌 수 있습니다 — 엔진이 credential 추측에 대해 가진 유일한 방어이므로,
+  성공한 로그인은 실패 횟수를 소비하지 않습니다. Argon2 pool은 기본적으로 최대 4개를
+  동시에 검증하며 초과 로그인은 대기하므로 동시 session 개수 제한은 아닙니다. 모든
+  제한은 process-local이며 재시작하면 초기화됩니다. Source 제한은 관측된 peer address를
+  사용하므로 하나의 proxy 뒤에 있는 client가 같은 한도를 공유할 수 있습니다. Network
+  edge에서도 connection 및 request limit을 적용하세요. 로그인 제한 설정 6개는 `[auth]`
+  아래에서 변경할 수 있고 lockout도 끌 수 있습니다. 엔진이 credential 추측에 대해 가진 유일한 방어이므로,
   network 경계에서 접근이 제한된 listener에서만 완화하세요.
 - **Space별 grant 표면 없음:** 서로 신뢰하지 않는 tenant 사이에 강한 격리가
   필요하면 분리된 trusted deployment를 사용하세요.

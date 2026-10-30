@@ -6,10 +6,19 @@
   <img src="assets/byoridb-icon.png" alt="ByoriDB official icon" width="256">
 </p>
 
-ByoriDB is an ontology graph database written in Rust. It provides an
-nGQL-inspired query language, a persistent property graph, RDFS-Plus-style
-forward reasoning, recommendation primitives, and point-in-time reads for
-asserted vertices and edges.
+ByoriDB is a Rust graph and ontology database designed around **AI agents as
+the primary callers**. The product goal is a predictable loop: discover the
+schema, query relationships, inspect evidence, prepare a change, apply it within
+the caller's authority, and verify the outcome. Agent memory is one application
+of this general-purpose engine.
+
+The [agent-first design](architecture/agent-first.html) describes the adopted
+direction and planned contracts. Today the engine provides an nGQL-inspired
+query language, a persistent property graph, RDFS-Plus-style forward reasoning,
+recommendation primitives, and point-in-time reads for asserted vertices and
+edges. Structured agent operations, durable request outcomes, and revision-bound
+previews are planned; the [API reference](reference/api.html) documents the
+implemented interface.
 
 The supported deployment today is a **single ByoriDB server backed by one redb
 database**. The repository also contains partition-routing, Meta/Storage RPC,
@@ -20,7 +29,7 @@ before planning a clustered deployment.
 ## What is implemented
 
 - **Property graph**: spaces, tags, edge types, vertices, edges, and secondary
-  indexes.
+  indexes, including edge updates and indexed tag/edge `LOOKUP`.
 - **Queries**: `FETCH`, `GO`, `MATCH`, `LOOKUP`, `FIND PATH`, `EXPLAIN`, and
   `PROFILE`.
 - **Ontology features**: class hierarchies, semantic edge declarations,

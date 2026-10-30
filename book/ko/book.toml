@@ -1,7 +1,7 @@
 [book]
 title = "ByoriDB 문서"
 authors = ["ByoriDB Contributors"]
-description = "Rust로 작성한 ontology graph database 문서"
+description = "Agent-first 그래프·온톨로지 데이터베이스: 제품 설계, 구현된 API, 운영"
 language = "ko"
 multilingual = false
 src = "../src.ko"

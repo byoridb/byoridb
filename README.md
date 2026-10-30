@@ -6,18 +6,28 @@
   <img src="book/src/assets/byoridb-icon.png" alt="ByoriDB official icon" width="256">
 </p>
 
-> A semantic graph database written in Rust, with ontology inference,
-> provenance, and point-in-time history.
+> An agent-first graph and ontology database, designed for evidence-backed
+> queries and reliable state changes.
 
-ByoriDB combines a property-graph core with a semantic layer. It provides an
-nGQL-style query surface, write-time ontology materialization, explanations for
-inferred edges, and temporal reads from one standalone server process.
+ByoriDB's primary callers are AI agents. Its product goal is to let them discover
+the data model, query relationships, inspect derivations, and change state with
+explicit outcomes. Humans configure access, inspect behavior, and operate the
+service. Agent memory, dependency analysis, and knowledge-driven applications
+share the same general-purpose engine.
+
+The current Rust implementation combines a property graph with a semantic layer:
+nGQL-style queries, write-time ontology materialization, inferred-edge
+explanations, and asserted-fact temporal reads in one standalone server process.
+The [product philosophy and design](docs/PRODUCT_DESIGN.md) defines the target
+agent contract; [the development plan](docs/PLAN.md) distinguishes implemented
+behavior from planned discovery, structured operations, and reliable retries.
 
 > [!NOTE]
 > Looking for the local knowledge graph and agent-memory product for Claude
 > Code, Codex, and other coding agents? See
-> **[byoridb/byori](https://github.com/byoridb/byori)**. This repository is the
-> general-purpose database engine used underneath it.
+> **[byoridb/byori](https://github.com/byoridb/byori)**. Byori is an agent-memory
+> application and MCP integration built on this general-purpose engine. Its
+> domain-specific tools are distinct from the engine's planned agent contract.
 
 > [!CAUTION]
 > The standalone, single-node launcher is the primary supported path. The
@@ -28,7 +38,10 @@ inferred edges, and temporal reads from one standalone server process.
 ## Capabilities
 
 - **Property graph and nGQL-style queries:** `MATCH`, `GO`, `FETCH`, `LOOKUP`,
-  `FIND PATH`, schema operations, and data mutation.
+  `FIND PATH`, schema operations, and vertex/edge mutation, including edge
+  `UPDATE` and indexed edge `LOOKUP`.
+- **Vertex IDs:** standalone spaces support `INT64` and `FIXED_STRING(n)` IDs;
+  `RECOMMEND` remains `INT64`-only and `WHY` accepts integer IDs.
 - **Ontology inference:** write-time materialization for class hierarchies and
   selected RDFS-Plus/OWL 2 RL-style rules, including transitive, symmetric,
   inverse, subproperty, equivalent-property, and two-link property-chain rules.
@@ -89,16 +102,17 @@ and current multi-instance deployments do not coordinate session revocation.
 
 ### Release archives
 
-The latest published release is
-[v0.3.3](https://github.com/byoridb/byoridb/releases/tag/v0.3.3), with archives
-for Linux x86_64 and macOS on Intel and Apple Silicon. That tag predates the
-current `main` branch's authentication hardening, shared HTTP/gRPC session
-state, temporal v1.1 changes, and edge `AS OF` reads. Build from a pinned
-`main` commit if you need the behavior documented below, and identify deployed
-artifacts by tag or commit SHA.
+The documented release baseline is
+[v0.4.20](https://github.com/byoridb/byoridb/releases/tag/v0.4.20), published on
+2026-08-30 (KST), with archives for Linux x86_64/arm64 and macOS x86_64/arm64.
+The macOS binaries are signed and notarized. Find newer artifacts on the
+[latest release page](https://github.com/byoridb/byoridb/releases/latest), and
+identify deployed artifacts by tag or commit SHA. Changes on `main` after a tag
+are not included in that release.
 
-See [Installation](book/src/getting-started/installation.md) for the current
-ARM Linux, Windows, macOS signing, and archive-license limitations.
+Windows is not currently supported. See
+[Installation](book/src/getting-started/installation.md) for platform support,
+signature verification, and legacy archive limitations.
 
 ### Prerequisites
 
@@ -162,9 +176,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
 ## Security and deployment boundaries
 
-ByoriDB currently provides no native TLS termination and no general-purpose
-login rate limiter. Put HTTP and gRPC behind trusted TLS termination, restrict
-network access, and add rate limiting before exposing either listener.
+ByoriDB provides process-local failed-login throttling, account lockout, and a
+bounded Argon2 verification pool. Six throttle settings and the sliding session
+TTL are configurable under `[auth]`. Native TLS termination is not implemented;
+put HTTP and gRPC behind trusted TLS termination, restrict network access, and
+apply connection and request limits at the edge. See
+[Configuration](book/src/getting-started/configuration.md#sessions-and-login-throttling)
+for the available controls.
 
 The built-in roles apply their permissions to `*` (every space), and the
 current query language has no space-scoped `GRANT` syntax. They are therefore
@@ -176,6 +194,7 @@ checklist, and private vulnerability-reporting instructions.
 
 ## Documentation
 
+- [Product philosophy and agent-first design](docs/PRODUCT_DESIGN.md)
 - [Quick start](QUICKSTART.md)
 - [User and operations guide](book/src/SUMMARY.md)
 - [Implementation status, constraints, and roadmap](docs/PLAN.md)

@@ -6,6 +6,9 @@
 생성하는 과정을 설명합니다. standalone 단일 노드 운영이 주 지원 경로이며 현재
 cluster launcher는 production-ready 상태가 아닙니다.
 
+아래는 운영자 설정과 현재 API의 예제입니다. 채택한 Agent-first 상호작용 모델과
+계획 중인 계약은 [제품 설계](docs/PRODUCT_DESIGN.ko.md)를 참고하세요.
+
 ## 1. 사전 요구사항
 
 - Linux 또는 macOS (native Windows는 현재 지원하지 않음)
@@ -16,11 +19,12 @@ storage backend는 pure Rust(redb)이므로 C++ build toolchain이 필요하지 
 
 ## 2. Workspace 빌드
 
-현재 최신 공개 릴리스
-[v0.3.3](https://github.com/byoridb/byoridb/releases/tag/v0.3.3)은 현재 `main`의
-인증 강화, HTTP/gRPC session state 공유, temporal v1.1 변경 및 edge `AS OF`
-조회보다 이전입니다. 아래 명령은 현재 checkout을 빌드합니다. 재현성이 중요하면
-commit SHA를 고정하세요.
+문서의 릴리스 기준은
+[v0.4.20](https://github.com/byoridb/byoridb/releases/tag/v0.4.20)
+(2026-08-30 KST)입니다. 이후 artifact는
+[최신 릴리스 페이지](https://github.com/byoridb/byoridb/releases/latest)에서 확인하세요.
+아래 명령은 현재 checkout을 빌드합니다. 재현성이 중요하면 tag 또는 commit SHA를
+고정하세요. tag 이후 `main`의 변경은 해당 릴리스에 포함되지 않습니다.
 
 ```bash
 git clone https://github.com/byoridb/byoridb.git

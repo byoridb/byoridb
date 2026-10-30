@@ -7,6 +7,15 @@ query shape, redb file, durability, cache warmth, filesystem, hardware에 따라
 달라집니다. Capacity planning에 사용하는 수치는 대상 build와 workload에서
 재현 가능한 실행으로 얻어야 합니다.
 
+## Agent 작업 결과
+
+[Agent-first 설계](../architecture/agent-first.html)는 성공한 Agent 작업을 제품
+수준의 평가 기준으로 삼습니다. EVAL-1은 계획이며 이 페이지에 Agent 벤치마크 결과를
+보고하는 것은 아닙니다. 이후 실행에서는 모델·prompt·도구·서버 버전, fixture, 예산,
+반복 횟수를 고정하고 호출·토큰·지연·비용을 비교하기 전에 답변·근거·최종 상태를
+검증해야 합니다. 실패한 실행, 중복 쓰기, 비인가 변경, 중단 뒤 복구도 포함합니다.
+엔진 단독 측정과 전체 Agent 작업 결과를 구분하세요.
+
 ## 저장소의 benchmark 도구
 
 ### Criterion microbenchmark
@@ -83,6 +92,9 @@ FETCH PROP ON person 42;
 
 `FETCH`는 정확한 current-view key를 만들고 여러 VID에 batch get을 사용합니다.
 일반 `MATCH`에는 더 많은 planning과 scan/expansion 작업이 있습니다.
+수백 개 ID를 포함하는 batch의 응답 크기와 성능은
+[issue #10](https://github.com/byoridb/byoridb/issues/10)에서 추적하는 LDBC 규모의
+회귀 검증이 아직 필요합니다.
 
 ### Secondary index 생성과 사용
 
@@ -91,13 +103,26 @@ CREATE TAG INDEX person_name_idx ON person(name);
 LOOKUP ON person WHERE person.name == "Alice";
 ```
 
-현재 secondary-index fast path는 single-field equality predicate만 추출합니다.
-`<`, `<=`, `>`, `>=`, `!=` predicate는 tag scan에서 평가되며 range index scan을
-사용하지 않습니다. `EXPLAIN`으로 실제 access path를 확인하세요.
-
-label-only `MATCH`는 자동 유지되는 tag-VID index를 사용할 수 있습니다. 해당 index
+`EXPLAIN`으로 실제 access path를 확인하세요. label-only `MATCH`는 자동 유지되는
+tag-VID index를 사용할 수 있습니다. 해당 index
 entry 도입 전에 생성된 오래된 data는 backfill/reload 전까지 full-scan fallback을
 사용할 수 있습니다.
+
+Standalone `LOOKUP`은 single-field tag 및 edge index로 equality와 지원되는 ordered
+range(`>`, `>=`, `<`, `<=`)를 조회합니다. Edge `UPDATE`는 edge 변경과 함께 index
+entry를 갱신합니다.
+
+- Tag range access는 Boolean 또는 정수 schema와 일치하는 literal을 요구합니다.
+  Float/Double property는 저장된 정수와 실수가 서로 다른 index key 영역에 놓이므로
+  predicate scan을 사용합니다.
+- Edge range helper는 Boolean, 정수, 0이나 NaN이 아닌 실수 boundary를 지원합니다.
+  String key는 사전순 range access를 제공하지 않으며, 지원하지 않는 boundary는
+  predicate scan으로 돌아갑니다.
+- Distributed 실행에서는 ordered `LOOKUP` range를 거부합니다. `!=`는 ordered
+  range fast path가 아닙니다.
+
+Predicate와 data type별 실제 `EXPLAIN`/`PROFILE` access path를 확인하세요. Index가
+존재한다고 모든 query가 이를 사용하는 것은 아닙니다.
 
 ### Result set 제한
 

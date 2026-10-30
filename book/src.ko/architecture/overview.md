@@ -6,6 +6,10 @@ ByoriDB는 Rust workspace이며 기본 server는 query, metadata, storage logic�
 process에 조합합니다. 이것이 저장소의 standalone binary와 현재 deployment
 manifest가 실제로 실행하는 architecture입니다.
 
+주 목표 호출자는 에이전트입니다. [Agent-first 설계](agent-first.html)는 같은 서비스와
+저장 경로 위에 타입 있는 연산 경계를 추가하는 계획입니다. 아래 그림은 미래 계약이
+아닌 현재 실행 구조를 나타냅니다.
+
 ```text
                     +-----------------------+
                     | Rust CLI / gRPC / HTTP|

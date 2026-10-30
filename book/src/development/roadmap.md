@@ -1,132 +1,116 @@
 # Roadmap
 
-[한국어](../ko/development/roadmap.html)
+**English** | [한국어](../ko/development/roadmap.html)
 
-This page summarizes the direction visible in the current source tree. It is
-not a release schedule or a compatibility promise. `docs/PLAN.md` is the
-detailed engineering source of truth; historical incident notes in that file
-should not be interpreted as a statement about a live environment today.
+Updated 2026-10-30 against **v0.4.20** (`c9bd11c`). ByoriDB is developing into an
+**agent-first, general-purpose graph and ontology database**. Agents are direct
+consumers; people operate, evaluate, govern and purchase deployments. Agent memory
+is one use case. The goal is correct task completion with inspectable evidence and
+reliable state changes; agent cost or speed advantages still need measurement.
 
-This summary was last checked against `main` at `8209f28` on 2026-07-30.
+The [product philosophy and design](https://github.com/byoridb/byoridb/blob/main/docs/PRODUCT_DESIGN.md)
+define the target contracts. The delivery source of truth is
+[docs/PLAN.md](https://github.com/byoridb/byoridb/blob/main/docs/PLAN.md).
+This is an approved direction and acceptance plan, not a release schedule.
+New agent contracts below remain **PLANNED**, not available APIs.
 
-## Available on the current main line
+## Available in the released baseline
 
-### Graph and query core
+- Vertex and edge CRUD, `FETCH`, `GO`, `MATCH`, tag/edge `LOOKUP`, path finding,
+  `EXPLAIN` and `PROFILE`. Edge updates and eligible local edge-index ranges are
+  implemented; node labels support conjunction and disjunction.
+- INT64 and standalone string VIDs for graph CRUD/traversal, tag/edge/reverse
+  indexes, and persisted HNSW recommendation indexes.
+- Class hierarchies, disjoint/equivalent classes, semantic edge rules, two-link
+  property chains, current-view inference, edge `WHY`, DRed retraction and shapes.
+- Structural, embedding and blended recommendations.
+- Asserted current/history atomic writes and vertex/edge `FETCH ... AS OF`, plus
+  full snapshot backup and restore that preserve both tables.
+- A single-node redb server with shared HTTP/gRPC authentication, durable users,
+  built-in roles, local revocation, configurable login throttling and session TTL.
 
-- spaces, tags, edge types, vertices, edges, and tag/edge indexes;
-- vertex `INSERT`, `UPDATE`, and `DELETE`, plus edge `INSERT` and `DELETE`;
-- `FETCH`, `GO`, `MATCH`, `LOOKUP`, and path finding;
-- variable-length MATCH paths, reverse-edge traversal, grouping and common
-  aggregates;
-- `EXPLAIN` access-path reporting and runtime `PROFILE` observations;
-- multi-row batched DML and resource guards for scans, traversal, and result
-  materialization.
+These capabilities have limits. `WHY` and recommendation still need string VID
+parity. `sameAs` merging is irreversible. Compound statements are not transactions.
+Scan and inference limits do not yet have a uniform complete-or-error contract.
+Backup metadata verification is not a full content check or restore drill.
+Native TLS, space-scoped grants and a supported multi-node runtime are absent.
+Selected nGQL/OWL-style features do not imply full language/standard conformance.
 
-### Ontology and recommendations
+## Next delivery stages
 
-- class hierarchies, disjointness, equivalent classes and properties;
-- transitive, symmetric, inverse, subproperty, domain/range, and two-link
-  property-chain semantics;
-- current-view forward materialization, inference provenance, `WHY`, and
-  incremental edge retraction support;
-- `owl:sameAs` canonical merging with documented irreversible behavior;
-- shape declarations, write-time checks, and consistency queries;
-- structural, embedding, and blended recommendations, including persisted HNSW
-  indexes for larger vector sets.
+| Order | Outcome | Acceptance focus |
+|---|---|---|
+| Release prerequisite | Resolve dependency audit findings (DEP-1) | Compatible dependency updates, current audit and workspace gates; the 2026-10-30 audit reported 10 baseline vulnerabilities and failed |
+| 1 | Correctness and machine contracts (QRY-1–4, API-1–2, AGT-1–2, EVAL-1) | Complete results or explicit errors, inference recovery, actual cancellation; typed parameters/errors, authorized discovery, bounded results/evidence and an early agent evaluation baseline |
+| 2 | Recovery, reliable writes and access boundaries (OPS-1–2, TXN-1–2, SEC-3/1, AGT-3–4) | Restore drills and versioned storage; explicit compound outcomes then atomic DML; early space grants/TLS; durable idempotent outcomes, revisions and preview/apply |
+| 3 | Ontology consistency and evidence (SEM-6/3/4/7/8) | String VID parity, vertex-type explanations, shape/inference and cardinality policy, revision-checked `sameAs` preview/merge records, assertion origin and explicit premise-trust policy |
+| 4 | SDKs, import and adapters (API-3–4, AGT-5) | One official SDK, bulk-import semantic parity, shared protocol/MCP adapter acceptance fixtures and explicit ownership |
+| 5 | Operational acceptance (SEC-5) | Metrics/diagnostics access and retention, observable runtime behavior, tested recovery/upgrade runbooks |
+| 6 | Correctness- and agent-evaluation-driven performance (PERF-1–3) | Correct results and successful agent work before throughput/cost, real concurrency, LDBC batch-read acceptance, measured optimization |
 
-### Storage and temporal state
+The first implementation slice, **QRY-1**, propagates errors returned by
+`OPTIONAL MATCH` execution and pattern resolution while preserving genuine
+no-match null bindings. It is implemented on `main` in commit `10a7811` with
+eight focused regressions and prior workspace/documentation checks passing;
+release publication has not been verified. DEP-1 remains a release-readiness requirement; dependency upgrades
+are a separate compatibility-reviewed change. Lower-level swallowed errors and
+resource-limit semantics remain in QRY-2.
 
-- pure-Rust redb current-view storage with protobuf vertex/edge payloads;
-- a physically separate asserted-fact history table;
-- atomic redb application of the current entity mutation and matching history
-  version on the executor's temporal DML path;
-- monotonic transaction timestamps that avoid same-millisecond history-key
-  collisions;
-- vertex and edge `FETCH PROP ... AS OF <epoch-ms>`, including tombstones;
-- snapshot backup and restore that preserve current and history tables.
+Next, run **DEP-1**, **QRY-2**, **AGT-1 read-only discovery contract/fixtures**, and
+**EVAL-1 baseline fixtures** in parallel. Agree the minimum API-2 discovery/error/
+value envelope and authorization policy before AGT-1 runtime work. Restore drills,
+TLS validation and benchmark baselines can start now. Space grants and TLS do not
+wait for SDK delivery. Design agreement is distinct from implementation acceptance;
+a capability may be advertised only after its runtime behavior passes acceptance.
 
-### Service and operations
+EVAL-1 covers discovery, traversal, explanation, retraction, timeout/retry,
+concurrent writes and access denial. Verify exact final state, evidence and denied
+side effects first. Pin model/version/date, prompts/settings, data/seed, repetitions
+and budgets; declare success targets before testing and record unsupported baseline
+tasks. Compare calls, tokens and latency only for equivalent successful work.
 
-- authenticated gRPC and HTTP query services sharing one service instance;
-- durable non-root users, built-in roles, recursive statement authorization,
-  session invalidation after security-state changes, and admin-only query
-  diagnostics;
-- Prometheus query metrics, health/readiness endpoints, and graceful draining;
-- an interactive Rust CLI, offline CSV bulk loader, Docker assets, and a
-  single-replica Azure AKS deployment definition.
+## Machine-contract boundaries
 
-## Current product boundaries
+Current HTTP/gRPC query execution supports `read_only`; edge `WHY` returns string
+columns. Typed query parameters, structured discovery/proof envelopes, durable
+idempotency, revision checks and preview/apply are planned. A separate MCP server
+may belong to `byori`; adapter availability does not create engine capabilities.
+Adapters must preserve authorization, types, completeness, budgets and outcomes.
 
-The following limitations are part of the current status, not completed
-features:
+A proposed partial-result mode is not implemented: it would require explicit
+opt-in and machine-readable reasons. Page completion, query completeness and
+inference status must be distinct; snapshot support must be declared accurately.
+A write error is not proof of rollback. Idempotency requires an atomic commit of
+the mutation, scoped request key and durable outcome; unknown/expired outcomes
+cannot authorize blind retry. Preview never grants authority: apply rechecks
+permissions and revisions and rejects stale or expired plans without side effects.
+An explanation proves derivation from recorded facts/rules, not source truth.
 
-- **Multi-node operation:** partition, RPC, Meta, migration, and custom Raft
-  components exist, but the launcher does not wire a complete Storage/Raft
-  cluster or route normal Graph queries through it.
-- **Temporal semantics:** valid time is not user-specified; one epoch-ms value
-  is used for valid and transaction time. Temporal `MATCH`/`GO`, intervals, and
-  historical inferred facts are absent.
-- **Sessions:** session and active-auth state is in process, is cleared on
-  restart, and is not shared across replicas.
-- **Transport security:** the server has no native TLS. Deployments need trusted
-  TLS termination, network restrictions, and external traffic controls.
-- **Transactions:** redb operations are transactional, but the query language
-  has no general multi-statement transaction or compound rollback.
-- **Edge updates:** `UPDATE EDGE` is accepted by the parser, but the current
-  plan/executor path only implements vertex updates.
-- **API maturity:** gRPC complex values use a JSON fallback in the structured
-  response; the older JSON byte field remains for compatibility.
-- **Operational packaging:** there is no supported Kubernetes operator, Helm
-  chart, or automated multi-node upgrade procedure.
+## Later extensions need explicit entry criteria
 
-## Active engineering directions
+- **Historical graph queries:** start with asserted `MATCH/GO AS OF` after
+  recovery and snapshot semantics are established. Historical inference also
+  needs versioned rules and identity mappings. Valid-time writes and retention
+  require separate contracts.
+- **RDF/Turtle interchange:** define a supported mapping for IRIs, blank nodes,
+  datatypes and multi-values and prove round-trip preservation. This is not a
+  commitment to SPARQL or a full RDF-store redesign.
+- **Distribution:** require an actual capacity/availability need and an operating
+  owner. Bootstrap, Raft/storage wiring, coherent deployment, authorization and
+  multi-process failure/upgrade tests must pass before advertising support.
+- **Volcano/parallel execution:** start from measured intermediate-memory,
+  LIMIT-latency or throughput bottlenecks, with result parity throughout.
 
-### Complete the distributed runtime
+## Existing issue boundaries
 
-The largest architecture gap is to connect and validate what is already present:
+[#10](https://github.com/byoridb/byoridb/issues/10) has engine batching implemented;
+external LDBC harness acceptance remains. The engine part of
+[#23](https://github.com/byoridb/byoridb/issues/23) is implemented; client retry work
+belongs to `byori`. [#24](https://github.com/byoridb/byoridb/issues/24) concerns the
+remaining Windows support policy and implementation. Linux/macOS x86_64/arm64
+release artifacts already exist.
 
-- Storage RPC and per-partition Raft startup;
-- peer discovery, bootstrap, membership changes, and leader routing;
-- distributed Graph execution parity across query types;
-- replication/recovery/failover tests in real multi-process deployments;
-- a session and authorization design for multiple Graph replicas;
-- upgrade, snapshot, migration, and observability runbooks.
-
-This work must close before documentation can recommend replicas greater than
-one for shared data.
-
-### Expand bitemporal queries
-
-Likely next temporal increments include explicit valid-time intervals,
-independent transaction-time selection, interval queries, temporal graph
-traversal/pattern matching, and a defined policy for inferred history. Any
-extension must preserve current-view performance and backup compatibility.
-
-### Improve execution scalability
-
-Parallel execution and better cost-based planning remain measurement-driven
-work. Priorities include bounding memory, avoiding accidental full scans,
-improving large aggregation paths, and publishing reproducible benchmarks
-instead of fixed marketing QPS numbers.
-
-### Harden operations and security
-
-Further work includes native or formally documented TLS integration, external
-rate limiting, more complete space-scoped authorization administration,
-cluster-wide session revocation, backup automation, restore drills, and
-metrics whose declared storage/session/partition series are fed by runtime
-state.
-
-### Mature client and wire formats
-
-The Rust client is the implemented client surface. Rich first-class protobuf
-representations for complex values and additional language clients should
-follow an explicit compatibility policy rather than ad-hoc wire changes.
-
-## How to help
-
-Choose an issue or a concrete item in `docs/PLAN.md`, keep the change scoped,
-and follow the [contribution guide](contributing.html). For distributed, Raft,
-temporal, authentication, and storage changes, include the specialized
-regression tests and document the remaining boundary as carefully as the new
-capability.
+Choose a scoped task from the detailed plan and follow the
+[contribution guide](contributing.md). Include behavioral acceptance tests and
+update English/Korean documentation together. Historical design and incident
+notes are archived in `docs/archive/`; they do not describe a live deployment.

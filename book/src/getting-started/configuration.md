@@ -11,14 +11,15 @@ only `--version` and `--help`, and rejects anything else:
 
 ```bash
 $ byoridb-server --version
-byoridb-server 0.3.3 (commit 9200800a1b2c, release)
+byoridb-server 0.4.20 (commit c9bd11c39001, release)
 
 $ byoridb-server --help    # lists every key and environment variable below
 ```
 
-`--version` reports the commit the binary was built from, which is how a
-deployed artifact is identified while there is no maintained semver release
-line. A build made from a modified working tree is marked `-dirty`, and a build
+The output above illustrates the v0.4.20 release baseline; an installed binary
+reports its own version and commit. `--version` identifies the exact build,
+including revisions that were not tagged. A build made from a modified working
+tree is marked `-dirty`, and a build
 made outside a git checkout reports `unknown`. Both flags exit without reading
 credentials, opening storage, or binding a listener, so they are safe to run
 against an installed binary at any time.
@@ -83,8 +84,9 @@ The CLI uses separate variables:
 
 `[auth]` sets how long a bearer session lives and how failed logins are
 throttled. Failed logins are limited per account, per source address, and by a
-lockout; successful logins are never throttled and there is no ceiling on
-concurrent logins — see [Login throttling](../reference/api.md#login-throttling)
+lockout. Successful logins do not consume failure budgets; concurrent Argon2
+verification queues rather than limits sessions — see
+[Login throttling](../reference/api.md#login-throttling)
 for the wire contract. The defaults are the right choice for an exposed
 listener:
 
@@ -201,8 +203,9 @@ as a production distributed deployment.
 
 ## Network security
 
-The gRPC and HTTP servers do not terminate TLS and there is no built-in
-network-level login rate limiter. For any non-local deployment:
+The gRPC and HTTP servers do not terminate TLS. Built-in login failure budgets
+and bounded Argon2 verification are process-local; they do not limit general
+connection or query traffic. For any non-local deployment:
 
 - terminate TLS at a trusted ingress or proxy;
 - restrict listener access with a firewall or network policy;

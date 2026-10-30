@@ -15,6 +15,8 @@ documentation 개선을 환영합니다.
   먼저 issue를 열고 제안 동작 및 compatibility 영향을 설명하세요.
 - 현재 구현 제약과 알려진 regression 영역은 [docs/PLAN.ko.md](docs/PLAN.ko.md)를
   확인하세요.
+- 제품 원칙과 목표 Agent 계약은 [docs/PRODUCT_DESIGN.ko.md](docs/PRODUCT_DESIGN.ko.md)를
+  따르세요. 개발 상태는 PLAN, 구현된 동작은 API 레퍼런스가 담당합니다.
 - 변경 범위를 집중해서 유지하세요. 관련 없는 formatting, refactor, feature 작업을
   한 Pull Request에 섞지 마세요.
 
@@ -87,6 +89,27 @@ example은 두 언어에서 동일하게 유지합니다.
 
 현재 코드에 존재하는 동작을 문서화하세요. 미완성 또는 experimental behavior는
 명확히 표시하며 특히 현재 multi-node launcher를 production-ready로 설명하지 마세요.
+
+## Agent 계약 검토
+
+동작을 변경할 때는 가능해지는 Agent 작업과 개발 계획의 관련 수용 항목을 명시하세요.
+해당하는 계약 범위를 검토합니다.
+
+- **Discovery와 값:** 인가된 스키마 노출, capability 버전, 타입 있는 인자,
+  정확한 ID와 손실 없는 결과 표현.
+- **조회와 근거:** 완전한 결과 또는 오류, 예산, pagination 일관성, 도출 근거와
+  출처 구분, 알 수 없거나 누락된 근거.
+- **변경:** 원자적 경계, 중단 뒤 결과, 중복 요청, revision 충돌, 준비한 변경의
+  인가 재검사.
+- **Adapter:** HTTP/gRPC/SDK/MCP 의미 일치와 공유 서비스의 강제. 도구 힌트는
+  권한을 부여하거나 서버 검사를 대체하지 않습니다.
+
+집중 동작 회귀를 추가하고 Agent-facing 계약이 바뀌면 관련 EVAL-1 fixture도
+추가하세요. EVAL-1은 계획 단계입니다. Harness가 생기기 전에는 재현 가능한 작업,
+예상 답변·근거, 예상 최종 상태, 실행하지 못한 평가를 명시적으로 기록합니다.
+호출·토큰·속도보다 정확성을 먼저 확인하고 합성 adapter test를 자율 Agent 실행
+성공으로 표시하지 마세요. 문서만 바뀐 경우 양 언어 내용·예제·링크·빌드를 확인하고
+실행하지 않은 runtime·모델 결과를 만들어내지 않습니다.
 
 ## 필수 검증
 

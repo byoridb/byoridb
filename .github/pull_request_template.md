@@ -25,3 +25,9 @@
 ## 테스트 계획
 
 <!-- Describe how you tested your changes -->
+
+## Agent 계약 영향
+
+<!-- 동작 변경에 해당할 때만: docs/PRODUCT_DESIGN.md 및 PLAN의 작업 ID,
+     예상 Agent 작업·답변/근거·최종 상태, 인가·완전성·재시도/충돌 의미,
+     검증한 protocol과 미실행 평가를 적으세요. 문서 변경은 링크/한영/빌드 결과를 적으세요. -->

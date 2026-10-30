@@ -11,15 +11,17 @@ automatically supported.
 | Family | Current statements |
 | --- | --- |
 | Spaces and schema | `CREATE`, `ALTER`, `DROP`, `SHOW`, `DESCRIBE`, `USE` |
-| Data mutation | `INSERT VERTEX`, `UPDATE VERTEX`, `DELETE VERTEX`, `INSERT EDGE`, `DELETE EDGE` |
+| Data mutation | `INSERT VERTEX`, `UPDATE VERTEX`, `DELETE VERTEX`, `INSERT EDGE`, `UPDATE EDGE`, `DELETE EDGE` |
 | Query | `FETCH PROP`, `GO`, `MATCH`, `LOOKUP`, `FIND`, `RECOMMEND` |
 | Ontology | `CREATE CLASS`, `CREATE SHAPE`, `CHECK CONSISTENCY`, `CHECK SHAPE`, `WHY` |
 | Administration | `CREATE/ALTER/DROP USER`, `GRANT/REVOKE ROLE`, `SHOW USER/USERS`, `SHOW ROLE/ROLES`, `SHOW SESSIONS`, `BALANCE` |
 | Inspection | `EXPLAIN <statement>`, `PROFILE <statement>` |
 
-See the linked guide pages for execution limitations. For example,
-`UPDATE EDGE` is accepted by the parser but is not wired to a working executor,
-and `LOOKUP` currently operates on tags rather than edge types.
+`UPDATE EDGE` updates existing edges and their indexes. `LOOKUP` operates on
+tags and edge types, using equality or eligible ordered-range index paths in
+standalone mode. Supported range key domains and scan fallbacks are described
+in [Performance](../reference/performance.md#create-and-use-secondary-indexes);
+see the statement guides for the remaining execution restrictions.
 
 ## Lexical rules
 
