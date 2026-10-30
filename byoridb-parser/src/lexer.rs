@@ -6,6 +6,28 @@
 
 use logos::Logos;
 
+// Logos' generated automaton for a repeated escaped-string regex can recurse
+// with the input length in debug builds. Scan literals iteratively so a long
+// property value does not consume the thread stack. Keep quotes and escapes
+// intact for parser::unquote, including the original rejection of backslash-LF.
+fn quoted_string(lex: &mut logos::Lexer<'_, Token>, delimiter: char) -> Option<String> {
+    let mut escaped = false;
+    for (offset, character) in lex.remainder().char_indices() {
+        if escaped {
+            if character == '\n' {
+                return None;
+            }
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == delimiter {
+            lex.bump(offset + character.len_utf8());
+            return Some(lex.slice().to_string());
+        }
+    }
+    None
+}
+
 #[derive(Logos, Debug, Clone, PartialEq)]
 #[logos(skip r"[ \t\r\n\f]+")]
 pub enum Token {
@@ -380,9 +402,9 @@ pub enum Token {
     // escapes intact) is stored; `parser::unquote` strips quotes and interprets
     // the escapes. Without `\\.`, a value containing the delimiter quote or a
     // backslash truncated the token (the LDBC-only/integer-VID blind spot).
-    #[regex(r#""([^"\\]|\\.)*""#, |lex| lex.slice().to_string())]
+    #[token("\"", |lex| quoted_string(lex, '"'))]
     StringLiteral(std::string::String),
-    #[regex(r"'([^'\\]|\\.)*'", |lex| lex.slice().to_string())]
+    #[token("'", |lex| quoted_string(lex, '\''))]
     SingleQuotedString(std::string::String),
     #[regex(r"-?[0-9]+", |lex| lex.slice().parse().ok(), priority = 2)]
     Integer(i64),
@@ -546,6 +568,52 @@ mod tests {
             tokens[0].token,
             Token::SingleQuotedString(r"'it\'s'".to_string())
         );
+    }
+
+    #[test]
+    fn long_quoted_literals_use_constant_stack() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                for delimiter in ['"', '\''] {
+                    // Both plain and escaped Unicode strings exceed the size
+                    // that previously overflowed the default test-thread stack.
+                    for body in ["a".repeat(256 * 1024), "한글\\\"\\'\\\\".repeat(32 * 1024)] {
+                        let quoted = format!("{delimiter}{body}{delimiter}");
+                        let tokens = Lexer::new(&format!("{quoted} 42")).tokenize().unwrap();
+                        assert_eq!(tokens.len(), 2);
+                        let expected = if delimiter == '"' {
+                            Token::StringLiteral(quoted)
+                        } else {
+                            Token::SingleQuotedString(quoted)
+                        };
+                        assert_eq!(tokens[0].token, expected);
+                        assert_eq!(tokens[1].token, Token::Integer(42));
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn quoted_literal_boundaries_and_invalid_escapes() {
+        for query in [
+            "\"unterminated",
+            "'unterminated",
+            "\"trailing\\",
+            "'trailing\\",
+            "\"a\\\nb\"",
+            "'a\\\nb'",
+        ] {
+            assert!(Lexer::new(query).tokenize().is_err(), "{query:?}");
+        }
+        let tokens = Lexer::new("\"a\nb\"\n'한글' 42").tokenize().unwrap();
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0].token, Token::StringLiteral("\"a\nb\"".into()));
+        assert_eq!((tokens[1].line, tokens[1].column), (3, 1));
+        assert_eq!((tokens[2].line, tokens[2].column), (3, 10));
     }
 
     #[test]
