@@ -275,7 +275,7 @@ checksum = "5dd9dc738b7a8311c7ade152424974d8115f2cdad61e8dab8dac9f2362298510"
 
 [[package]]
 name = "byoridb"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "anyhow",
  "byoridb-codec",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "byoridb-bulkloader"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "anyhow",
  "byoridb-codec",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "byoridb-client"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "anyhow",
  "byoridb-common",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "byoridb-codec"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "bincode",
  "byoridb-common",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "byoridb-common"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "anyhow",
  "argon2",
@@ -369,7 +369,7 @@ dependencies = [
 
 [[package]]
 name = "byoridb-executor"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "async-trait",
  "bincode",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "byoridb-graph"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "anyhow",
  "argon2",
@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "byoridb-kvstore"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "byoridb-meta"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "byoridb-parser"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "anyhow",
  "byoridb-common",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "byoridb-storage"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "anyhow",
  "async-trait",
