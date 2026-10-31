@@ -2,7 +2,7 @@
 
 **English** | [한국어](../ko/development/roadmap.html)
 
-Updated 2026-10-31 against released **v0.4.22** (`main` at `6851936`). ByoriDB is developing into an
+Updated 2026-10-31 against released **v0.4.23** (tag commit `fb96cb3`). ByoriDB is developing into an
 **agent-first, general-purpose graph and ontology database**. Agents are direct
 consumers; people operate, evaluate, govern and purchase deployments. Agent memory
 is one use case. The goal is correct task completion with inspectable evidence and
@@ -16,13 +16,15 @@ Read-only discovery contract 1 and the foundations correctness fixes are release
 Broader agent contracts remain PLANNED or IN PROGRESS; an unfinished task may
 contain released slices, as recorded in the plan.
 
-[CI](https://github.com/byoridb/byoridb/actions/runs/41054788495) and
-[Auto-release](https://github.com/byoridb/byoridb/actions/runs/41054789050) succeeded.
-The [v0.4.22 release](https://github.com/byoridb/byoridb/releases/tag/v0.4.22) has four
-Linux/macOS x86_64/arm64 `.tar.gz` artifacts. The previous v0.4.21/pre-foundations
-snapshot is historical; active QRY-2 branch work below is not yet released.
+Implementation `2cb4072` passed [CI](https://github.com/byoridb/byoridb/actions/runs/41177637017);
+release `fb96cb3` passed [Auto-release](https://github.com/byoridb/byoridb/actions/runs/41177636969).
+The [v0.4.23 release](https://github.com/byoridb/byoridb/releases/tag/v0.4.23) was
+published on 2026-10-31 at 07:06:25 UTC with four Linux/macOS x86_64/arm64
+`.tar.gz` archives. Each contains server/CLI/backup and LICENSE/NOTICES. Hosted
+runtime gates and direct downloaded-artifact checks passed; local and hosted
+suites each report 1,272 passed, 0 failed and 8 existing ignored across 37 suites.
 
-## Available in v0.4.22
+## Earlier foundations — v0.4.22
 
 - Vertex and edge CRUD, `FETCH`, `GO`, `MATCH`, tag/edge `LOOKUP`, path finding,
   `EXPLAIN` and `PROFILE`. Edge updates and eligible local edge-index ranges are
@@ -63,24 +65,23 @@ Selected nGQL/OWL-style features do not imply full language/standard conformance
 
 **QRY-1 is DONE and released in v0.4.22.** It propagates errors returned by
 `OPTIONAL MATCH` execution and pattern resolution while preserving genuine
-no-match null bindings; eight focused regressions passed. The release proof is
-linked above. The same release includes MATCH candidate-scan and variable-length
+no-match null bindings; eight focused regressions passed. Its historical
+release proof is retained in the detailed plan. The same release includes MATCH candidate-scan and variable-length
 cap errors, index-partition error propagation, strict tag-index decoding and
 iterative long-string lexing. A small query `LIMIT` cannot bypass candidate
 budgets. Broader QRY-2 acceptance remains **IN PROGRESS**.
 
-The current source consolidates LOOKUP/FIND/MATCH completeness, distributed
+v0.4.23 consolidates LOOKUP/FIND/MATCH completeness, distributed
 index continuation and remote fetch checks, inference recovery, single-statement
 DML staging, backup integrity/restore drills and server lifecycle fixes. See the
 [standalone acceptance record](https://github.com/byoridb/byoridb/blob/main/docs/DEPLOYMENT_READINESS.md)
 for exact guarantees and executable evidence. QRY-2 remains IN PROGRESS. QRY-3,
-OPS-1 and SEC-1 are DONE at source acceptance, with release publication pending.
-Local gates and real recovery/TLS drills passed; hosted workflows and archives
-for the final commit must still confirm publication. The
+OPS-1 and SEC-1 are **DONE (released v0.4.23)**. Local gates, real recovery/TLS
+drills, hosted workflows and the published artifacts passed acceptance. The
 [TLS deployment profile](../operations/secure-deployment.md) is the supported
 network boundary. A single-statement transaction does not complete TXN-2's future
 multi-statement/inference contract. Typed operations, idempotency and revisions
-remain planned; the release workflow must pass before publication is claimed.
+remain planned; releasing this standalone increment does not complete those contracts.
 
 ## Machine-contract boundaries
 

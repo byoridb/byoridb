@@ -2,7 +2,7 @@
 
 [English](../../development/roadmap.html) | **한국어**
 
-2026-10-31, 출시된 **v0.4.22**(`main`의 `6851936`) 기준으로 갱신했습니다. ByoriDB는 **Agent를 직접 사용자로
+2026-10-31, 출시된 **v0.4.23**(tag commit `fb96cb3`) 기준으로 갱신했습니다. ByoriDB는 **Agent를 직접 사용자로
 삼는 범용 그래프·온톨로지 DB**를 지향합니다. 사람은 배포를 운영·평가·통제하고 도입을
 결정합니다. Agent 메모리는 여러 사용례 중 하나입니다. 확인 가능한 근거와 신뢰할 수 있는
 상태 변경을 통해 작업을 정확하게 끝내는 것이 목표이며, Agent 비용·속도 우위는 앞으로
@@ -15,13 +15,15 @@
 계약은 PLANNED 또는 IN PROGRESS이며 미완료 작업도 플랜에 기록한 일부 구현이
 출시됐을 수 있습니다.
 
-[CI](https://github.com/byoridb/byoridb/actions/runs/41054788495)와
-[Auto-release](https://github.com/byoridb/byoridb/actions/runs/41054789050)가 성공했습니다.
-[v0.4.22 릴리스](https://github.com/byoridb/byoridb/releases/tag/v0.4.22)에 Linux/macOS
-x86_64/arm64 `.tar.gz` 산출물 4개가 있습니다. 이전 v0.4.21/pre-foundations 상태는
-과거 기록이며 아래 진행 중인 QRY-2 브랜치 변경은 미출시입니다.
+구현 `2cb4072`의 [CI](https://github.com/byoridb/byoridb/actions/runs/41177637017),
+릴리스 `fb96cb3`의 [Auto-release](https://github.com/byoridb/byoridb/actions/runs/41177636969)가 성공했습니다.
+[v0.4.23 릴리스](https://github.com/byoridb/byoridb/releases/tag/v0.4.23)는
+2026-10-31 07:06:25 UTC에 Linux/macOS x86_64/arm64 `.tar.gz` archive 4개로
+게시됐습니다. 각각 server/CLI/backup과 LICENSE/NOTICES를 포함하며 호스팅 runtime
+gate와 직접 다운로드한 artifact 검사도 통과했습니다. 로컬·호스팅 suite는 각각
+37개 suite에서 1,272 passed, 0 failed, 기존 ignored 8개입니다.
 
-## v0.4.22에서 제공하는 기능
+## 이전 foundations — v0.4.22
 
 - vertex/edge CRUD, `FETCH`, `GO`, `MATCH`, tag/edge `LOOKUP`, 경로 탐색,
   `EXPLAIN`·`PROFILE`. edge UPDATE와 지원되는 로컬 edge index range가 구현됐고,
@@ -60,21 +62,21 @@ x86_64/arm64 `.tar.gz` 산출물 4개가 있습니다. 이전 v0.4.21/pre-founda
 
 **QRY-1은 DONE이며 v0.4.22로 출시됐습니다.** 정상적인 매칭 없음의 null binding을
 유지하면서 `OPTIONAL MATCH` 실행·패턴 해석 오류를 전파하며 집중 회귀 8개를
-통과했습니다. 릴리스 근거는 위 링크에 있습니다. 같은 릴리스에 MATCH 후보·가변 길이
+통과했습니다. 당시 릴리스 근거는 상세 플랜에 유지합니다. 같은 릴리스에 MATCH 후보·가변 길이
 상한의 오류, index partition 오류 전파, 엄격한 tag-index decode, 긴 문자열의 반복
 스캐너도 포함됩니다. 작은 query `LIMIT`이 후보 예산을 우회하지는 않습니다.
 더 넓은 QRY-2 수용은 **IN PROGRESS**입니다.
 
-현재 소스에는 LOOKUP/FIND/MATCH 완전성, 분산 index 이어 읽기·원격 fetch 검증,
+v0.4.23에는 LOOKUP/FIND/MATCH 완전성, 분산 index 이어 읽기·원격 fetch 검증,
 추론 복구, 단일 문장 DML 준비, 백업 무결성·복원과 서버 lifecycle 보강이 반영됐습니다.
 정확한 보장과 실행 근거는
 [standalone 인수 기록](https://github.com/byoridb/byoridb/blob/main/docs/DEPLOYMENT_READINESS.ko.md)을
-참고하세요. QRY-2는 IN PROGRESS입니다. QRY-3, OPS-1, SEC-1은 소스 인수 기준으로
-DONE이며 릴리스 게시 대기 상태입니다. 로컬 gate와 실제 복구·TLS 검증을 통과했으며
-최종 commit의 호스팅 workflow와 archive를 확인해야 게시 완료가 됩니다. [TLS 배포 프로필](../operations/secure-deployment.md)이 지원 네트워크 경계입니다.
+참고하세요. QRY-2는 IN PROGRESS입니다. QRY-3, OPS-1, SEC-1은
+**DONE (released v0.4.23)**입니다. 로컬 gate·실제 복구/TLS 검증·호스팅 workflow와
+게시 artifact가 인수 검증을 통과했습니다. [TLS 배포 프로필](../operations/secure-deployment.md)이 지원 네트워크 경계입니다.
 단일 문장 transaction은 향후 TXN-2의 다중 문장·추론 전체 계약을 완성하지 않습니다.
-Typed operation, idempotency, revision은 계획에 남으며 실제 게시 완료는 릴리스
-workflow 성공 후에만 확인합니다.
+Typed operation, idempotency, revision은 계획에 남으며 이번 standalone 릴리스가
+해당 계약까지 완성한 것은 아닙니다.
 
 ## 기계 계약의 경계
 

@@ -2,25 +2,30 @@
 
 > **English** | [한국어](DEPLOYMENT_READINESS.ko.md)
 >
-> Source contract, 2026-10-31. Use the exact release's CI result and artifacts
-> as publication evidence; a local test result does not prove a hosted release.
+> Verified release **v0.4.23**, published 2026-10-31 at 07:06:25 UTC.
+> Local checks, hosted gates and published-artifact evidence are distinguished below.
 
 The first supported deployment is one standalone server and redb volume, with
 HTTP and gRPC sharing authentication, sessions and execution. Agents consume
 authorized discovery and text queries. [PLAN.md](PLAN.md) retains the remaining
 typed-operation, idempotency, revision, SDK and multi-node roadmap.
 
-## Local acceptance — 2026-10-31
+## Release acceptance — v0.4.23
 
-QRY-3, OPS-1 and SEC-1 are **DONE (source accepted; release pending)** for the
-standalone contracts below. This acceptance records the working tree based on
-`6851936` (v0.4.22); it is not evidence that these changes shipped in v0.4.22.
+QRY-3, OPS-1 and SEC-1 are **DONE (released v0.4.23)** for the standalone
+contracts below. Implementation commit
+[`2cb4072d0314bc911e9165c218d87feeacadbc10`](https://github.com/byoridb/byoridb/commit/2cb4072d0314bc911e9165c218d87feeacadbc10)
+passed [CI](https://github.com/byoridb/byoridb/actions/runs/41177637017).
+The version-bump/tag commit
+[`fb96cb3751934f447833b7ce97e3230459be1830`](https://github.com/byoridb/byoridb/commit/fb96cb3751934f447833b7ce97e3230459be1830)
+passed [Auto-release](https://github.com/byoridb/byoridb/actions/runs/41177636969)
+and is the target of the [published v0.4.23 tag](https://github.com/byoridb/byoridb/releases/tag/v0.4.23).
 QRY-2 remains IN PROGRESS for the broader completeness/result-envelope work.
 
 | Check | Observed result |
 |---|---|
 | Formatting, locked workspace check and Clippy | PASS with all targets/features; Clippy uses `-D warnings` |
-| Serial locked workspace tests | **1,272 passed, 0 failed, 8 existing ignored across 37 suites** |
+| Serial locked workspace tests | Local, hosted CI and exact-ref release gate each report **1,272 passed, 0 failed, 8 existing ignored across 37 suites** |
 | Dependency audit | **0 vulnerabilities**; the existing `bincode` 1.3.3 unmaintained warning remains the tracked format-migration boundary |
 | Docker TLS deployment | Source and prebuilt image drills PASS; final integrated source `--build` drill PASS. Real HTTPS/gRPC authentication, private backend, denied operations routes, certificate rotation, restart persistence and log redaction checked |
 | Independent release/profile review | No blocking findings after fixes |
@@ -29,14 +34,12 @@ QRY-2 remains IN PROGRESS for the broader completeness/result-envelope work.
 | Recovery fixture timings | `data.redb`: **294,912 bytes**; create **0.084 s**, verify **0.028 s**, restore **0.055 s** |
 | Startup fixture timings | Initial **0.267 s**, restart **0.237 s**, restored data **0.244 s** |
 | Documentation | English then Korean mdBook builds and 14-pair code/status/link checks PASS |
-| Hosted publication | **Pending**: exact-commit CI and auto-release success, signing/notarization, four archives and artifact runtime gates |
+| Hosted publication | **PASS**: CI and auto-release completed successfully; four Linux/macOS x86_64/arm64 archives, each with server/CLI/backup plus LICENSE/NOTICES. macOS binaries signed/notarized; extracted runtime smoke passed for every target, natively on Linux and through Rosetta for macOS x86_64 |
+| Published-asset verification | **PASS**: downloaded all four archives, matched release-asset SHA-256 values, checked exactly five members and all 12 binary architectures; verified six macOS signatures. Downloaded macOS arm64 binaries report v0.4.23/`fb96cb3` and pass HTTP/gRPC restart and backup/restore smoke |
 
-This is the pre-publication acceptance snapshot; the workflow and release links
-below provide subsequent publication evidence.
-
-Local container and recovery fixtures demonstrate the tested boundaries, not a
-production throughput or universal RPO/RTO. A hosted release is complete only
-when the final committed SHA and its artifacts satisfy the publication row.
+Local build/recovery timings above are measurements of the acceptance fixture;
+they are not production throughput or universal RPO/RTO. The hosted workflow
+links identify the release tested and published, rather than a later docs-only commit.
 
 ## Implemented acceptance boundaries
 

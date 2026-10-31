@@ -20,6 +20,14 @@ installation will select the expected compiler automatically.
 Windows is not currently supported. ByoriDB uses the pure-Rust `redb` storage
 engine, so RocksDB and a C++ RocksDB toolchain are not required.
 
+The **v0.4.23 Linux prebuilt archives** for both x86_64 and arm64 require
+**glibc 2.39 or newer** to run all three tools, such as Ubuntu 24.04. The verified
+ELF requirements are glibc 2.34 for the server and backup tool, and 2.39 for the
+CLI. These are requirements of this release's archives, not an ABI promise for
+future versions. On an older distribution, build from source there or use the
+separately built and tested source Docker image. Review each release's runtime
+requirements before upgrading.
+
 The release workflow builds Linux arm64 natively on GitHub's arm64 runner.
 
 Every macOS binary in a new tagged archive — `byoridb-server`, `byoridb-cli`,

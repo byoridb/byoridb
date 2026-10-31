@@ -2,7 +2,7 @@
 
 > **English** | [한국어](PLAN.ko.md)
 >
-> Updated: 2026-10-31. Released baseline: `main` at `6851936`, **v0.4.22**.
+> Updated: 2026-10-31. Latest verified release: **v0.4.23** at `fb96cb3`.
 > This is a source-based plan, not a live deployment report. Unreleased work and
 > checks performed during this revision are identified separately below.
 
@@ -38,11 +38,11 @@ imply complete nGQL, OWL, SHACL, RDF, or SPARQL conformance.
 
 The product direction is approved. Discovery contract 1 and the foundations
 correctness fixes are released in **v0.4.22**; broader machine contracts remain
-**PLANNED or IN PROGRESS**. The following table describes that released baseline,
-not the active `codex/query-completeness` branch. Proposed mutation envelopes,
+**PLANNED or IN PROGRESS**. The table preserves the earlier v0.4.22 baseline;
+the v0.4.23 additions and acceptance are recorded below. Proposed mutation envelopes,
 idempotency, revision checks and snapshot guarantees are not available API behavior.
 
-## Released baseline and boundaries
+## Earlier released baseline — v0.4.22
 
 | Area | Available at v0.4.22 | Remaining boundary |
 |---|---|---|
@@ -62,14 +62,13 @@ Storage range primitives accept Boolean, integer, and eligible floating-point
 boundaries; not every query/type combination uses an index. String key encoding
 is not lexical. Check the executor and `EXPLAIN` together when extending coverage.
 The v0.4.22 Compose replicas run independent servers, not one shared-data cluster.
-The current source replaces that example with one loopback-only standalone service.
+v0.4.23 replaces that example with one loopback-only standalone service.
 
 ## Status and delivery order
 
 **DONE** requires implementation, acceptance checks, and documentation evidence.
-`DONE (source accepted; release pending)` records completed local acceptance;
-it does not claim a published artifact. A released status also needs the exact
-commit’s successful hosted workflows and published archives.
+Source acceptance alone does not claim a published artifact. A released status
+also needs the exact commit’s successful hosted workflows and published archives.
 **IN PROGRESS** means the overall task is unfinished; accepted slices may already
 be released, as stated in each delivery record. It does not advertise the whole
 task as available. **PLANNED** has not passed acceptance. **GATED** requires the
@@ -114,7 +113,7 @@ not the status of the current release.
 |---|---|---|---|
 | QRY-1 / DONE (released v0.4.22) | Propagate `OPTIONAL MATCH` errors | None | Genuine no-match retains null-binding semantics. Errors returned by optional execution and pattern resolution propagate unchanged, with injected storage failures, partial-row failures and chained cases covered. Eight focused regressions and workspace/documentation checks pass; see the v0.4.22 hosted proof above. Released in v0.4.22; broader completeness remains QRY-2. The release proof is linked above. |
 | QRY-2 / IN PROGRESS | Uniform scan/traversal/result completeness | QRY-1; co-design API-2/AGT-2 result contract | Audit limiting paths and swallowed lower MATCH index/partition errors. Below/at/above a cap, return the complete query-defined result or an explicit error. User `LIMIT` is query semantics. Any partial mode needs separate design, explicit opt-in and a machine-readable reason; no partial mode is currently promised. |
-| QRY-3 / DONE (source accepted; release pending) | Inference completeness and recovery | QRY-2 error contract | Cap/error cannot report completed closure. Fault tests expose asserted/derived write state; retry/rebuild converges without duplicate or stale provenance. Specify rollback versus resumable recovery first: an error alone does not prove rollback. |
+| QRY-3 / DONE (released v0.4.23) | Inference completeness and recovery | QRY-2 error contract | Cap/error cannot report completed closure. Fault tests expose asserted/derived write state; retry/rebuild converges without duplicate or stale provenance. Specify rollback versus resumable recovery first: an error alone does not prove rollback. |
 | QRY-4 / PLANNED | Real server deadline and cancellation | QRY-2; QRY-3 for writes | Expensive execution stops at tested cancellation points, cleans up resources/diagnostics and returns stable HTTP/gRPC errors. Test write interruption and atomic boundaries; a setting or client disconnect alone is not proof of cancellation. |
 | API-1 / PLANNED | Typed query parameters | Design now; QRY-1–2 for execution acceptance | Pass IDs, Unicode, nulls and lists without interpolation over HTTP/gRPC; consistent missing/type errors; distinguish parameters from compound variables. |
 | API-2 / IN PROGRESS | Stable errors, values and capabilities | Minimum envelope design now; full acceptance needs QRY-1–4 and TXN-1 | Fix error/retry/outcome meanings, integer precision, complex values and version compatibility. Define the discovery envelope before AGT-1 implementation. Admit capabilities only after their runtime checks; unknown mutation outcome is not a safe-to-retry success/failure claim. |
@@ -134,7 +133,7 @@ run is claimed.
 
 #### Standalone completion work
 
-The current source adds distributed LOOKUP pagination/remote fetch validation,
+v0.4.23 adds distributed LOOKUP pagination/remote fetch validation,
 strict local LOOKUP/FIND/MATCH completeness, durable inference recovery, atomic
 single-statement DML preparation, verified backup/restore, supervised server
 lifecycle and a private TLS deployment profile. The supported contracts, failure
@@ -142,9 +141,12 @@ semantics and executable evidence are consolidated in
 [standalone release acceptance](DEPLOYMENT_READINESS.md).
 
 QRY-2 remains IN PROGRESS: these accepted paths do not imply all future bounded
-result/evidence APIs. QRY-3, OPS-1 and SEC-1 are DONE at source acceptance,
-with publication pending. The acceptance record reports the current local gates
-and recovery/TLS drills separately from hosted release evidence.
+result/evidence APIs. QRY-3, OPS-1 and SEC-1 are DONE and released in v0.4.23.
+Implementation commit `2cb4072` passed [CI](https://github.com/byoridb/byoridb/actions/runs/41177637017);
+release commit `fb96cb3` passed [Auto-release](https://github.com/byoridb/byoridb/actions/runs/41177636969).
+The [published release](https://github.com/byoridb/byoridb/releases/tag/v0.4.23)
+contains four Linux/macOS archives; the acceptance record separates local timings
+from hosted and published-artifact evidence.
 TXN-2 remains PLANNED: statement preparation is not a public multi-statement
 atomic batch and inferred closure still commits separately. Typed parameters,
 idempotency, revisions, space grants and multi-node operation remain roadmap work.
@@ -153,12 +155,12 @@ idempotency, revisions, space grants and multi-node operation remain roadmap wor
 
 | ID / status | Work | Dependencies | Acceptance |
 |---|---|---|---|
-| OPS-1 / DONE (source accepted; release pending) | Backup content checks and restore drills | None | Detect missing/truncated/corrupt content. Restore in isolation; compare current/history queries, tombstones, schema, indexes, users and string-ID mappings; record recovery time. Do not damage the source or an existing target. |
+| OPS-1 / DONE (released v0.4.23) | Backup content checks and restore drills | None | Detect missing/truncated/corrupt content. Restore in isolation; compare current/history queries, tombstones, schema, indexes, users and string-ID mappings; record recovery time. Do not damage the source or an existing target. |
 | OPS-2 / PLANNED | Storage-format version and upgrade policy | OPS-1 | Record format independently of package version; test old fixtures, unsupported-version rejection, backup/recovery and data preservation; document the supported migration window. |
 | TXN-1 / PLANNED | Compound partial-write contract | QRY-1; co-design API-2 mutation outcomes | Document/test committed prefixes after a failing statement, stable failed-statement/partial-application reporting and retry safety. Do not imply rollback. |
 | TXN-2 / PLANNED | Atomic single-space DML batch | TXN-1, OPS-2, QRY-3 | Define supported statements/bounds; injected failure/crash leaves all or none of current data, history, indexes, counters and supported inference/provenance effects. Reject unsupported operations before mutation. |
 | SEC-3 / PLANNED | Durable space-scoped grants | Co-design ACL/discovery errors with API-2/AGT-1; no SDK dependency | Deny cross-space access via direct, compound, profiled, discovery and administrative paths; test grant/revoke, restart and local session invalidation. Do not leak schema, evidence or operation outcomes through lookup endpoints. |
-| SEC-1 / DONE (source accepted; release pending) | Supported TLS deployment profile | None; can start now | Test a trusted proxy or native TLS, private backend listeners, header/credential redaction and certificate rotation; no plaintext credential path over untrusted networks. |
+| SEC-1 / DONE (released v0.4.23) | Supported TLS deployment profile | None; can start now | Test a trusted proxy or native TLS, private backend listeners, header/credential redaction and certificate rotation; no plaintext credential path over untrusted networks. |
 | AGT-3 / PLANNED | Idempotency and durable mutation-outcome lookup | TXN-2, OPS-2, SEC-3; agreed API-2 mutation envelope | Atomically commit a scoped request key/fingerprint, mutation and durable outcome. Test concurrent duplicates, key/payload conflicts, crash/restart and timeout lookup. Define retention/expiry: unknown or expired outcomes must not be silently replayed as known-safe writes. Authorize lookup/replay and bound storage. |
 | AGT-4 / PLANNED | Expected revisions, conflicts and preview/apply | TXN-2, AGT-3, SEC-3; agreed API-2 mutation envelope | Atomically validate expected revisions and apply supported changes. Preview binds request/affected state and expiry; apply rechecks authorization and relevant revisions. Reject stale/expired plans without side effects; preview is not an authorization grant. Test concurrent writes, revoked access and deterministic conflict reporting. |
 
@@ -245,8 +247,9 @@ acceptance boundaries rather than duplicating the historical issue diary.
 contracts and repeatable runtime/recovery checks. Historical v0.4.22 hosted proof
 is linked above. The current local suite passed 1,272 tests (0 failed, 8 existing
 ignored across 37 suites), alongside format/check/Clippy/audit and real Docker TLS
-drills. Native runtime timings and exact-commit hosted publication are recorded
-separately; older local test totals are superseded.
+drills. The hosted CI and exact-ref release gate also passed the same 1,272 tests.
+Native runtime timings and verified v0.4.23 publication are recorded separately;
+older local test totals are superseded.
 
 ### Per-task delivery checks
 

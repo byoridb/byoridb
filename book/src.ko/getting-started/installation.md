@@ -19,6 +19,13 @@ CLI, backup 도구, license와 notices가 포함됩니다. 릴리스 workflow는
 Windows는 현재 지원하지 않습니다. ByoriDB의 저장소 엔진은 순수 Rust 기반
 `redb`이므로 RocksDB나 RocksDB용 C++ 툴체인은 필요하지 않습니다.
 
+**v0.4.23 Linux prebuilt archive**의 x86_64·arm64 모두 도구 3개를 전부 실행하려면
+**glibc 2.39 이상**이 필요합니다. Ubuntu 24.04 등이 해당합니다. 검증한 ELF 요구사항은
+server·backup 도구가 glibc 2.34, CLI가 2.39입니다. 이번 릴리스 archive의 요구사항이며
+향후 버전의 ABI를 보장하지는 않습니다. 이전 배포판에서는 해당 환경에서 소스 빌드하거나
+별도로 빌드·검증한 source Docker image를 사용하세요. 업그레이드 전에 각 릴리스의
+runtime 요구사항을 확인하세요.
+
 Release workflow는 GitHub arm64 runner에서 Linux arm64를 native build합니다.
 
 새 tag archive의 macOS binary — `byoridb-server`, `byoridb-cli`,

@@ -2,7 +2,7 @@
 
 > [English](PLAN.md) | **한국어**
 >
-> 갱신: 2026-10-31. 릴리스 기준선: `main`의 `6851936`, **v0.4.22**.
+> 갱신: 2026-10-31. 최신 검증 릴리스: `fb96cb3`의 **v0.4.23**.
 > 소스 기준 계획이며 실시간 배포 상태 보고가 아닙니다. 이번 개편 중의 검증 결과와
 > 미출시 작업은 아래에서 별도로 구분합니다.
 
@@ -32,11 +32,11 @@ DB는 저장·조회·추론·설명·제약 평가·프로토콜 계약을 담�
 전체 준수를 뜻하지 않습니다.
 
 제품 방향은 승인됐습니다. Discovery 계약 1과 foundations 정확성 수정은 **v0.4.22**로
-출시됐으며 더 넓은 기계 계약은 **PLANNED 또는 IN PROGRESS**입니다. 다음 표는 현재
-작업 중인 `codex/query-completeness` 브랜치가 아닌 릴리스 기준선입니다. 제안한 쓰기
+출시됐으며 더 넓은 기계 계약은 **PLANNED 또는 IN PROGRESS**입니다. 다음 표는 이전
+v0.4.22 기준선을 보존하며 v0.4.23의 추가 기능과 인수 결과는 아래에 기록합니다. 제안한 쓰기
 envelope·멱등성·revision 검사·snapshot 보장은 현재 API 기능이 아닙니다.
 
-## 릴리스 기준선과 제약
+## 이전 릴리스 기준선 — v0.4.22
 
 | 영역 | v0.4.22에서 제공 | 남은 제약 |
 |---|---|---|
@@ -55,15 +55,14 @@ envelope·멱등성·revision 검사·snapshot 보장은 현재 API 기능이 �
 저장소의 범위 조회 primitive는 Boolean·정수·지원되는 부동소수 경계를 받지만 모든
 쿼리·타입 조합이 인덱스를 사용하지는 않습니다. 문자열 키 인코딩은 사전순이 아닙니다.
 지원 범위 확대 시 실행기와 `EXPLAIN`을 함께 검증합니다. v0.4.22의 Compose replica는
-데이터를 공유하는 클러스터가 아니라 독립 서버입니다. 현재 소스는 이를 loopback 전용
+데이터를 공유하는 클러스터가 아니라 독립 서버입니다. v0.4.23은 이를 loopback 전용
 standalone 서비스 하나로 바꿨습니다.
 
 ## 상태와 개발 순서
 
 **DONE**은 구현·수용 검증·문서의 근거가 갖춰진 상태입니다.
-`DONE (source accepted; release pending)`은 로컬 인수 완료이며 artifact 게시를
-뜻하지 않습니다. 출시 상태에는 해당 commit의 호스팅 workflow 성공과 게시 archive가
-추가로 필요합니다. **IN PROGRESS**는 전체
+소스 인수 완료만으로 artifact 게시를 뜻하지는 않습니다. 출시 상태에는 해당 commit의
+호스팅 workflow 성공과 게시 archive가 추가로 필요합니다. **IN PROGRESS**는 전체
 작업이 미완료인 상태이며 수용된 일부 구현은 기록에 명시한 대로 이미 출시됐을 수 있습니다.
 작업 전체가 제공된다는 뜻은 아닙니다. **PLANNED**는 수용 기준 미통과,
 **GATED**는 명시한 수요나 설계 결정이 필요한 상태입니다. 의존성은 고정 작업 ID로
@@ -103,7 +102,7 @@ x86_64/arm64 `.tar.gz` 산출물 4개를 확인했습니다. DEP-1은 출시 완
 |---|---|---|---|
 | QRY-1 / DONE (released v0.4.22) | `OPTIONAL MATCH` 오류 전파 | 없음 | 정상적인 매칭 없음은 null binding 유지. optional 호출의 실행 오류와 패턴 해석 오류를 그대로 전파. 저장소 오류·일부 행 처리 후 실패·연속 optional 경로를 검증. 집중 회귀 8개와 workspace·문서 검증 통과. 위 v0.4.22 호스팅 근거 참조. v0.4.22로 출시됐으며 넓은 완전성 작업은 QRY-2에 남음. 위 릴리스 근거 링크 참조. |
 | QRY-2 / IN PROGRESS | scan·탐색·결과 완전성 계약 통일 | QRY-1; API-2/AGT-2 결과 계약 공동 설계 | 상한 경로와 하위 MATCH 인덱스/partition의 오류 무시를 감사. cap 미만·경계·초과에서 쿼리가 정의한 완전한 결과 또는 명시적 오류 반환. 사용자 `LIMIT`은 정상 쿼리 의미. 부분 결과 모드는 별도 설계·명시적 opt-in·기계 판독 가능한 사유가 필요하며 현재 제공을 약속하지 않음. |
-| QRY-3 / DONE (source accepted; release pending) | 추론 완전성과 복구 | QRY-2 오류 계약 | cap·오류가 추론 완료로 보고되지 않음. 실패 주입으로 asserted/derived 쓰기 상태를 확인하고 재시도·재구성이 중복·낡은 근거 없이 수렴. rollback 또는 재개 복구를 먼저 정의하며 오류 반환만으로 rollback을 보장하지 않음. |
+| QRY-3 / DONE (released v0.4.23) | 추론 완전성과 복구 | QRY-2 오류 계약 | cap·오류가 추론 완료로 보고되지 않음. 실패 주입으로 asserted/derived 쓰기 상태를 확인하고 재시도·재구성이 중복·낡은 근거 없이 수렴. rollback 또는 재개 복구를 먼저 정의하며 오류 반환만으로 rollback을 보장하지 않음. |
 | QRY-4 / PLANNED | 실제 서버 deadline·취소 | QRY-2; 쓰기는 QRY-3 | 실행 중인 무거운 쿼리를 검증된 취소 지점에서 중단하고 자원·진단 상태를 정리하며 HTTP/gRPC에서 안정적인 오류 반환. 쓰기 중단·원자성 경계 검증. 설정값이나 클라이언트 연결 종료만으로 취소를 구현했다고 보지 않음. |
 | API-1 / PLANNED | 타입 있는 쿼리 파라미터 | 설계 즉시; 실행 수용은 QRY-1–2 | HTTP/gRPC로 ID·유니코드·null·list를 문자열 보간 없이 전달. 누락·타입 오류 일관성, 기존 compound 변수와 구분. |
 | API-2 / IN PROGRESS | 오류·값 타입·capability 계약 | 최소 envelope 설계 즉시; 전체 수용은 QRY-1–4와 TXN-1 | 오류·재시도·결과 상태 의미, 정수 정밀도·복합값·버전 호환 정책 고정. AGT-1 구현 전에 discovery envelope 정의. runtime 검증을 통과한 capability만 제공. 쓰기 결과를 모른다는 상태를 안전한 재시도가 가능한 성공·실패로 표현하지 않음. |
@@ -122,14 +121,17 @@ EVAL-1의 [fixture 절차](../tests/fixtures/agent-workflows/README.ko.md)는 �
 
 #### Standalone 완결 작업
 
-현재 소스에는 분산 LOOKUP pagination·원격 payload 검증, 로컬 LOOKUP/FIND/MATCH
+v0.4.23에는 분산 LOOKUP pagination·원격 payload 검증, 로컬 LOOKUP/FIND/MATCH
 완전성, 영속 추론 복구, 단일 문장 DML의 원자적 준비, 백업·복원 검증, 서버 lifecycle
 감시와 비공개 backend TLS 배포 프로필이 추가됐습니다. 지원 계약, 실패 의미와 실행
 근거는 [standalone 릴리스 인수 기준](DEPLOYMENT_READINESS.ko.md)으로 정리했습니다.
 
 QRY-2는 IN PROGRESS입니다. 검증된 경로가 향후 모든 bounded result/evidence API를
-의미하지 않습니다. QRY-3, OPS-1, SEC-1은 소스 인수 기준으로 DONE이며 게시 대기
-상태입니다. 인수 기록은 현재 로컬 gate·복구·TLS 검증과 호스팅 릴리스 근거를 구분합니다. 단일 문장
+의미하지 않습니다. QRY-3, OPS-1, SEC-1은 DONE이며 v0.4.23으로 출시됐습니다.
+구현 commit `2cb4072`의 [CI](https://github.com/byoridb/byoridb/actions/runs/41177637017),
+릴리스 commit `fb96cb3`의 [Auto-release](https://github.com/byoridb/byoridb/actions/runs/41177636969)가
+성공했고 [게시 릴리스](https://github.com/byoridb/byoridb/releases/tag/v0.4.23)에 Linux/macOS
+archive 4개가 있습니다. 인수 기록은 로컬 측정 시간과 호스팅·게시 artifact 근거를 구분합니다. 단일 문장
 준비는 공개된 다중 문장 atomic batch가 아니고 추론 closure도 별도로 commit하므로
 TXN-2는 PLANNED를 유지합니다. Typed parameter, idempotency, revision, space 권한,
 multi-node는 후속 계획입니다.
@@ -138,12 +140,12 @@ multi-node는 후속 계획입니다.
 
 | ID / 상태 | 작업 | 의존성 | 수용 기준 |
 |---|---|---|---|
-| OPS-1 / DONE (source accepted; release pending) | 백업 내용 검사·복원 시험 | 없음 | 누락·잘림·손상을 탐지. 격리된 DB에 복원해 current/history 조회, tombstone, schema, index, 사용자, 문자열 ID 매핑 비교 및 복구 시간 기록. 원본·기존 대상 보호. |
+| OPS-1 / DONE (released v0.4.23) | 백업 내용 검사·복원 시험 | 없음 | 누락·잘림·손상을 탐지. 격리된 DB에 복원해 current/history 조회, tombstone, schema, index, 사용자, 문자열 ID 매핑 비교 및 복구 시간 기록. 원본·기존 대상 보호. |
 | OPS-2 / PLANNED | 저장 형식 버전·업그레이드 정책 | OPS-1 | package와 독립적인 형식 버전 기록. 이전 fixture, 미지원 버전 거부, 백업·복구와 데이터 보존 검증. 지원 migration 범위 문서화. |
 | TXN-1 / PLANNED | compound의 부분 쓰기 계약 | QRY-1; API-2 쓰기 결과 공동 설계 | 실패 전 문장이 commit될 수 있음을 문서·검증에 반영. 실패 문장·부분 반영 상태와 재시도 안전성 계약을 고정하고 rollback을 암시하지 않음. |
 | TXN-2 / PLANNED | 단일 space DML 원자적 batch | TXN-1, OPS-2, QRY-3 | 지원 문장·상한 정의. 실패·crash 주입 시 current, history, index, counter, 지원하는 추론·근거 효과가 전부 또는 전무. 미지원 연산은 변경 전에 거부. |
 | SEC-3 / PLANNED | 영속 space별 권한 | API-2/AGT-1과 ACL·탐색 오류 공동 설계; SDK 의존 없음 | direct·compound·profile·discovery·관리 경로의 space 간 접근 차단. grant/revoke·재시작·로컬 세션 회수 검증. 조회 endpoint로 schema·근거·연산 결과가 누출되지 않음. |
-| SEC-1 / DONE (source accepted; release pending) | 지원하는 TLS 배포 구성 | 없음; 즉시 착수 가능 | 신뢰할 수 있는 proxy 또는 native TLS, 비공개 backend listener, header/credential 마스킹과 인증서 교체 시험. 신뢰하지 않는 망에서 credential 평문 전송 경로 없음. |
+| SEC-1 / DONE (released v0.4.23) | 지원하는 TLS 배포 구성 | 없음; 즉시 착수 가능 | 신뢰할 수 있는 proxy 또는 native TLS, 비공개 backend listener, header/credential 마스킹과 인증서 교체 시험. 신뢰하지 않는 망에서 credential 평문 전송 경로 없음. |
 | AGT-3 / PLANNED | 멱등성과 영속 쓰기 결과 조회 | TXN-2, OPS-2, SEC-3; 합의한 API-2 쓰기 envelope | 범위를 정한 요청 key/fingerprint·변경·영속 결과를 원자적으로 commit. 동시 중복·같은 key의 다른 payload·crash/restart·timeout 후 조회 검증. 보존·만료를 정의하고 불명·만료 결과를 안전이 확인된 쓰기로 재실행하지 않음. 조회·재반환 권한 검사와 저장 상한 적용. |
 | AGT-4 / PLANNED | expected revision·충돌·preview/apply | TXN-2, AGT-3, SEC-3; 합의한 API-2 쓰기 envelope | expected revision 검사와 지원 변경을 원자 적용. preview는 요청·영향 상태·만료를 묶으며 apply 시 권한·관련 revision 재검사. 낡거나 만료된 계획은 변경 없이 거부하고 preview 자체가 권한을 부여하지 않음. 동시 쓰기·권한 회수·결정적 충돌 응답 검증. |
 
@@ -227,8 +229,9 @@ functional/inverse-functional property(SEM-1)와 일반 chain(SEM-2)은 구체�
 [인수 기록](DEPLOYMENT_READINESS.ko.md)에 구현 계약과 재현 가능한 runtime/복구 검증을
 정리했습니다. 과거 v0.4.22의 원격 근거는 위 링크로 유지합니다. 현재 로컬 suite는
 37개 suite에서 1,272개 통과, 실패 0개, 기존 ignored 8개이며 format/check/Clippy/audit와
-실제 Docker TLS 검증도 통과했습니다. Native runtime 소요 시간과 정확한 commit의
-호스팅 게시 근거는 별도로 기록하며 이전 로컬 테스트 개수는 대체합니다.
+실제 Docker TLS 검증도 통과했습니다. 호스팅 CI와 정확한 ref의 release gate에서도 같은
+1,272개 테스트가 통과했습니다. Native runtime 소요 시간과 검증된 v0.4.23 게시 근거는
+별도로 기록하며 이전 로컬 테스트 개수는 대체합니다.
 
 ### 작업별 완료 검증
 

@@ -2,25 +2,30 @@
 
 > **한국어** | [English](DEPLOYMENT_READINESS.md)
 >
-> 2026-10-31 소스 계약입니다. 실제 게시 근거는 해당 릴리스의 CI 결과와 artifact로
-> 확인해야 하며 로컬 테스트 성공이 원격 릴리스 완료를 의미하지는 않습니다.
+> **v0.4.23** 검증 릴리스, 게시 시각 2026-10-31 07:06:25 UTC.
+> 로컬 검증·호스팅 gate·게시 artifact 근거를 아래에서 구분합니다.
 
 1차 지원 배포는 standalone 서버 하나와 redb volume이며 HTTP와 gRPC가 인증,
 session, 실행을 공유합니다. Agent는 권한을 검사한 discovery와 text query를 사용합니다.
 Typed operation, idempotency, revision, SDK와 multi-node 후속 계획은
 [PLAN.ko.md](PLAN.ko.md)에 남아 있습니다.
 
-## 로컬 인수 — 2026-10-31
+## 릴리스 인수 — v0.4.23
 
-아래 standalone 계약에 대해 QRY-3, OPS-1, SEC-1은
-**DONE (source accepted; release pending)**입니다. 이 기록은 `6851936`(v0.4.22)을
-기준으로 한 작업 트리의 인수 결과이며 새 변경이 v0.4.22로 출시됐다는 근거가 아닙니다.
+아래 standalone 계약에 대해 QRY-3, OPS-1, SEC-1은 **DONE (released v0.4.23)**입니다.
+구현 commit
+[`2cb4072d0314bc911e9165c218d87feeacadbc10`](https://github.com/byoridb/byoridb/commit/2cb4072d0314bc911e9165c218d87feeacadbc10)의
+[CI](https://github.com/byoridb/byoridb/actions/runs/41177637017)가 성공했습니다.
+버전 갱신·tag commit
+[`fb96cb3751934f447833b7ce97e3230459be1830`](https://github.com/byoridb/byoridb/commit/fb96cb3751934f447833b7ce97e3230459be1830)은
+[Auto-release](https://github.com/byoridb/byoridb/actions/runs/41177636969)를 통과했고
+[게시된 v0.4.23 tag](https://github.com/byoridb/byoridb/releases/tag/v0.4.23)의 대상입니다.
 더 넓은 완전성·결과 envelope 작업인 QRY-2는 IN PROGRESS를 유지합니다.
 
 | 검증 | 확인한 결과 |
 |---|---|
 | Formatting, locked workspace check와 Clippy | 모든 target/feature에서 PASS; Clippy는 `-D warnings` 적용 |
-| 직렬 locked workspace test | **37개 suite에서 1,272 passed, 0 failed, 기존 ignored 8개** |
+| 직렬 locked workspace test | 로컬·호스팅 CI·정확한 ref의 release gate 모두 **37개 suite에서 1,272 passed, 0 failed, 기존 ignored 8개** |
 | 의존성 audit | **취약점 0건**; 기존 `bincode` 1.3.3 unmaintained 경고는 저장 형식 migration 제약으로 추적 유지 |
 | Docker TLS 배포 | Source·prebuilt image 검증 PASS, 최종 통합 source `--build` 검증 PASS. 실제 HTTPS/gRPC 인증, 비공개 backend, 운영 route 차단, 인증서 교체, 재시작 후 데이터 유지와 log 비노출 확인 |
 | 독립 release/profile 검토 | 수정 후 차단 이슈 없음 |
@@ -29,13 +34,12 @@ Typed operation, idempotency, revision, SDK와 multi-node 후속 계획은
 | 복구 fixture 소요 시간 | `data.redb` **294,912 bytes**; 생성 **0.084초**, 검증 **0.028초**, 복원 **0.055초** |
 | 시작 fixture 소요 시간 | 최초 **0.267초**, 재시작 **0.237초**, 복원 데이터 **0.244초** |
 | 문서 | 영문→한국어 mdBook 순차 빌드와 14쌍 code/status/link 검사 PASS |
-| 호스팅 게시 | **대기**: 정확한 commit의 CI·auto-release 성공, signing/notarization, archive 4개와 artifact runtime gate |
+| 호스팅 게시 | **PASS**: CI·auto-release 성공, Linux/macOS x86_64/arm64 archive 4개에 각각 server/CLI/backup과 LICENSE/NOTICES 포함. macOS binary signing/notarization 및 모든 target의 압축 해제 runtime smoke 통과; Linux native, macOS x86_64 Rosetta 실행 |
+| 게시 artifact 검증 | **PASS**: archive 4개를 직접 내려받아 release asset SHA-256, 정확히 5개 member와 binary 12개의 architecture 확인; macOS 서명 6개 검증. 다운로드한 macOS arm64 binary는 v0.4.23/`fb96cb3`을 보고하며 HTTP/gRPC 재시작·백업/복구 smoke 통과 |
 
-이 문서는 게시 전 인수 시점의 기록입니다. 이후 게시 근거는 아래 workflow·release 링크에서
-확인합니다.
-
-로컬 container·복구 fixture는 검증한 경계의 근거이며 운영 처리량이나 보편적인 RPO/RTO가
-아닙니다. 최종 commit SHA와 artifact가 게시 항목을 충족해야 호스팅 릴리스가 완료됩니다.
+위 로컬 build·복구 소요 시간은 인수 fixture의 측정값이며 운영 처리량이나 보편적인
+RPO/RTO가 아닙니다. 호스팅 workflow 링크는 이후의 문서 전용 commit이 아닌 실제 검증·
+게시된 릴리스를 가리킵니다.
 
 ## 구현된 인수 경계
 
