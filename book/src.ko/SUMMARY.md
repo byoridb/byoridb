@@ -29,6 +29,7 @@
 
 - [보안](./operations/security.md)
 - [배포](./operations/deployment.md)
+- [TLS 단일 노드 배포](./operations/secure-deployment.md)
 - [백업 및 복구](./operations/backup.md)
 - [모니터링](./operations/monitoring.md)
 

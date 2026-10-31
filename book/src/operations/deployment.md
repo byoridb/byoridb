@@ -7,7 +7,8 @@ data directory. The server exposes Graph gRPC on port `9669` and HTTP on port
 `19669` by default.
 
 Do not deploy multiple independent processes as a shared cluster. The
-distributed components are not fully wired into the launcher; see
+distributed components are not fully wired into the launcher, which rejects
+non-default cluster settings before startup; see
 [Distributed systems](../architecture/distributed.html).
 
 ## Required secret
@@ -70,8 +71,8 @@ docker build -t byoridb-server:local .
 docker run --rm \
   -e BYORIDB_ROOT_PASSWORD \
   -e BYORIDB__STORAGE__DATA_PATHS=/app/data \
-  -p 9669:9669 \
-  -p 19669:19669 \
+  -p 127.0.0.1:9669:9669 \
+  -p 127.0.0.1:19669:19669 \
   -v byoridb-data:/app/data \
   byoridb-server:local
 ```
@@ -80,12 +81,17 @@ Or run one service from the checked-in Compose file:
 
 ```bash
 export BYORIDB_ROOT_PASSWORD='replace-with-a-managed-secret'
-docker compose up --build byoridb-server-1
+docker compose up --build byoridb
 ```
 
-The three services in `docker-compose.yml` use separate named volumes and no
-cluster settings. Starting all three creates three unrelated databases on
-different host ports, not replicas.
+The default Compose file starts one standalone server with loopback-only host
+ports and a persistent named volume. Both images run as UID/GID 10001 and ship
+the offline backup tool. Existing bind-mounted data must be owned by that user;
+do not recursively change ownership on an unrelated path.
+
+For access over a network, use the tested [TLS profile](secure-deployment.md).
+It provides separate TLS HTTP/gRPC ports, a private backend, an allowlist that
+excludes operations endpoints, and certificate rotation instructions.
 
 ## Repository AKS deployment
 
@@ -107,8 +113,17 @@ your environment. Applying the raw StatefulSet can also reintroduce its
 placeholder image instead of the intended commit image, so use the repository's
 CI-gated rendering workflow.
 
+The legacy AKS manifests do not configure TLS. A source-IP allowlist does not
+encrypt credentials; do not expose those plaintext services across an untrusted
+network. Use the tested TLS profile as the supported deployment reference and
+validate an equivalent ingress/private-backend boundary before adapting AKS.
+
 The manifest's one replica and one PVC are intentional. Increasing the replica
 count does not create a ByoriDB cluster.
+
+The pod uses UID/GID and `fsGroup` 10001 for the non-root image. Validate the
+storage driver's group-ownership support on a restored PVC before upgrading an
+older root-owned deployment; ownership migration can take time on large volumes.
 
 These files show repository configuration, not the observed health, image, or
 rollout status of a live AKS environment. Inspect the target environment at
@@ -130,10 +145,13 @@ curl -f http://127.0.0.1:19669/ready
 There is no registered standard gRPC health service. Use the HTTP endpoints for
 the checked-in Kubernetes probes.
 
-On `SIGTERM` or Ctrl+C, the process fails readiness, waits up to 25 seconds for
-in-flight queries, signals the network servers, and checkpoints redb. The AKS
-manifest gives the pod a 300-second termination grace period so the process is
-not killed during this sequence.
+The server reserves both API listeners before opening storage or announcing
+readiness. A bind failure or unexpected exit of either server fails the process.
+On `SIGTERM` or Ctrl+C, it fails readiness, waits up to 25 seconds for in-flight
+requests, signals the network servers, and checkpoints redb. A drain timeout or
+checkpoint failure produces a nonzero exit; an interrupted write outcome may be
+uncertain. The AKS manifest gives the pod a 300-second termination grace period
+so the process is not killed during this sequence.
 
 ## Network security
 

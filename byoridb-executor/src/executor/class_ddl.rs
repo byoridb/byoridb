@@ -225,6 +225,79 @@ impl Executor {
             )));
         }
 
+        // RESTRICT every persisted schema reference. Rebuilding inference does
+        // not fix a dangling DOMAIN/RANGE: it would recreate the same class
+        // name, while hierarchy expansion itself is evaluated dynamically.
+        let mut references = Vec::new();
+        for class in self.list_classes(&space).await? {
+            if class.name != name
+                && (class.disjoint.contains(&name) || class.equivalent_classes.contains(&name))
+            {
+                references.push(format!("class {}", class.name));
+            }
+        }
+        for (key, bytes) in self
+            .ctx
+            .kvstore
+            .scan_prefix(format!("space:{space}:edge:").as_bytes())
+            .await?
+        {
+            let schema: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let edge = schema
+                .get("name")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    ExecutionError::InvalidOperation(
+                        "Invalid edge schema name while checking class references".into(),
+                    )
+                })?;
+            if key != SchemaKey::edge(&space, edge) {
+                return Err(ExecutionError::InvalidOperation(
+                    "Edge schema key/name mismatch while checking class references".into(),
+                ));
+            }
+            let semantics: byoridb_parser::ast::SemanticFlags = match schema.get("semantics") {
+                Some(value) => serde_json::from_value(value.clone())?,
+                None => Default::default(),
+            };
+            if semantics.domain.as_deref() == Some(name.as_str())
+                || semantics.range.as_deref() == Some(name.as_str())
+            {
+                references.push(format!("edge {edge}"));
+            }
+        }
+        for (key, bytes) in self
+            .ctx
+            .kvstore
+            .scan_prefix(&SchemaKey::shape_prefix(&space))
+            .await?
+        {
+            let shape: super::shape::ShapeDef = serde_json::from_slice(&bytes)?;
+            if key != SchemaKey::shape(&space, &shape.name) {
+                return Err(ExecutionError::InvalidOperation(
+                    "Shape schema key/name mismatch while checking class references".into(),
+                ));
+            }
+            if shape.target_class == name {
+                references.push(format!("shape {}", shape.name));
+            }
+        }
+        for index in self
+            .mutation_indexes(&space, byoridb_storage::IndexType::Tag)
+            .await?
+        {
+            if index.schema_name == name {
+                references.push(format!("index {}", index.index_name));
+            }
+        }
+        if !references.is_empty() {
+            references.sort();
+            return Err(ExecutionError::InvalidOperation(format!(
+                "Class {name} is referenced by {}; remove those references before dropping it",
+                references.join(", ")
+            )));
+        }
+
         self.ctx
             .kvstore
             .batch_delete(vec![class_key, SchemaKey::tag(&space, &name)])
@@ -617,5 +690,71 @@ mod tests {
             leftover.is_empty(),
             "class metadata must die with the space"
         );
+    }
+}
+
+#[cfg(test)]
+mod class_reference_tests {
+    use super::*;
+    use crate::{context::ExecutionContext, ExecutionPlanBuilder};
+    use byoridb_kvstore::{KVStore, MemoryKVStore};
+    use std::sync::Arc;
+    async fn run(e: &Executor, q: &str) -> Result<ExecutorResult> {
+        e.execute(ExecutionPlanBuilder::build(byoridb_parser::parse(q).unwrap()).unwrap())
+            .await
+    }
+    async fn rejects(reference: &str, remove: Option<&str>) {
+        let store = Arc::new(MemoryKVStore::new());
+        let e = Executor::new(Arc::new(
+            ExecutionContext::new(store.clone()).with_space("default".into()),
+        ));
+        run(&e, "CREATE CLASS person(name STRING)").await.unwrap();
+        run(&e, reference).await.unwrap();
+        let before = store.scan_prefix(b"").await.unwrap();
+        assert!(
+            run(&e, "DROP CLASS person").await.is_err(),
+            "reference must restrict DROP: {reference}"
+        );
+        assert_eq!(store.scan_prefix(b"").await.unwrap(), before);
+        if let Some(remove) = remove {
+            run(&e, remove).await.unwrap();
+            run(&e, "DROP CLASS person").await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn domain_reference_restricts_class_drop() {
+        rejects("CREATE EDGE lives() DOMAIN person", Some("DROP EDGE lives")).await;
+    }
+    #[tokio::test]
+    async fn range_reference_restricts_class_drop() {
+        rejects("CREATE EDGE lives() RANGE person", Some("DROP EDGE lives")).await;
+    }
+    #[tokio::test]
+    async fn disjoint_reference_restricts_class_drop() {
+        rejects(
+            "CREATE CLASS other() DISJOINT WITH person",
+            Some("DROP CLASS other"),
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn equivalent_reference_restricts_class_drop() {
+        rejects("CREATE CLASS other() EQUIVALENT TO person", None).await;
+    }
+    #[tokio::test]
+    async fn shape_reference_restricts_class_drop() {
+        rejects(
+            "CREATE SHAPE named ON person (name STRING REQUIRED)",
+            Some("DROP SHAPE named"),
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn index_reference_restricts_class_drop() {
+        rejects(
+            "CREATE TAG INDEX person_name ON person(name)",
+            Some("DROP INDEX TAG person_name"),
+        )
+        .await;
     }
 }

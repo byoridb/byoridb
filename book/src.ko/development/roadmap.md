@@ -2,7 +2,7 @@
 
 [English](../../development/roadmap.html) | **한국어**
 
-2026-10-30, 코드 기준선 **v0.4.21**(`6d77d89`)에서 갱신했습니다. ByoriDB는 **Agent를 직접 사용자로
+2026-10-31, 출시된 **v0.4.22**(`main`의 `6851936`) 기준으로 갱신했습니다. ByoriDB는 **Agent를 직접 사용자로
 삼는 범용 그래프·온톨로지 DB**를 지향합니다. 사람은 배포를 운영·평가·통제하고 도입을
 결정합니다. Agent 메모리는 여러 사용례 중 하나입니다. 확인 가능한 근거와 신뢰할 수 있는
 상태 변경을 통해 작업을 정확하게 끝내는 것이 목표이며, Agent 비용·속도 우위는 앞으로
@@ -11,10 +11,17 @@
 [제품 철학과 디자인](https://github.com/byoridb/byoridb/blob/main/docs/PRODUCT_DESIGN.ko.md)은
 목표 계약을 정의하고, [docs/PLAN.ko.md](https://github.com/byoridb/byoridb/blob/main/docs/PLAN.ko.md)가
 구현 상태의 기준입니다. 승인된 방향·수용 계획이며 확정 릴리스 일정이 아닙니다.
-읽기 전용 discovery 계약 1은 foundations에서 구현하며 다른 Agent 계약은
-플랜에 기록한 PLANNED 또는 IN PROGRESS 상태입니다.
+읽기 전용 discovery 계약 1과 foundations 정확성 수정은 출시됐습니다. 더 넓은 Agent
+계약은 PLANNED 또는 IN PROGRESS이며 미완료 작업도 플랜에 기록한 일부 구현이
+출시됐을 수 있습니다.
 
-## 코드 기준선에서 제공하는 기능
+[CI](https://github.com/byoridb/byoridb/actions/runs/41054788495)와
+[Auto-release](https://github.com/byoridb/byoridb/actions/runs/41054789050)가 성공했습니다.
+[v0.4.22 릴리스](https://github.com/byoridb/byoridb/releases/tag/v0.4.22)에 Linux/macOS
+x86_64/arm64 `.tar.gz` 산출물 4개가 있습니다. 이전 v0.4.21/pre-foundations 상태는
+과거 기록이며 아래 진행 중인 QRY-2 브랜치 변경은 미출시입니다.
+
+## v0.4.22에서 제공하는 기능
 
 - vertex/edge CRUD, `FETCH`, `GO`, `MATCH`, tag/edge `LOOKUP`, 경로 탐색,
   `EXPLAIN`·`PROFILE`. edge UPDATE와 지원되는 로컬 edge index range가 구현됐고,
@@ -28,8 +35,12 @@
   보존하는 전체 snapshot 백업·복원.
 - HTTP/gRPC 인증을 공유하는 단일 노드 redb 서버, 영속 사용자·기본 role·로컬 세션 회수,
   설정 가능한 로그인 제한·세션 TTL.
+- HTTP/gRPC의 인증된 읽기 전용 discovery 계약 1: 크기가 제한된 schema, 전역 역할
+  권한, 명시적인 capability와 고정 discovery 오류.
+- `OPTIONAL MATCH` 오류 전파와 MATCH 후보·가변 길이 상한의 명시적 오류.
+  Index partition 실패를 전파하고 손상된 tag-index key를 거부합니다.
 
-이 기능들에는 제약이 있습니다. `WHY`·추천은 문자열 VID 일관성을 보강해야 하고,
+해당 릴리스 기준선의 기능들에는 제약이 있습니다. `WHY`·추천은 문자열 VID 일관성을 보강해야 하고,
 `sameAs` 병합은 되돌릴 수 없습니다. compound는 트랜잭션이 아닙니다. scan·추론 상한의
 완전한 결과 또는 오류 계약이 통일되지 않았습니다. 백업 metadata 검사는 전체 내용 검사나
 실제 복원 시험이 아닙니다. native TLS·space별 권한·지원되는 다중 노드 런타임도 없습니다.
@@ -39,7 +50,7 @@
 
 | 순서 | 목표 | 수용 기준의 중심 |
 |---|---|---|
-| 릴리스 선결 | 의존성 감사 해결(DEP-1) | 호환 버전 갱신으로 audit 취약점 10→0. 자동 버전 갱신·릴리스 경로에도 audit 필수화 |
+| 릴리스 요건 — 완료 | DEP-1 DONE, v0.4.22 출시 | 수용 시 취약점 0건, bincode unmaintained 경고 1건 유지. 자동 버전 갱신·릴리스 경로에 audit 필수화, 이후 릴리스도 재통과 필요 |
 | 1 | 정확성과 기계 계약(QRY-1–4, API-1–2, AGT-1–2, EVAL-1) | 완전한 결과 또는 명시적 오류, 추론 복구·실제 취소. 타입 있는 파라미터·오류, 권한 내 탐색, 범위가 제한된 결과·근거, 초기 Agent 평가 기준선 |
 | 2 | 복구·신뢰할 수 있는 쓰기·접근 경계(OPS-1–2, TXN-1–2, SEC-3/1, AGT-3–4) | 복원 시험·저장 형식 버전. compound 결과 명시 후 DML 원자성. space 권한·TLS 조기 제공, 영속 멱등 결과·revision·preview/apply |
 | 3 | 온톨로지 일관성과 근거(SEM-6/3/4/7/8) | 문자열 VID, 정점 타입 설명, shape/추론·cardinality 정책, revision을 검사하는 `sameAs` preview·병합 기록, assertion 출처·명시적 전제 신뢰 정책 |
@@ -47,33 +58,23 @@
 | 5 | 운영 수용 검증(SEC-5) | metrics/진단 접근·보존 정책, runtime 상태 관측, 검증된 복구·업그레이드 runbook |
 | 6 | 정확성·Agent 평가에 기반한 성능(PERF-1–3) | 처리량·비용보다 결과 정확성·Agent 작업 성공 우선. 실제 동시 실행, LDBC batch-read 수용, 실측에 따른 최적화 |
 
-첫 구현 단위인 **QRY-1**은 정상적인 매칭 없음의 null binding을 유지하면서
-`OPTIONAL MATCH` 실행·패턴 해석이 반환한 오류를 전파합니다.
-`main`의 커밋 `10a7811`에서 집중 회귀 8개와 이전 workspace·문서 검증을
-통과했으며 릴리스 발행은 확인하지 않았습니다.
+**QRY-1은 DONE이며 v0.4.22로 출시됐습니다.** 정상적인 매칭 없음의 null binding을
+유지하면서 `OPTIONAL MATCH` 실행·패턴 해석 오류를 전파하며 집중 회귀 8개를
+통과했습니다. 릴리스 근거는 위 링크에 있습니다. 같은 릴리스에 MATCH 후보·가변 길이
+상한의 오류, index partition 오류 전파, 엄격한 tag-index decode, 긴 문자열의 반복
+스캐너도 포함됩니다. 작은 query `LIMIT`이 후보 예산을 우회하지는 않습니다.
+더 넓은 QRY-2 수용은 **IN PROGRESS**입니다.
 
-후속 foundations 변경은 MATCH 후보 스캔·가변 길이 탐색 상한을 명시적인 오류로
-반환하고 index partition 실패를 전파하며 손상된 tag-index key를 거부합니다.
-긴 문자열 lexer를 반복 스캐너로 바꿔 스택 초과도 수정합니다. 작은 query `LIMIT`이
-후보 scan budget을 우회하지는 않습니다. LOOKUP/path 상한, projection/decode 오류,
-count 최적화 수용 검증이 남아 QRY-2는 IN PROGRESS입니다.
-
-HTTP `POST /api/v1/discover`와 gRPC `Discover`가 discovery 계약 1을 제공합니다.
-인증된 tag/edge/property 스키마를 제한된 크기로 반환하고 전역 역할 권한, 미지원
-capability, 안정적인 discovery 오류를 명시합니다. 타입 있는 query 파라미터,
-snapshot/revision token, space별 권한을 뜻하지 않습니다.
-[API 레퍼런스](../reference/api.html#read-only-discovery-contract-1)를 참조하세요.
-결정적인 EVAL-1 fixture 두 개는 discovery, 정확한 INT64/문자열 ID 응답, 쓰기 거부,
-최종 상태 유지를 검증하며 자율 모델 실행은 아닙니다.
-
-다음 작업은 남은 QRY-2 감사와 API-1 타입 파라미터 바인딩이며, API-2의 일반 결과/오류
-의미와 추론·철회 fixture를 함께 진행합니다. 복원 시험·TLS도 병행할 수 있습니다.
-Capability를 공개하기 전에 runtime 수용 검증을 통과해야 합니다.
-
-EVAL-1은 탐색·관계 조회·설명·철회·timeout/재시도·동시 쓰기·접근 거부를 다룹니다.
-최종 상태·근거의 정확성과 거부된 변경의 부재를 먼저 검증합니다. 모델/버전/날짜,
-prompt/settings, 데이터/seed, 반복 횟수·예산을 고정하고 실행 전에 성공 기준을 선언하며
-기준선의 미지원 작업을 기록합니다. 동등하게 성공한 작업끼리 호출·토큰·지연을 비교합니다.
+현재 소스에는 LOOKUP/FIND/MATCH 완전성, 분산 index 이어 읽기·원격 fetch 검증,
+추론 복구, 단일 문장 DML 준비, 백업 무결성·복원과 서버 lifecycle 보강이 반영됐습니다.
+정확한 보장과 실행 근거는
+[standalone 인수 기록](https://github.com/byoridb/byoridb/blob/main/docs/DEPLOYMENT_READINESS.ko.md)을
+참고하세요. QRY-2는 IN PROGRESS입니다. QRY-3, OPS-1, SEC-1은 소스 인수 기준으로
+DONE이며 릴리스 게시 대기 상태입니다. 로컬 gate와 실제 복구·TLS 검증을 통과했으며
+최종 commit의 호스팅 workflow와 archive를 확인해야 게시 완료가 됩니다. [TLS 배포 프로필](../operations/secure-deployment.md)이 지원 네트워크 경계입니다.
+단일 문장 transaction은 향후 TXN-2의 다중 문장·추론 전체 계약을 완성하지 않습니다.
+Typed operation, idempotency, revision은 계획에 남으며 실제 게시 완료는 릴리스
+workflow 성공 후에만 확인합니다.
 
 ## 기계 계약의 경계
 

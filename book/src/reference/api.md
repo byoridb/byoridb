@@ -328,6 +328,11 @@ returns HTTP 413.
 Both query routes accept an optional `read_only` flag. The gRPC `ExecuteRequest`
 carries the same field.
 
+HTTP query bodies accept only `session_id`, `query` and `read_only`. Unknown
+fields, including `params` or a misspelled `readOnly`, return HTTP 422 before
+execution. Typed parameter binding remains unsupported; the embedded
+`execute_with_params` method rejects nonempty parameters rather than ignoring them.
+
 ```bash
 curl -sS http://127.0.0.1:19669/api/v1/query \
   -H 'Content-Type: application/json' \
@@ -391,6 +396,20 @@ code.
 `/api/v1/query/json` returns the same statuses and codes in its raw JSON text,
 except that its HTTP 413 response is a plain string without a `QUERY_TOO_LARGE`
 code.
+
+### Mutation outcomes and inference recovery
+
+Single-statement DML stages its graph/history/index/vector/counter/sameAs changes
+before one Memory/redb commit. Closure completion happens separately; an execution
+error or lost response can follow a committed assertion. Compound queries commit
+clause by clause, so a later error does not roll back an earlier clause. There is
+no durable idempotency key or mutation-outcome lookup to make blind retries safe.
+
+Use `CHECK INFERENCE` to inspect `complete` or `repair_required`. If repair is
+required, graph reads and further mutations fail until GOD/ADMIN runs
+`REPAIR INFERENCE`; it is also rejected when `read_only` is true. Repair preserves
+asserted history. Inspect current facts after repair before retrying. See
+[inference status and recovery](../guide/ngql/dql.md#inference-status-and-recovery).
 
 ### Sign out
 

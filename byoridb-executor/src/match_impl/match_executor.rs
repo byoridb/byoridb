@@ -13,12 +13,11 @@
 //! filters via [`PatternMatcher::matches_node`] / `matches_edge_data`.
 
 use super::pattern_matcher::PatternMatcher;
-use crate::algo;
 use crate::context::ExecutionContext;
 use crate::error::{ExecutionError, Result};
 use crate::executor::ExecutorResult;
 use crate::profile::ProfileOp;
-use byoridb_codec::{EdgeData, VertexCodec};
+use byoridb_codec::EdgeData;
 use byoridb_parser::ast::{
     BinaryOperator, EdgeDirection, EdgePattern, Expression, Literal, NodePattern, Pattern,
 };
@@ -67,7 +66,41 @@ impl MatchExecutor {
 
     /// Execute a MATCH query
     pub async fn execute_match(&self, plan: crate::plan::MatchPlan) -> Result<ExecutorResult> {
+        let executor = crate::executor::Executor::new(self.ctx.clone());
+        let space = self
+            .ctx
+            .space
+            .as_deref()
+            .ok_or_else(|| ExecutionError::InvalidOperation("No space selected".to_string()))?;
+        let lock = executor.inference_lock(space);
+        let _guard = lock.read().await;
+        executor.ensure_inference_clean(space).await?;
+        self.execute_match_unfenced(plan).await
+    }
+
+    /// The generic executor already holds the inference read fence. Acquiring
+    /// it again could deadlock when a writer is queued between the two reads.
+    pub(crate) async fn execute_match_unfenced(
+        &self,
+        plan: crate::plan::MatchPlan,
+    ) -> Result<ExecutorResult> {
         let start = std::time::Instant::now();
+        crate::plan::validate_match_expressions(&plan)?;
+        let order_keys = crate::plan::match_order_keys(&plan)?;
+        let window = match (plan.offset, plan.limit) {
+            (Some(offset), Some(limit)) => Some(offset.checked_add(limit).ok_or_else(|| {
+                ExecutionError::InvalidOperation(
+                    "MATCH OFFSET + LIMIT exceeds the supported range".to_string(),
+                )
+            })?),
+            (None, limit) => limit,
+            _ => None,
+        };
+        let aggregates = plan.group_by.is_some()
+            || plan
+                .return_clause
+                .as_ref()
+                .is_some_and(|cols| cols.iter().any(|col| is_aggregate_expr(&col.expression)));
 
         let space = self
             .ctx
@@ -83,49 +116,6 @@ impl MatchExecutor {
             .try_execute_simple_count(&plan, &space, &matcher)
             .await?
         {
-            return Ok(ExecutorResult {
-                columns,
-                rows,
-                latency_ms: start.elapsed().as_millis() as u64,
-            });
-        }
-
-        // Indexed GROUP BY + COUNT(*) fast-path: when grouping by a single
-        // indexed property with no WHERE/edges, count via index scan instead of
-        // decoding every vertex blob. ORDER BY/OFFSET/LIMIT still apply here.
-        if let Some((columns, mut rows)) = self.try_indexed_group_count(&plan, vid_type).await? {
-            if !plan.order_by.is_empty() {
-                sort_rows_by_order(&mut rows, &columns, &plan.order_by);
-            }
-            if let Some(offset) = plan.offset {
-                rows = rows.into_iter().skip(offset).collect();
-            }
-            if let Some(limit) = plan.limit {
-                rows.truncate(limit);
-            }
-            return Ok(ExecutorResult {
-                columns,
-                rows,
-                latency_ms: start.elapsed().as_millis() as u64,
-            });
-        }
-
-        // Edge-degree GROUP BY COUNT fast-path: `MATCH (c:Tag)<-[:e]-() RETURN
-        // c.prop, COUNT(*)` — count each group node's edge keys (no EdgeData
-        // decode) instead of traversing+decoding every edge. ORDER BY/LIMIT apply.
-        if let Some((columns, mut rows)) = self
-            .try_edge_degree_group_count(&plan, &space, &matcher, vid_type)
-            .await?
-        {
-            if !plan.order_by.is_empty() {
-                sort_rows_by_order(&mut rows, &columns, &plan.order_by);
-            }
-            if let Some(offset) = plan.offset {
-                rows = rows.into_iter().skip(offset).collect();
-            }
-            if let Some(limit) = plan.limit {
-                rows.truncate(limit);
-            }
             return Ok(ExecutorResult {
                 columns,
                 rows,
@@ -162,7 +152,11 @@ impl MatchExecutor {
             *vid = crate::ontology::representative_of(&self.ctx, &space, *vid).await?;
         }
 
-        let used_reverse = if flat.edges.len() == 1 && plan.optional_patterns.is_empty() {
+        let used_reverse = if flat.edges.len() == 1
+            && flat.edges[0].range.is_none()
+            && matches!(flat.edges[0].direction, EdgeDirection::Outgoing)
+            && plan.optional_patterns.is_empty()
+        {
             let end_node = flat.nodes[0];
             let end_var = end_node.variable.as_deref().unwrap_or("");
             if let Some(&end_vid) = id_bindings.get(end_var) {
@@ -197,16 +191,16 @@ impl MatchExecutor {
             // ORDER BY needs the full result set before truncating, so the
             // early-exit limit only applies when there is no ordering (and no
             // WHERE post-filter / multi-pattern join).
-            let row_limit =
-                if plan.where_clause.is_none() && !is_multiple && plan.order_by.is_empty() {
-                    match (plan.offset, plan.limit) {
-                        (Some(off), Some(lim)) => Some(off + lim),
-                        (None, Some(lim)) => Some(lim),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
+            let row_limit = if plan.where_clause.is_none()
+                && !is_multiple
+                && plan.order_by.is_empty()
+                && !aggregates
+                && plan.optional_patterns.is_empty()
+            {
+                window
+            } else {
+                None
+            };
             // If WHERE id(start_var)==X, skip the full candidate scan.
             let start_var_name = flat.start.variable.as_deref().unwrap_or("");
             let start_vid_override = id_bindings.get(start_var_name).copied();
@@ -247,31 +241,19 @@ impl MatchExecutor {
                     });
 
                     let mut rows_for_base: Vec<MatchBindings> = Vec::new();
-                    if let Some(start_vid) = already_bound_vid {
-                        let mut b = base_row.clone();
-                        self.match_edges(
-                            &space,
-                            &add_flat.edges,
-                            &add_flat.nodes,
-                            0,
-                            start_vid,
-                            &matcher,
-                            &mut b,
-                            &mut rows_for_base,
-                        )
-                        .await?;
-                    } else {
-                        let mut b = base_row.clone();
-                        self.match_flat_pattern(
-                            &add_flat,
-                            &matcher,
-                            &mut b,
-                            &mut rows_for_base,
-                            None,
-                            None,
-                        )
-                        .await?;
-                    }
+                    let mut bindings_for_base = base_row.clone();
+                    // Even a previously bound start must satisfy this
+                    // pattern's labels/properties and still exist. The VID
+                    // override avoids a scan while retaining strict loading.
+                    self.match_flat_pattern(
+                        &add_flat,
+                        &matcher,
+                        &mut bindings_for_base,
+                        &mut rows_for_base,
+                        None,
+                        already_bound_vid,
+                    )
+                    .await?;
 
                     // INNER join: only keep base rows that matched.
                     for r in rows_for_base {
@@ -323,38 +305,37 @@ impl MatchExecutor {
                             })
                         });
 
-                        if let Some(start_vid) = already_bound_vid {
-                            let start_var = opt_flat.start.variable.as_ref().unwrap().clone();
-                            let mut opt_bindings = base_row.clone();
-                            opt_bindings.insert(start_var, byoridb_common::Value::Int(start_vid));
-                            self.match_edges(
-                                &space,
-                                &opt_flat.edges,
-                                &opt_flat.nodes,
-                                0,
-                                start_vid,
-                                &matcher,
-                                &mut opt_bindings,
-                                &mut opt_rows,
-                            )
-                            .await?;
-                        } else {
-                            // Start variable not bound — scan all candidates
-                            let mut opt_bindings = base_row.clone();
-                            self.match_flat_pattern(
-                                &opt_flat,
-                                &matcher,
-                                &mut opt_bindings,
-                                &mut opt_rows,
-                                None,
-                                None,
-                            )
-                            .await?;
-                        }
+                        let mut opt_bindings = base_row.clone();
+                        self.match_flat_pattern(
+                            &opt_flat,
+                            &matcher,
+                            &mut opt_bindings,
+                            &mut opt_rows,
+                            None,
+                            already_bound_vid,
+                        )
+                        .await?;
 
                         if opt_rows.is_empty() {
-                            // No matches: keep base row (optional vars → NULL in projection)
-                            next_rows.push(base_row);
+                            // Explicit NULL bindings must survive later OPTIONAL
+                            // patterns; an absent map entry would be re-scanned
+                            // and rebound as if this variable were new.
+                            let mut null_extended = base_row;
+                            for variable in std::iter::once(opt_flat.start)
+                                .chain(opt_flat.nodes.iter().copied())
+                                .filter_map(|node| node.variable.as_ref())
+                                .chain(
+                                    opt_flat
+                                        .edges
+                                        .iter()
+                                        .filter_map(|edge| edge.variable.as_ref()),
+                                )
+                            {
+                                null_extended.values.entry(variable.clone()).or_insert(
+                                    byoridb_common::Value::Null(byoridb_common::NullType::Null),
+                                );
+                            }
+                            next_rows.push(null_extended);
                         } else {
                             for opt_row in opt_rows {
                                 let mut merged = base_row.clone();
@@ -405,7 +386,10 @@ impl MatchExecutor {
             let rows_in = binding_rows.len();
             let mut out = Vec::new();
             for row_bindings in binding_rows {
-                if self.eval_condition(where_expr, &row_bindings, &space).await {
+                if self
+                    .eval_condition(where_expr, &row_bindings, &space)
+                    .await?
+                {
                     out.push(row_bindings);
                 }
             }
@@ -467,13 +451,15 @@ impl MatchExecutor {
                 // 2. For each group, project non-agg columns + compute agg columns
 
                 // Group raw binding rows (not yet projected) by key values
-                let mut groups: std::collections::BTreeMap<Vec<String>, Vec<MatchBindings>> =
+                let mut groups: std::collections::BTreeMap<Vec<MatchGroupKey>, Vec<MatchBindings>> =
                     std::collections::BTreeMap::new();
                 for row_bindings in &filtered {
                     let mut key_parts = Vec::new();
                     for key_expr in &group_exprs {
-                        let v = self.eval_return_expr(key_expr, row_bindings, &space).await;
-                        key_parts.push(format!("{:?}", v)); // stable key
+                        let v = self
+                            .eval_return_expr(key_expr, row_bindings, &space)
+                            .await?;
+                        key_parts.push(match_group_key(&v)?);
                     }
                     groups
                         .entry(key_parts)
@@ -483,6 +469,7 @@ impl MatchExecutor {
 
                 // For each group, compute the output row
                 let mut result_rows = Vec::new();
+                let mut aggregate_bytes = 0usize;
                 for (_key, group_bindings) in groups {
                     let mut row = Vec::new();
                     for col in return_cols {
@@ -493,7 +480,7 @@ impl MatchExecutor {
                                 &group_bindings,
                                 &space,
                             )
-                            .await
+                            .await?
                             .into_iter()
                             .next()
                             .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null))
@@ -504,10 +491,13 @@ impl MatchExecutor {
                                 group_bindings.first().unwrap(),
                                 &space,
                             )
-                            .await
+                            .await?
                         };
                         row.push(val);
                     }
+                    aggregate_bytes =
+                        aggregate_bytes.saturating_add(crate::context::estimate_row_bytes(&row));
+                    self.ctx.check_result_budget(aggregate_bytes)?;
                     result_rows.push(row);
                 }
                 (col_names, result_rows)
@@ -515,15 +505,10 @@ impl MatchExecutor {
                 // Global aggregate (no GROUP BY): reduce all rows to one
                 let agg_row = self
                     .compute_aggregate_row(return_cols, &filtered, &space)
-                    .await;
-                (
-                    col_names,
-                    if filtered.is_empty() {
-                        vec![]
-                    } else {
-                        vec![agg_row]
-                    },
-                )
+                    .await?;
+                self.ctx
+                    .check_result_budget(crate::context::estimate_row_bytes(&agg_row))?;
+                (col_names, vec![agg_row])
             } else {
                 let mut projected = Vec::new();
                 // Track the real footprint of projected rows (which can hold
@@ -535,7 +520,7 @@ impl MatchExecutor {
                     for col in return_cols {
                         let val = self
                             .eval_return_expr(&col.expression, &row_bindings, &space)
-                            .await;
+                            .await?;
                         row.push(val);
                     }
                     proj_bytes += crate::context::estimate_row_bytes(&row);
@@ -594,7 +579,7 @@ impl MatchExecutor {
         // ORDER BY — sort the projected rows before OFFSET/LIMIT truncation.
         let mut rows = rows;
         if !plan.order_by.is_empty() {
-            sort_rows_by_order(&mut rows, &columns, &plan.order_by);
+            sort_rows_by_order(&mut rows, &order_keys);
         }
         // OFFSET — skip rows before LIMIT
         if let Some(offset) = plan.offset {
@@ -612,379 +597,9 @@ impl MatchExecutor {
         })
     }
 
-    /// Fast-path for `MATCH (v:Tag) RETURN v.Tag.prop AS x, COUNT(*) AS n
-    /// GROUP BY v.Tag.prop` (no WHERE / OPTIONAL / edges) where `prop` has a
-    /// single-field tag index: counts grouped values via an index scan, with no
-    /// vertex-blob decode. Returns `None` when the shape or index doesn't
-    /// qualify — the caller then runs the normal full-scan aggregation.
-    async fn try_indexed_group_count(
-        &self,
-        plan: &crate::plan::MatchPlan,
-        vid_type: crate::vid::SpaceVidType,
-    ) -> Result<Option<(Vec<String>, Vec<Vec<byoridb_common::Value>>)>> {
-        // Property-index entries contain only internal i64 VIDs and this path
-        // never materializes bindings. Until it can validate reverse mappings,
-        // FIXED_STRING must use the normal path where corruption is surfaced.
-        if !matches!(vid_type, crate::vid::SpaceVidType::Int64) {
-            return Ok(None);
-        }
-        // Shape gates: no WHERE / OPTIONAL, single-node pattern, single GROUP BY.
-        if plan.where_clause.is_some() || !plan.optional_patterns.is_empty() {
-            return Ok(None);
-        }
-        let flat = flatten_pattern(&plan.pattern)?;
-        if !flat.edges.is_empty() {
-            return Ok(None);
-        }
-        let group_by = match &plan.group_by {
-            Some(g) if g.len() == 1 => g,
-            _ => return Ok(None),
-        };
-        let return_cols = match &plan.return_clause {
-            Some(c) if c.len() == 2 => c,
-            _ => return Ok(None),
-        };
-        // RETURN must be exactly one aggregate (COUNT) + one non-aggregate that
-        // equals the GROUP BY expression.
-        let agg_count = return_cols
-            .iter()
-            .filter(|c| is_aggregate_expr(&c.expression))
-            .count();
-        if agg_count != 1 {
-            return Ok(None);
-        }
-        let group_expr = &group_by[0];
-        let non_agg: Vec<_> = return_cols
-            .iter()
-            .filter(|c| !is_aggregate_expr(&c.expression))
-            .collect();
-        if non_agg.len() != 1 || &non_agg[0].expression != group_expr {
-            return Ok(None);
-        }
-        // Only COUNT is index-countable here (SUM/AVG/etc. need the value).
-        let agg = return_cols
-            .iter()
-            .find(|c| is_aggregate_expr(&c.expression))
-            .unwrap();
-        if !matches!(&agg.expression, Expression::FunctionCall { name, .. }
-            if name.eq_ignore_ascii_case("COUNT"))
-        {
-            return Ok(None);
-        }
-        // group_expr must be a vertex property `v.Tag.prop` → PropRef.prop.
-        let prop = match group_expr {
-            Expression::PropRef { prop, .. } => prop.clone(),
-            _ => return Ok(None),
-        };
-        let label = match flat.start.labels.first() {
-            Some(l) => l.clone(),
-            None => return Ok(None),
-        };
-        // Find a single-field tag index on (label, prop).
-        let index_manager = match self.ctx.index_manager.as_ref() {
-            Some(im) => im,
-            None => return Ok(None),
-        };
-        let space_id = self.ctx.resolve_space_id().await;
-        let index_def = match index_manager
-            .list_tag_indexes(space_id)
-            .await
-            .into_iter()
-            .find(|i| i.schema_name == label && i.fields.len() == 1 && i.fields[0] == prop)
-        {
-            Some(i) => i,
-            None => return Ok(None),
-        };
-        // Count via index scan (part_id 1 — INSERT writes all tag indexes there).
-        let counts = index_manager
-            .tag_index_group_counts(1, &index_def)
-            .await
-            .map_err(|error| byoridb_storage::StorageError::Index(error.to_string()))?;
-        let col_names: Vec<String> = return_cols
-            .iter()
-            .map(|c| {
-                c.alias
-                    .clone()
-                    .unwrap_or_else(|| expr_to_col_name(&c.expression))
-            })
-            .collect();
-        let group_is_first = !is_aggregate_expr(&return_cols[0].expression);
-        let rows = counts
-            .into_iter()
-            .map(|(iv, n)| {
-                let gv = index_value_to_value(iv);
-                let cv = byoridb_common::Value::Int(n as i64);
-                if group_is_first {
-                    vec![gv, cv]
-                } else {
-                    vec![cv, gv]
-                }
-            })
-            .collect();
-        Ok(Some((col_names, rows)))
-    }
-
-    /// Fast-path for `MATCH (c:Tag)<-[:etype]-() RETURN c.<prop>, COUNT(*)` and
-    /// the forward `->` form: the per-group count is just how many edge keys
-    /// share the group node's edge prefix
-    /// (`{space}:in-edge:{vid}:{etype}:` / `{space}:edge:{vid}:{etype}:`), so we
-    /// count keys with no `EdgeData` decode and decode only the (few) group-node
-    /// blobs to read `<prop>`. This turns the 33M-edge TOP-category/brand
-    /// aggregation from a multi-minute full traversal into a keys-only count.
-    ///
-    /// Returns `None` (→ normal full traversal) unless the shape qualifies:
-    /// single fixed 1-hop edge, single edge type, directed, **no label/prop on
-    /// the far node** (skipping its decode must be safe), no WHERE/OPTIONAL, and
-    /// RETURN = [start-node PropRef, COUNT(*)] (explicit GROUP BY, if present,
-    /// must equal that PropRef).
-    async fn try_edge_degree_group_count(
-        &self,
-        plan: &crate::plan::MatchPlan,
-        space: &str,
-        matcher: &PatternMatcher,
-        vid_type: crate::vid::SpaceVidType,
-    ) -> Result<Option<(Vec<String>, Vec<Vec<byoridb_common::Value>>)>> {
-        // This keys-only path does not visit the far edge endpoint. Use normal
-        // traversal for FIXED_STRING so both endpoint mappings are validated.
-        if !matches!(vid_type, crate::vid::SpaceVidType::Int64) {
-            return Ok(None);
-        }
-        if plan.where_clause.is_some() || !plan.optional_patterns.is_empty() {
-            return Ok(None);
-        }
-        let flat = flatten_pattern(&plan.pattern)?;
-        if flat.edges.len() != 1 {
-            return Ok(None);
-        }
-        let edge = flat.edges[0];
-        // Fixed single-type edge with no edge-property filter.
-        if edge.range.is_some() || edge.edge_types.len() != 1 || !edge.props.is_empty() {
-            return Ok(None);
-        }
-        let etype = edge.edge_types[0].clone();
-        let reverse = match edge.direction {
-            EdgeDirection::Incoming => true,
-            EdgeDirection::Outgoing => false,
-            // Undirected = out ∪ in; counting both prefixes would double-count.
-            EdgeDirection::Undirected => return Ok(None),
-        };
-        // The far node must carry no filter — we never decode the edge's other
-        // endpoint, so a label/prop there could change the result.
-        let end = flat.nodes[0];
-        if !end.labels.is_empty() || !end.props.is_empty() {
-            return Ok(None);
-        }
-        let start_var = match flat.start.variable.as_deref() {
-            Some(v) => v.to_string(),
-            None => return Ok(None),
-        };
-        let label = match flat.start.labels.first() {
-            Some(l) => l.clone(),
-            None => return Ok(None),
-        };
-        let return_cols = match &plan.return_clause {
-            Some(c) if c.len() == 2 => c,
-            _ => return Ok(None),
-        };
-        if return_cols
-            .iter()
-            .filter(|c| is_aggregate_expr(&c.expression))
-            .count()
-            != 1
-        {
-            return Ok(None);
-        }
-        let non_agg: Vec<_> = return_cols
-            .iter()
-            .filter(|c| !is_aggregate_expr(&c.expression))
-            .collect();
-        if non_agg.len() != 1 {
-            return Ok(None);
-        }
-        let group_expr = non_agg[0].expression.clone();
-        // An explicit GROUP BY must match the grouping column.
-        if let Some(g) = &plan.group_by {
-            if g.len() != 1 || g[0] != group_expr {
-                return Ok(None);
-            }
-        }
-        // Aggregate must be COUNT (SUM/AVG need values we don't read).
-        let agg = return_cols
-            .iter()
-            .find(|c| is_aggregate_expr(&c.expression))
-            .unwrap();
-        if !matches!(&agg.expression, Expression::FunctionCall { name, .. }
-            if name.eq_ignore_ascii_case("COUNT"))
-        {
-            return Ok(None);
-        }
-        // The group expression must be a property of the start node, so the only
-        // blobs we decode are the (few) group nodes — read in one batch below.
-        let prop_name = match &group_expr {
-            Expression::PropRef { object, prop }
-                if object == &start_var || object.starts_with(&format!("{}.", start_var)) =>
-            {
-                prop.clone()
-            }
-            _ => return Ok(None),
-        };
-
-        // Enumerate start vids via the tag-vid index ({space}:tagvid:{label}:).
-        let tagvid_prefix = format!("{}:tagvid:{}:", space, label).into_bytes();
-        let tagvid_entries = self.ctx.kvstore.scan_prefix(&tagvid_prefix).await?;
-        if tagvid_entries.is_empty() {
-            // No tag-vid index entries (e.g. legacy data) — fall back so the
-            // full scan can still answer correctly.
-            return Ok(None);
-        }
-        let indexed_vids: Vec<i64> = tagvid_entries
-            .iter()
-            .filter_map(|(key, _)| {
-                // key = {space}:tagvid:{label}:{vid} — vid is the last segment.
-                std::str::from_utf8(key)
-                    .ok()
-                    .and_then(|s| s.rsplit(':').next())
-                    .and_then(|s| s.parse::<i64>().ok())
-            })
-            .collect();
-
-        // Revalidate tag-vid entries before trusting counters or edge prefixes.
-        // Stale keys must not create phantom groups, and a stale-only index must
-        // fall back to traversal so legacy/pre-index live rows remain visible.
-        let vertex_keys: Vec<Vec<u8>> = indexed_vids
-            .iter()
-            .map(|&vid| crate::key::SchemaKey::vertex(space, vid))
-            .collect();
-        let indexed_blobs = self.ctx.kvstore.batch_get(&vertex_keys).await?;
-        let mut vids = Vec::new();
-        let mut blobs = Vec::new();
-        for (vid, blob) in indexed_vids.into_iter().zip(indexed_blobs) {
-            let Some(blob) = blob else { continue };
-            if matcher.matches_node(&blob, flat.start)? {
-                crate::vid::display_vid(&self.ctx, space, vid_type, vid).await?;
-                vids.push(vid);
-                blobs.push(blob);
-            }
-        }
-        if vids.is_empty() {
-            return Ok(None);
-        }
-
-        // Counts per group node. Prefer precomputed degree counters — a single
-        // batch_get instead of scanning 33M edge keys. Only trust them when the
-        // space declares no semantics (counters track asserted edges only, so an
-        // inferred-edge space would undercount) and they're actually present
-        // (a not-yet-backfilled space has none → prefix-count). Otherwise fall
-        // back to the keys-only prefix count (correct, slower).
-        let counts: Vec<u64> = {
-            let counter_usable = !self.space_has_semantics(space).await?;
-            let from_counter = if counter_usable {
-                let counter_keys: Vec<Vec<u8>> = vids
-                    .iter()
-                    .map(|&vid| {
-                        if reverse {
-                            crate::key::SchemaKey::indeg_counter(space, &etype, vid)
-                        } else {
-                            crate::key::SchemaKey::outdeg_counter(space, &etype, vid)
-                        }
-                    })
-                    .collect();
-                let cblobs = self.ctx.kvstore.batch_get(&counter_keys).await?;
-                if cblobs.iter().any(|b| b.is_some()) {
-                    Some(
-                        cblobs
-                            .iter()
-                            .map(|b| {
-                                b.as_ref()
-                                    .and_then(|x| crate::key::SchemaKey::decode_count(x))
-                                    .filter(|&c| c > 0)
-                                    .map(|c| c as u64)
-                                    .unwrap_or(0)
-                            })
-                            .collect(),
-                    )
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            match from_counter {
-                Some(c) => c,
-                None => {
-                    let edge_prefixes: Vec<Vec<u8>> = vids
-                        .iter()
-                        .map(|&vid| {
-                            if reverse {
-                                format!("{}:in-edge:{}:{}:", space, vid, etype).into_bytes()
-                            } else {
-                                format!("{}:edge:{}:{}:", space, vid, etype).into_bytes()
-                            }
-                        })
-                        .collect();
-                    self.ctx.kvstore.count_prefixes(edge_prefixes).await?
-                }
-            }
-        };
-        let col_names: Vec<String> = return_cols
-            .iter()
-            .map(|c| {
-                c.alias
-                    .clone()
-                    .unwrap_or_else(|| expr_to_col_name(&c.expression))
-            })
-            .collect();
-        let group_is_first = !is_aggregate_expr(&return_cols[0].expression);
-
-        let mut rows: Vec<Vec<byoridb_common::Value>> = Vec::new();
-        for (i, &count) in counts.iter().enumerate() {
-            if count == 0 {
-                continue; // no edges of this type → not interesting for TOP-k
-            }
-            let gv = tag_prop_value(&blobs[i], &label, &prop_name);
-            let cv = byoridb_common::Value::Int(count as i64);
-            rows.push(if group_is_first {
-                vec![gv, cv]
-            } else {
-                vec![cv, gv]
-            });
-        }
-        Ok(Some((col_names, rows)))
-    }
-
-    /// True if any edge type in the space declares semantic flags (transitive /
-    /// inverseOf / subPropertyOf / domain / range). Degree counters track only
-    /// asserted edges, so the counter fast-path must defer to the prefix-count
-    /// path where inference would add edges. Cheap — edge schemas number in the
-    /// dozens.
-    async fn space_has_semantics(&self, space: &str) -> Result<bool> {
-        let prefix = format!("space:{}:edge:", space).into_bytes();
-        let entries = self.ctx.kvstore.scan_prefix(&prefix).await?;
-        for (_, v) in &entries {
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(v) {
-                // CREATE EDGE always serializes a `semantics` object, even when
-                // empty — so check for an actually-set flag, not mere presence.
-                if let Some(sem) = json.get("semantics") {
-                    let active = sem
-                        .get("transitive")
-                        .and_then(|x| x.as_bool())
-                        .unwrap_or(false)
-                        || sem
-                            .get("symmetric")
-                            .and_then(|x| x.as_bool())
-                            .unwrap_or(false)
-                        || ["inverse_of", "subproperty_of", "domain", "range"]
-                            .iter()
-                            .any(|k| sem.get(*k).map(|x| !x.is_null()).unwrap_or(false));
-                    if active {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        Ok(false)
-    }
-
+    /// Stream only a plain single-node COUNT(*). Grouped and edge counts use
+    /// normal matching so predicates, endpoint validation and grouping remain
+    /// identical to the corresponding projected rows.
     async fn try_execute_simple_count(
         &self,
         plan: &crate::plan::MatchPlan,
@@ -994,7 +609,6 @@ impl MatchExecutor {
         if plan.where_clause.is_some()
             || !plan.optional_patterns.is_empty()
             || plan.group_by.is_some()
-            || plan.offset.is_some()
         {
             return Ok(None);
         }
@@ -1006,7 +620,9 @@ impl MatchExecutor {
 
         let is_count = matches!(
             &return_cols[0].expression,
-            Expression::FunctionCall { name, .. } if name.eq_ignore_ascii_case("COUNT")
+            Expression::FunctionCall { name, args }
+                if name.eq_ignore_ascii_case("COUNT")
+                    && matches!(args.as_slice(), [Expression::Identifier(star)] if star == "*")
         );
         if !is_count {
             return Ok(None);
@@ -1019,7 +635,7 @@ impl MatchExecutor {
 
         let agg_start = std::time::Instant::now();
         let count = self
-            .count_node_matches_unlimited(space, &path.start, matcher)
+            .count_node_matches_bounded(space, &path.start, matcher)
             .await?;
         if self.ctx.profiling() {
             self.ctx.record_profile(
@@ -1035,40 +651,45 @@ impl MatchExecutor {
             .clone()
             .unwrap_or_else(|| expr_to_col_name(&return_cols[0].expression));
 
-        Ok(Some((
-            vec![col_name],
-            vec![vec![byoridb_common::Value::Int(count as i64)]],
-        )))
+        let count = i64::try_from(count).map_err(|_| {
+            ExecutionError::ResourceExhausted("MATCH count exceeds INT64 range".to_string())
+        })?;
+        let rows = if plan.limit == Some(0) || plan.offset.unwrap_or(0) > 0 {
+            Vec::new()
+        } else {
+            vec![vec![byoridb_common::Value::Int(count)]]
+        };
+        Ok(Some((vec![col_name], rows)))
     }
 
-    async fn count_node_matches_unlimited(
+    async fn count_node_matches_bounded(
         &self,
         space: &str,
         node: &NodePattern,
         matcher: &PatternMatcher,
     ) -> Result<usize> {
         let profiling = self.ctx.profiling();
-        // Count by STREAMING the scan — never materialize the matched set. A
-        // `COUNT` only needs the tally, so collecting every entry into a `Vec`
-        // (as the old code did via `scan_prefix_limited(.., None)`) was an
-        // unbounded allocation that OOM-killed the node on large tags (88M
-        // vertices ≈ GBs per query). `scan_stream` uses a bounded channel, so
-        // memory stays O(1) regardless of tag size.
-        if node.props.is_empty() {
+        // Keep only a tally and a bounded revalidation batch. Production
+        // backends stream through a bounded channel; the trait's default scan
+        // implementation may still materialize its own input. Charge every raw
+        // row, including stale index entries, and probe one row beyond the cap.
+        // A single-label index cannot cover an OR-label union.
+        let is_label_union = node.labels.len() > 1
+            && matches!(node.label_match, byoridb_parser::ast::LabelMatch::Any);
+        if node.props.is_empty() && !is_label_union {
             if let Some(label) = node.labels.first() {
                 let prefix = format!("{}:tagvid:{}:", space, label);
                 let t = std::time::Instant::now();
                 let mut stream = self.ctx.kvstore.scan_stream(prefix.as_bytes()).await?;
                 let vid_type = crate::vid::space_vid_type(&self.ctx, space).await?;
-                let mut raw_count = 0u64;
+                let mut raw_count = 0usize;
                 let mut count = 0usize;
                 let mut pending = Vec::with_capacity(256);
                 while let Some(item) = stream.next().await {
                     let (key, _) = item?;
                     raw_count += 1;
-                    if let Some(vid) = trailing_vid(&key) {
-                        pending.push(vid);
-                    }
+                    self.check_candidate_scan_size(raw_count, "tag-vid count scan")?;
+                    pending.push(decode_candidate_vid(&key, prefix.as_bytes())?);
                     if pending.len() == 256 {
                         count += self
                             .count_valid_tagvid_chunk(space, node, matcher, vid_type, &pending)
@@ -1112,17 +733,14 @@ impl MatchExecutor {
         let t = std::time::Instant::now();
         let mut stream = self.ctx.kvstore.scan_stream(prefix.as_bytes()).await?;
         let vid_type = crate::vid::space_vid_type(&self.ctx, space).await?;
-        let mut count = 0u64;
-        let mut scanned = 0u64;
+        let mut count = 0usize;
+        let mut scanned = 0usize;
         while let Some(item) = stream.next().await {
             let (key, value) = item?;
             scanned += 1;
-            if matcher.matches_node(&value, node)? {
-                let vid = trailing_vid(&key).ok_or_else(|| {
-                    ExecutionError::InvalidOperation(format!(
-                        "corrupt vertex key while scanning FIXED_STRING space '{space}'"
-                    ))
-                })?;
+            self.check_candidate_scan_size(scanned, "full vertex count scan")?;
+            let vid = decode_candidate_vid(&key, prefix.as_bytes())?;
+            if matcher.matches_node(vid, &value, node)? {
                 crate::vid::display_vid(&self.ctx, space, vid_type, vid).await?;
                 count += 1;
             }
@@ -1131,12 +749,12 @@ impl MatchExecutor {
             self.ctx.record_profile(
                 ProfileOp::FullScan,
                 format!("scanned {} vertices (count)", scanned),
-                count,
+                count as u64,
                 t.elapsed().as_micros() as u64,
                 true,
             );
         }
-        Ok(count as usize)
+        Ok(count)
     }
 
     async fn count_valid_tagvid_chunk(
@@ -1155,7 +773,7 @@ impl MatchExecutor {
         let mut count = 0;
         for (&vid, blob) in vids.iter().zip(blobs) {
             let Some(blob) = blob else { continue };
-            if matcher.matches_node(&blob, node)? {
+            if matcher.matches_node(vid, &blob, node)? {
                 crate::vid::display_vid(&self.ctx, space, vid_type, vid).await?;
                 count += 1;
             }
@@ -1190,525 +808,414 @@ impl MatchExecutor {
         Ok(())
     }
 
-    /// Evaluate a return expression against bound variables, fetching vertex
-    /// properties from KV when needed.
+    /// Evaluate a projection without converting failed storage reads or corrupt
+    /// records into ordinary data-level NULLs.
     async fn eval_return_expr(
         &self,
         expr: &Expression,
         bindings: &MatchBindings,
         space: &str,
-    ) -> byoridb_common::Value {
-        match expr {
-            // RETURN v — vertex/edge variable: return full object, not just VID
+    ) -> Result<byoridb_common::Value> {
+        use byoridb_common::{NullType, Value};
+        Ok(match expr {
             Expression::Identifier(name) => {
                 if let Some(edge) = bindings.edges.get(name) {
                     return self.edge_data_to_value(edge, space).await;
                 }
                 match bindings.get(name) {
-                    Some(byoridb_common::Value::Int(vid)) => {
-                        self.build_vertex_value(*vid, space).await
-                    }
+                    Some(Value::Int(vid)) => self.build_vertex_value(*vid, space).await?,
                     Some(other) => other.clone(),
-                    None => byoridb_common::Value::Null(byoridb_common::NullType::Null),
+                    None => Value::Null(NullType::Null),
                 }
             }
-
             Expression::Literal(lit) => match lit {
-                Literal::Int(i) => byoridb_common::Value::Int(*i),
-                Literal::Float(f) => byoridb_common::Value::Float(*f),
-                Literal::String(s) => byoridb_common::Value::String(s.clone()),
-                Literal::Bool(b) => byoridb_common::Value::Bool(*b),
-                Literal::Null => byoridb_common::Value::Null(byoridb_common::NullType::Null),
+                Literal::Int(i) => Value::Int(*i),
+                Literal::Float(f) => Value::Float(*f),
+                Literal::String(s) => Value::String(s.clone()),
+                Literal::Bool(b) => Value::Bool(*b),
+                Literal::Null => Value::Null(NullType::Null),
             },
-
-            // "var.tag.prop" → PropRef { object: "var.tag", prop: "prop" }
             Expression::PropRef { object, prop } => {
-                self.fetch_prop_ref(object, prop, bindings, space).await
+                self.fetch_prop_ref(object, prop, bindings, space).await?
             }
-
-            // id(v) — returns the VID of bound variable v
-            Expression::FunctionCall { name, args } if name.to_lowercase() == "id" => {
+            Expression::FunctionCall { name, args } if name.eq_ignore_ascii_case("id") => {
                 if let Some(Expression::Identifier(var)) = args.first() {
                     match bindings.get(var) {
-                        Some(byoridb_common::Value::Int(v)) => {
-                            match crate::vid::space_vid_type(&self.ctx, space).await {
-                                Ok(vid_type) => {
-                                    crate::vid::display_vid(&self.ctx, space, vid_type, *v)
-                                        .await
-                                        .unwrap_or(byoridb_common::Value::Null(
-                                            byoridb_common::NullType::Null,
-                                        ))
-                                }
-                                Err(_) => {
-                                    byoridb_common::Value::Null(byoridb_common::NullType::Null)
-                                }
-                            }
-                        }
+                        Some(Value::Int(vid)) => self.display_match_vid(space, *vid).await?,
                         Some(other) => other.clone(),
-                        None => byoridb_common::Value::Null(byoridb_common::NullType::Null),
+                        None => Value::Null(NullType::Null),
                     }
                 } else {
-                    byoridb_common::Value::Null(byoridb_common::NullType::Null)
+                    Value::Null(NullType::Null)
                 }
             }
-
-            // Edge accessors preserve the stored edge orientation, regardless
-            // of whether MATCH traversed it forwards, backwards, or as an
-            // undirected edge. Invalid arguments use typed nulls instead of
-            // silently returning an ordinary NULL.
             Expression::FunctionCall { name, args }
                 if matches!(
-                    name.to_lowercase().as_str(),
+                    name.to_ascii_lowercase().as_str(),
                     "src" | "dst" | "type" | "rank" | "ranking"
                 ) =>
             {
                 let [Expression::Identifier(var)] = args.as_slice() else {
-                    return byoridb_common::Value::Null(byoridb_common::NullType::BadType);
+                    return Ok(Value::Null(NullType::BadType));
                 };
                 if !bindings.contains_key(var) {
-                    return byoridb_common::Value::Null(byoridb_common::NullType::UnknownProp);
+                    return Ok(Value::Null(NullType::UnknownProp));
                 }
-
                 let Some(edge) = bindings.edges.get(var) else {
-                    return byoridb_common::Value::Null(byoridb_common::NullType::BadType);
+                    return Ok(Value::Null(NullType::BadType));
                 };
-                match name.to_lowercase().as_str() {
-                    "src" => self.display_match_vid(space, edge.src_vid).await,
-                    "dst" => self.display_match_vid(space, edge.dst_vid).await,
-                    "type" => byoridb_common::Value::String(edge.edge_type.clone()),
-                    "rank" | "ranking" => byoridb_common::Value::Int(edge.ranking),
+                match name.to_ascii_lowercase().as_str() {
+                    "src" => self.display_match_vid(space, edge.src_vid).await?,
+                    "dst" => self.display_match_vid(space, edge.dst_vid).await?,
+                    "type" => Value::String(edge.edge_type.clone()),
+                    "rank" | "ranking" => Value::Int(edge.ranking),
                     _ => unreachable!(),
                 }
             }
-
-            // properties(v) / properties(e) — flat map of all properties
-            Expression::FunctionCall { name, args } if name.to_lowercase() == "properties" => {
+            Expression::FunctionCall { name, args } if name.eq_ignore_ascii_case("properties") => {
                 if let Some(Expression::Identifier(var)) = args.first() {
                     if let Some(edge) = bindings.edges.get(var) {
-                        return byoridb_common::Value::Map(byoridb_common::datatypes::map::Map {
+                        return Ok(Value::Map(byoridb_common::datatypes::map::Map {
                             data: edge.properties.clone(),
-                        });
+                        }));
                     }
-                    if let Some(byoridb_common::Value::Int(vid)) = bindings.get(var) {
-                        // Vertex: merge all tag properties
-                        self.fetch_vertex_props_flat(*vid, space).await
+                    if let Some(Value::Int(vid)) = bindings.get(var) {
+                        self.fetch_vertex_props_flat(*vid, space).await?
                     } else {
-                        byoridb_common::Value::Null(byoridb_common::NullType::Null)
+                        Value::Null(NullType::Null)
                     }
                 } else {
-                    byoridb_common::Value::Null(byoridb_common::NullType::Null)
+                    Value::Null(NullType::Null)
                 }
             }
-
-            // tags(v) / labels(v) — list of tag names
             Expression::FunctionCall { name, args }
-                if matches!(name.to_lowercase().as_str(), "tags" | "labels") =>
+                if matches!(name.to_ascii_lowercase().as_str(), "tags" | "labels") =>
             {
                 if let Some(Expression::Identifier(var)) = args.first() {
-                    if let Some(byoridb_common::Value::Int(vid)) = bindings.get(var) {
+                    if let Some(Value::Int(vid)) = bindings.get(var) {
                         let key = format!("{}:vertex:{}", space, vid);
-                        if let Ok(Some(blob)) = self.ctx.kvstore.get(key.as_bytes()).await {
-                            if let Ok(v) = VertexCodec::decode_vertex(&blob) {
-                                let tag_names: Vec<byoridb_common::Value> = v
+                        if let Some(blob) = self.ctx.kvstore.get(key.as_bytes()).await? {
+                            let vertex = crate::record_decode::decode_vertex(*vid, &blob)?;
+                            return Ok(Value::List(byoridb_common::datatypes::list::List {
+                                values: vertex
                                     .tags
-                                    .iter()
-                                    .map(|t| byoridb_common::Value::String(t.name.clone()))
-                                    .collect();
-                                return byoridb_common::Value::List(
-                                    byoridb_common::datatypes::list::List { values: tag_names },
-                                );
-                            }
+                                    .into_iter()
+                                    .map(|tag| Value::String(tag.name))
+                                    .collect(),
+                            }));
                         }
                     }
                 }
-                byoridb_common::Value::Null(byoridb_common::NullType::Null)
+                Value::Null(NullType::Null)
             }
-
-            // is_a(v, "Class") — ontology class membership incl. SUBCLASS OF
-            // ancestors (PLAN.md O-7). True iff v's tags ∪ their transitive
-            // superclasses contain the named class.
-            Expression::FunctionCall { name, args } if name.to_lowercase() == "is_a" => {
+            Expression::FunctionCall { name, args }
+                if matches!(name.to_ascii_lowercase().as_str(), "is_a" | "isa") =>
+            {
                 if let (
                     Some(Expression::Identifier(var)),
                     Some(Expression::Literal(Literal::String(class))),
                 ) = (args.first(), args.get(1))
                 {
-                    if let Some(byoridb_common::Value::Int(vid)) = bindings.get(var) {
-                        if let Ok(Some(set)) =
-                            crate::ontology::vertex_class_set(&self.ctx, space, *vid).await
+                    if let Some(Value::Int(vid)) = bindings.get(var) {
+                        if let Some(set) =
+                            crate::ontology::vertex_class_set(&self.ctx, space, *vid).await?
                         {
-                            return byoridb_common::Value::Bool(set.contains(class));
+                            return Ok(Value::Bool(set.contains(class)));
                         }
                     }
                 }
-                byoridb_common::Value::Bool(false)
+                Value::Bool(false)
             }
-
-            // List literal — the right operand of `IN`, and projectable on its
-            // own. Without this arm a list evaluated to NULL and every `IN`
-            // comparison silently failed.
             Expression::List(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
-                    values.push(Box::pin(self.eval_return_expr(item, bindings, space)).await);
+                    values.push(Box::pin(self.eval_return_expr(item, bindings, space)).await?);
                 }
-                byoridb_common::Value::List(byoridb_common::datatypes::list::List { values })
+                Value::List(byoridb_common::datatypes::list::List { values })
             }
-
-            // Any other function is a scalar one. Its arguments are resolved
-            // here, because they may reference bound variables and stored
-            // properties, and the values are then handed to the shared function
-            // library rather than reimplemented — a second copy is how MATCH
-            // came to lack `toLower` while the other evaluators had it (#102).
-            //
-            // The name is already known to be implemented: the planner rejects
-            // an unknown function before execution, so reaching this arm with
-            // one is impossible. A `BadType` null is what remains for an
-            // argument of the wrong type, which is what this evaluator returns
-            // for that everywhere else.
             Expression::FunctionCall { name, args } => {
                 let mut values = Vec::with_capacity(args.len());
                 for arg in args {
-                    values.push(Box::pin(self.eval_return_expr(arg, bindings, space)).await);
+                    values.push(Box::pin(self.eval_return_expr(arg, bindings, space)).await?);
                 }
-                crate::evaluator::Evaluator::apply_scalar_function(name, &values).unwrap_or(
-                    byoridb_common::Value::Null(byoridb_common::NullType::BadType),
-                )
+                crate::evaluator::Evaluator::apply_scalar_function(name, &values)
+                    .unwrap_or(Value::Null(NullType::BadType))
             }
-
-            _ => byoridb_common::Value::Null(byoridb_common::NullType::Null),
-        }
-    }
-
-    /// Build a full `Value::Vertex` object from a VID by fetching from KV.
-    async fn build_vertex_value(&self, vid: i64, space: &str) -> byoridb_common::Value {
-        let displayed_vid = match crate::vid::space_vid_type(&self.ctx, space).await {
-            Ok(vid_type) => crate::vid::display_vid(&self.ctx, space, vid_type, vid)
-                .await
-                .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null)),
-            Err(_) => byoridb_common::Value::Null(byoridb_common::NullType::Null),
-        };
-        let key = format!("{}:vertex:{}", space, vid);
-        let blob = match self.ctx.kvstore.get(key.as_bytes()).await {
-            Ok(Some(b)) => b,
             _ => {
-                // No vertex data → return bare VID as Vertex
-                return byoridb_common::Value::Vertex(Box::new(byoridb_common::Vertex {
-                    vid: displayed_vid,
-                    tags: vec![],
-                }));
+                return Err(ExecutionError::InvalidOperation(
+                    "Unsupported MATCH projection expression".to_string(),
+                ))
             }
-        };
-        let codec_vertex = match VertexCodec::decode_vertex(&blob) {
-            Ok(v) => v,
-            Err(_) => {
-                return byoridb_common::Value::Vertex(Box::new(byoridb_common::Vertex {
-                    vid: displayed_vid,
-                    tags: vec![],
-                }))
-            }
-        };
-
-        let tags: Vec<byoridb_common::datatypes::vertex::Tag> = codec_vertex
-            .tags
-            .iter()
-            .map(|t| {
-                let props: std::collections::HashMap<String, byoridb_common::Value> = t
-                    .properties
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                byoridb_common::datatypes::vertex::Tag::with_props(t.name.clone(), props)
-            })
-            .collect();
-
-        byoridb_common::Value::Vertex(Box::new(byoridb_common::Vertex {
-            vid: displayed_vid,
-            tags,
-        }))
+        })
     }
 
-    async fn display_match_vid(&self, space: &str, vid: i64) -> byoridb_common::Value {
-        match crate::vid::space_vid_type(&self.ctx, space).await {
-            Ok(vid_type) => crate::vid::display_vid(&self.ctx, space, vid_type, vid)
-                .await
-                .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null)),
-            Err(_) => byoridb_common::Value::Null(byoridb_common::NullType::Null),
-        }
-    }
-
-    /// Build a user-facing edge without leaking internal surrogate VIDs.
-    async fn edge_data_to_value(&self, edge: &EdgeData, space: &str) -> byoridb_common::Value {
-        let src = self.display_match_vid(space, edge.src_vid).await;
-        let dst = self.display_match_vid(space, edge.dst_vid).await;
-        byoridb_common::Value::Edge(Box::new(byoridb_common::Edge::with_props(
-            src,
-            dst,
-            0, // edge_type numeric (unused for display)
-            edge.edge_type.clone(),
-            edge.ranking,
-            edge.properties.clone(),
+    /// A missing record retains the existing bare-VID representation; an
+    /// unreadable or malformed record is an execution failure.
+    async fn build_vertex_value(&self, vid: i64, space: &str) -> Result<byoridb_common::Value> {
+        let displayed_vid = self.display_match_vid(space, vid).await?;
+        let key = format!("{}:vertex:{}", space, vid);
+        let tags = match self.ctx.kvstore.get(key.as_bytes()).await? {
+            Some(blob) => crate::record_decode::decode_vertex(vid, &blob)?
+                .tags
+                .into_iter()
+                .map(|tag| {
+                    byoridb_common::datatypes::vertex::Tag::with_props(tag.name, tag.properties)
+                })
+                .collect(),
+            None => vec![],
+        };
+        Ok(byoridb_common::Value::Vertex(Box::new(
+            byoridb_common::Vertex {
+                vid: displayed_vid,
+                tags,
+            },
         )))
     }
 
-    /// Return all vertex properties as a flat map (merging all tags).
-    async fn fetch_vertex_props_flat(&self, vid: i64, space: &str) -> byoridb_common::Value {
-        let key = format!("{}:vertex:{}", space, vid);
-        let blob = match self.ctx.kvstore.get(key.as_bytes()).await {
-            Ok(Some(b)) => b,
-            _ => {
-                return byoridb_common::Value::Map(byoridb_common::datatypes::map::Map {
-                    data: std::collections::HashMap::new(),
-                })
-            }
-        };
-        let codec_vertex = match VertexCodec::decode_vertex(&blob) {
-            Ok(v) => v,
-            Err(_) => {
-                return byoridb_common::Value::Map(byoridb_common::datatypes::map::Map {
-                    data: std::collections::HashMap::new(),
-                })
-            }
-        };
+    async fn display_match_vid(&self, space: &str, vid: i64) -> Result<byoridb_common::Value> {
+        let vid_type = crate::vid::space_vid_type(&self.ctx, space).await?;
+        crate::vid::display_vid(&self.ctx, space, vid_type, vid).await
+    }
 
-        let mut map = std::collections::HashMap::new();
-        for tag in &codec_vertex.tags {
-            if codec_vertex.tags.len() == 1 {
-                // Single tag → flat (no prefix)
-                for (k, v) in &tag.properties {
-                    map.insert(k.clone(), v.clone());
-                }
-            } else {
-                // Multiple tags → prefix with tag name
-                for (k, v) in &tag.properties {
-                    map.insert(format!("{}.{}", tag.name, k), v.clone());
+    /// Build a user-facing edge without leaking internal surrogate VIDs.
+    async fn edge_data_to_value(
+        &self,
+        edge: &EdgeData,
+        space: &str,
+    ) -> Result<byoridb_common::Value> {
+        let src = self.display_match_vid(space, edge.src_vid).await?;
+        let dst = self.display_match_vid(space, edge.dst_vid).await?;
+        Ok(byoridb_common::Value::Edge(Box::new(
+            byoridb_common::Edge::with_props(
+                src,
+                dst,
+                0,
+                edge.edge_type.clone(),
+                edge.ranking,
+                edge.properties.clone(),
+            ),
+        )))
+    }
+
+    async fn fetch_vertex_props_flat(
+        &self,
+        vid: i64,
+        space: &str,
+    ) -> Result<byoridb_common::Value> {
+        let key = format!("{}:vertex:{}", space, vid);
+        let mut map = HashMap::new();
+        if let Some(blob) = self.ctx.kvstore.get(key.as_bytes()).await? {
+            let vertex = crate::record_decode::decode_vertex(vid, &blob)?;
+            for tag in &vertex.tags {
+                for (key, value) in &tag.properties {
+                    let name = if vertex.tags.len() == 1 {
+                        key.clone()
+                    } else {
+                        format!("{}.{}", tag.name, key)
+                    };
+                    map.insert(name, value.clone());
                 }
             }
         }
-        byoridb_common::Value::Map(byoridb_common::datatypes::map::Map { data: map })
+        Ok(byoridb_common::Value::Map(
+            byoridb_common::datatypes::map::Map { data: map },
+        ))
     }
 
-    /// Resolve a PropRef { object, prop } where `object` is either
-    /// "var.tag" (three-level MATCH syntax) or "var" (two-level).
+    /// Resolve either var.tag.prop or var.prop, preserving missing-property NULL.
     async fn fetch_prop_ref(
         &self,
         object: &str,
         prop: &str,
         bindings: &MatchBindings,
         space: &str,
-    ) -> byoridb_common::Value {
+    ) -> Result<byoridb_common::Value> {
+        use byoridb_common::{NullType, Value};
         let (var_name, tag_name) = if let Some(dot) = object.find('.') {
             (&object[..dot], Some(&object[dot + 1..]))
         } else {
             (object, None)
         };
-
         if let Some(edge) = bindings.edges.get(var_name) {
-            return edge
+            return Ok(edge
                 .properties
                 .get(prop)
                 .cloned()
-                .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null));
+                .unwrap_or(Value::Null(NullType::Null)));
         }
-
-        let vid = match bindings.get(var_name) {
-            Some(byoridb_common::Value::Int(v)) => *v,
-            _ => return byoridb_common::Value::Null(byoridb_common::NullType::Null),
+        let Some(Value::Int(vid)) = bindings.get(var_name) else {
+            return Ok(Value::Null(NullType::Null));
         };
-
         let key = format!("{}:vertex:{}", space, vid);
-        let blob = match self.ctx.kvstore.get(key.as_bytes()).await {
-            Ok(Some(b)) => b,
-            _ => return byoridb_common::Value::Null(byoridb_common::NullType::Null),
+        let Some(blob) = self.ctx.kvstore.get(key.as_bytes()).await? else {
+            return Ok(Value::Null(NullType::Null));
         };
-        let vertex = match VertexCodec::decode_vertex(&blob) {
-            Ok(v) => v,
-            Err(_) => return byoridb_common::Value::Null(byoridb_common::NullType::Null),
-        };
-
-        if let Some(_tag) = tag_name {
-            vertex
-                .tags
-                .iter()
-                .find(|t| t.name.eq_ignore_ascii_case(_tag))
-                .and_then(|t| t.properties.get(prop))
-                .cloned()
-                .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null))
-        } else {
-            // Two-level: "var.prop" — search all tags for the property
-            for tag in &vertex.tags {
-                if let Some(val) = tag.properties.get(prop) {
-                    return val.clone();
-                }
-            }
-            byoridb_common::Value::Null(byoridb_common::NullType::Null)
-        }
+        let vertex = crate::record_decode::decode_vertex(*vid, &blob)?;
+        Ok(vertex
+            .tags
+            .iter()
+            .filter(|tag| tag_name.is_none_or(|name| tag.name.eq_ignore_ascii_case(name)))
+            .find_map(|tag| tag.properties.get(prop).cloned())
+            .unwrap_or(Value::Null(NullType::Null)))
     }
 
-    /// Evaluate a WHERE condition against bound variables (async for property
-    /// lookups).
     fn eval_condition<'a>(
         &'a self,
         expr: &'a Expression,
         bindings: &'a MatchBindings,
         space: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + 'a>> {
         Box::pin(async move {
-            match expr {
+            Ok(match expr {
                 Expression::BinaryOp { op, left, right } => match op {
                     BinaryOperator::And => {
-                        self.eval_condition(left, bindings, space).await
-                            && self.eval_condition(right, bindings, space).await
+                        self.eval_condition(left, bindings, space).await?
+                            && self.eval_condition(right, bindings, space).await?
                     }
                     BinaryOperator::Or => {
-                        self.eval_condition(left, bindings, space).await
-                            || self.eval_condition(right, bindings, space).await
+                        self.eval_condition(left, bindings, space).await?
+                            || self.eval_condition(right, bindings, space).await?
                     }
                     BinaryOperator::Regex => {
-                        // `expr =~ "pattern"` — regex match
-                        let lv = self.eval_return_expr(left, bindings, space).await;
-                        let rv = self.eval_return_expr(right, bindings, space).await;
+                        let lv = self.eval_return_expr(left, bindings, space).await?;
+                        let rv = self.eval_return_expr(right, bindings, space).await?;
                         match (&lv, &rv) {
                             (
                                 byoridb_common::Value::String(s),
                                 byoridb_common::Value::String(pat),
                             ) => regex::Regex::new(pat)
-                                .map(|re| re.is_match(s))
-                                .unwrap_or(false),
+                                .map_err(|error| {
+                                    ExecutionError::InvalidOperation(format!(
+                                        "Invalid MATCH regular expression: {error}"
+                                    ))
+                                })?
+                                .is_match(s),
                             _ => false,
                         }
                     }
                     _ => {
-                        let lv = self.eval_return_expr(left, bindings, space).await;
-                        let rv = self.eval_return_expr(right, bindings, space).await;
+                        let lv = self.eval_return_expr(left, bindings, space).await?;
+                        let rv = self.eval_return_expr(right, bindings, space).await?;
                         compare_values(&lv, &rv, op)
                     }
                 },
-                // Boolean-valued function (e.g. `WHERE is_a(n, "Animal")`).
-                Expression::FunctionCall { .. } => matches!(
-                    self.eval_return_expr(expr, bindings, space).await,
+                _ => matches!(
+                    self.eval_return_expr(expr, bindings, space).await?,
                     byoridb_common::Value::Bool(true)
                 ),
-                _ => false,
-            }
+            })
         })
     }
 
-    /// Compute a single aggregate row from all binding rows.
     async fn compute_aggregate_row(
         &self,
         cols: &[crate::plan::MatchReturnColumn],
         all_bindings: &[MatchBindings],
         space: &str,
-    ) -> Vec<byoridb_common::Value> {
+    ) -> Result<Vec<byoridb_common::Value>> {
+        use byoridb_common::{NullType, Value};
         let mut row = Vec::new();
         for col in cols {
             let val = match &col.expression {
-                Expression::FunctionCall { name, args } => {
+                Expression::FunctionCall { name, args } if is_aggregate_expr(&col.expression) => {
                     let arg = args.first();
-                    match name.to_uppercase().as_str() {
-                        "COUNT" => byoridb_common::Value::Int(all_bindings.len() as i64),
-                        "SUM" => {
+                    match name.to_ascii_uppercase().as_str() {
+                        "COUNT" => {
+                            let mut count = 0i64;
+                            for bindings in all_bindings {
+                                if matches!(arg, Some(Expression::Identifier(name)) if name == "*")
+                                    || !matches!(
+                                        self.eval_return_expr(
+                                            arg.expect("validated aggregate argument"),
+                                            bindings,
+                                            space
+                                        )
+                                        .await?,
+                                        Value::Null(_)
+                                    )
+                                {
+                                    count += 1;
+                                }
+                            }
+                            Value::Int(count)
+                        }
+                        "SUM" | "AVG" => {
                             let mut sum = 0f64;
+                            let mut int_sum = 0i128;
                             let mut all_int = true;
-                            if let Some(a) = arg {
-                                for b in all_bindings {
-                                    match self.eval_return_expr(a, b, space).await {
-                                        byoridb_common::Value::Int(i) => sum += i as f64,
-                                        byoridb_common::Value::Float(f) => {
-                                            sum += f;
-                                            all_int = false;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            if all_int {
-                                byoridb_common::Value::Int(sum as i64)
-                            } else {
-                                byoridb_common::Value::Float(sum)
-                            }
-                        }
-                        "AVG" => {
-                            let mut sum = 0f64;
                             let mut count = 0usize;
-                            if let Some(a) = arg {
-                                for b in all_bindings {
-                                    match self.eval_return_expr(a, b, space).await {
-                                        byoridb_common::Value::Int(i) => {
-                                            sum += i as f64;
+                            if let Some(arg) = arg {
+                                for bindings in all_bindings {
+                                    match self.eval_return_expr(arg, bindings, space).await? {
+                                        Value::Int(value) => {
+                                            sum += value as f64;
+                                            int_sum += i128::from(value);
                                             count += 1;
                                         }
-                                        byoridb_common::Value::Float(f) => {
-                                            sum += f;
+                                        Value::Float(value) => {
+                                            sum += value;
+                                            all_int = false;
                                             count += 1;
                                         }
                                         _ => {}
                                     }
                                 }
                             }
-                            if count == 0 {
-                                byoridb_common::Value::Null(byoridb_common::NullType::Null)
+                            if !sum.is_finite() {
+                                return Err(ExecutionError::InvalidOperation(
+                                    "MATCH aggregate produced a non-finite number".into(),
+                                ));
+                            }
+                            if name.eq_ignore_ascii_case("AVG") {
+                                if count == 0 {
+                                    Value::Null(NullType::Null)
+                                } else {
+                                    Value::Float(sum / count as f64)
+                                }
+                            } else if all_int {
+                                Value::Int(i64::try_from(int_sum).map_err(|_| {
+                                    ExecutionError::InvalidOperation(
+                                        "MATCH SUM exceeds the integer range".into(),
+                                    )
+                                })?)
                             } else {
-                                byoridb_common::Value::Float(sum / count as f64)
+                                Value::Float(sum)
                             }
                         }
-                        "MAX" => {
-                            let mut best: Option<byoridb_common::Value> = None;
-                            if let Some(a) = arg {
-                                for b in all_bindings {
-                                    let v = self.eval_return_expr(a, b, space).await;
-                                    best = Some(match best {
-                                        None => v,
-                                        Some(cur) => {
-                                            if compare_values(&v, &cur, &BinaryOperator::Gt) {
-                                                v
-                                            } else {
-                                                cur
-                                            }
-                                        }
-                                    });
+                        "MIN" | "MAX" => {
+                            let mut best = None;
+                            let op = if name.eq_ignore_ascii_case("MIN") {
+                                BinaryOperator::Lt
+                            } else {
+                                BinaryOperator::Gt
+                            };
+                            if let Some(arg) = arg {
+                                for bindings in all_bindings {
+                                    let value = self.eval_return_expr(arg, bindings, space).await?;
+                                    if matches!(value, Value::Null(_)) {
+                                        continue;
+                                    }
+                                    if best
+                                        .as_ref()
+                                        .is_none_or(|current| compare_values(&value, current, &op))
+                                    {
+                                        best = Some(value);
+                                    }
                                 }
                             }
-                            best.unwrap_or(byoridb_common::Value::Null(
-                                byoridb_common::NullType::Null,
-                            ))
+                            best.unwrap_or(Value::Null(NullType::Null))
                         }
-                        "MIN" => {
-                            let mut best: Option<byoridb_common::Value> = None;
-                            if let Some(a) = arg {
-                                for b in all_bindings {
-                                    let v = self.eval_return_expr(a, b, space).await;
-                                    best = Some(match best {
-                                        None => v,
-                                        Some(cur) => {
-                                            if compare_values(&v, &cur, &BinaryOperator::Lt) {
-                                                v
-                                            } else {
-                                                cur
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            best.unwrap_or(byoridb_common::Value::Null(
-                                byoridb_common::NullType::Null,
-                            ))
-                        }
-                        _ => byoridb_common::Value::Null(byoridb_common::NullType::Null),
+                        _ => unreachable!(),
                     }
                 }
-                other => {
-                    // Non-aggregate in aggregate context: first row's value
-                    match all_bindings.first() {
-                        Some(b) => self.eval_return_expr(other, b, space).await,
-                        None => byoridb_common::Value::Null(byoridb_common::NullType::Null),
-                    }
-                }
+                other => match all_bindings.first() {
+                    Some(bindings) => self.eval_return_expr(other, bindings, space).await?,
+                    None => Value::Null(NullType::Null),
+                },
             };
             row.push(val);
         }
-        row
+        Ok(row)
     }
 
     /// Reverse-traversal optimisation for single-edge patterns where the end
@@ -1741,7 +1248,7 @@ impl MatchExecutor {
             Some(b) => b,
             None => return Ok(()), // end vertex doesn't exist
         };
-        if !matcher.matches_node(&end_blob, end_node)? {
+        if !matcher.matches_node(end_vid, &end_blob, end_node)? {
             return Ok(()); // end vertex doesn't match label/prop filter
         }
 
@@ -1750,8 +1257,14 @@ impl MatchExecutor {
         // scan (PLAN.md O-1).
         let rev_profiling = self.ctx.profiling();
         let rev_start = std::time::Instant::now();
-        let incoming =
-            algo::get_incoming_neighbors(&self.ctx, space, end_vid, &edge_pat.edge_types).await?;
+        let incoming = super::var_length::neighbors_for_direction(
+            &self.ctx,
+            space,
+            end_vid,
+            &edge_pat.edge_types,
+            &EdgeDirection::Incoming,
+        )
+        .await?;
         if rev_profiling {
             self.ctx.record_profile(
                 ProfileOp::Expand,
@@ -1768,15 +1281,13 @@ impl MatchExecutor {
             .unwrap_or_else(|| "__anon_0__".to_string());
 
         // Batch-fetch start-node vertex blobs.
-        let surviving: Vec<(i64, EdgeData)> = incoming
-            .into_iter()
-            .filter(|n| {
-                matcher
-                    .matches_edge_data(&n.edge, edge_pat)
-                    .unwrap_or(false)
-            })
-            .map(|n| (n.dst, n.edge)) // dst here == src of the forward edge
-            .collect();
+        let mut surviving = Vec::with_capacity(incoming.len());
+        for neighbor in incoming {
+            if matcher.matches_edge_data(&neighbor.edge, edge_pat)? {
+                // Reverse traversal exposes the source of the forward edge.
+                surviving.push((neighbor.dst, neighbor.edge));
+            }
+        }
 
         if surviving.is_empty() {
             return Ok(());
@@ -1794,25 +1305,22 @@ impl MatchExecutor {
                 Some(b) => b,
                 None => continue,
             };
-            if !matcher.matches_node(&src_blob, start_node)? {
+            if !matcher.matches_node(src_vid, &src_blob, start_node)? {
                 continue;
             }
 
-            bindings.insert(start_var.clone(), byoridb_common::Value::Int(src_vid));
-            bindings.insert(end_var.to_string(), byoridb_common::Value::Int(end_vid));
-
-            if let Some(ref edge_var) = edge_pat.variable {
-                bind_edge_variable(bindings, edge_var, &edge_data);
+            let mut next_bindings = bindings.clone();
+            if !bind_vertex_variable(&mut next_bindings, &start_var, src_vid)?
+                || !bind_vertex_variable(&mut next_bindings, end_var, end_vid)?
+            {
+                continue;
             }
-
-            rows.push(bindings.clone());
-
-            // Clean up edge-var bindings
             if let Some(ref edge_var) = edge_pat.variable {
-                unbind_edge_variable(bindings, edge_var);
+                if !bind_edge_variable(&mut next_bindings, edge_var, &edge_data)? {
+                    continue;
+                }
             }
-            bindings.remove(&start_var);
-            bindings.remove(end_var);
+            rows.push(next_bindings);
         }
 
         tracing::debug!(
@@ -1852,20 +1360,25 @@ impl MatchExecutor {
             .clone()
             .unwrap_or_else(|| "__anon_0__".to_string());
 
+        if let Some(variable) = flat.start.variable.as_ref() {
+            if bindings.edges.contains_key(variable) {
+                return Err(binding_kind_error(variable));
+            }
+            if matches!(bindings.get(variable), Some(byoridb_common::Value::Null(_))) {
+                return Ok(());
+            }
+        }
+
         // WHERE id(start_var)==X shortcut: skip the full candidate scan and
         // use the single bound VID directly. But a bound id must still satisfy
         // the start node's label/property filters — otherwise `(n:product)
         // WHERE id(n)==X` would match a vertex of any tag (bug: the override
         // bypassed `matches_node`).
         let candidates = if let Some(vid) = start_vid_override {
-            if flat.start.labels.is_empty() && flat.start.props.is_empty() {
-                vec![vid]
-            } else {
-                let key = format!("{}:vertex:{}", space, vid);
-                match self.ctx.kvstore.get(key.as_bytes()).await? {
-                    Some(blob) if matcher.matches_node(&blob, flat.start)? => vec![vid],
-                    _ => vec![],
-                }
+            let key = format!("{}:vertex:{}", space, vid);
+            match self.ctx.kvstore.get(key.as_bytes()).await? {
+                Some(blob) if matcher.matches_node(vid, &blob, flat.start)? => vec![vid],
+                _ => vec![],
             }
         } else {
             self.find_node_candidates(space, flat.start, matcher)
@@ -1886,7 +1399,17 @@ impl MatchExecutor {
                 }
             }
 
-            bindings.insert(start_var.clone(), byoridb_common::Value::Int(candidate_vid));
+            // A branch owns its temporary bindings so a repeated variable
+            // cannot overwrite or remove an identity needed by sibling hops.
+            let mut next_bindings = bindings.clone();
+            if flat.start.variable.is_some() {
+                if !bind_vertex_variable(&mut next_bindings, &start_var, candidate_vid)? {
+                    continue;
+                }
+            } else {
+                // Anonymous starts are not shared join variables.
+                next_bindings.insert(start_var.clone(), byoridb_common::Value::Int(candidate_vid));
+            }
 
             let edge_timer = if expand_profiling {
                 Some(std::time::Instant::now())
@@ -1900,15 +1423,13 @@ impl MatchExecutor {
                 0,
                 candidate_vid,
                 matcher,
-                bindings,
+                &mut next_bindings,
                 rows,
             )
             .await?;
             if let Some(t) = edge_timer {
                 expand_us += t.elapsed().as_micros() as u64;
             }
-
-            bindings.remove(&start_var);
         }
 
         if expand_profiling {
@@ -1973,17 +1494,9 @@ impl MatchExecutor {
         self.check_candidate_scan_size(scanned, "full vertex scan")?;
 
         for (key, value) in results {
-            let key_str = String::from_utf8_lossy(&key);
-            let vid_str = match key_str.split(':').nth(2) {
-                Some(s) => s,
-                None => continue,
-            };
-            let vid: i64 = match vid_str.parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let vid = decode_candidate_vid(&key, prefix.as_bytes())?;
 
-            if matcher.matches_node(&value, node)? {
+            if matcher.matches_node(vid, &value, node)? {
                 candidates.push(vid);
             }
         }
@@ -2106,14 +1619,8 @@ impl MatchExecutor {
                     }
                     let indexed_vids: Vec<i64> = results
                         .iter()
-                        .filter_map(|(key, _)| {
-                            // Last colon-separated segment is the vid
-                            String::from_utf8_lossy(key)
-                                .rsplit(':')
-                                .next()
-                                .and_then(|s| s.parse().ok())
-                        })
-                        .collect();
+                        .map(|(key, _)| decode_candidate_vid(key, prefix.as_bytes()))
+                        .collect::<Result<_>>()?;
                     let vertex_keys: Vec<Vec<u8>> = indexed_vids
                         .iter()
                         .map(|vid| format!("{}:vertex:{}", space, vid).into_bytes())
@@ -2122,7 +1629,7 @@ impl MatchExecutor {
                     let mut vids = Vec::with_capacity(indexed_vids.len());
                     for (vid, blob) in indexed_vids.into_iter().zip(vertex_blobs) {
                         if let Some(blob) = blob {
-                            if matcher.matches_node(&blob, node)? {
+                            if matcher.matches_node(vid, &blob, node)? {
                                 vids.push(vid);
                             }
                         }
@@ -2161,6 +1668,11 @@ impl MatchExecutor {
         };
 
         let partition_num = self.ctx.get_partition_num().unwrap_or(1);
+        if partition_num == 0 {
+            return Err(ExecutionError::InvalidOperation(
+                "MATCH partition count must be greater than zero".to_string(),
+            ));
+        }
         let idx_profiling = self.ctx.profiling();
         let idx_start = std::time::Instant::now();
         let mut vids = Vec::new();
@@ -2196,7 +1708,7 @@ impl MatchExecutor {
         let mut candidates = Vec::new();
         for (vid, blob) in vids.into_iter().zip(blobs.into_iter()) {
             if let Some(blob) = blob {
-                if matcher.matches_node(&blob, node)? {
+                if matcher.matches_node(vid, &blob, node)? {
                     candidates.push(vid);
                 }
             }
@@ -2226,10 +1738,9 @@ impl MatchExecutor {
 
     /// Match edges starting from a vertex.
     ///
-    /// Uses the shared [`algo::get_neighbors`] helper so MATCH benefits from
-    /// the same edge-type prefilter and proto/JSON auto-decoding as BFS and
-    /// `GO`. Destination vertex blobs are fetched in a single `batch_get`
-    /// rather than one round-trip per surviving edge.
+    /// Uses MATCH's strict edge reader with key/payload validation and
+    /// propagated scan errors. Destination vertices are batch-fetched and
+    /// validated before their bindings become result rows.
     #[allow(clippy::too_many_arguments)]
     fn match_edges<'a>(
         &'a self,
@@ -2282,11 +1793,14 @@ impl MatchExecutor {
                         Some(b) => b,
                         None => continue,
                     };
-                    if !matcher.matches_node(&dst_blob, node)? {
+                    if !matcher.matches_node(dst_vid, &dst_blob, node)? {
                         continue;
                     }
+                    let mut next_bindings = bindings.clone();
                     if let Some(ref node_var) = node.variable {
-                        bindings.insert(node_var.clone(), byoridb_common::Value::Int(dst_vid));
+                        if !bind_vertex_variable(&mut next_bindings, node_var, dst_vid)? {
+                            continue;
+                        }
                     }
                     self.match_edges(
                         space,
@@ -2295,13 +1809,10 @@ impl MatchExecutor {
                         edge_idx + 1,
                         dst_vid,
                         matcher,
-                        bindings,
+                        &mut next_bindings,
                         rows,
                     )
                     .await?;
-                    if let Some(ref node_var) = node.variable {
-                        bindings.remove(node_var);
-                    }
                 }
                 return Ok(());
             }
@@ -2341,15 +1852,20 @@ impl MatchExecutor {
                     Some(b) => b,
                     None => continue,
                 };
-                if !matcher.matches_node(&dst_blob, node)? {
+                if !matcher.matches_node(dst_vid, &dst_blob, node)? {
                     continue;
                 }
 
+                let mut next_bindings = bindings.clone();
                 if let Some(ref edge_var) = edge.variable {
-                    bind_edge_variable(bindings, edge_var, &edge_data);
+                    if !bind_edge_variable(&mut next_bindings, edge_var, &edge_data)? {
+                        continue;
+                    }
                 }
                 if let Some(ref node_var) = node.variable {
-                    bindings.insert(node_var.clone(), byoridb_common::Value::Int(dst_vid));
+                    if !bind_vertex_variable(&mut next_bindings, node_var, dst_vid)? {
+                        continue;
+                    }
                 }
 
                 self.match_edges(
@@ -2359,17 +1875,10 @@ impl MatchExecutor {
                     edge_idx + 1,
                     dst_vid,
                     matcher,
-                    bindings,
+                    &mut next_bindings,
                     rows,
                 )
                 .await?;
-
-                if let Some(ref edge_var) = edge.variable {
-                    unbind_edge_variable(bindings, edge_var);
-                }
-                if let Some(ref node_var) = node.variable {
-                    bindings.remove(node_var);
-                }
             }
 
             Ok(())
@@ -2377,19 +1886,130 @@ impl MatchExecutor {
     }
 }
 
-fn bind_edge_variable(bindings: &mut MatchBindings, var: &str, edge: &EdgeData) {
-    bindings.insert(var.to_string(), byoridb_common::Value::Int(edge.dst_vid));
-    bindings.edges.insert(var.to_string(), edge.clone());
+/// Decode the complete VID suffix of a candidate key. Invalid keys cannot be
+/// dropped because doing so may hide incomplete scans or corrupt identities.
+pub(super) fn decode_candidate_vid(key: &[u8], prefix: &[u8]) -> Result<i64> {
+    key.strip_prefix(prefix)
+        .and_then(|suffix| std::str::from_utf8(suffix).ok())
+        .and_then(|suffix| {
+            let vid: i64 = suffix.parse().ok()?;
+            // Later record reads use SchemaKey's canonical decimal form.
+            // Accepting aliases such as +1/01 would fabricate absent VIDs.
+            (vid.to_string() == suffix).then_some(vid)
+        })
+        .ok_or_else(|| ExecutionError::InvalidOperation("Invalid MATCH vertex key".to_string()))
 }
 
-fn unbind_edge_variable(bindings: &mut MatchBindings, var: &str) {
-    bindings.remove(var);
-    bindings.edges.remove(var);
+fn binding_kind_error(variable: &str) -> ExecutionError {
+    ExecutionError::InvalidOperation(format!(
+        "MATCH variable '{variable}' cannot be both a vertex and an edge"
+    ))
+}
+
+/// Repeated variables constrain an existing identity. NULL from an earlier
+/// optional miss is a real binding and cannot be rebound to a new graph object.
+fn bind_vertex_variable(bindings: &mut MatchBindings, var: &str, vid: i64) -> Result<bool> {
+    if bindings.edges.contains_key(var) {
+        return Err(binding_kind_error(var));
+    }
+    match bindings.get(var) {
+        Some(byoridb_common::Value::Int(existing)) => Ok(*existing == vid),
+        Some(byoridb_common::Value::Null(_)) => Ok(false),
+        Some(_) => Err(binding_kind_error(var)),
+        None => {
+            bindings.insert(var.to_string(), byoridb_common::Value::Int(vid));
+            Ok(true)
+        }
+    }
+}
+
+fn bind_edge_variable(bindings: &mut MatchBindings, var: &str, edge: &EdgeData) -> Result<bool> {
+    if let Some(existing) = bindings.edges.get(var) {
+        return Ok(existing.src_vid == edge.src_vid
+            && existing.dst_vid == edge.dst_vid
+            && existing.edge_type == edge.edge_type
+            && existing.ranking == edge.ranking);
+    }
+    match bindings.get(var) {
+        Some(byoridb_common::Value::Null(_)) => Ok(false),
+        Some(_) => Err(binding_kind_error(var)),
+        None => {
+            bindings.insert(var.to_string(), byoridb_common::Value::Int(edge.dst_vid));
+            bindings.edges.insert(var.to_string(), edge.clone());
+            Ok(true)
+        }
+    }
 }
 
 fn is_aggregate_expr(expr: &Expression) -> bool {
     matches!(expr, Expression::FunctionCall { name, .. }
         if matches!(name.to_uppercase().as_str(), "COUNT" | "SUM" | "AVG" | "MAX" | "MIN"))
+}
+
+/// Canonical typed grouping keys avoid HashMap iteration order and Value's
+/// hash implementation. Graph objects group by stored identity, not properties.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchGroupKey {
+    Empty,
+    Null(u8),
+    Bool(bool),
+    Int(i64),
+    Float(u64),
+    String(String),
+    List(Vec<MatchGroupKey>),
+    Map(Vec<(String, MatchGroupKey)>),
+    Vertex(Box<MatchGroupKey>),
+    Edge(Box<(MatchGroupKey, MatchGroupKey, String, i32, i64)>),
+    Temporal(u8, String),
+}
+
+fn match_group_key(value: &byoridb_common::Value) -> Result<MatchGroupKey> {
+    use byoridb_common::Value;
+    Ok(match value {
+        Value::Empty => MatchGroupKey::Empty,
+        Value::Null(kind) => MatchGroupKey::Null(*kind as u8),
+        Value::Bool(value) => MatchGroupKey::Bool(*value),
+        Value::Int(value) => MatchGroupKey::Int(*value),
+        Value::Float(value) if value.is_finite() => MatchGroupKey::Float(if *value == 0.0 {
+            0.0f64.to_bits()
+        } else {
+            value.to_bits()
+        }),
+        Value::String(value) => MatchGroupKey::String(value.clone()),
+        Value::List(list) => MatchGroupKey::List(
+            list.values
+                .iter()
+                .map(match_group_key)
+                .collect::<Result<_>>()?,
+        ),
+        Value::Map(map) => {
+            let mut entries = map
+                .data
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), match_group_key(value)?)))
+                .collect::<Result<Vec<_>>>()?;
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            MatchGroupKey::Map(entries)
+        }
+        Value::Vertex(vertex) => MatchGroupKey::Vertex(Box::new(match_group_key(&vertex.vid)?)),
+        Value::Edge(edge) => MatchGroupKey::Edge(Box::new((
+            match_group_key(&edge.src)?,
+            match_group_key(&edge.dst)?,
+            edge.name.clone(),
+            edge.edge_type,
+            edge.ranking,
+        ))),
+        Value::Date(value) => MatchGroupKey::Temporal(0, serde_json::to_string(value)?),
+        Value::Time(value) => MatchGroupKey::Temporal(1, serde_json::to_string(value)?),
+        Value::DateTime(value) => MatchGroupKey::Temporal(2, serde_json::to_string(value)?),
+        Value::Duration(value) => MatchGroupKey::Temporal(3, serde_json::to_string(value)?),
+        _ => {
+            return Err(ExecutionError::InvalidOperation(format!(
+                "Unsupported or non-finite MATCH grouping value: {:?}",
+                value.type_of()
+            )))
+        }
+    })
 }
 
 /// Derive a display name from a return expression (used when no alias given).
@@ -2402,32 +2022,10 @@ fn expr_to_col_name(expr: &Expression) -> String {
     }
 }
 
-/// Sort projected rows in place by ORDER BY keys (before OFFSET/LIMIT). Each
-/// key is matched to a result column by RETURN alias or expression name; keys
-/// that don't match any column are skipped.
-fn sort_rows_by_order(
-    rows: &mut [Vec<byoridb_common::Value>],
-    columns: &[String],
-    order_by: &[byoridb_parser::ast::OrderByItem],
-) {
-    let keys: Vec<(usize, bool)> = order_by
-        .iter()
-        .filter_map(|item| {
-            let name = match &item.expr {
-                Expression::Identifier(s) => s.clone(),
-                other => expr_to_col_name(other),
-            };
-            columns
-                .iter()
-                .position(|c| c == &name)
-                .map(|idx| (idx, item.descending))
-        })
-        .collect();
-    if keys.is_empty() {
-        return;
-    }
+/// Sort using the column indices validated before data access.
+fn sort_rows_by_order(rows: &mut [Vec<byoridb_common::Value>], keys: &[(usize, bool)]) {
     rows.sort_by(|a, b| {
-        for &(idx, desc) in &keys {
+        for &(idx, desc) in keys {
             let ord = match (a.get(idx), b.get(idx)) {
                 (Some(x), Some(y)) => value_sort_cmp(x, y),
                 _ => std::cmp::Ordering::Equal,
@@ -2458,33 +2056,6 @@ fn value_sort_cmp(a: &byoridb_common::Value, b: &byoridb_common::Value) -> std::
         (Null(_), _) => Ordering::Greater,
         (_, Null(_)) => Ordering::Less,
         _ => Ordering::Equal,
-    }
-}
-
-/// Convert a storage-layer IndexValue (from an index key) into a query Value.
-fn index_value_to_value(iv: byoridb_storage::key::IndexValue) -> byoridb_common::Value {
-    use byoridb_storage::key::IndexValue;
-    match iv {
-        IndexValue::Null => byoridb_common::Value::Null(byoridb_common::NullType::Null),
-        IndexValue::Bool(b) => byoridb_common::Value::Bool(b),
-        IndexValue::Int(i) => byoridb_common::Value::Int(i),
-        IndexValue::Float(f) => byoridb_common::Value::Float(f),
-        IndexValue::String(s) => byoridb_common::Value::String(s),
-    }
-}
-
-/// Read one tag's property from a vertex blob (edge-degree fast-path labels each
-/// group by its node's prop). Returns Null if the blob can't decode, the tag is
-/// absent, or the property is unset.
-fn tag_prop_value(blob: &[u8], label: &str, prop: &str) -> byoridb_common::Value {
-    match VertexCodec::decode_vertex(blob) {
-        Ok(v) => v
-            .tags
-            .iter()
-            .find(|t| t.name.eq_ignore_ascii_case(label))
-            .and_then(|t| t.properties.get(prop).cloned())
-            .unwrap_or(byoridb_common::Value::Null(byoridb_common::NullType::Null)),
-        Err(_) => byoridb_common::Value::Null(byoridb_common::NullType::Null),
     }
 }
 
@@ -2642,15 +2213,6 @@ pub(super) fn expression_as_value(expr: &Expression) -> Option<byoridb_common::V
         Expression::Literal(Literal::Null) => Some(byoridb_common::Value::null()),
         _ => None,
     }
-}
-
-fn trailing_vid(key: &[u8]) -> Option<i64> {
-    std::str::from_utf8(key)
-        .ok()?
-        .rsplit(':')
-        .next()?
-        .parse()
-        .ok()
 }
 
 pub(super) fn byoridb_value_to_index_value(value: &byoridb_common::Value) -> IndexValue {

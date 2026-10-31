@@ -2,11 +2,11 @@
 
 # 설치
 
-문서의 릴리스 기준인
-[v0.4.20](https://github.com/byoridb/byoridb/releases/tag/v0.4.20)
-(2026-08-30 KST)은 Linux x86_64/arm64와 macOS x86_64/arm64 archive를 제공합니다.
-이후 artifact는 [최신 릴리스 페이지](https://github.com/byoridb/byoridb/releases/latest)에서
-확인하세요. 이전 release에 새 플랫폼이나 서명이 소급 추가되지는 않습니다. tag는
+[최신 릴리스 페이지](https://github.com/byoridb/byoridb/releases/latest)에서 Linux
+x86_64/arm64와 macOS x86_64/arm64 archive를 제공합니다. 각 archive에는 server,
+CLI, backup 도구, license와 notices가 포함됩니다. 릴리스 workflow는 게시 전에 압축을
+푼 binary로 인증된 HTTP/gRPC 쿼리, 정상 종료·재시작과 백업·복구를 실행합니다.
+이전 release에 새 검증, 플랫폼이나 서명이 소급 추가되지는 않습니다. tag는
 현재 `main`보다 이전일 수 있으며, 아래 source build는 현재 checkout을 빌드합니다.
 저장소가 Rust 1.90을 고정하므로 `rustup`을 사용하면 알맞은 컴파일러가 자동으로
 선택됩니다.

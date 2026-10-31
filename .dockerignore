@@ -1,8 +1,17 @@
 target/
 !target/release/byoridb-server
+!target/release/byoridb-backup
 !target/release/byoridb-bulkloader
 !target/release/byoridb-cli
+!target/x86_64-unknown-linux-gnu/release/byoridb-server
+!target/x86_64-unknown-linux-gnu/release/byoridb-backup
+!target/x86_64-unknown-linux-gnu/release/byoridb-bulkloader
+!target/x86_64-unknown-linux-gnu/release/byoridb-cli
 **/*.rs.bk
 .git/
 .env
 data/
+
+# Never send generated TLS credentials to a build context.
+deploy/secure/certs/
+**/privkey.pem

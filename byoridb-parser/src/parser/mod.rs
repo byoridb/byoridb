@@ -200,9 +200,18 @@ impl Parser {
             Token::Lookup => self.parse_lookup(),
             Token::Recommend => self.parse_recommend(),
             // CHECK CONSISTENCY (O-6 disjointness) / CHECK SHAPE (shape validation)
+            Token::Repair => {
+                self.advance();
+                self.consume_token(Token::Inference)?;
+                Ok(Statement::RepairInference)
+            }
             Token::Check => {
                 self.advance();
                 match self.peek_token()? {
+                    Token::Inference => {
+                        self.advance();
+                        Ok(Statement::CheckInference)
+                    }
                     Token::Consistency => {
                         self.advance();
                         Ok(Statement::CheckConsistency)
@@ -212,7 +221,7 @@ impl Parser {
                         Ok(Statement::CheckShape)
                     }
                     other => Err(ParseError::UnexpectedToken(format!(
-                        "Expected CONSISTENCY or SHAPE after CHECK, got {}",
+                        "Expected CONSISTENCY, SHAPE, or INFERENCE after CHECK, got {}",
                         Self::diagnostic_token(&other)
                     ))),
                 }

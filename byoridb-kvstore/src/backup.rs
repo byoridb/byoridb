@@ -6,7 +6,7 @@
 //!
 //! redb is a single-file, pure-Rust store with built-in ACID durability
 //! (every commit fsyncs). A consistent point-in-time backup is taken by
-//! opening the source under a read transaction (an MVCC snapshot) and
+//! opening the stopped source under a read transaction (an MVCC snapshot) and
 //! draining every key/value into a fresh redb file. Restore copies that
 //! static file back into a target directory.
 //!
@@ -24,11 +24,12 @@
 //! manager.restore_backup(&backup_info.id, "/path/to/restore", false)?;
 //! ```
 
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition, TableHandle};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
-use std::path::{Path, PathBuf};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -81,16 +82,23 @@ pub type Result<T> = std::result::Result<T, BackupError>;
 /// Metadata for a backup
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupInfo {
-    /// Unique backup identifier (timestamp-based)
+    /// Unique backup identifier (timestamp plus exclusive random directory suffix)
     pub id: String,
     /// Timestamp when backup was created (Unix epoch seconds)
     pub created_at: u64,
-    /// Size of backup in bytes
+    /// Exact size of data.redb in bytes (metadata is excluded)
     pub size_bytes: u64,
     /// Optional description/label
     pub label: Option<String>,
     /// Source database path
     pub source_path: String,
+    /// Absent only on legacy archives created before integrity manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// Options for creating backups
@@ -121,273 +129,515 @@ pub struct BackupManager {
 }
 
 impl BackupManager {
-    /// Create a new BackupManager
-    ///
-    /// # Arguments
-    /// * `db_path` - Path to the database directory (holds `data.redb`)
-    /// * `backup_dir` - Path where backups will be stored
+    /// Create a manager. Backup operations use a canonical root and reject
+    /// explicit parent traversal and symlink leaves.
     pub fn new<P: AsRef<Path>, Q: AsRef<Path>>(db_path: P, backup_dir: Q) -> Result<Self> {
-        let db_path = db_path.as_ref().to_path_buf();
-        let backup_dir = backup_dir.as_ref().to_path_buf();
-
-        if !backup_dir.exists() {
-            fs::create_dir_all(&backup_dir)?;
-            // Restrict access to owner only — backup files contain raw DB data
+        reject_parent_components(db_path.as_ref())?;
+        reject_parent_components(backup_dir.as_ref())?;
+        reject_symlink(backup_dir.as_ref())?;
+        if !backup_dir.as_ref().exists() {
+            fs::create_dir_all(backup_dir.as_ref())?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o700))?;
+                fs::set_permissions(backup_dir.as_ref(), fs::Permissions::from_mode(0o700))?;
             }
-            info!("Created backup directory: {:?}", backup_dir);
         }
-
+        let backup_dir = fs::canonicalize(backup_dir)?;
+        if !backup_dir.is_dir() {
+            return Err(invalid("Backup root must be a directory"));
+        }
         Ok(Self {
-            db_path,
+            db_path: db_path.as_ref().to_path_buf(),
             backup_dir,
         })
     }
 
-    /// Create a consistent backup of the database.
-    ///
-    /// Opens the source redb under a read snapshot and drains it into a fresh
-    /// redb file under a timestamped subdirectory.
+    /// Snapshot a stopped database into an exclusively created archive.
+    /// redb's exclusive file lock rejects a concurrently running server.
     pub fn create_backup(&self, options: Option<BackupOptions>) -> Result<BackupInfo> {
         let options = options.unwrap_or_default();
-
-        let timestamp = SystemTime::now()
+        reject_symlink(&self.db_path)?;
+        require_regular_file(&self.db_path.join(DATA_FILE))?;
+        let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
+            .map_err(|e| invalid(format!("Invalid system clock: {e}")))?;
+        let timestamp = created.as_secs();
+        // tempfile uses exclusive directory creation and retries collisions;
+        // timestamps alone reused and overwrote archives within one second.
+        let archive = tempfile::Builder::new()
+            .prefix(&format!(
+                "backup_{timestamp}_{:09}_",
+                created.subsec_nanos()
+            ))
+            .rand_bytes(16)
+            .tempdir_in(&self.backup_dir)?;
+        let backup_id = archive
+            .path()
+            .file_name()
             .unwrap()
-            .as_secs();
-        let backup_id = format!("backup_{}", timestamp);
-        let backup_path = self.backup_dir.join(&backup_id);
-
-        info!(
-            "Creating backup '{}' from {:?} to {:?}",
-            backup_id, self.db_path, backup_path
-        );
-
-        fs::create_dir_all(&backup_path)?;
-        snapshot_copy(&self.db_path.join(DATA_FILE), &backup_path.join(DATA_FILE))?;
-
-        let size_bytes = calculate_dir_size(&backup_path)?;
-
+            .to_string_lossy()
+            .into_owned();
+        let data_path = archive.path().join(DATA_FILE);
+        snapshot_copy(&self.db_path.join(DATA_FILE), &data_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&data_path, fs::Permissions::from_mode(0o600))?;
+        }
         let backup_info = BackupInfo {
             id: backup_id,
             created_at: timestamp,
-            size_bytes,
+            size_bytes: fs::metadata(&data_path)?.len(),
             label: options.label,
-            source_path: self.db_path.to_string_lossy().to_string(),
+            source_path: self.db_path.to_string_lossy().into_owned(),
+            format_version: Some(1),
+            data_file: Some(DATA_FILE.to_string()),
+            sha256: Some(hash_file(&data_path)?),
         };
-
+        verify_data(&data_path, &backup_info)?;
         self.save_backup_metadata(&backup_info)?;
-
+        sync_dir(archive.path())?;
+        sync_dir(&self.backup_dir)?;
+        let _ = archive.keep();
         info!(
-            "Backup '{}' created successfully ({} bytes)",
+            "Backup '{}' created and verified ({} bytes)",
             backup_info.id, backup_info.size_bytes
         );
-
         Ok(backup_info)
     }
 
-    /// List all available backups
+    /// List manifests. Malformed archive directories fail explicitly rather
+    /// than disappearing from an operator's verify-all or retention run.
     pub fn list_backups(&self) -> Result<Vec<BackupInfo>> {
         let mut backups = Vec::new();
-
-        if !self.backup_dir.exists() {
-            return Ok(backups);
-        }
-
         for entry in fs::read_dir(&self.backup_dir)? {
             let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir()
-                && path
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with("backup_"))
-            {
-                let metadata_path = path.join("backup_metadata.json");
-                if metadata_path.exists() {
-                    match self.load_backup_metadata(&path) {
-                        Ok(info) => backups.push(info),
-                        Err(e) => {
-                            warn!("Failed to load backup metadata from {:?}: {}", path, e);
-                        }
-                    }
-                } else if let Some(info) = self.reconstruct_backup_info(&path) {
-                    backups.push(info);
-                }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("backup_") {
+                backups.push(self.get_backup(&name)?);
             }
         }
-
-        // Sort by creation time (newest first)
-        backups.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
+        backups.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         Ok(backups)
     }
 
-    /// Get information about a specific backup
+    /// Read and validate a manifest. This does not verify database bytes;
+    /// use `verify_backup` before treating an archive as recoverable.
     pub fn get_backup(&self, backup_id: &str) -> Result<BackupInfo> {
-        let backup_path = self.backup_dir.join(backup_id);
-
-        if !backup_path.exists() {
-            return Err(BackupError::BackupNotFound(backup_id.to_string()));
-        }
-
-        self.load_backup_metadata(&backup_path).or_else(|_| {
-            self.reconstruct_backup_info(&backup_path)
-                .ok_or_else(|| BackupError::InvalidBackup(backup_id.to_string()))
-        })
+        let backup_path = self.backup_path(backup_id)?;
+        let info = self.load_backup_metadata(&backup_path)?;
+        validate_manifest(&info, backup_id)?;
+        Ok(info)
     }
 
-    /// Restore a backup to a target **directory**.
-    ///
-    /// # Arguments
-    /// * `backup_id` - ID of the backup to restore
-    /// * `target_path` - Directory where `data.redb` will be placed
-    /// * `overwrite` - If true, overwrite existing target directory
+    /// Check the manifest, exact file size, SHA-256 (new archives), redb page
+    /// checksums and both table traversals. Legacy manifests lack a digest;
+    /// they receive size and redb checks and are identified by version=None.
+    /// Integrity checks run on a temporary copy and never repair the archive.
+    pub fn verify_backup(&self, backup_id: &str) -> Result<BackupInfo> {
+        let info = self.get_backup(backup_id)?;
+        verify_data(&self.backup_path(backup_id)?.join(DATA_FILE), &info)?;
+        Ok(info)
+    }
+
+    /// Validate and stage before changing an existing target. On promotion
+    /// failure, the original directory is renamed back. The target must be
+    /// stopped, outside the archive root, and explicitly opted into overwrite.
     pub fn restore_backup<P: AsRef<Path>>(
         &self,
         backup_id: &str,
         target_path: P,
         overwrite: bool,
     ) -> Result<()> {
-        let backup_path = self.backup_dir.join(backup_id);
-        let target_path = target_path.as_ref();
+        self.restore_with(
+            backup_id,
+            target_path.as_ref(),
+            overwrite,
+            |src, dst| {
+                fs::copy(src, dst)?;
+                Ok(())
+            },
+            |src, dst| fs::rename(src, dst),
+        )
+    }
 
-        if !backup_path.exists() {
-            return Err(BackupError::BackupNotFound(backup_id.to_string()));
+    fn restore_with<C, P>(
+        &self,
+        backup_id: &str,
+        target: &Path,
+        overwrite: bool,
+        copy: C,
+        promote: P,
+    ) -> Result<()>
+    where
+        C: FnOnce(&Path, &Path) -> std::io::Result<()>,
+        P: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    {
+        // Invalid archives must not create, remove or rename the target.
+        let info = self.verify_backup(backup_id)?;
+        reject_parent_components(target)?;
+        reject_symlink(target)?;
+        let target = resolved_target(target)?;
+        if target.starts_with(&self.backup_dir) || self.backup_dir.starts_with(&target) {
+            return Err(invalid("Restore target and backup root must not overlap"));
         }
-
-        self.validate_backup(&backup_path)?;
-
-        if target_path.exists() {
-            if overwrite {
-                warn!("Removing existing target directory: {:?}", target_path);
-                fs::remove_dir_all(target_path)?;
-            } else {
-                return Err(BackupError::RestoreTargetExists(
-                    target_path.to_string_lossy().to_string(),
-                ));
+        let existed = target.try_exists()?;
+        if existed && !overwrite {
+            return Err(BackupError::RestoreTargetExists(
+                target.display().to_string(),
+            ));
+        }
+        if existed && !target.is_dir() {
+            return Err(invalid("Restore target must be a directory"));
+        }
+        // Hold redb's OS-level lock until promotion finishes, without opening
+        // or repairing the old database. A corrupt stopped DB can be replaced.
+        let old_data = target.join(DATA_FILE);
+        let _target_lock = if old_data.try_exists()? {
+            require_regular_file(&old_data)?;
+            let file = File::options().read(true).write(true).open(&old_data)?;
+            file.try_lock()
+                .map_err(|e| invalid(format!("Target database must be stopped: {e}")))?;
+            Some(file)
+        } else {
+            None
+        };
+        let parent = target
+            .parent()
+            .ok_or_else(|| invalid("Target has no parent"))?;
+        fs::create_dir_all(parent)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".byoridb-restore-")
+            .tempdir_in(parent)?;
+        let ready = staging.path().join("ready");
+        let previous = staging.path().join("previous");
+        fs::create_dir(&ready)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&ready, fs::Permissions::from_mode(0o700))?;
+        }
+        let data_path = ready.join(DATA_FILE);
+        copy(&self.backup_path(backup_id)?.join(DATA_FILE), &data_path)?;
+        verify_data(&data_path, &info)?;
+        File::open(&data_path)?.sync_all()?;
+        sync_dir(&ready)?;
+        // Recheck before mutation; no-overwrite must also reject a target that
+        // appeared while the archive was being copied.
+        if target.try_exists()? != existed {
+            return Err(invalid("Restore target changed while staging"));
+        }
+        reject_symlink(&target)?;
+        if existed {
+            fs::rename(&target, &previous)?;
+            // Persist the old target's recovery location before publishing the
+            // replacement. A process interruption can be recovered manually
+            // from `previous` while the two directory renames are in flight.
+            if let Err(error) = sync_dir(staging.path()).and_then(|_| sync_dir(parent)) {
+                if let Err(rollback) = fs::rename(&previous, &target) {
+                    let preserved = staging.keep();
+                    return Err(invalid(format!(
+                        "Restore staging sync failed: {error}; rollback failed: {rollback}; original target preserved at {}",
+                        preserved.join("previous").display()
+                    )));
+                }
+                return Err(error);
             }
         }
-
-        info!("Restoring backup '{}' to {:?}", backup_id, target_path);
-
-        // The backup's data.redb is a static, consistent file — a plain copy
-        // into the target directory is sufficient. Metadata is left behind.
-        fs::create_dir_all(target_path)?;
-        fs::copy(backup_path.join(DATA_FILE), target_path.join(DATA_FILE))?;
-
-        info!(
-            "Backup '{}' restored successfully to {:?}",
-            backup_id, target_path
-        );
-
+        if let Err(error) = promote(&ready, &target) {
+            if existed {
+                if let Err(rollback) = fs::rename(&previous, &target) {
+                    let preserved = staging.keep();
+                    return Err(invalid(format!("Promotion failed: {error}; rollback failed: {rollback}; original target preserved at {}", preserved.join("previous").display())));
+                }
+            }
+            return Err(error.into());
+        }
+        if let Err(error) = sync_dir(parent).and_then(|_| sync_dir(staging.path())) {
+            // Keep both recoverable copies if durability cannot be confirmed.
+            if fs::rename(&target, &ready).is_err()
+                || (existed && fs::rename(&previous, &target).is_err())
+            {
+                let preserved = staging.keep();
+                return Err(invalid(format!(
+                    "Restore directory sync failed: {error}; recovery files preserved at {}",
+                    preserved.display()
+                )));
+            }
+            return Err(error);
+        }
+        // This is the commit point. Failure to remove the old target is not a
+        // restore failure; any residual staging files can be removed manually.
+        drop(_target_lock);
+        if let Err(error) = staging.close() {
+            warn!(
+                "Restored target, but could not remove staging directory: {}",
+                error
+            );
+        }
+        info!("Backup '{}' restored to {:?}", backup_id, target);
         Ok(())
     }
 
-    /// Delete a backup
     pub fn delete_backup(&self, backup_id: &str) -> Result<()> {
-        let backup_path = self.backup_dir.join(backup_id);
-
-        if !backup_path.exists() {
-            return Err(BackupError::BackupNotFound(backup_id.to_string()));
-        }
-
-        info!("Deleting backup '{}'", backup_id);
-        fs::remove_dir_all(&backup_path)?;
-
+        fs::remove_dir_all(self.backup_path(backup_id)?)?;
         Ok(())
     }
 
-    /// Delete old backups, keeping only the most recent N backups
     pub fn cleanup_old_backups(&self, keep_count: usize) -> Result<Vec<String>> {
-        let backups = self.list_backups()?;
         let mut deleted = Vec::new();
-
-        if backups.len() <= keep_count {
-            return Ok(deleted);
-        }
-
-        // Delete older backups (list is sorted newest first)
-        for backup in backups.into_iter().skip(keep_count) {
-            info!("Cleaning up old backup: {}", backup.id);
+        for backup in self.list_backups()?.into_iter().skip(keep_count) {
             self.delete_backup(&backup.id)?;
             deleted.push(backup.id);
         }
-
         Ok(deleted)
     }
 
-    /// Validate that a backup is complete and openable.
-    fn validate_backup(&self, backup_path: &Path) -> Result<()> {
-        let data_file = backup_path.join(DATA_FILE);
-        if !data_file.exists() {
-            return Err(BackupError::InvalidBackup(format!(
-                "Missing {} file",
-                DATA_FILE
-            )));
+    fn backup_path(&self, backup_id: &str) -> Result<PathBuf> {
+        if backup_id.is_empty()
+            || !backup_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(invalid("Backup ID must be one directory name"));
         }
-
-        match Database::open(&data_file) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(BackupError::InvalidBackup(format!(
-                "Failed to open backup: {}",
-                e
-            ))),
+        let path = self.backup_dir.join(backup_id);
+        reject_symlink(&path)?;
+        if !path.try_exists()? {
+            return Err(BackupError::BackupNotFound(backup_id.into()));
         }
+        if !path.is_dir() {
+            return Err(invalid("Backup must be a directory"));
+        }
+        Ok(path)
     }
 
-    /// Save backup metadata to JSON file
     fn save_backup_metadata(&self, info: &BackupInfo) -> Result<()> {
-        let backup_path = self.backup_dir.join(&info.id);
-        let metadata_path = backup_path.join("backup_metadata.json");
-
-        let file = File::create(&metadata_path)?;
-        let writer = BufWriter::new(file);
-
-        serde_json::to_writer_pretty(writer, info)
+        validate_manifest(info, &info.id)?;
+        let bytes = serde_json::to_vec_pretty(info)
             .map_err(|e| BackupError::Serialization(e.to_string()))?;
-
+        if bytes.len() > 1024 * 1024 {
+            return Err(invalid("Backup manifest exceeds 1 MiB"));
+        }
+        let file = File::create_new(self.backup_path(&info.id)?.join("backup_metadata.json"))?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&bytes)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
         Ok(())
     }
 
-    /// Load backup metadata from JSON file
     fn load_backup_metadata(&self, backup_path: &Path) -> Result<BackupInfo> {
-        let metadata_path = backup_path.join("backup_metadata.json");
-
-        let file = File::open(&metadata_path)?;
-        let reader = BufReader::new(file);
-
-        serde_json::from_reader(reader).map_err(|e| BackupError::Serialization(e.to_string()))
+        let path = backup_path.join("backup_metadata.json");
+        require_regular_file(&path)?;
+        if fs::metadata(&path)?.len() > 1024 * 1024 {
+            return Err(invalid("Backup manifest exceeds 1 MiB"));
+        }
+        serde_json::from_reader(BufReader::new(File::open(path)?))
+            .map_err(|e| BackupError::Serialization(e.to_string()))
     }
+}
 
-    /// Reconstruct backup info from directory when metadata is missing
-    fn reconstruct_backup_info(&self, backup_path: &Path) -> Option<BackupInfo> {
-        let id = backup_path.file_name()?.to_string_lossy().to_string();
+fn invalid(message: impl Into<String>) -> BackupError {
+    BackupError::InvalidBackup(message.into())
+}
 
-        // Parse timestamp from ID (format: backup_<timestamp>)
-        let timestamp: u64 = id.strip_prefix("backup_")?.parse().ok()?;
-
-        let size_bytes = calculate_dir_size(backup_path).ok()?;
-
-        Some(BackupInfo {
-            id,
-            created_at: timestamp,
-            size_bytes,
-            label: None,
-            source_path: "unknown".to_string(),
-        })
+fn reject_parent_components(path: &Path) -> Result<()> {
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(invalid("Parent traversal is not allowed in backup paths"));
     }
+    Ok(())
+}
+
+fn reject_symlink(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Err(invalid(format!(
+            "Symlinks are not allowed: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn require_regular_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid(format!(
+            "Expected regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+// Resolve existing ancestors before overlap checks, including OS aliases such
+// as /tmp -> /private/tmp. Only missing suffixes are appended afterwards.
+fn resolved_target(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut missing = Vec::new();
+    while !ancestor.try_exists()? {
+        missing.push(
+            ancestor
+                .file_name()
+                .ok_or_else(|| invalid("Invalid restore path"))?
+                .to_os_string(),
+        );
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| invalid("Invalid restore path"))?;
+    }
+    let mut resolved = fs::canonicalize(ancestor)?;
+    for part in missing.into_iter().rev() {
+        resolved.push(part);
+    }
+    if resolved.parent().is_none() {
+        return Err(invalid("Cannot restore over filesystem root"));
+    }
+    Ok(resolved)
+}
+
+fn validate_manifest(info: &BackupInfo, id: &str) -> Result<()> {
+    if info.id != id || info.size_bytes == 0 || info.created_at > 253_402_300_799 {
+        return Err(invalid("Manifest ID, timestamp or data size is invalid"));
+    }
+    match (
+        info.format_version,
+        info.data_file.as_deref(),
+        info.sha256.as_deref(),
+    ) {
+        (None, None, None) => Ok(()),
+        (Some(1), Some(DATA_FILE), Some(hash))
+            if hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid("Unsupported or incomplete backup manifest format")),
+    }
+}
+
+fn hash_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn verify_data(path: &Path, info: &BackupInfo) -> Result<()> {
+    require_regular_file(path)?;
+    if fs::metadata(path)?.len() != info.size_bytes {
+        return Err(invalid("Backup data size does not match manifest"));
+    }
+    let scratch = tempfile::Builder::new()
+        .prefix("byoridb-verify-")
+        .tempdir()?;
+    let copy = scratch.path().join(DATA_FILE);
+    fs::copy(path, &copy)?;
+    if fs::metadata(&copy)?.len() != info.size_bytes {
+        return Err(invalid("Backup changed while being verified"));
+    }
+    if let Some(expected) = &info.sha256 {
+        if &hash_file(&copy)? != expected {
+            return Err(invalid("Backup SHA-256 does not match manifest"));
+        }
+    }
+    // redb 4.1 can panic in Database::drop after detecting corrupt pages.
+    // Keep the entire temporary database lifetime inside the unwind boundary;
+    // a rejected archive is an error, never a process-wide verification crash.
+    std::panic::catch_unwind(|| verify_redb_copy(&copy, info))
+        .map_err(|_| invalid("redb rejected corrupt backup during integrity checking"))?
+}
+
+fn verify_redb_copy(copy: &Path, info: &BackupInfo) -> Result<()> {
+    // Redb may repair during open as well as check_integrity. Abort automatic
+    // repair on open, and reject check_integrity's repaired (false) result.
+    let mut builder = redb::Builder::new();
+    builder.set_repair_callback(|session| session.abort());
+    let mut db = builder.open(copy)?;
+    if !db.check_integrity()? {
+        return Err(invalid("Backup requires redb repair"));
+    }
+    let read = db.begin_read()?;
+    let names = read
+        .list_tables()?
+        .map(|t| t.name().to_string())
+        .collect::<Vec<_>>();
+    if !names.iter().any(|name| name == "kv")
+        || names.iter().any(|name| name != "kv" && name != "history")
+        || read.list_multimap_tables()?.next().is_some()
+    {
+        return Err(invalid("Backup database has missing or unsupported tables"));
+    }
+    for table in [KV_TABLE, HISTORY_TABLE] {
+        match read.open_table(table) {
+            Ok(table) => {
+                for row in table.range::<&[u8]>(..)? {
+                    let _ = row?;
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) if info.format_version.is_none() => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+fn sync_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// Open `src` redb under a read snapshot and drain every key/value into a
 /// freshly created `dst` redb file. This yields a consistent, self-contained
-/// copy regardless of concurrent commits to `src`.
+/// copy. Opening a database held by a running server fails its exclusive lock.
 fn snapshot_copy(src: &Path, dst: &Path) -> Result<()> {
-    let source = Database::open(src)?;
+    // Read-only open holds a shared lock (excluding redb writers) without
+    // changing source bytes. Check its physical pages before copying records:
+    // otherwise corrupted source values could become a clean-looking archive.
+    let source = redb::ReadOnlyDatabase::open(src)?;
+    let source_info = BackupInfo {
+        id: "source".into(),
+        created_at: 0,
+        size_bytes: fs::metadata(src)?.len(),
+        label: None,
+        source_path: src.to_string_lossy().into_owned(),
+        format_version: None,
+        data_file: None,
+        sha256: None,
+    };
+    verify_data(src, &source_info)?;
     let rtx = source.begin_read()?;
+    if rtx
+        .list_tables()?
+        .any(|table| table.name() != "kv" && table.name() != "history")
+        || rtx.list_multimap_tables()?.next().is_some()
+    {
+        return Err(invalid("Source database contains unsupported tables"));
+    }
 
     let dest = Database::create(dst)?;
     let wtx = dest.begin_write()?;
@@ -409,28 +659,6 @@ fn snapshot_copy(src: &Path, dst: &Path) -> Result<()> {
     }
     wtx.commit()?;
     Ok(())
-}
-
-/// Calculate total size of a directory recursively
-fn calculate_dir_size(path: &Path) -> Result<u64> {
-    let mut total = 0;
-
-    if path.is_file() {
-        return Ok(fs::metadata(path)?.len());
-    }
-
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_file() {
-            total += fs::metadata(&path)?.len();
-        } else if path.is_dir() {
-            total += calculate_dir_size(&path)?;
-        }
-    }
-
-    Ok(total)
 }
 
 /// Format bytes as human-readable string
@@ -688,6 +916,360 @@ mod tests {
 
         let result = manager.get_backup("nonexistent");
         assert!(matches!(result, Err(BackupError::BackupNotFound(_))));
+    }
+
+    #[test]
+    fn regression_rapid_backups_never_overwrite() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("db");
+        create_test_db(&db);
+        let manager = BackupManager::new(&db, temp.path().join("archives")).unwrap();
+        let first = manager.create_backup(None).unwrap();
+        let first_bytes = fs::read(manager.backup_dir.join(&first.id).join(DATA_FILE)).unwrap();
+        let second = manager.create_backup(None).unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            fs::read(manager.backup_dir.join(&first.id).join(DATA_FILE)).unwrap(),
+            first_bytes
+        );
+        assert_eq!(manager.list_backups().unwrap().len(), 2);
+        assert_eq!(manager.list_backups().unwrap()[0].id, second.id);
+        assert_eq!(manager.cleanup_old_backups(1).unwrap(), vec![first.id]);
+    }
+
+    #[test]
+    fn regression_archive_paths_cannot_escape_root() {
+        let temp = TempDir::new().unwrap();
+        let outside = temp.path().join("outside");
+        create_test_db(&outside);
+        let manager = BackupManager::new(&outside, temp.path().join("archives")).unwrap();
+        assert!(manager.delete_backup("../outside").is_err());
+        assert!(outside.join(DATA_FILE).exists());
+    }
+
+    #[test]
+    fn regression_invalid_metadata_cannot_be_reconstructed() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("db");
+        create_test_db(&db);
+        let manager = BackupManager::new(&db, temp.path().join("archives")).unwrap();
+        let info = manager.create_backup(None).unwrap();
+        fs::write(
+            manager
+                .backup_dir
+                .join(&info.id)
+                .join("backup_metadata.json"),
+            b"garbage",
+        )
+        .unwrap();
+        assert!(manager.get_backup(&info.id).is_err());
+    }
+
+    fn fixture() -> (TempDir, BackupManager, BackupInfo) {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("db");
+        create_test_db(&db);
+        let manager = BackupManager::new(&db, temp.path().join("archives")).unwrap();
+        let info = manager.create_backup(None).unwrap();
+        (temp, manager, info)
+    }
+
+    fn write_manifest(manager: &BackupManager, info: &BackupInfo) {
+        fs::write(
+            manager
+                .backup_dir
+                .join(&info.id)
+                .join("backup_metadata.json"),
+            serde_json::to_vec(info).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verification_rejects_missing_truncated_and_corrupt_data_without_mutating_it() {
+        for mode in ["missing", "truncate", "corrupt"] {
+            let (_temp, manager, info) = fixture();
+            let data = manager.backup_dir.join(&info.id).join(DATA_FILE);
+            match mode {
+                "missing" => fs::remove_file(&data).unwrap(),
+                "truncate" => File::options()
+                    .write(true)
+                    .open(&data)
+                    .unwrap()
+                    .set_len(32)
+                    .unwrap(),
+                _ => {
+                    let mut bytes = fs::read(&data).unwrap();
+                    bytes[0] ^= 0xff;
+                    fs::write(&data, bytes).unwrap();
+                }
+            }
+            let before = fs::read(&data).ok();
+            assert!(manager.verify_backup(&info.id).is_err(), "{mode}");
+            assert_eq!(
+                fs::read(&data).ok(),
+                before,
+                "verification must never repair original bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_manifest_is_verified_without_a_digest_but_corrupt_content_fails() {
+        let (_temp, manager, mut info) = fixture();
+        info.format_version = None;
+        info.data_file = None;
+        info.sha256 = None;
+        write_manifest(&manager, &info);
+        assert!(manager
+            .verify_backup(&info.id)
+            .unwrap()
+            .format_version
+            .is_none());
+        let data = manager.backup_dir.join(&info.id).join(DATA_FILE);
+        let mut bytes = fs::read(&data).unwrap();
+        bytes[0] ^= 0xff;
+        fs::write(&data, &bytes).unwrap();
+        assert!(manager.verify_backup(&info.id).is_err());
+        assert_eq!(fs::read(&data).unwrap(), bytes);
+    }
+
+    #[test]
+    fn database_page_corruption_is_rejected_even_with_a_matching_digest() {
+        let (_temp, manager, mut info) = fixture();
+        let data = manager.backup_dir.join(&info.id).join(DATA_FILE);
+        let mut bytes = fs::read(&data).unwrap();
+        let index = bytes
+            .windows(6)
+            .position(|w| w == b"value1")
+            .expect("fixture payload must be in a data page");
+        bytes[index] ^= 1;
+        fs::write(&data, &bytes).unwrap();
+        info.sha256 = Some(hash_file(&data).unwrap());
+        write_manifest(&manager, &info);
+        assert!(
+            manager.verify_backup(&info.id).is_err(),
+            "SHA-256 agreement does not replace redb page checks"
+        );
+        assert_eq!(
+            fs::read(data).unwrap(),
+            bytes,
+            "repair must never change archived bytes"
+        );
+    }
+
+    #[test]
+    fn corrupt_source_is_not_repaired_or_laundered_into_a_valid_backup() {
+        let (_temp, manager, _info) = fixture();
+        let source = manager.db_path.join(DATA_FILE);
+        let mut bytes = fs::read(&source).unwrap();
+        let index = bytes.windows(6).position(|w| w == b"value1").unwrap();
+        bytes[index] ^= 1;
+        fs::write(&source, &bytes).unwrap();
+        assert!(manager.create_backup(None).is_err());
+        assert_eq!(fs::read(source).unwrap(), bytes);
+        assert_eq!(
+            manager.list_backups().unwrap().len(),
+            1,
+            "failed backup must clean up its partial directory"
+        );
+    }
+
+    #[test]
+    fn legacy_kv_only_archives_restore_but_version_one_requires_history_table() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("source");
+        create_test_db(&db);
+        let manager = BackupManager::new(&db, temp.path().join("archives")).unwrap();
+        let archive = manager.backup_dir.join("backup_1");
+        fs::create_dir(&archive).unwrap();
+        fs::copy(db.join(DATA_FILE), archive.join(DATA_FILE)).unwrap();
+        let mut info = BackupInfo {
+            id: "backup_1".into(),
+            created_at: 1,
+            size_bytes: fs::metadata(archive.join(DATA_FILE)).unwrap().len(),
+            label: None,
+            source_path: db.to_string_lossy().into_owned(),
+            format_version: Some(1),
+            data_file: Some(DATA_FILE.into()),
+            sha256: Some(hash_file(&archive.join(DATA_FILE)).unwrap()),
+        };
+        write_manifest(&manager, &info);
+        assert!(manager.verify_backup(&info.id).is_err());
+        info.format_version = None;
+        info.data_file = None;
+        info.sha256 = None;
+        write_manifest(&manager, &info);
+        manager.verify_backup(&info.id).unwrap();
+        let target = temp.path().join("legacy_restored");
+        manager.restore_backup(&info.id, &target, false).unwrap();
+        assert_eq!(read_key(&target, b"key1"), Some(b"value1".to_vec()));
+    }
+
+    #[test]
+    fn invalid_manifest_id_version_filename_digest_and_size_fail_closed() {
+        let (_temp, manager, good) = fixture();
+        for mode in ["id", "version", "filename", "digest", "size", "timestamp"] {
+            let mut info = good.clone();
+            match mode {
+                "id" => info.id = "another_archive".into(),
+                "version" => info.format_version = Some(999),
+                "filename" => info.data_file = Some("../data.redb".into()),
+                "digest" => info.sha256 = Some("0".repeat(64)),
+                "timestamp" => info.created_at = u64::MAX,
+                _ => info.size_bytes += 1,
+            }
+            fs::write(
+                manager
+                    .backup_dir
+                    .join(&good.id)
+                    .join("backup_metadata.json"),
+                serde_json::to_vec(&info).unwrap(),
+            )
+            .unwrap();
+            assert!(manager.verify_backup(&good.id).is_err(), "{mode}");
+        }
+    }
+
+    #[test]
+    fn list_and_verify_do_not_hide_malformed_archives() {
+        let (_temp, manager, info) = fixture();
+        fs::remove_file(
+            manager
+                .backup_dir
+                .join(&info.id)
+                .join("backup_metadata.json"),
+        )
+        .unwrap();
+        assert!(manager.list_backups().is_err());
+        assert!(manager.verify_backup(&info.id).is_err());
+    }
+
+    #[test]
+    fn restore_validation_failure_preserves_existing_target() {
+        let (temp, manager, info) = fixture();
+        let target = temp.path().join("target");
+        create_test_db(&target);
+        fs::write(target.join("sentinel"), b"original").unwrap();
+        let original = fs::read(target.join(DATA_FILE)).unwrap();
+        fs::remove_file(manager.backup_dir.join(&info.id).join(DATA_FILE)).unwrap();
+        assert!(manager.restore_backup(&info.id, &target, true).is_err());
+        assert_eq!(fs::read(target.join(DATA_FILE)).unwrap(), original);
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn restore_partial_copy_and_staging_validation_failure_preserve_target() {
+        for copy_errors in [true, false] {
+            let (temp, manager, info) = fixture();
+            let target = temp.path().join("target");
+            create_test_db(&target);
+            let original = fs::read(target.join(DATA_FILE)).unwrap();
+            let result = manager.restore_with(
+                &info.id,
+                &target,
+                true,
+                |_, destination| {
+                    fs::write(destination, b"partial copy")?;
+                    if copy_errors {
+                        Err(std::io::Error::other("injected disk full"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_, _| panic!("invalid staging must never be promoted"),
+            );
+            assert!(result.is_err());
+            assert_eq!(fs::read(target.join(DATA_FILE)).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn restore_promotion_failure_rolls_back_original_target() {
+        let (temp, manager, info) = fixture();
+        let target = temp.path().join("target");
+        create_test_db(&target);
+        fs::write(target.join("sentinel"), b"original").unwrap();
+        let original = fs::read(target.join(DATA_FILE)).unwrap();
+        assert!(manager
+            .restore_with(
+                &info.id,
+                &target,
+                true,
+                |src, dst| {
+                    fs::copy(src, dst)?;
+                    Ok(())
+                },
+                |_, _| Err(std::io::Error::other("injected rename failure"))
+            )
+            .is_err());
+        assert_eq!(fs::read(target.join(DATA_FILE)).unwrap(), original);
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn restore_refuses_archive_root_and_ancestors_or_descendants() {
+        let (temp, manager, info) = fixture();
+        for target in [
+            temp.path().to_path_buf(),
+            manager.backup_dir.clone(),
+            manager.backup_dir.join("new_target"),
+            manager.backup_dir.join(&info.id),
+        ] {
+            assert!(manager.restore_backup(&info.id, target, true).is_err());
+            assert!(manager.verify_backup(&info.id).is_ok());
+        }
+    }
+
+    #[test]
+    fn backup_and_restore_refuse_a_live_database_lock() {
+        let (temp, manager, info) = fixture();
+        let source = Database::open(manager.db_path.join(DATA_FILE)).unwrap();
+        assert!(manager.create_backup(None).is_err());
+        drop(source);
+        let target = temp.path().join("target");
+        create_test_db(&target);
+        let live = Database::open(target.join(DATA_FILE)).unwrap();
+        assert!(manager.restore_backup(&info.id, &target, true).is_err());
+        drop(live);
+        assert_eq!(read_key(&target, b"key1"), Some(b"value1".to_vec()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_data_manifest_and_restore_symlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+        for mode in ["directory", "data", "metadata", "target"] {
+            let (temp, manager, info) = fixture();
+            let archive = manager.backup_dir.join(&info.id);
+            match mode {
+                "directory" => {
+                    symlink(&archive, manager.backup_dir.join("backup_link")).unwrap();
+                    assert!(manager.verify_backup("backup_link").is_err());
+                    assert!(manager.delete_backup("backup_link").is_err());
+                }
+                "data" | "metadata" => {
+                    let file = archive.join(if mode == "data" {
+                        DATA_FILE
+                    } else {
+                        "backup_metadata.json"
+                    });
+                    let outside = temp.path().join("outside");
+                    fs::rename(&file, &outside).unwrap();
+                    symlink(&outside, &file).unwrap();
+                    assert!(manager.verify_backup(&info.id).is_err());
+                    assert!(outside.exists());
+                }
+                _ => {
+                    let outside = temp.path().join("outside");
+                    create_test_db(&outside);
+                    let target = temp.path().join("target");
+                    symlink(&outside, &target).unwrap();
+                    assert!(manager.restore_backup(&info.id, &target, true).is_err());
+                    assert!(outside.join(DATA_FILE).exists());
+                }
+            }
+        }
     }
 
     // ----- format_bytes edges -------------------------------------------

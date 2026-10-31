@@ -43,6 +43,113 @@ fn compute_batch_checksum(data: &[KeyValuePair]) -> u64 {
     hasher.finish()
 }
 
+fn decode_query_vertex(vid: i64, data: &[u8]) -> Result<byoridb_codec::VertexData, Status> {
+    let invalid = || Status::data_loss("Invalid vertex metadata");
+    let proto = Codec::is_proto_format(data);
+    if !proto {
+        let json: serde_json::Value = serde_json::from_slice(data).map_err(|_| invalid())?;
+        if json
+            .get("vid")
+            .is_some_and(|value| value.as_i64() != Some(vid))
+        {
+            return Err(invalid());
+        }
+        let tags = json
+            .get("tags")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(invalid)?;
+        if tags.iter().any(|tag| {
+            tag.get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+                || tag.get("props").is_some_and(|props| !props.is_object())
+        }) {
+            return Err(invalid());
+        }
+    }
+    let mut vertex = Codec::decode_vertex(data).map_err(|_| invalid())?;
+    if proto && vertex.vid != vid {
+        return Err(invalid());
+    }
+    vertex.vid = vid;
+    Ok(vertex)
+}
+
+fn decode_query_edge(key: &EdgeKey, data: &[u8]) -> Result<byoridb_codec::EdgeData, Status> {
+    let invalid = || Status::data_loss("Invalid edge metadata");
+    if !Codec::is_proto_format(data) {
+        let json: serde_json::Value = serde_json::from_slice(data).map_err(|_| invalid())?;
+        if json
+            .get("src")
+            .and_then(serde_json::Value::as_i64)
+            .is_none()
+            || json
+                .get("dst")
+                .and_then(serde_json::Value::as_i64)
+                .is_none()
+            || json
+                .get("ranking")
+                .or_else(|| json.get("rank"))
+                .is_some_and(|value| value.as_i64().is_none())
+            || json
+                .get("props")
+                .or_else(|| json.get("properties"))
+                .is_some_and(|value| !value.is_object())
+        {
+            return Err(invalid());
+        }
+    }
+    let edge = Codec::decode_edge(data).map_err(|_| invalid())?;
+    if edge.src_vid != key.src_vid
+        || edge.dst_vid != key.dst_vid
+        || edge.ranking != key.ranking
+        || edge.edge_type != key.edge_type
+        || edge.edge_type.is_empty()
+    {
+        return Err(invalid());
+    }
+    Ok(edge)
+}
+
+fn encode_query_properties(
+    properties: &HashMap<String, byoridb_common::Value>,
+    requested: &[String],
+) -> Result<HashMap<String, Vec<u8>>, Status> {
+    properties
+        .iter()
+        .filter(|(name, _)| requested.is_empty() || requested.contains(name))
+        .map(|(name, value)| {
+            bincode::serialize(value)
+                .map(|bytes| (name.clone(), bytes))
+                .map_err(|error| Status::internal(format!("Failed to serialize property: {error}")))
+        })
+        .collect()
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VertexScanCursor {
+    version: u8,
+    space_id: u32,
+    part_id: u32,
+    tag_name: String,
+    prop_names: Vec<String>,
+    last_key: Vec<u8>,
+}
+
+fn scan_key_vid(key: &[u8], prefix: &[u8]) -> Result<i64, Status> {
+    let suffix = key
+        .strip_prefix(prefix)
+        .ok_or_else(|| Status::data_loss("Invalid vertex key"))?;
+    let text = std::str::from_utf8(suffix).map_err(|_| Status::data_loss("Invalid vertex key"))?;
+    let vid = text
+        .parse::<i64>()
+        .map_err(|_| Status::data_loss("Invalid vertex key"))?;
+    if vid.to_string() != text {
+        return Err(Status::data_loss("Invalid vertex key"));
+    }
+    Ok(vid)
+}
+
 /// Storage RPC service implementation
 pub struct StorageRpcService {
     partition_manager: Arc<PartitionManager>,
@@ -71,6 +178,32 @@ impl StorageRpcService {
             kvstore,
             index_manager,
         }
+    }
+
+    async fn ensure_query_partition(&self, space_id: u32, part_id: u32) -> Result<(), Status> {
+        match self.partition_manager.get_status(space_id, part_id).await {
+            LocalPartitionStatus::Leader | LocalPartitionStatus::Follower => Ok(()),
+            _ => Err(Status::unavailable(format!(
+                "Partition {part_id} in space {space_id} is not ready for queries"
+            ))),
+        }
+    }
+
+    async fn ensure_fetch_partitions(&self, space_id: u32, vids: &[i64]) -> Result<(), Status> {
+        let partition_num = self
+            .partition_manager
+            .get_partition_num(space_id)
+            .await
+            .filter(|count| *count > 0)
+            .ok_or_else(|| Status::failed_precondition("Invalid partition configuration"))?;
+        let partitions: std::collections::HashSet<_> = vids
+            .iter()
+            .map(|vid| byoridb_common::hash::compute_partition(*vid, partition_num))
+            .collect();
+        for part_id in partitions {
+            self.ensure_query_partition(space_id, part_id).await?;
+        }
+        Ok(())
     }
 
     /// Convert proto IndexValue to storage IndexValue
@@ -459,6 +592,8 @@ impl StorageService for StorageRpcService {
             req.vids.len()
         );
 
+        self.ensure_fetch_partitions(space_id, &req.vids).await?;
+
         let mut vertices = Vec::new();
 
         // Build keys for batch lookup
@@ -468,63 +603,34 @@ impl StorageService for StorageRpcService {
             .map(|vid| format!("{}:vertex:{}", space_id, vid).into_bytes())
             .collect();
 
-        // Batch get from KVStore
-        match self.kvstore.batch_get(&keys).await {
-            Ok(results) => {
-                for (vid, data_opt) in req.vids.iter().zip(results.iter()) {
-                    if let Some(data) = data_opt {
-                        // Use codec to decode vertex (supports both Proto and JSON formats)
-                        if let Ok(vertex_data) = Codec::decode_vertex(data) {
-                            let mut tag_data_list = Vec::new();
-
-                            for tag in &vertex_data.tags {
-                                // Filter by requested tag names if specified
-                                if !req.tag_names.is_empty() && !req.tag_names.contains(&tag.name) {
-                                    continue;
-                                }
-
-                                let mut properties: HashMap<String, Vec<u8>> = HashMap::new();
-
-                                for (key, value) in &tag.properties {
-                                    // Filter by requested property names if specified
-                                    if !req.prop_names.is_empty() && !req.prop_names.contains(key) {
-                                        continue;
-                                    }
-                                    // Encode property value using bincode
-                                    if let Ok(bytes) = bincode::serialize(value) {
-                                        properties.insert(key.clone(), bytes);
-                                    }
-                                }
-
-                                tag_data_list.push(TagData {
-                                    tag_name: tag.name.clone(),
-                                    properties,
-                                });
-                            }
-
-                            vertices.push(VertexData {
-                                vid: *vid,
-                                tags: tag_data_list,
-                            });
-                        }
-                    }
-                }
-
-                Ok(Response::new(BatchGetVerticesResponse {
-                    code: ErrorCode::Succeeded as i32,
-                    vertices,
-                    error_message: String::new(),
-                }))
-            }
-            Err(e) => {
-                error!("Failed to batch get vertices: {}", e);
-                Ok(Response::new(BatchGetVerticesResponse {
-                    code: ErrorCode::EInternalError as i32,
-                    vertices: vec![],
-                    error_message: format!("Failed to fetch vertices: {}", e),
-                }))
-            }
+        let results = self
+            .kvstore
+            .batch_get(&keys)
+            .await
+            .map_err(|error| Status::internal(format!("Failed to fetch vertices: {error}")))?;
+        if results.len() != req.vids.len() {
+            return Err(Status::data_loss("Incomplete batch get response"));
         }
+        for (vid, data) in req.vids.iter().zip(results) {
+            let Some(data) = data else { continue };
+            let vertex = decode_query_vertex(*vid, &data)?;
+            let mut tags = Vec::new();
+            for tag in vertex.tags {
+                if !req.tag_names.is_empty() && !req.tag_names.contains(&tag.name) {
+                    continue;
+                }
+                tags.push(TagData {
+                    tag_name: tag.name,
+                    properties: encode_query_properties(&tag.properties, &req.prop_names)?,
+                });
+            }
+            vertices.push(VertexData { vid: *vid, tags });
+        }
+        Ok(Response::new(BatchGetVerticesResponse {
+            code: ErrorCode::Succeeded as i32,
+            vertices,
+            error_message: String::new(),
+        }))
     }
 
     /// Batch get edges by EdgeKey list
@@ -541,6 +647,15 @@ impl StorageService for StorageRpcService {
             req.edge_keys.len()
         );
 
+        self.ensure_fetch_partitions(
+            space_id,
+            &req.edge_keys
+                .iter()
+                .map(|key| key.src_vid)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
         let mut edges = Vec::new();
 
         // Build keys for batch lookup
@@ -549,61 +664,34 @@ impl StorageService for StorageRpcService {
             .iter()
             .map(|ek| {
                 format!(
-                    "{}:edge:{}:{}:{}",
-                    space_id, ek.src_vid, ek.edge_type, ek.ranking
+                    "{}:edge:{}:{}:{}:{}",
+                    space_id, ek.src_vid, ek.edge_type, ek.dst_vid, ek.ranking
                 )
                 .into_bytes()
             })
             .collect();
 
-        // Batch get from KVStore
-        match self.kvstore.batch_get(&keys).await {
-            Ok(results) => {
-                for (_edge_key, data_opt) in req.edge_keys.iter().zip(results.iter()) {
-                    if let Some(data) = data_opt {
-                        // Use codec to decode edge (supports both Proto and JSON formats)
-                        if let Ok(edge_data) = Codec::decode_edge(data) {
-                            let mut properties: HashMap<String, Vec<u8>> = HashMap::new();
-
-                            for (key, value) in &edge_data.properties {
-                                // Filter by requested property names if specified
-                                if !req.prop_names.is_empty() && !req.prop_names.contains(key) {
-                                    continue;
-                                }
-                                // Encode property value using bincode
-                                if let Ok(bytes) = bincode::serialize(value) {
-                                    properties.insert(key.clone(), bytes);
-                                }
-                            }
-
-                            edges.push(EdgeData {
-                                key: Some(EdgeKey {
-                                    src_vid: edge_data.src_vid,
-                                    dst_vid: edge_data.dst_vid,
-                                    edge_type: edge_data.edge_type.clone(),
-                                    ranking: edge_data.ranking,
-                                }),
-                                properties,
-                            });
-                        }
-                    }
-                }
-
-                Ok(Response::new(BatchGetEdgesResponse {
-                    code: ErrorCode::Succeeded as i32,
-                    edges,
-                    error_message: String::new(),
-                }))
-            }
-            Err(e) => {
-                error!("Failed to batch get edges: {}", e);
-                Ok(Response::new(BatchGetEdgesResponse {
-                    code: ErrorCode::EInternalError as i32,
-                    edges: vec![],
-                    error_message: format!("Failed to fetch edges: {}", e),
-                }))
-            }
+        let results = self
+            .kvstore
+            .batch_get(&keys)
+            .await
+            .map_err(|error| Status::internal(format!("Failed to fetch edges: {error}")))?;
+        if results.len() != req.edge_keys.len() {
+            return Err(Status::data_loss("Incomplete batch get response"));
         }
+        for (key, data) in req.edge_keys.iter().zip(results) {
+            let Some(data) = data else { continue };
+            let edge = decode_query_edge(key, &data)?;
+            edges.push(EdgeData {
+                key: Some(key.clone()),
+                properties: encode_query_properties(&edge.properties, &req.prop_names)?,
+            });
+        }
+        Ok(Response::new(BatchGetEdgesResponse {
+            code: ErrorCode::Succeeded as i32,
+            edges,
+            error_message: String::new(),
+        }))
     }
 
     /// Scan vertices in a partition
@@ -614,6 +702,7 @@ impl StorageService for StorageRpcService {
         let req = request.into_inner();
         let space_id = req.space_id;
         let part_id = req.part_id;
+        self.ensure_query_partition(space_id, part_id).await?;
 
         debug!(
             "ScanVertices: space_id={}, part_id={}, tag={}",
@@ -635,149 +724,107 @@ impl StorageService for StorageRpcService {
             }));
         }
 
-        // Build scan prefix for partition
-        let prefix = format!("{}:vertex:", space_id);
-        let limit = if req.limit > 0 {
-            req.limit as usize
-        } else {
-            1000
-        };
-
-        // Determine start key (use cursor if provided)
-        let start_key = if req.cursor.is_empty() {
-            prefix.clone().into_bytes()
-        } else {
-            req.cursor.clone()
-        };
-
-        // Create filter to select only vertices in this partition
         let partition_num = self
             .partition_manager
             .get_partition_num(space_id)
             .await
-            .unwrap_or(100);
-        let tag_filter = req.tag_name.clone();
-
-        let filter_fn: byoridb_kvstore::FilterFn = Box::new(move |key: &[u8], value: &[u8]| {
-            // Extract VID from key format: {space_id}:vertex:{vid}
-            let key_str = String::from_utf8_lossy(key);
-            let parts: Vec<&str> = key_str.split(':').collect();
-            if parts.len() < 3 {
-                return false;
+            .filter(|count| *count > 0 && part_id > 0 && part_id <= *count)
+            .ok_or_else(|| Status::failed_precondition("Invalid partition configuration"))?;
+        let prefix = format!("{space_id}:vertex:").into_bytes();
+        let mut end = prefix.clone();
+        *end.last_mut().unwrap() += 1;
+        let mut start = if req.cursor.is_empty() {
+            prefix.clone()
+        } else {
+            let cursor: VertexScanCursor = serde_json::from_slice(&req.cursor)
+                .map_err(|_| Status::invalid_argument("Invalid vertex scan cursor"))?;
+            if cursor.version != 1
+                || cursor.space_id != space_id
+                || cursor.part_id != part_id
+                || cursor.tag_name != req.tag_name
+                || cursor.prop_names != req.prop_names
+                || byoridb_common::hash::compute_partition(
+                    scan_key_vid(&cursor.last_key, &prefix)?,
+                    partition_num,
+                ) != part_id
+            {
+                return Err(Status::invalid_argument(
+                    "Vertex scan cursor does not match this query",
+                ));
             }
-
-            // Parse VID and check partition
-            if let Ok(vid) = parts[2].parse::<i64>() {
-                let computed_part = byoridb_common::hash::compute_partition(vid, partition_num);
-                if computed_part != part_id {
-                    return false;
+            let mut start = cursor.last_key;
+            start.push(0);
+            start
+        };
+        let limit = if req.limit == 0 {
+            1000
+        } else {
+            req.limit as usize
+        };
+        let mut vertices = Vec::new();
+        let mut last_key = Vec::new();
+        let mut has_more = false;
+        'scan: loop {
+            let entries = self
+                .kvstore
+                .scan_range(&start, &end, Some(256))
+                .await
+                .map_err(|error| Status::internal(format!("Failed to scan vertices: {error}")))?;
+            let count = entries.len();
+            for (key, value) in entries {
+                start = key.clone();
+                start.push(0);
+                let vid = scan_key_vid(&key, &prefix)?;
+                if byoridb_common::hash::compute_partition(vid, partition_num) != part_id {
+                    continue;
                 }
-            } else {
-                return false;
-            }
-
-            // Filter by tag if specified
-            if !tag_filter.is_empty() {
-                // Use codec to decode vertex (supports both Proto and JSON formats)
-                if let Ok(vertex_data) = byoridb_codec::VertexCodec::decode_vertex(value) {
-                    return vertex_data.tags.iter().any(|tag| tag.name == tag_filter);
+                let vertex = decode_query_vertex(vid, &value)?;
+                if !req.tag_name.is_empty()
+                    && !vertex.tags.iter().any(|tag| tag.name == req.tag_name)
+                {
+                    continue;
                 }
-                return false;
-            }
-
-            true
-        });
-
-        match self
-            .kvstore
-            .scan_with_filter(&start_key, filter_fn, Some(limit + 1))
-            .await
-        {
-            Ok(results) => {
-                let has_more = results.len() > limit;
-                let actual_results: Vec<_> = results.into_iter().take(limit).collect();
-
-                let next_cursor = if has_more {
-                    actual_results
-                        .last()
-                        .map(|(k, _)| {
-                            // Create cursor for next page (key after last)
-                            let mut next = k.clone();
-                            next.push(0);
-                            next
-                        })
-                        .unwrap_or_default()
-                } else {
-                    vec![]
-                };
-
-                let mut vertices = Vec::new();
-                for (key, value) in actual_results {
-                    // Use codec to decode vertex (supports both Proto and JSON formats)
-                    if let Ok(vertex_data) = Codec::decode_vertex(&value) {
-                        // Use VID from decoded data instead of parsing key
-                        let vid = vertex_data.vid;
-
-                        let mut tag_data_list = Vec::new();
-                        for tag in &vertex_data.tags {
-                            // Filter by tag name if specified
-                            if !req.tag_name.is_empty() && tag.name != req.tag_name {
-                                continue;
-                            }
-
-                            let mut properties: HashMap<String, Vec<u8>> = HashMap::new();
-                            for (prop_key, prop_value) in &tag.properties {
-                                if !req.prop_names.is_empty() && !req.prop_names.contains(prop_key)
-                                {
-                                    continue;
-                                }
-                                // Encode property value using bincode
-                                if let Ok(bytes) = bincode::serialize(prop_value) {
-                                    properties.insert(prop_key.clone(), bytes);
-                                }
-                            }
-
-                            tag_data_list.push(TagData {
-                                tag_name: tag.name.clone(),
-                                properties,
-                            });
-                        }
-
-                        vertices.push(VertexData {
-                            vid,
-                            tags: tag_data_list,
-                        });
-                    } else {
-                        // Fallback: extract VID from key if decode fails
-                        let key_str = String::from_utf8_lossy(&key);
-                        let vid = key_str
-                            .split(':')
-                            .nth(2)
-                            .and_then(|s| s.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        warn!("Failed to decode vertex for vid={}", vid);
+                if vertices.len() == limit {
+                    has_more = true;
+                    break 'scan;
+                }
+                let mut tags = Vec::new();
+                for tag in vertex.tags {
+                    if !req.tag_name.is_empty() && tag.name != req.tag_name {
+                        continue;
                     }
+                    tags.push(TagData {
+                        tag_name: tag.name,
+                        properties: encode_query_properties(&tag.properties, &req.prop_names)?,
+                    });
                 }
-
-                Ok(Response::new(ScanVerticesResponse {
-                    code: ErrorCode::Succeeded as i32,
-                    vertices,
-                    next_cursor,
-                    has_more,
-                    error_message: String::new(),
-                }))
+                vertices.push(VertexData { vid, tags });
+                last_key = key;
             }
-            Err(e) => {
-                error!("Failed to scan vertices: {}", e);
-                Ok(Response::new(ScanVerticesResponse {
-                    code: ErrorCode::EInternalError as i32,
-                    vertices: vec![],
-                    next_cursor: vec![],
-                    has_more: false,
-                    error_message: format!("Failed to scan vertices: {}", e),
-                }))
+            if count < 256 {
+                break;
             }
         }
+        let next_cursor = if has_more {
+            serde_json::to_vec(&VertexScanCursor {
+                version: 1,
+                space_id,
+                part_id,
+                tag_name: req.tag_name,
+                prop_names: req.prop_names,
+                last_key,
+            })
+            .map_err(|error| Status::internal(error.to_string()))?
+        } else {
+            vec![]
+        };
+        Ok(Response::new(ScanVerticesResponse {
+            code: ErrorCode::Succeeded as i32,
+            vertices,
+            next_cursor,
+            has_more,
+            error_message: String::new(),
+        }))
     }
 
     /// Scan edges in a partition
@@ -945,6 +992,7 @@ impl StorageService for StorageRpcService {
         let req = request.into_inner();
         let space_id = req.space_id;
         let part_id = req.part_id;
+        self.ensure_query_partition(space_id, part_id).await?;
 
         debug!(
             "GetNeighborsBySource: space_id={}, part_id={}, src_count={}, edge_types={:?}",
@@ -971,7 +1019,8 @@ impl StorageService for StorageRpcService {
             .partition_manager
             .get_partition_num(space_id)
             .await
-            .unwrap_or(100);
+            .filter(|count| *count > 0)
+            .ok_or_else(|| Status::failed_precondition("Invalid partition configuration"))?;
 
         let limit_per_src = if req.limit_per_src > 0 {
             Some(req.limit_per_src as usize)
@@ -984,62 +1033,50 @@ impl StorageService for StorageRpcService {
         let edge_types_owned: Vec<String> = req.edge_types.clone();
 
         for src_vid in &req.src_vids {
-            // Guard against cross-partition src VIDs reaching this node by
-            // accident. Silently skip rather than error to support a caller
-            // that fans out the same list to multiple partitions.
             let computed_part = byoridb_common::hash::compute_partition(*src_vid, partition_num);
             if computed_part != part_id {
-                continue;
+                return Err(Status::invalid_argument(
+                    "Source VID belongs to another partition",
+                ));
             }
 
             let prefix = format!("{}:edge:{}:", space_id, src_vid);
-            let edge_types_for_filter: std::collections::HashSet<String> =
-                edge_types_owned.iter().cloned().collect();
-            let filter_fn: byoridb_kvstore::FilterFn = Box::new(move |key: &[u8], _v: &[u8]| {
-                if edge_types_for_filter.is_empty() {
-                    return true;
-                }
-                let key_str = String::from_utf8_lossy(key);
-                let parts: Vec<&str> = key_str.split(':').collect();
-                if parts.len() < 5 {
-                    return false;
-                }
-                edge_types_for_filter.contains(parts[3])
-            });
-
-            let results = match self
+            let results = self
                 .kvstore
-                .scan_with_filter(prefix.as_bytes(), filter_fn, limit_per_src)
+                .scan_prefix(prefix.as_bytes())
                 .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    error!(
-                        "GetNeighborsBySource scan failed for src={}: {}",
-                        src_vid, e
-                    );
+                .map_err(|error| Status::internal(format!("Neighbor scan failed: {error}")))?;
+            let mut count = 0;
+            for (key, value) in results {
+                let suffix = key
+                    .strip_prefix(prefix.as_bytes())
+                    .and_then(|suffix| std::str::from_utf8(suffix).ok())
+                    .ok_or_else(|| Status::data_loss("Invalid neighbor edge key"))?;
+                let parts: Vec<_> = suffix.split(':').collect();
+                if parts.len() != 3 || parts[0].is_empty() {
+                    return Err(Status::data_loss("Invalid neighbor edge key"));
+                }
+                let dst_vid = parts[1]
+                    .parse::<i64>()
+                    .map_err(|_| Status::data_loss("Invalid neighbor destination"))?;
+                let ranking = parts[2]
+                    .parse::<i64>()
+                    .map_err(|_| Status::data_loss("Invalid neighbor rank"))?;
+                if dst_vid.to_string() != parts[1] || ranking.to_string() != parts[2] {
+                    return Err(Status::data_loss("Noncanonical neighbor edge key"));
+                }
+                let edge_key = EdgeKey {
+                    src_vid: *src_vid,
+                    dst_vid,
+                    ranking,
+                    edge_type: parts[0].to_owned(),
+                };
+                let edge_data = decode_query_edge(&edge_key, &value)?;
+                if !edge_types_owned.is_empty() && !edge_types_owned.contains(&edge_data.edge_type)
+                {
                     continue;
                 }
-            };
-
-            if !results.is_empty() {
-                sources_with_edges += 1;
-            }
-
-            for (_, value) in results {
-                let edge_data = match Codec::decode_edge(&value) {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                let mut properties: HashMap<String, Vec<u8>> = HashMap::new();
-                for (prop_key, prop_value) in &edge_data.properties {
-                    if !req.prop_names.is_empty() && !req.prop_names.contains(prop_key) {
-                        continue;
-                    }
-                    if let Ok(bytes) = bincode::serialize(prop_value) {
-                        properties.insert(prop_key.clone(), bytes);
-                    }
-                }
+                let properties = encode_query_properties(&edge_data.properties, &req.prop_names)?;
 
                 all_edges.push(EdgeData {
                     key: Some(EdgeKey {
@@ -1050,6 +1087,13 @@ impl StorageService for StorageRpcService {
                     }),
                     properties,
                 });
+                count += 1;
+                if limit_per_src.is_some_and(|limit| count >= limit) {
+                    break;
+                }
+            }
+            if count > 0 {
+                sources_with_edges += 1;
             }
         }
 
@@ -1071,6 +1115,7 @@ impl StorageService for StorageRpcService {
         let req = request.into_inner();
         let space_id = req.space_id;
         let part_id = req.part_id;
+        self.ensure_query_partition(space_id, part_id).await?;
 
         debug!(
             "LookupTagIndex: space_id={}, part_id={}, index_id={}, index_name={}",
@@ -1106,14 +1151,21 @@ impl StorageService for StorageRpcService {
         };
 
         let index_def = match index_def {
-            Some(def) if def.index_type == IndexType::Tag => def,
+            Some(def)
+                if def.index_type == IndexType::Tag
+                    && def.space_id == space_id
+                    && (req.index_name.is_empty() || req.index_name == def.index_name) =>
+            {
+                def
+            }
             Some(_) => {
                 return Ok(Response::new(LookupTagIndexResponse {
                     code: ErrorCode::EInvalidRequest as i32,
                     vids: vec![],
                     next_cursor: vec![],
                     has_more: false,
-                    error_message: "Index is not a tag index".to_string(),
+                    error_message: "Tag index identity or type does not match the request"
+                        .to_string(),
                 }));
             }
             None => {
@@ -1146,31 +1198,16 @@ impl StorageService for StorageRpcService {
         // Perform index lookup
         match self
             .index_manager
-            .lookup_tag(part_id, &index_def, &values, limit + 1)
+            .lookup_tag_page(part_id, &index_def, &values, limit, &req.cursor)
             .await
         {
-            Ok(vids) => {
-                let has_more = vids.len() > limit;
-                let result_vids: Vec<i64> = vids.into_iter().take(limit).collect();
-
-                let next_cursor = if has_more && !result_vids.is_empty() {
-                    // Use last VID as cursor
-                    result_vids
-                        .last()
-                        .map(|v| v.to_le_bytes().to_vec())
-                        .unwrap_or_default()
-                } else {
-                    vec![]
-                };
-
-                Ok(Response::new(LookupTagIndexResponse {
-                    code: ErrorCode::Succeeded as i32,
-                    vids: result_vids,
-                    next_cursor,
-                    has_more,
-                    error_message: String::new(),
-                }))
-            }
+            Ok((result_vids, next_cursor, has_more)) => Ok(Response::new(LookupTagIndexResponse {
+                code: ErrorCode::Succeeded as i32,
+                vids: result_vids,
+                next_cursor,
+                has_more,
+                error_message: String::new(),
+            })),
             Err(e) => {
                 error!("Failed to lookup tag index: {}", e);
                 Ok(Response::new(LookupTagIndexResponse {
@@ -1192,6 +1229,7 @@ impl StorageService for StorageRpcService {
         let req = request.into_inner();
         let space_id = req.space_id;
         let part_id = req.part_id;
+        self.ensure_query_partition(space_id, part_id).await?;
 
         debug!(
             "LookupEdgeIndex: space_id={}, part_id={}, index_id={}, index_name={}",
@@ -1227,14 +1265,21 @@ impl StorageService for StorageRpcService {
         };
 
         let index_def = match index_def {
-            Some(def) if def.index_type == IndexType::Edge => def,
+            Some(def)
+                if def.index_type == IndexType::Edge
+                    && def.space_id == space_id
+                    && (req.index_name.is_empty() || req.index_name == def.index_name) =>
+            {
+                def
+            }
             Some(_) => {
                 return Ok(Response::new(LookupEdgeIndexResponse {
                     code: ErrorCode::EInvalidRequest as i32,
                     edges: vec![],
                     next_cursor: vec![],
                     has_more: false,
-                    error_message: "Index is not an edge index".to_string(),
+                    error_message: "Edge index identity or type does not match the request"
+                        .to_string(),
                 }));
             }
             None => {
@@ -1267,39 +1312,19 @@ impl StorageService for StorageRpcService {
         // Perform index lookup
         match self
             .index_manager
-            .lookup_edge(part_id, &index_def, &values, limit + 1)
+            .lookup_edge_page(part_id, &index_def, &values, limit, &req.cursor)
             .await
         {
-            Ok(edges) => {
-                let has_more = edges.len() > limit;
-                let edge_type_name = index_def.schema_name.clone();
-                let result_edges: Vec<EdgeKey> = edges
+            Ok((edges, next_cursor, has_more)) => {
+                let result_edges = edges
                     .into_iter()
-                    .take(limit)
-                    .map(|(src_vid, rank, dst_vid)| EdgeKey {
+                    .map(|(src_vid, ranking, dst_vid)| EdgeKey {
                         src_vid,
                         dst_vid,
-                        edge_type: edge_type_name.clone(),
-                        ranking: rank,
+                        ranking,
+                        edge_type: index_def.schema_name.clone(),
                     })
                     .collect();
-
-                let next_cursor = if has_more && !result_edges.is_empty() {
-                    // Use last edge key as cursor
-                    result_edges
-                        .last()
-                        .map(|e| {
-                            let mut cursor = Vec::new();
-                            cursor.extend_from_slice(&e.src_vid.to_le_bytes());
-                            cursor.extend_from_slice(&e.ranking.to_le_bytes());
-                            cursor.extend_from_slice(&e.dst_vid.to_le_bytes());
-                            cursor
-                        })
-                        .unwrap_or_default()
-                } else {
-                    vec![]
-                };
-
                 Ok(Response::new(LookupEdgeIndexResponse {
                     code: ErrorCode::Succeeded as i32,
                     edges: result_edges,
@@ -1489,6 +1514,8 @@ mod tests {
         let pm = Arc::new(PartitionManager::new("127.0.0.1".to_string(), 0));
         // Register space but do NOT add the partition — node doesn't own it.
         pm.register_space(1, 1).await;
+        // Locally present data must not bypass the partition readiness check.
+        put_edge(&memory, 1, 100, 200, "follow", 0).await;
         let service = StorageRpcService::new(pm, kvstore);
 
         let request = tonic::Request::new(GetNeighborsBySourceRequest {
@@ -1499,8 +1526,7 @@ mod tests {
             limit_per_src: 0,
             prop_names: vec![],
         });
-        let response = service.get_neighbors_by_source(request).await.unwrap();
-        let inner = response.into_inner();
-        assert_eq!(inner.code, ErrorCode::EPartitionNotFound as i32);
+        let error = service.get_neighbors_by_source(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
     }
 }

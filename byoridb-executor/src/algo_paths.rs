@@ -12,16 +12,15 @@
 //! `knows`). Edges inserted before the in-edge index existed are invisible
 //! to reverse expansion — the same space-reload caveat as O-1.
 
-use crate::algo::{edge_type_from_key, TraversalMetrics};
+use crate::algo::{decode_query_edge, edge_type_from_key, TraversalMetrics};
 use crate::context::ExecutionContext;
-use crate::error::Result;
-use byoridb_codec::VertexCodec;
+use crate::error::{ExecutionError, Result};
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Collect the distinct neighbor vids of `vid`: destinations of outgoing
-/// edges, plus sources of incoming edges when `bidirect`. Only the vid is
-/// decoded (fast-path field extraction), never the full `EdgeData`.
+/// edges, plus sources of incoming edges when `bidirect`. Relevant payloads
+/// are validated in full; corruption must not turn a reachable path into absence.
 async fn collect_neighbor_vids(
     ctx: &ExecutionContext,
     space: &str,
@@ -44,10 +43,7 @@ async fn collect_neighbor_vids(
             }
         }
         metrics.scanned_edges += 1;
-        let dst = match VertexCodec::decode_edge_dst(&value) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
+        let dst = decode_query_edge(&key, &value)?.dst_vid;
         metrics.decoded_edges += 1;
         if seen.insert(dst) {
             neighbors.push(dst);
@@ -70,10 +66,7 @@ async fn collect_neighbor_vids(
             metrics.scanned_edges += 1;
             // In-edge values are denormalized edge payloads; the neighbor we
             // expand to is the edge's *source*.
-            let src = match VertexCodec::decode_edge_src(&value) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+            let src = decode_query_edge(&key, &value)?.src_vid;
             metrics.decoded_edges += 1;
             if seen.insert(src) {
                 neighbors.push(src);
@@ -87,8 +80,8 @@ async fn collect_neighbor_vids(
 /// Single shortest path by hop count, with optional bidirectional expansion.
 ///
 /// Semantics match [`crate::algo::bfs_shortest_path`]: paths are at most
-/// `max_steps` hops, `ctx.config.max_traversal_nodes` caps the visited set
-/// (`metrics.cap_reached` when hit), and the first path found is returned.
+/// `max_steps` hops. `max_traversal_nodes` caps expanded vertices; exceeding
+/// it returns `ResourceExhausted`, while a complete search may return no path.
 pub async fn shortest_path(
     ctx: &ExecutionContext,
     start: i64,
@@ -100,7 +93,6 @@ pub async fn shortest_path(
     let mut metrics = TraversalMetrics::default();
 
     if start == target {
-        metrics.visited_vertices = 1;
         return Ok((Some(vec![start]), metrics));
     }
 
@@ -116,14 +108,15 @@ pub async fn shortest_path(
     metrics.record_frontier(queue.len());
 
     while let Some((current, step)) = queue.pop_front() {
-        metrics.visited_vertices += 1;
-        if max_nodes > 0 && metrics.visited_vertices > max_nodes as u64 {
-            metrics.cap_reached = true;
-            break;
-        }
         if step >= max_steps {
             continue;
         }
+        if max_nodes > 0 && metrics.visited_vertices >= max_nodes as u64 {
+            return Err(ExecutionError::ResourceExhausted(
+                "FIND traversal exceeded max_traversal_nodes".to_string(),
+            ));
+        }
+        metrics.visited_vertices += 1;
 
         let neighbors =
             collect_neighbor_vids(ctx, &space, current, &edge_type_set, bidirect, &mut metrics)
@@ -151,10 +144,9 @@ pub async fn shortest_path(
 /// shortest parent is missed. Paths are then enumerated by walking the DAG
 /// backwards from `target`.
 ///
-/// `max_paths` bounds enumeration (`0` = unlimited); the executor compares
-/// the result length against the cap to warn about truncation. If
-/// `max_traversal_nodes` aborts the search mid-level the parent DAG is
-/// incomplete, so no paths are returned and `metrics.cap_reached` is set.
+/// `max_paths` bounds enumeration (`0` = unlimited). Discovering one more
+/// complete path than the cap, or exceeding the expanded-vertex budget
+/// mid-level, returns `ResourceExhausted` rather than an incomplete answer.
 pub async fn all_shortest_paths(
     ctx: &ExecutionContext,
     start: i64,
@@ -167,7 +159,6 @@ pub async fn all_shortest_paths(
     let mut metrics = TraversalMetrics::default();
 
     if start == target {
-        metrics.visited_vertices = 1;
         return Ok((vec![vec![start]], metrics));
     }
 
@@ -183,18 +174,17 @@ pub async fn all_shortest_paths(
     let mut current_depth = 0usize;
     let mut found = false;
 
-    'levels: while !frontier.is_empty() && current_depth < max_steps && !found {
+    while !frontier.is_empty() && current_depth < max_steps && !found {
         metrics.record_frontier(frontier.len());
         let mut next_frontier = Vec::new();
 
         for &u in &frontier {
-            metrics.visited_vertices += 1;
-            if max_nodes > 0 && metrics.visited_vertices > max_nodes as u64 {
-                // Aborting mid-level leaves the parent DAG incomplete; a
-                // partial all-paths answer is wrong, so return none.
-                metrics.cap_reached = true;
-                break 'levels;
+            if max_nodes > 0 && metrics.visited_vertices >= max_nodes as u64 {
+                return Err(ExecutionError::ResourceExhausted(
+                    "FIND traversal exceeded max_traversal_nodes".to_string(),
+                ));
             }
+            metrics.visited_vertices += 1;
 
             let neighbors =
                 collect_neighbor_vids(ctx, &space, u, &edge_type_set, bidirect, &mut metrics)
@@ -224,7 +214,7 @@ pub async fn all_shortest_paths(
         current_depth += 1;
     }
 
-    if !found || metrics.cap_reached {
+    if !found {
         return Ok((Vec::new(), metrics));
     }
 
@@ -234,15 +224,19 @@ pub async fn all_shortest_paths(
     let mut paths = Vec::new();
     let mut stack = vec![vec![target]];
     while let Some(partial) = stack.pop() {
-        if max_paths > 0 && paths.len() >= max_paths {
-            break;
-        }
         // Stack entries always hold at least [target]; guard instead of
         // panicking per the no-expect gate rule.
         let Some(&head) = partial.last() else {
             continue;
         };
         if head == start {
+            // Count one extra completed path: exactly the configured number
+            // succeeds, and no partial DAG stack entry is mistaken for overflow.
+            if max_paths > 0 && paths.len() >= max_paths {
+                return Err(ExecutionError::ResourceExhausted(
+                    "FIND ALL SHORTEST PATHS exceeded max_find_paths".to_string(),
+                ));
+            }
             let mut path = partial;
             path.reverse();
             paths.push(path);
@@ -281,7 +275,7 @@ fn reconstruct_path(parent: &HashMap<i64, i64>, start: i64, target: i64) -> Vec<
 mod tests {
     use super::*;
     use crate::context::ExecutionConfig;
-    use byoridb_codec::EdgeData;
+    use byoridb_codec::{EdgeData, VertexCodec};
     use byoridb_kvstore::store::MemoryKVStore;
     use std::sync::Arc;
 
@@ -423,10 +417,10 @@ mod tests {
             insert_edge(&ctx, mid, 4, "knows").await;
         }
 
-        let (paths, _) = all_shortest_paths(&ctx, 1, 4, &knows(), 10, false, 2)
-            .await
-            .unwrap();
-        assert_eq!(paths.len(), 2);
+        assert!(matches!(
+            all_shortest_paths(&ctx, 1, 4, &knows(), 10, false, 2).await,
+            Err(ExecutionError::ResourceExhausted(_))
+        ));
     }
 
     #[tokio::test]
@@ -439,11 +433,10 @@ mod tests {
         insert_edge(&ctx, 1, 2, "knows").await;
         insert_edge(&ctx, 2, 3, "knows").await;
 
-        let (paths, metrics) = all_shortest_paths(&ctx, 1, 3, &knows(), 10, false, 0)
-            .await
-            .unwrap();
-        assert!(paths.is_empty());
-        assert!(metrics.cap_reached);
+        assert!(matches!(
+            all_shortest_paths(&ctx, 1, 3, &knows(), 10, false, 0).await,
+            Err(ExecutionError::ResourceExhausted(_))
+        ));
     }
 
     #[tokio::test]

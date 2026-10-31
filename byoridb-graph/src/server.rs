@@ -56,6 +56,15 @@ impl GraphServer {
 
     /// Start the gRPC server with compression support
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind(self.addr).await?;
+        self.start_with_listener(listener).await
+    }
+
+    /// Serve a listener bound by the launcher before either protocol is ready.
+    pub async fn start_with_listener(
+        self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use std::time::Duration;
 
         info!(
@@ -84,7 +93,7 @@ impl GraphServer {
 
         Server::builder()
             .add_service(service_server)
-            .serve(self.addr)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await?;
 
         Ok(())
@@ -136,6 +145,15 @@ impl HttpServer {
 
     /// Start the HTTP server
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind(self.addr).await?;
+        self.start_with_listener(listener).await
+    }
+
+    /// Serve a listener bound by the launcher before either protocol is ready.
+    pub async fn start_with_listener(
+        self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use std::time::Duration;
 
         info!("Starting HTTP server on {}", self.addr);
@@ -166,7 +184,6 @@ impl HttpServer {
             .route("/api/v1/query/json", post(execute_query_json))
             .with_state(state);
 
-        let listener = tokio::net::TcpListener::bind(self.addr).await?;
         info!("HTTP server listening on {}", self.addr);
 
         axum::serve(
@@ -731,6 +748,7 @@ struct SessionResponse {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QueryRequest {
     #[serde(deserialize_with = "id_str::deserialize")]
     session_id: i64,
@@ -761,6 +779,14 @@ mod tests {
     use crate::auth::AuthManager;
     use byoridb_kvstore::MemoryKVStore;
     use std::time::Duration;
+
+    #[test]
+    fn query_body_rejects_unsupported_parameters_and_misspelled_options() {
+        for extra in [r#""params":{"id":1}"#, r#""readOnly":true"#] {
+            let payload = format!(r#"{{"session_id":"1","query":"DELETE VERTEX 1",{extra}}}"#);
+            assert!(serde_json::from_str::<QueryRequest>(&payload).is_err());
+        }
+    }
 
     #[test]
     fn session_id_is_json_string_and_accepts_string_or_number() {

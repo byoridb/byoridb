@@ -2,7 +2,33 @@
 
 # Data queries
 
-Query statements use the space selected by the authenticated session.
+Query statements use the space selected by the authenticated session. This page
+describes the current source; consult the release matching your deployed binary.
+
+## Inference status and recovery
+
+```sql
+USE my_space;
+CHECK INFERENCE;
+REPAIR INFERENCE;
+```
+
+`CHECK INFERENCE` returns `space` and `status` columns, with `complete` or
+`repair_required`; ordinary read permission is sufficient. `REPAIR INFERENCE`
+requires GOD/ADMIN and a writable request, rebuilds current closure and returns
+the same status shape. It is repeatable and preserves asserted history.
+
+A semantic mutation commits its asserted changes and a durable incomplete marker
+before completing inference. A failure, cancellation or restart leaves graph
+reads and further mutations blocked until repair succeeds. Status checks remain
+available. An error does not prove that assertions rolled back: have an
+administrator repair, inspect current facts, and only then decide whether to retry.
+Compound statements commit clause by clause; they are not a transaction.
+
+Updating an inferred-only edge explicitly promotes it to an assertion. Deleting
+one directly is rejected; delete its supporting assertions instead. The
+`__inferred__` property is reserved for the engine. Historical inference is not
+reconstructed by repair, and sameAs merges remain irreversible.
 
 ## FETCH PROP
 
@@ -166,6 +192,46 @@ ORDER BY people DESC
 LIMIT 10;
 ```
 
+**Current MATCH contract:**
+projection, WHERE, grouping and aggregate evaluation propagate storage, decode
+and VID-resolution failures rather than converting them to missing values.
+Genuinely missing properties and typed nulls retain their meanings; a directly
+addressed VID that does not exist remains no match. Decoded MATCH candidates,
+directional/optional edges and intermediate vertices are identity-checked.
+Required/OPTIONAL bound starts recheck their labels and literal properties.
+Undirected self-loops count once by full edge identity; distinct ranks and opposite
+edges remain distinct. Required/OPTIONAL bound destinations cannot be overwritten:
+repeated node variables keep the same VID and repeated edge variables keep full
+edge identity. A node/edge binding-kind collision raises an error when encountered.
+Newly introduced OPTIONAL null bindings cannot later be rebound. Validation
+concerns decoded records, not an exhaustive integrity scan.
+
+`COUNT(expr)` excludes nulls and `MIN/MAX` skip them. A global aggregate over
+empty input produces one row before `LIMIT/OFFSET`; result windows apply after
+aggregation and do not bypass aggregate overflow checks. Integer-only `SUM`
+returns an exact integer or an overflow error. Floating `SUM/AVG` reject
+nonfinite results; this does not define a total ordering for mixed-type or
+nonfinite `MIN/MAX` inputs.
+
+Grouping uses canonical typed keys: map entry order is ignored, vertices/edges
+use their graph identity, and floating `+0`/`-0` group together. Integers and
+floats remain different groups. Nonfinite values and Path/Set/DataSet/Geography
+group keys are explicitly unsupported. `ORDER BY` must name an unambiguous output
+alias or exactly match a projected expression; unknown/ambiguous references fail
+before scanning. Aggregate output rows are checked against the shared estimated
+result-memory budget; this does not cap all intermediate grouping memory.
+
+The planner rejects unsupported MATCH arithmetic, unary and map-constructor
+expressions; `COLLECT`; nested/misplaced aggregates; and nonliteral node/edge
+pattern properties before reading data, even for empty input. Aggregates are
+supported only as top-level RETURN calls; they cannot be nested inside scalar
+functions/lists or used as WHERE/GROUP BY expressions. This restriction does
+not prohibit property maps returned by `properties()`. The current source
+also accepts `isa` as an alias for `is_a`. The reverse lookup shortcut is limited
+to outgoing patterns without a range, and `EXPLAIN` applies the same direction/range
+restriction. This slice is not a claim of complete MATCH semantics; QRY-2 remains
+IN PROGRESS.
+
 For ontology-aware membership, use `is_a`:
 
 ```sql
@@ -201,7 +267,12 @@ values:
 
 ### Aggregates
 
-`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COLLECT`.
+Supported MATCH aggregates are `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`.
+`COLLECT` is not implemented; the current source rejects it before data access.
+`COUNT(*)` counts rows, while `COUNT(expr)` excludes null values.
+The eligible plain single-node `COUNT(*)` path streams validated candidates;
+grouped and edge counts use normal matching. Both retain their applicable scan
+budgets and result-window semantics.
 
 ### Scalar functions
 
@@ -273,10 +344,11 @@ An equality predicate on an indexed property can use the secondary index, for
 both tags and edge types. Eligible ordered ranges use single-field indexes in
 standalone mode; other supported predicates use a bounded predicate scan:
 
-- Ordered range predicates (`>`, `>=`, `<`, `<=`) on an **edge type** use the
-  index when the boundary is a bool, an integer, or a non-zero non-NaN float.
-  A string boundary falls back to a scan, because the string index encoding is
-  length-prefixed and therefore not ordered.
+- Ordered range predicates (`>`, `>=`, `<`, `<=`) on an **edge type**
+  use the index only with a compatible property schema and boundary.
+  Float/Double properties use predicate scans to cover both integer and float key domains.
+  `EXPLAIN` uses the same choice. String boundaries fall back to a scan because
+  their length-prefixed index encoding is not lexical.
 - Ordered range predicates on a **tag** use a single-field index when a Boolean
   or integer literal matches the schema type. Float/Double properties fall back
   to a scan because integer and float values occupy different index key domains.
@@ -285,7 +357,37 @@ standalone mode; other supported predicates use a bounded predicate scan:
   field-to-field comparison) is **rejected** rather than silently matching
   everything.
 
-The default fallback scan limit is 100,000 rows and is configurable.
+The default scan budget is 100,000 candidates, configured by
+`BYORIDB_MAX_SCAN_LIMIT`.
+
+**Current source contract:** local tag/edge LOOKUP
+counts raw candidates in each full-prefix or index-partition scan, before
+predicate filtering and stale-entry revalidation. `0` disables that budget.
+Exactly the cap may succeed; observing candidate cap+1 fails the query instead
+of returning a truncated success. Query `LIMIT/OFFSET` controls the result window
+independently: even `LIMIT 1` cannot hide a candidate-budget overflow. This is a
+per-scan budget, not a global total-work, edge-count or memory bound. Relevant
+index-partition, schema and decode failures propagate, and malformed edge-index
+keys fail. LOOKUP and FIND share an edge decoder that rejects malformed JSON,
+invalid structural member types and explicit key/payload identity mismatches;
+LOOKUP also validates vertex records. Legacy omitted vertex VID, edge rank and
+properties retain their defaults. Validation covers records actually decoded:
+LIMIT may stop later decoding and FIND can skip unrelated edge types. It does not
+validate every acquired candidate, detect all corruption or validate FIND vertices.
+Distributed indexed LOOKUP validates the complete partition topology, applies
+this raw budget independently to every partition and follows query-bound keyset
+cursors. It fetches payloads from the owning storage service, validates their
+identity and typed properties, and fails on a missing or failed partition.
+Result limits do not split the budget between partitions. Pages do not establish
+a snapshot across concurrent writes; distributed full scans and ordered ranges
+remain unsupported. These component guarantees do not enable the standalone
+launcher to run a replicated cluster.
+
+Float equality uses the existing epsilon comparison, so indexed execution scans
+and rechecks the entire selected index instead of fetching one exact float key.
+Every candidate counts toward the scan budget. Integer and float equality remain
+type-strict; an integer literal does not match a stored float merely because
+both have the same numeric magnitude.
 
 Index candidates are always revalidated against the stored vertex or edge, so a
 stale index entry cannot become a result. Use `EXPLAIN` or `PROFILE` to see
@@ -312,8 +414,30 @@ FIND ALL SHORTEST PATHS FROM 1 TO 3 OVER knows UPTO 5 STEPS;
 ```
 
 The `OVER` target is one edge type or `*`, not a comma-separated edge list.
-Path traversal and all-shortest-path enumeration are bounded by executor
-resource caps.
+`FIND WHERE` and `FIND YIELD` are not implemented and are rejected explicitly
+before resolving vertex IDs.
+
+**Current source contract:**
+
+- `max_traversal_nodes` charges expanded vertices, or vertex/hop states for
+  hop-bounded weighted queries. Its default is 100,000; `0` disables it. Exceeding
+  it fails the query. It does not bound queued frontier memory or scanned edges.
+- `FIND ALL SHORTEST PATHS` uses `max_find_paths` (default 1,024; `0` disables).
+  Exactly that many complete paths may succeed; finding another complete path
+  fails rather than truncating the output.
+- Explicit `UPTO n STEPS` limits weighted as well as unweighted paths. Without
+  `UPTO`, unweighted queries default to 10 steps while weighted queries have no
+  hop bound; the execution work budget still applies. `UPTO` values above
+  `u32::MAX` are rejected during parsing rather than wrapped.
+- A missing or nonnumeric `WEIGHT BY` property retains the legacy unit-weight
+  default of `1`. Numeric weights must be nonnegative and finite. Conservative
+  validation of reachable weights can do work beyond the returned path;
+  negative/nonfinite numeric weights or relevant corrupt edge data cause an
+  error. Finding a cheap target path early does not finish validation/execution.
+
+These contracts describe the current checkout; older releases are unchanged.
+See [runtime guards](../../reference/performance.md#runtime-guards) for limits
+and the remaining execution boundaries.
 
 ## RECOMMEND
 

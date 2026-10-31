@@ -19,12 +19,7 @@ variables, which take precedence. Section keys use a double underscore:
 
   BYORIDB__SERVER__GRAPH_ADDR       gRPC listen address          [0.0.0.0:9669]
   BYORIDB__SERVER__HTTP_ADDR        HTTP listen address          [0.0.0.0:19669]
-  BYORIDB__SERVER__STORAGE_ADDR     storage RPC listen address   [0.0.0.0:44500]
   BYORIDB__STORAGE__DATA_PATHS      comma-separated data dirs    [data/storage]
-  BYORIDB__CLUSTER__PEERS           comma-separated meta peers   [empty]
-  BYORIDB__CLUSTER__NODE_ID         raft node id                 [1]
-  BYORIDB__CLUSTER__META_ADDR       meta gRPC listen address     [0.0.0.0:9559]
-  BYORIDB__CLUSTER__ADVERTISE_ADDR  advertised meta address      [127.0.0.1:9559]
 
 Other environment variables:
 
@@ -37,8 +32,9 @@ Other environment variables:
   BYORIDB_MAX_SCAN_LIMIT per-scan row cap                            [100_000]
   RUST_LOG               tracing filter
 
-Leaving BYORIDB__CLUSTER__PEERS empty selects single-node mode, which is the
-only supported deployment. See docs/PLAN.md before configuring peers.";
+BYORIDB__CLUSTER__PEERS must remain empty and all other cluster settings must
+keep their defaults. The launcher supports single-node deployment and rejects
+cluster configuration. Storage RPC is not exposed. See docs/PLAN.md.";
 
 #[derive(Parser)]
 #[command(
@@ -96,56 +92,24 @@ async fn main() -> anyhow::Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let shutdown_state = std::sync::Arc::new(byoridb_graph::ShutdownState::new());
 
-    // 3.5. Cluster mode detection
-    let is_cluster = !config.cluster.peers.is_empty();
-    if is_cluster {
-        info!(
-            node_id = config.cluster.node_id,
-            peers = ?config.cluster.peers,
-            meta_addr = %config.cluster.meta_addr,
-            advertise_addr = %config.cluster.advertise_addr,
-            "Cluster mode: starting Meta server"
-        );
-        let meta_config = byoridb_meta::MetaServerConfig {
-            data_path: std::path::PathBuf::from("data/meta"),
-            grpc_addr: config.cluster.meta_addr.parse().with_context(|| {
-                format!("Invalid cluster.meta_addr: {}", config.cluster.meta_addr)
-            })?,
-            http_addr: None,
-            advertise_host: config
-                .cluster
-                .advertise_addr
-                .split_once(':')
-                .map(|(h, _)| h)
-                .unwrap_or("127.0.0.1")
-                .to_string(),
-            advertise_port: config
-                .cluster
-                .advertise_addr
-                .split_once(':')
-                .map(|(_, p)| p)
-                .unwrap_or("9559")
-                .parse()
-                .unwrap_or(9559),
-        };
-        let mut meta_server = byoridb_meta::MetaServer::with_config(meta_config)
-            .await
-            .context("Failed to initialize Meta server")?;
-        let mut meta_shutdown_rx = shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            tokio::select! {
-                result = meta_server.start() => {
-                    if let Err(e) = result { error!("Meta server failed: {}", e); }
-                }
-                _ = meta_shutdown_rx.recv() => {
-                    info!("Meta server received shutdown signal");
-                }
-            }
-        });
-        info!("Meta server started (node_id={})", config.cluster.node_id);
-    } else {
-        info!("Standalone mode (single-node). Set BYORIDB__CLUSTER__PEERS to enable cluster.");
-    }
+    // The advertised deployment is standalone. Starting only Meta while graph
+    // and storage remain local would look like a functioning replicated server.
+    anyhow::ensure!(
+        config.cluster.is_standalone(),
+        "Cluster deployment is not supported by this launcher; keep cluster settings at their defaults"
+    );
+
+    // Bind both protocols before storage initialization or any readiness claim.
+    // A partial startup is an error, never a healthy process with a dead API.
+    let graph_listener = tokio::net::TcpListener::bind(config.server.graph_addr)
+        .await
+        .context("Failed to bind gRPC listener")?;
+    let http_listener = tokio::net::TcpListener::bind(config.server.http_addr)
+        .await
+        .context("Failed to bind HTTP listener")?;
+    let graph_listen_addr = graph_listener.local_addr()?;
+    let http_listen_addr = http_listener.local_addr()?;
+    info!("Standalone mode (single-node)");
 
     // 4. Start Storage Server
     let mut storage_server = byoridb_storage::StorageServer::new();
@@ -219,57 +183,48 @@ async fn main() -> anyhow::Result<()> {
     graph_service.hydrate_persisted_users().await?;
     drop(root_password);
 
-    // 5.1 Start Graph Service (gRPC)
-    let graph_addr = config.server.graph_addr;
+    // Both listener sockets are already reserved. Any unexpected server exit
+    // is supervised alongside OS signals and causes an unsuccessful shutdown.
     let graph_server =
-        byoridb_graph::server::GraphServer::with_service(graph_addr, graph_service.clone());
+        byoridb_graph::server::GraphServer::with_service(graph_listen_addr, graph_service.clone());
     let mut graph_shutdown_rx = shutdown_tx.subscribe();
-
-    let graph_handle = tokio::spawn(async move {
-        info!("Graph Service starting on {}", graph_addr);
-
+    let mut graph_handle = tokio::spawn(async move {
         tokio::select! {
-            result = graph_server.start() => {
-                if let Err(e) = result {
-                    error!("Graph Service failed: {}", e);
-                }
-            }
-            _ = graph_shutdown_rx.recv() => {
-                info!("Graph Service received shutdown signal");
-            }
+            result = graph_server.start_with_listener(graph_listener) =>
+                result.map_err(|error| error.to_string()),
+            _ = graph_shutdown_rx.recv() => Ok(()),
         }
     });
-
-    // 6. Start HTTP Service over the same authentication/session state.
-    let http_addr = config.server.http_addr;
     let http_server =
-        byoridb_graph::server::HttpServer::with_service(http_addr, graph_service.clone());
+        byoridb_graph::server::HttpServer::with_service(http_listen_addr, graph_service.clone());
     let mut http_shutdown_rx = shutdown_tx.subscribe();
-
-    let http_handle = tokio::spawn(async move {
-        info!("HTTP Service starting on {}", http_addr);
-
+    let mut http_handle = tokio::spawn(async move {
         tokio::select! {
-            result = http_server.start() => {
-                if let Err(e) = result {
-                    error!("HTTP Service failed: {}", e);
-                }
-            }
-            _ = http_shutdown_rx.recv() => {
-                info!("HTTP Service received shutdown signal");
-            }
+            result = http_server.start_with_listener(http_listener) =>
+                result.map_err(|error| error.to_string()),
+            _ = http_shutdown_rx.recv() => Ok(()),
         }
     });
 
-    // 7. Wait for shutdown signal
-    info!("ByoriDB Server is ready. Press Ctrl+C to shutdown.");
-
+    info!(%graph_listen_addr, %http_listen_addr, "ByoriDB Server is ready");
+    let mut failures = Vec::new();
+    let mut graph_finished = false;
+    let mut http_finished = false;
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl+C, initiating graceful shutdown...");
+        result = tokio::signal::ctrl_c() => {
+            if let Err(error) = result {
+                failures.push(format!("Ctrl+C handler failed: {error}"));
+            }
+            info!("Initiating graceful shutdown");
         }
-        _ = terminate_signal() => {
-            info!("Received SIGTERM, initiating graceful shutdown...");
+        _ = terminate_signal() => info!("Received SIGTERM, initiating graceful shutdown"),
+        result = &mut graph_handle => {
+            graph_finished = true;
+            failures.push(format!("gRPC service exited unexpectedly: {result:?}"));
+        }
+        result = &mut http_handle => {
+            http_finished = true;
+            failures.push(format!("HTTP service exited unexpectedly: {result:?}"));
         }
     }
 
@@ -289,6 +244,8 @@ async fn main() -> anyhow::Result<()> {
     if drained {
         info!("All in-flight queries drained");
     } else {
+        failures
+            .push("active query drain timed out; mutation outcomes may be uncertain".to_string());
         warn!(
             "Drain timed out after {:?}; {} query(ies) still running will be cut",
             drain_timeout,
@@ -301,23 +258,15 @@ async fn main() -> anyhow::Result<()> {
     // Send shutdown signal to all services
     let _ = shutdown_tx.send(());
 
-    // Wait for services to finish (with timeout)
-    let shutdown_timeout = tokio::time::Duration::from_secs(30);
-
-    info!("Waiting for Graph Service to shutdown...");
-    if tokio::time::timeout(shutdown_timeout, graph_handle)
-        .await
-        .is_err()
-    {
-        warn!("Graph Service shutdown timed out");
-    }
-
-    info!("Waiting for HTTP Service to shutdown...");
-    if tokio::time::timeout(shutdown_timeout, http_handle)
-        .await
-        .is_err()
-    {
-        warn!("HTTP Service shutdown timed out");
+    for (name, finished, handle) in [
+        ("gRPC", graph_finished, &mut graph_handle),
+        ("HTTP", http_finished, &mut http_handle),
+    ] {
+        if !finished {
+            if let Err(error) = finish_service(name, handle).await {
+                failures.push(error.to_string());
+            }
+        }
     }
 
     // Stop storage server. This checkpoints redb (2-phase Immediate commit) so
@@ -325,11 +274,32 @@ async fn main() -> anyhow::Result<()> {
     // which on a large dataset takes many minutes (2026-06-26 incident).
     info!("Stopping Storage Server...");
     if let Err(e) = storage_server.stop().await {
-        error!("Error stopping storage server: {}", e);
+        failures.push(format!("Storage checkpoint failed: {e}"));
     }
 
+    anyhow::ensure!(
+        failures.is_empty(),
+        "Server shutdown failed: {}",
+        failures.join("; ")
+    );
     info!("ByoriDB Server shutdown complete");
     Ok(())
+}
+
+async fn finish_service(
+    name: &str,
+    handle: &mut tokio::task::JoinHandle<Result<(), String>>,
+) -> anyhow::Result<()> {
+    match tokio::time::timeout(std::time::Duration::from_secs(30), &mut *handle).await {
+        Ok(result) => result
+            .with_context(|| format!("{name} server task failed"))?
+            .map_err(|error| anyhow::anyhow!("{name} server failed: {error}")),
+        Err(_) => {
+            handle.abort();
+            let _ = handle.await;
+            anyhow::bail!("{name} server shutdown timed out");
+        }
+    }
 }
 
 /// Wait for SIGTERM signal (Unix only)

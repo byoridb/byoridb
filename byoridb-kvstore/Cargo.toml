@@ -20,7 +20,7 @@ parking_lot = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true }
 
-[dev-dependencies]
+sha2 = "0.10"
 tempfile = "3.10"
 
 [lints]

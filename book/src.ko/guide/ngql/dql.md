@@ -2,7 +2,33 @@
 
 [English](../../../guide/ngql/dql.html) | **한국어**
 
-query statement는 인증 session에서 `USE`로 선택한 space를 사용합니다.
+Query statement는 인증 session에서 `USE`로 선택한 space를 사용합니다. 이 문서는
+현재 소스를 설명하므로 배포한 binary와 일치하는 릴리스 문서를 확인하세요.
+
+<a id="inference-status-and-recovery"></a>
+
+## 추론 상태와 복구
+
+```sql
+USE my_space;
+CHECK INFERENCE;
+REPAIR INFERENCE;
+```
+
+`CHECK INFERENCE`는 `space`, `status` column을 반환하며 상태는 `complete` 또는
+`repair_required`입니다. 일반 읽기 권한으로 실행할 수 있습니다. `REPAIR INFERENCE`는
+GOD/ADMIN과 쓰기 가능한 요청을 요구하고 현재 closure를 재구축한 뒤 같은 형태의 상태를
+반환합니다. 반복 실행할 수 있고 asserted history를 보존합니다.
+
+Semantic 변경은 asserted 변경과 영속 미완료 marker를 먼저 commit한 뒤 추론을 완성합니다.
+실패·취소·재시작이 발생하면 복구가 성공할 때까지 graph 읽기와 추가 변경을 차단하며 상태
+조회는 계속 허용합니다. 오류가 assertion rollback을 뜻하지는 않습니다. 관리자가 복구한
+뒤 현재 fact를 확인하고 재시도를 결정하세요. Compound 문장은 절별 commit이며 전체
+transaction이 아닙니다.
+
+Inferred-only edge를 UPDATE하면 명시적 assertion으로 승격합니다. 직접 DELETE는
+거부하므로 근거 assertion을 삭제하세요. `__inferred__` property는 엔진용으로 예약돼
+있습니다. Repair는 과거 추론을 재구성하지 않으며 sameAs 병합은 계속 비가역적입니다.
 
 ## FETCH PROP
 
@@ -161,6 +187,39 @@ ORDER BY people DESC
 LIMIT 10;
 ```
 
+**현재 MATCH 계약:** projection·
+WHERE·grouping·aggregate 평가에서 저장소·decode·VID 해석 오류를 없는 값으로 바꾸지
+않고 전파합니다. 실제로 없는 속성과 typed null은 기존 의미를 유지하고 직접 지정한 VID가
+없으면 매칭 없음입니다. Decode한 MATCH 후보·방향별/optional edge·중간 vertex의
+identity를 검사합니다. Required/OPTIONAL의 bound 시작점은 label과 literal property를
+다시 확인합니다. 무방향 self-loop는 전체 edge identity로 한 번만 세고 다른 rank·반대
+방향 edge는 구분합니다. Required/OPTIONAL의 bound 도착점을 덮어쓰지 않으며 반복
+node 변수는 같은 VID, 반복 edge 변수는 전체 edge identity를 유지합니다. node/edge binding 종류 충돌을
+만나면 명시적 오류입니다. OPTIONAL이 새로 도입한 null binding을
+뒤에서 다시 바인딩하지 않습니다. 실제 decode한 레코드의 검증이며 전체 무결성 검사는 아닙니다.
+
+`COUNT(expr)`은 null을 제외하고 `MIN/MAX`도 null을 건너뜁니다. 빈 입력의 global
+aggregate는 `LIMIT/OFFSET` 적용 전 한 행을 만듭니다. 결과 범위는 집계 후 적용하며
+집계 overflow 검사를 우회하지 않습니다. 정수만의 `SUM`은 정확한 정수를 반환하거나
+범위 초과 오류가 됩니다. 실수 `SUM/AVG`는 비유한 결과를 거부하지만 혼합 타입·비유한
+`MIN/MAX` 입력의 완전한 정렬 순서를 정의한다는 뜻은 아닙니다.
+
+Grouping은 타입을 보존하는 정규화 key를 사용합니다. Map 항목 순서는 무시하고
+vertex/edge는 graph identity를 사용하며 실수 `+0`/`-0`은 같은 group으로 묶습니다.
+정수와 실수는 다른 group입니다. 비유한 값과 Path/Set/DataSet/Geography group key는
+명시적으로 미지원입니다. `ORDER BY`는 모호하지 않은 출력 별칭 또는 projected 표현식과
+정확히 일치해야 하며 없거나 모호한 참조는 scan 전에 거부합니다. 집계 출력 행은 공통
+추정 결과 메모리 예산을 검사하지만 grouping 중간 메모리 전체를 제한하지는 않습니다.
+
+Planner는 MATCH의 미지원 산술·단항·map 생성 표현식, `COLLECT`, 중첩·잘못 배치한
+집계, 비literal node/edge pattern property를 빈 입력에서도 데이터 접근 전에 거부합니다.
+집계는 top-level RETURN 호출만 지원하므로 scalar 함수·list 안에 중첩하거나 WHERE/
+GROUP BY 표현식으로 사용할 수 없습니다. `properties()`가 반환하는 property map을
+금지하는 것은 아닙니다. 현재 실행 경로는 `isa`를 `is_a`의 별칭으로도 받습니다.
+역방향 조회 shortcut은 range 없는 outgoing pattern으로 제한하며 `EXPLAIN`도 같은
+방향/range 제한을 적용합니다. MATCH 의미 전체를 완성했다는 주장은 아니며 QRY-2는
+IN PROGRESS입니다.
+
 ontology-aware membership는 `is_a`를 사용합니다.
 
 ```sql
@@ -194,7 +253,11 @@ nebula> MATCH (n:doc) WHERE frobnicate(n.doc.body) RETURN n;
 
 ### 집계
 
-`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COLLECT`.
+지원하는 MATCH 집계는 `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`입니다.
+`COLLECT`는 미구현이며 현재 실행 경로는 데이터 접근 전에 거부합니다. 현재 동작에서
+`COUNT(*)`는 행을 세고 `COUNT(expr)`은 null 값을 제외합니다. 지원되는 단순 단일 node
+`COUNT(*)`는 검증한 후보를 streaming 집계하며 grouped/edge count는 일반 matching을
+사용합니다. 두 경로 모두 해당 scan 예산과 결과 범위 의미를 유지합니다.
 
 ### 스칼라 함수
 
@@ -264,9 +327,10 @@ indexed 속성의 동등 조건은 tag와 edge type 모두 secondary index를 �
 Standalone mode에서 지원되는 ordered range는 single-field index를 사용하며, 그 밖의
 지원되는 조건은 bounded predicate scan을 사용합니다.
 
-- **edge type**의 순서 비교 조건(`>`, `>=`, `<`, `<=`)은 경계가 bool·정수·0이 아닌
-  non-NaN float일 때 index를 사용합니다. 문자열 경계는 scan으로 fallback합니다 —
-  문자열 index 인코딩이 length-prefixed라 순서가 보장되지 않기 때문입니다.
+- **edge type** 순서 비교(`>`, `>=`, `<`, `<=`)는 property schema와 경계 타입이
+  호환될 때 index를 사용합니다. Float/Double이면 정수·실수 key 영역을 모두 포함하도록
+  predicate scan을 사용합니다. `EXPLAIN`도 같은 선택을 표시합니다. 문자열 경계는 length-prefixed index가
+  사전순을 보장하지 않으므로 scan으로 fallback합니다.
 - **tag**의 순서 비교 조건은 Boolean 또는 정수 literal이 schema type과 일치할 때
   single-field index를 사용합니다. Float/Double property는 정수와 실수가 서로 다른
   index key 영역에 놓이므로 scan으로 fallback합니다.
@@ -274,7 +338,33 @@ Standalone mode에서 지원되는 ordered range는 single-field index를 사용
 - pushdown이 표현할 수 없는 조건(`CONTAINS`, `STARTS WITH`, 필드 간 비교)은 조용히 전체를
   매칭하지 않고 **거부**됩니다.
 
-기본 fallback scan 상한은 100,000행이며 설정으로 바꿀 수 있습니다.
+기본 scan 예산은 후보 100,000개이며 `BYORIDB_MAX_SCAN_LIMIT`으로 설정합니다.
+
+**현재 소스의 계약:** 로컬 tag/edge LOOKUP은 조건 필터와
+낡은 index 항목 재검증 전에 full-prefix 또는 index partition scan별 원시 후보를 셉니다.
+`0`은 해당 예산을 끕니다. 정확히 cap이면 성공할 수 있고 cap+1번째 후보를 발견하면
+잘린 성공 대신 오류를 반환합니다. Query `LIMIT/OFFSET`은 결과 범위를 별도로 정하므로
+`LIMIT 1`도 후보 예산 초과를 숨기지 못합니다. 이는 scan별 예산이며 전체 작업량·edge
+개수·메모리의 전역 상한이 아닙니다. 관련 index partition·schema·decode 실패를 전파하고
+손상된 edge-index key를 거부합니다. LOOKUP/FIND의 공통 edge decoder는 잘못된 JSON,
+구조 멤버 타입, 명시된 key/payload identity 불일치를 거부하며 LOOKUP은 vertex도
+검사합니다. 이전 형식에서 생략한 vertex VID·edge rank·properties의 기본값은 유지합니다.
+실제 decode한 레코드가 대상이며 LIMIT이 이후 decode를 멈추거나 FIND가 무관한 edge
+type을 건너뛸 수 있습니다. 수집한 모든 후보의 검사·모든 손상 탐지·FIND의 vertex 레코드
+검증을 뜻하지 않습니다.
+
+분산 indexed LOOKUP은 전체 partition topology를 검증하고 partition마다 같은 원시
+후보 예산과 query에 묶인 keyset cursor를 적용합니다. 소유 storage service에서 payload를
+읽고 identity와 타입 있는 property를 검증하며 누락되거나 실패한 partition이 있으면
+전체 조회를 실패시킵니다. 결과 LIMIT으로 partition별 예산을 나누지 않습니다. Page는
+동시 쓰기에 대한 snapshot을 제공하지 않으며 분산 full scan과 ordered range는 계속
+미지원입니다. 이 component 보장이 standalone launcher의 복제 cluster 실행을 뜻하지는
+않습니다.
+
+Float 동등 비교는 기존 epsilon 비교를 사용하므로 정확한 float key 하나만 읽지 않고
+선택한 index 전체를 읽어 재검사합니다. 모든 후보가 scan 예산에 포함됩니다. Integer와
+float의 동등 비교는 타입을 구분하므로 수치가 같아도 정수 literal이 저장된 실수와
+일치하지는 않습니다.
 
 index 후보는 항상 저장된 vertex·edge와 대조해 재검증하므로, 낡은 index 항목이 결과가
 될 수 없습니다. 실제 access path는 `EXPLAIN` 또는 `PROFILE`로 확인하세요.
@@ -300,7 +390,27 @@ FIND ALL SHORTEST PATHS FROM 1 TO 3 OVER knows UPTO 5 STEPS;
 ```
 
 `OVER`는 하나의 edge type 또는 `*`를 받으며 comma-separated edge list는 받지 않습니다.
-path traversal과 all-shortest-path 열거에는 executor resource cap이 적용됩니다.
+`FIND WHERE`와 `FIND YIELD`는 미구현이며 vertex ID 해석 전에 해당 절을
+명시적으로 거부합니다.
+
+**현재 소스의 계약:**
+
+- `max_traversal_nodes`는 확장한 vertex를 세며 hop 제한이 있는 가중치 조회는
+  vertex/hop 상태를 셉니다. 기본 100,000이며 `0`이면 비활성화합니다. 초과하면 조회가
+  실패합니다. 대기 중인 frontier 메모리나 읽은 edge 개수의 상한은 아닙니다.
+- `FIND ALL SHORTEST PATHS`의 `max_find_paths`는 기본 1,024이며 `0`이면 비활성화합니다.
+  정확히 그 개수의 완성 경로는 성공할 수 있고 경로 하나를 더 찾으면 출력을 자르지 않고
+  실패합니다.
+- 명시한 `UPTO n STEPS`는 가중치·비가중치 경로 모두의 hop을 제한합니다. 생략하면
+  비가중치는 기본 10단계, 가중치는 hop 제한이 없으며 실행 작업 예산은 계속 적용됩니다.
+  `u32::MAX`를 넘는 `UPTO`는 wrap하지 않고 파싱 단계에서 거부합니다.
+- `WEIGHT BY` 속성이 없거나 숫자가 아니면 기존 단위 가중치 기본값 `1`을 유지합니다.
+  숫자 가중치는 음수가 아닌 유한 값이어야 합니다. 도달 가능한 가중치의 보수적 검증은
+  반환 경로 외의 작업을 추가할 수 있으며 음수·비유한 숫자나 관련 edge 데이터 손상은
+  오류가 됩니다. 저비용 목표 경로를 일찍 찾았다고 검증·실행이 끝난 것은 아닙니다.
+
+현재 checkout의 계약이며 이전 릴리스의 동작은 바뀌지 않습니다. 상한과 남은 실행 제약은
+[Runtime guard](../../reference/performance.md#runtime-guard)를 참고하세요.
 
 ## RECOMMEND
 

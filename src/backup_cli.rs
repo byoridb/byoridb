@@ -49,7 +49,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Create a new backup
+    /// Create a new backup of a stopped database
     Create {
         /// Path to the database directory
         #[arg(short, long)]
@@ -63,7 +63,7 @@ enum Commands {
         #[arg(short, long)]
         label: Option<String>,
 
-        /// Skip WAL flush before backup (faster but may miss recent writes)
+        /// Compatibility flag; redb commits are already durable (no extra flush)
         #[arg(long, default_value = "false")]
         no_flush: bool,
     },
@@ -104,7 +104,7 @@ enum Commands {
         #[arg(short, long)]
         target: PathBuf,
 
-        /// Overwrite target if it exists
+        /// Replace an existing stopped target after staging and validation
         #[arg(long, default_value = "false")]
         overwrite: bool,
     },
@@ -296,6 +296,15 @@ fn cmd_info(backup_dir: PathBuf, backup_id: String) -> Result<()> {
     println!("Created:     {}", format_timestamp(backup.created_at));
     println!("Size:        {}", format_bytes(backup.size_bytes));
     println!("Source:      {}", backup.source_path);
+    if let Some(version) = backup.format_version {
+        println!("Format:      {}", version);
+        println!(
+            "SHA-256:     {}",
+            backup.sha256.as_deref().unwrap_or("missing")
+        );
+    } else {
+        println!("Format:      legacy (no SHA-256 manifest)");
+    }
     if let Some(label) = &backup.label {
         println!("Label:       {}", label);
     }
@@ -438,10 +447,14 @@ fn cmd_verify(backup_dir: PathBuf, backup_id: Option<String>) -> Result<()> {
     for backup in backups {
         print!("Verifying {}... ", backup.id);
 
-        // Try to get the backup info (which includes validation)
-        match manager.get_backup(&backup.id) {
-            Ok(_) => {
-                println!("OK");
+        // Validate database bytes, not just the JSON manifest.
+        match manager.verify_backup(&backup.id) {
+            Ok(info) => {
+                if info.format_version.is_none() {
+                    println!("OK (legacy: size and redb integrity verified; no SHA-256 manifest)");
+                } else {
+                    println!("OK (SHA-256 and redb integrity verified)");
+                }
                 success_count += 1;
             }
             Err(e) => {
@@ -461,4 +474,18 @@ fn cmd_verify(backup_dir: PathBuf, backup_id: Option<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+    #[test]
+    fn metadata_only_archive_fails_verify() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("backup_123");
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::write(archive.join("backup_metadata.json"),
+            r#"{"id":"backup_123","created_at":123,"size_bytes":10,"label":null,"source_path":"source"}"#).unwrap();
+        assert!(cmd_verify(temp.path().to_path_buf(), Some("backup_123".into())).is_err());
+    }
 }

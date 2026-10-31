@@ -118,6 +118,10 @@ pub enum Token {
     Shape,
     #[token("REQUIRED", ignore(case))]
     Required,
+    #[token("INFERENCE", ignore(case))]
+    Inference,
+    #[token("REPAIR", ignore(case))]
+    Repair,
     #[token("WHY", ignore(case))]
     Why,
     #[token("MATCH", ignore(case))]

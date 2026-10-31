@@ -59,7 +59,7 @@ directly distinguish an unknown, disabled, locked, or wrong-password account.
 ### Authorization
 
 ByoriDB enforces statement-level role checks. User and role administration,
-`SHOW USERS`, `SHOW ROLES`, `SHOW SESSIONS`, and `BALANCE` require `GOD` or
+`SHOW USERS`, `SHOW ROLES`, `SHOW SESSIONS`, `REPAIR INFERENCE`, and `BALANCE` require `GOD` or
 `ADMIN`. Compound statements and the inner statement executed by `PROFILE` are
 checked recursively.
 
@@ -95,6 +95,9 @@ availability or operational metadata is sensitive.
 
 - **No native transport encryption:** HTTP and gRPC are plaintext. Terminate
   TLS at a trusted ingress, proxy, or service mesh and protect the backend hop.
+  The [standalone TLS profile](book/src/operations/secure-deployment.md) supplies
+  a tested private backend, encrypted HTTP/gRPC endpoints, restricted operations
+  routes and certificate rotation. The legacy AKS manifests alone do not.
 - **In-process login throttling only:** failed logins are throttled per account
   (20 per 60 s), per source IP (60 per 60 s), and by a 300 s lockout after five
   consecutive failures. Successful logins do not consume failure budgets. The

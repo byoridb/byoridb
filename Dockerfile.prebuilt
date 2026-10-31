@@ -1,24 +1,20 @@
-FROM ubuntu:24.04
-
-RUN apt-get update && apt-get install -y \
-    libssl3 \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
+# Prebuilt Linux binaries must target the same architecture and glibc <= Ubuntu 24.04.
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
+RUN apt-get update && apt-get install -y --no-install-recommends libssl3t64 ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 byoridb \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin byoridb \
+    && mkdir -p /app/data && chown 10001:10001 /app/data && chmod 700 /app/data
 WORKDIR /app
-
 ARG BINARY_PATH=target/release/byoridb-server
-COPY ${BINARY_PATH} /usr/local/bin/byoridb-server
-# Offline bulk loader — invoked by a Job (server scaled to 0) for large imports.
-# Built alongside the server in the deploy workflow; see deploy/azure/jobs/.
+ARG BACKUP_PATH=target/release/byoridb-backup
 ARG BULKLOADER_PATH=target/release/byoridb-bulkloader
-COPY ${BULKLOADER_PATH} /usr/local/bin/byoridb-bulkloader
-# Online admin/query CLI — used by maintenance Jobs such as text index rebuilds.
 ARG CLI_PATH=target/release/byoridb-cli
+COPY ${BINARY_PATH} /usr/local/bin/byoridb-server
+COPY ${BACKUP_PATH} /usr/local/bin/byoridb-backup
+COPY ${BULKLOADER_PATH} /usr/local/bin/byoridb-bulkloader
 COPY ${CLI_PATH} /usr/local/bin/byoridb-cli
-
-RUN mkdir -p /app/data
-
+USER 10001:10001
 EXPOSE 9669 19669
-
+STOPSIGNAL SIGTERM
 CMD ["byoridb-server"]

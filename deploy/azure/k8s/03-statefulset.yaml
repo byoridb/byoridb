@@ -20,6 +20,12 @@ spec:
         app.kubernetes.io/component: server
     spec:
       enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
       # Graceful shutdown must finish the redb checkpoint, or the next open runs
       # a multi-hour full repair on a large store (2026-06-29 incident: 100GB
       # redb). The shutdown sequence (drain ~25s + service stop ~30s + redb

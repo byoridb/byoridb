@@ -9,7 +9,7 @@ use crate::error::{ExecutionError, Result};
 use byoridb_codec::{EdgeData, VertexCodec};
 use futures::StreamExt;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct GraphNeighbor {
@@ -24,7 +24,9 @@ pub type NeighborVisitor = Box<dyn FnMut(GraphNeighbor) -> bool + Send>;
 /// scanned/decoded volume without re-running the traversal.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TraversalMetrics {
-    /// Vertices pulled from the queue (BFS) or heap (Dijkstra).
+    /// Expanded vertices (BFS/unbounded Dijkstra), or expanded (vertex, hops)
+    /// states for hop-constrained Dijkstra. Stale and hop-boundary entries and
+    /// terminal targets do not consume the expansion budget.
     pub visited_vertices: u64,
     /// Edge entries returned by `scan_with_filter` (post edge-type filter,
     /// pre decode). Counted via `visit_neighbors_limited`.
@@ -34,7 +36,8 @@ pub struct TraversalMetrics {
     pub decoded_edges: u64,
     /// Maximum size the BFS queue / Dijkstra heap reached during the run.
     pub max_frontier_size: u64,
-    /// True iff the traversal stopped because it hit `max_traversal_nodes`.
+    /// Legacy truncation signal retained for callers; FIND algorithms now
+    /// return ResourceExhausted on cap exhaustion instead of a partial result.
     pub cap_reached: bool,
 }
 
@@ -214,18 +217,57 @@ pub(crate) fn edge_type_from_key(key: &[u8]) -> Option<&str> {
     key_str.split(':').nth(3)
 }
 
+/// Strict decoder shared by FIND and LOOKUP. The legacy JSON codec defaults missing
+/// identities to zero, which can fabricate paths; validate those fields here
+/// and require both JSON and protobuf payload identities to agree with the key.
+pub(crate) fn decode_query_edge(key: &[u8], value: &[u8]) -> Result<EdgeData> {
+    let invalid = || ExecutionError::InvalidOperation("Invalid edge metadata".to_string());
+    if !VertexCodec::is_proto_format(value) {
+        let json: serde_json::Value = serde_json::from_slice(value).map_err(|_| invalid())?;
+        if json
+            .get("src")
+            .and_then(serde_json::Value::as_i64)
+            .is_none()
+            || json
+                .get("dst")
+                .and_then(serde_json::Value::as_i64)
+                .is_none()
+            || json
+                .get("ranking")
+                .or_else(|| json.get("rank"))
+                .is_some_and(|v| v.as_i64().is_none())
+            || json
+                .get("props")
+                .or_else(|| json.get("properties"))
+                .is_some_and(|v| !v.is_object())
+        {
+            return Err(invalid());
+        }
+    }
+    let edge = VertexCodec::decode_edge(value).map_err(|_| invalid())?;
+    let key = std::str::from_utf8(key).map_err(|_| invalid())?;
+    let parts: Vec<_> = key.split(':').collect();
+    if parts.len() != 6 || edge.edge_type != parts[3] || edge.edge_type.is_empty() {
+        return Err(invalid());
+    }
+    let first = parts[2].parse::<i64>().map_err(|_| invalid())?;
+    let second = parts[4].parse::<i64>().map_err(|_| invalid())?;
+    let rank = parts[5].parse::<i64>().map_err(|_| invalid())?;
+    let matches = match parts[1] {
+        "edge" => first == edge.src_vid && second == edge.dst_vid,
+        "in-edge" => first == edge.dst_vid && second == edge.src_vid,
+        _ => false,
+    };
+    if !matches || rank != edge.ranking {
+        return Err(invalid());
+    }
+    Ok(edge)
+}
+
 /// Breadth-First Search for unweighted shortest path.
 ///
-/// Uses the streaming `KVStore::scan_stream` API plus
-/// [`VertexCodec::decode_edge_dst`] so each neighbor is decoded in-place
-/// from the stream without materializing a `Vec<GraphNeighbor>`. This is
-/// the hot path for high-degree (celebrity-style) vertices — the previous
-/// implementation allocated one full `EdgeData` per spoke even though BFS
-/// only needs `dst_vid`.
-///
-/// Returns the shortest path along with [`TraversalMetrics`].
-/// `metrics.cap_reached` is set when the traversal stopped because of
-/// `ctx.config.max_traversal_nodes`.
+/// Shares FIND's streaming edge validation and expanded-vertex budget.
+/// An incomplete search is an error rather than a successful missing path.
 pub async fn bfs_shortest_path(
     ctx: &ExecutionContext,
     start: i64,
@@ -233,72 +275,7 @@ pub async fn bfs_shortest_path(
     edge_types: &[String],
     max_steps: usize,
 ) -> Result<(Option<Vec<i64>>, TraversalMetrics)> {
-    let mut metrics = TraversalMetrics::default();
-
-    if start == target {
-        metrics.visited_vertices = 1;
-        return Ok((Some(vec![start]), metrics));
-    }
-
-    let mut visited = HashSet::new();
-    let mut queue = VecDeque::new();
-    let mut parent = HashMap::new();
-
-    queue.push_back((start, 0));
-    visited.insert(start);
-    metrics.record_frontier(queue.len());
-
-    let max_nodes = ctx.config.max_traversal_nodes;
-    let space = ctx.space.as_ref().unwrap_or(&"default".to_string()).clone();
-    let edge_type_set: HashSet<&str> = edge_types.iter().map(|s| s.as_str()).collect();
-
-    while let Some((current, step)) = queue.pop_front() {
-        metrics.visited_vertices += 1;
-        if max_nodes > 0 && metrics.visited_vertices > max_nodes as u64 {
-            metrics.cap_reached = true;
-            break;
-        }
-
-        if step >= max_steps {
-            continue;
-        }
-
-        let edge_prefix = format!("{}:edge:{}:", space, current);
-        let mut stream = ctx.kvstore.scan_stream(edge_prefix.as_bytes()).await?;
-        while let Some(item) = stream.next().await {
-            let (key, value) = item?;
-            if !edge_type_set.is_empty() {
-                let edge_type = match edge_type_from_key(&key) {
-                    Some(t) => t,
-                    None => continue,
-                };
-                if !edge_type_set.contains(edge_type) {
-                    continue;
-                }
-            }
-            metrics.scanned_edges += 1;
-            let dst = match VertexCodec::decode_edge_dst(&value) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            metrics.decoded_edges += 1;
-            if !visited.contains(&dst) {
-                visited.insert(dst);
-                parent.insert(dst, current);
-                if dst == target {
-                    // Drop the stream early — the backing iterator task
-                    // sees the channel close and exits without scanning
-                    // the rest of this vertex's neighbors.
-                    drop(stream);
-                    return Ok((Some(reconstruct_path(parent, start, target)), metrics));
-                }
-                queue.push_back((dst, step + 1));
-                metrics.record_frontier(queue.len());
-            }
-        }
-    }
-
-    Ok((None, metrics))
+    crate::algo_paths::shortest_path(ctx, start, target, edge_types, max_steps, false).await
 }
 
 /// Dijkstra's Algorithm for weighted shortest path.
@@ -315,33 +292,63 @@ pub async fn dijkstra_shortest_path(
     edge_types: &[String],
     weight_prop: &str,
 ) -> Result<(Option<(Vec<i64>, f64)>, TraversalMetrics)> {
+    dijkstra_shortest_path_with_steps(ctx, start, target, edge_types, weight_prop, None).await
+}
+
+/// Hop-constrained Dijkstra uses (vertex, hops) states: a cheaper prefix that
+/// spent more hops must not discard a shorter feasible prefix. Without a hop
+/// bound, one distance per vertex preserves the established unbounded search.
+///
+/// All reachable expandable states (excluding the terminal target and the hop
+/// boundary) are scanned before returning the optimum. This is deliberately
+/// more conservative than stopping at the first target: a later relevant edge
+/// may invalidate Dijkstra's nonnegative/finite-weight precondition. Invalid
+/// weights, corrupt edges and safety-cap exhaustion fail the whole request.
+pub async fn dijkstra_shortest_path_with_steps(
+    ctx: &ExecutionContext,
+    start: i64,
+    target: i64,
+    edge_types: &[String],
+    weight_prop: &str,
+    max_steps: Option<usize>,
+) -> Result<(Option<(Vec<i64>, f64)>, TraversalMetrics)> {
     let mut metrics = TraversalMetrics::default();
+    if start == target {
+        return Ok((Some((vec![start], 0.0)), metrics));
+    }
     let mut dist = HashMap::new();
     let mut parent = HashMap::new();
     let mut heap = BinaryHeap::new();
-
-    dist.insert(start, 0.0_f64);
-    heap.push(Reverse(DisplayableOrderedFloat(0.0, start)));
+    let initial = (start, 0usize);
+    let mut best_target = None;
+    dist.insert(initial, 0.0_f64);
+    heap.push(Reverse(DisplayableOrderedFloat(0.0, start, 0)));
     metrics.record_frontier(heap.len());
 
     let space = ctx.space.as_ref().unwrap_or(&"default".to_string()).clone();
     let max_nodes = ctx.config.max_traversal_nodes;
     let edge_type_set: HashSet<&str> = edge_types.iter().map(|s| s.as_str()).collect();
 
-    while let Some(Reverse(DisplayableOrderedFloat(d, u))) = heap.pop() {
-        metrics.visited_vertices += 1;
-        if max_nodes > 0 && metrics.visited_vertices > max_nodes as u64 {
-            metrics.cap_reached = true;
-            break;
-        }
-
-        if u == target {
-            return Ok((Some((reconstruct_path(parent, start, target), d)), metrics));
-        }
-
-        if d > *dist.get(&u).unwrap_or(&f64::INFINITY) {
+    while let Some(Reverse(DisplayableOrderedFloat(d, u, hops))) = heap.pop() {
+        let state = (u, hops);
+        if d > *dist.get(&state).unwrap_or(&f64::INFINITY) {
             continue;
         }
+        if u == target {
+            if best_target.is_none_or(|(_, cost)| d < cost) {
+                best_target = Some((state, d));
+            }
+            continue;
+        }
+        if max_steps.is_some_and(|limit| hops >= limit) {
+            continue;
+        }
+        if max_nodes > 0 && metrics.visited_vertices >= max_nodes as u64 {
+            return Err(ExecutionError::ResourceExhausted(
+                "FIND weighted traversal exceeded max_traversal_nodes".to_string(),
+            ));
+        }
+        metrics.visited_vertices += 1;
 
         let edge_prefix = format!("{}:edge:{}:", space, u);
         let mut stream = ctx.kvstore.scan_stream(edge_prefix.as_bytes()).await?;
@@ -357,10 +364,7 @@ pub async fn dijkstra_shortest_path(
                 }
             }
             metrics.scanned_edges += 1;
-            let edge = match VertexCodec::decode_edge(&value) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+            let edge = decode_query_edge(&key, &value)?;
             metrics.decoded_edges += 1;
 
             let weight = edge
@@ -373,52 +377,60 @@ pub async fn dijkstra_shortest_path(
                 })
                 .unwrap_or(1.0);
 
-            if weight < 0.0 {
+            if !weight.is_finite() || weight < 0.0 {
                 return Err(ExecutionError::InvalidOperation(
-                    "Dijkstra shortest path does not support negative edge weights".to_string(),
+                    "Dijkstra shortest path requires finite nonnegative edge weights".to_string(),
                 ));
             }
 
             let dst = edge.dst_vid;
             let next_dist = d + weight;
-            if next_dist < *dist.get(&dst).unwrap_or(&f64::INFINITY) {
-                dist.insert(dst, next_dist);
-                parent.insert(dst, u);
-                heap.push(Reverse(DisplayableOrderedFloat(next_dist, dst)));
+            if !next_dist.is_finite() {
+                return Err(ExecutionError::InvalidOperation(
+                    "Dijkstra shortest path cost overflow".to_string(),
+                ));
+            }
+            let next_hops = if max_steps.is_some() { hops + 1 } else { 0 };
+            let next = (dst, next_hops);
+            if next_dist < *dist.get(&next).unwrap_or(&f64::INFINITY) {
+                dist.insert(next, next_dist);
+                parent.insert(next, state);
+                heap.push(Reverse(DisplayableOrderedFloat(next_dist, dst, next_hops)));
                 metrics.record_frontier(heap.len());
             }
         }
     }
 
-    Ok((None, metrics))
-}
-
-fn reconstruct_path(parent: HashMap<i64, i64>, start: i64, target: i64) -> Vec<i64> {
-    let mut path = vec![target];
-    let mut curr = target;
-    while curr != start {
-        if let Some(&p) = parent.get(&curr) {
-            curr = p;
-            path.push(curr);
-        } else {
-            break; // Should not happen if path exists
+    let result = if let Some((mut state, cost)) = best_target {
+        let mut path = vec![state.0];
+        while state != initial {
+            state = *parent.get(&state).ok_or_else(|| {
+                ExecutionError::InvalidOperation(
+                    "Invalid shortest-path predecessor state".to_string(),
+                )
+            })?;
+            path.push(state.0);
         }
-    }
-    path.reverse();
-    path
+        path.reverse();
+        Some((path, cost))
+    } else {
+        None
+    };
+    Ok((result, metrics))
 }
 
 // Wrapper for f64 to implement Ord
 #[derive(PartialEq, Debug)]
-struct DisplayableOrderedFloat(f64, i64);
+struct DisplayableOrderedFloat(f64, i64, usize);
 
 impl Eq for DisplayableOrderedFloat {}
 
 impl Ord for DisplayableOrderedFloat {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0
-            .partial_cmp(&other.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&other.0)
+            .then_with(|| self.1.cmp(&other.1))
+            .then_with(|| self.2.cmp(&other.2))
     }
 }
 
@@ -522,12 +534,10 @@ mod tests {
         insert_edge(&ctx, 1, 2, "follow", 0).await;
         insert_edge(&ctx, 2, 3, "follow", 0).await;
 
-        let (path, metrics) = bfs_shortest_path(&ctx, 1, 3, &["follow".to_string()], 10)
-            .await
-            .unwrap();
-
-        assert_eq!(path, None);
-        assert!(metrics.cap_reached);
+        assert!(matches!(
+            bfs_shortest_path(&ctx, 1, 3, &["follow".to_string()], 10).await,
+            Err(ExecutionError::ResourceExhausted(_))
+        ));
     }
 
     #[tokio::test]

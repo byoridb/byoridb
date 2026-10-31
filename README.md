@@ -45,8 +45,9 @@ query/discovery behavior from planned structured operations and reliable retries
 - **Ontology inference:** write-time materialization for class hierarchies and
   selected RDFS-Plus/OWL 2 RL-style rules, including transitive, symmetric,
   inverse, subproperty, equivalent-property, and two-link property-chain rules.
-- **Provenance:** `WHY` explains the rule and premises behind an inferred edge;
-  provenance supports incremental retraction when asserted edges are deleted.
+- **Provenance and recovery:** `WHY` explains an inferred edge’s rule and premises.
+  Semantic changes rebuild current closure. `CHECK INFERENCE` reports incomplete
+  state; an administrator can run `REPAIR INFERENCE` before reads resume.
 - **Identity merging:** explicit `sameAs` edges perform an irreversible
   canonical merge. This is intentionally narrower than complete OWL semantics.
 - **Temporal history:** asserted vertex and edge writes update the current view
@@ -92,9 +93,9 @@ The codebase is organized around three service components:
   the partitioning and custom Raft implementation.
 
 The supported standalone launcher starts embedded storage and the Graph HTTP
-and gRPC listeners in one process. It starts the Meta gRPC server only when
-`cluster.peers` is configured; doing so does not make the incomplete
-multi-node path production-ready. User records are durable, but live sessions
+and gRPC listeners in one process. It rejects non-default cluster settings;
+the partial Meta/Raft components do not constitute a supported multi-node
+deployment. User records are durable, but live sessions
 are not shared across processes. Restarting a server invalidates its sessions,
 and current multi-instance deployments do not coordinate session revocation.
 
@@ -102,17 +103,20 @@ and current multi-instance deployments do not coordinate session revocation.
 
 ### Release archives
 
-The documented release baseline is
-[v0.4.20](https://github.com/byoridb/byoridb/releases/tag/v0.4.20), published on
-2026-08-30 (KST), with archives for Linux x86_64/arm64 and macOS x86_64/arm64.
-The macOS binaries are signed and notarized. Find newer artifacts on the
-[latest release page](https://github.com/byoridb/byoridb/releases/latest), and
+The [latest release page](https://github.com/byoridb/byoridb/releases/latest)
+provides archives for Linux x86_64/arm64 and macOS x86_64/arm64.
+The macOS binaries are signed and notarized. Each archive contains the server,
+query CLI, offline backup tool, license and notices. The current release workflow requires runtime checks of
+the extracted binaries, including authentication, durable restart and restore.
+Older archives do not gain these checks retroactively.
+Use the release's successful workflow as deployment evidence, and
 identify deployed artifacts by tag or commit SHA. Changes on `main` after a tag
 are not included in that release.
 
 Windows is not currently supported. See
 [Installation](book/src/getting-started/installation.md) for platform support,
-signature verification, and legacy archive limitations.
+signature verification, and legacy archive limitations. For network deployment,
+use the [private TLS profile](book/src/operations/secure-deployment.md).
 
 ### Prerequisites
 
@@ -198,6 +202,7 @@ checklist, and private vulnerability-reporting instructions.
 - [Quick start](QUICKSTART.md)
 - [User and operations guide](book/src/SUMMARY.md)
 - [Implementation status, constraints, and roadmap](docs/PLAN.md)
+- [Standalone release acceptance and recovery boundaries](docs/DEPLOYMENT_READINESS.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Open-source notices](NOTICES.md)

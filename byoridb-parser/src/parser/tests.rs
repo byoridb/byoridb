@@ -905,6 +905,25 @@ fn test_parse_find_upto_rejects_non_positive_steps() {
 }
 
 #[test]
+fn test_parse_find_upto_preserves_u32_boundary_without_wrapping() {
+    let statement =
+        parse("FIND SHORTEST PATH FROM 1 TO 2 OVER knows UPTO 4294967295 STEPS").unwrap();
+    let Statement::Find(statement) = statement else {
+        panic!("expected FIND statement");
+    };
+    assert_eq!(statement.upto_steps, Some(u32::MAX));
+    for steps in ["4294967296", "4294967297", "9223372036854775807"] {
+        assert!(
+            parse(&format!(
+                "FIND SHORTEST PATH FROM 1 TO 2 OVER knows UPTO {steps} STEPS"
+            ))
+            .is_err(),
+            "out-of-range UPTO {steps} must not wrap"
+        );
+    }
+}
+
+#[test]
 fn test_parse_find_path_with_where_clause() {
     let result = parse("FIND PATH FROM 1 TO 2 OVER knows WHERE knows.since > 2020");
     assert!(result.is_ok(), "parse failed: {:?}", result);

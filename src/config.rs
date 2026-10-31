@@ -12,11 +12,8 @@ pub struct AppConfig {
     pub auth: AuthConfig,
 }
 
-/// Cluster / distributed mode configuration.
-///
-/// When `peers` is empty (default) the server runs in single-node standalone
-/// mode. Set `BYORIDB__CLUSTER__PEERS=host1:9559,host2:9559` to enable the
-/// distributed launcher (G-2).
+/// Reserved cluster configuration. The standalone launcher rejects non-default
+/// values until the graph and storage services are wired to a replicated cluster.
 #[derive(Debug, Deserialize)]
 pub struct ClusterConfig {
     /// Numeric node identity in the Raft group (default: 1).
@@ -31,7 +28,6 @@ pub struct ClusterConfig {
     pub advertise_addr: String,
     /// If true, this node bootstraps a new cluster on first start.
     /// Env: `BYORIDB__CLUSTER__BOOTSTRAP`
-    #[allow(dead_code)]
     pub bootstrap: bool,
     /// Meta gRPC listen address.
     /// Env: `BYORIDB__CLUSTER__META_ADDR`
@@ -47,6 +43,17 @@ impl Default for ClusterConfig {
             bootstrap: false,
             meta_addr: "0.0.0.0:9559".to_string(),
         }
+    }
+}
+
+impl ClusterConfig {
+    pub fn is_standalone(&self) -> bool {
+        let defaults = Self::default();
+        self.peers.is_empty()
+            && !self.bootstrap
+            && self.node_id == defaults.node_id
+            && self.advertise_addr == defaults.advertise_addr
+            && self.meta_addr == defaults.meta_addr
     }
 }
 

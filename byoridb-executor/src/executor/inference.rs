@@ -22,28 +22,19 @@
 //! (e.g. `subPropertyOf` into a `transitive` superproperty, or `inverseOf`
 //! composed with `symmetric`) are fully closed.
 //!
-//! **Inserts: incremental.** Declare semantics *before* inserting edges
-//! (`CREATE EDGE ... TRANSITIVE` then `INSERT EDGE`); each insert extends the
-//! closure over the current graph. A write cap (`max_traversal_nodes`) guards
-//! pathological closures and logs if hit.
-//!
-//! **Deletes — two strategies.**
-//! - DELETE EDGE uses **incremental DRed** (O-10 Phase 3,
-//!   [`Executor::retract_edges_incremental`]): overdelete the deleted edges'
-//!   dependent closure via reverse provenance, then rederive from surviving
-//!   neighbors. Touches only the affected region.
-//! - DELETE VERTEX still uses **full re-materialization** (O-9,
-//!   [`Executor::rematerialize_space`]): drops all inferred facts + provenance
-//!   and re-derives from the surviving asserted edges. O(graph) per delete; an
-//!   incremental DELETE VERTEX path is a follow-up.
-//!
-//! Both retract stale entailments while keeping facts still supported by another
-//! derivation.
+//! Semantic mutations and `REPAIR INFERENCE` rebuild the complete closure
+//! from current assertions under a per-space write lock. The durable dirty
+//! marker is committed with asserted graph/history changes and cleared only
+//! after successful derivation. Errors and cancellation leave reads fenced.
+//! `max_traversal_nodes` bounds newly derived edges/types: zero is unbounded,
+//! exactly the cap succeeds, and discovering another fact returns an error.
+//! Assertions/history may already be committed when that error is returned.
+//! Full rebuild is O(graph) and replaces incremental DRed for this release.
 
 use super::provenance::{Fact, Justification, RuleKind};
 use super::Executor;
 use crate::algo;
-use crate::error::Result;
+use crate::error::{ExecutionError, Result};
 use crate::key::SchemaKey;
 use byoridb_codec::{EdgeData as CodecEdgeData, VertexCodec};
 use byoridb_common::Value;
@@ -85,7 +76,7 @@ pub(super) struct RelMeta {
 }
 
 impl RelMeta {
-    fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.transitive.is_empty()
             && self.symmetric.is_empty()
             && self.inverse.is_empty()
@@ -99,102 +90,107 @@ impl RelMeta {
 }
 
 impl Executor {
-    /// Materialize the closure entailed by newly inserted `triples`. No-op when
-    /// the space declares no semantic relations. Called by INSERT EDGE after the
-    /// asserted edges are committed.
-    pub(super) async fn materialize_inserted_edges(
-        &self,
-        space: &str,
-        triples: Vec<Triple>,
-    ) -> Result<()> {
-        let meta = self.load_rel_meta(space).await?;
-        if meta.is_empty() {
-            return Ok(());
-        }
-        self.run_materialization(space, triples, &meta).await
-    }
-
-    /// Full re-materialization of a space's ontology closure (PLAN.md O-9, the
-    /// O-0 phase-1 retraction strategy). No-op when the space declares no
-    /// semantic relations. Called by DELETE EDGE/VERTEX after the assertion is
-    /// removed: it discards **all** materialized facts (`__inferred__` edges and
-    /// every `vtype`) and re-derives them from the surviving asserted edges, so a
-    /// deleted fact's stale entailments disappear while entailments still
-    /// supported by other paths are re-derived. Idempotent and complete (no
-    /// DRed-style overdeletion).
-    ///
-    /// Cost is O(graph) per call (full `{space}:edge:`/`{space}:vtype:` scans);
-    /// the empty-meta guard keeps semantic-free spaces at zero cost. Incremental
-    /// (B/F) retraction is a later optimization (O-0 phase 2).
+    /// Remove derived state and rebuild from surviving assertions. Even empty
+    /// semantic metadata must clean old derived facts after schema removal.
+    /// The caller holds the space write lock and maintains the dirty marker.
     pub(super) async fn rematerialize_space(&self, space: &str) -> Result<()> {
         let meta = self.load_rel_meta(space).await?;
-        if meta.is_empty() {
-            return Ok(());
-        }
-
-        // Partition the edge keyspace into asserted (kept as re-derivation seeds)
-        // and inferred (deleted, both directions).
-        let edge_prefix = format!("{}:edge:", space);
-        let entries = self.ctx.kvstore.scan_prefix(edge_prefix.as_bytes()).await?;
-        let mut asserted: Vec<Triple> = Vec::new();
-        for (key, value) in entries {
-            let Ok(edge) = VertexCodec::decode_edge(&value) else {
-                continue; // tolerate a non-edge / legacy blob under the prefix
-            };
-            if edge.properties.contains_key(INFERRED_MARKER) {
-                self.ctx.kvstore.delete(&key).await?;
-                let in_key = SchemaKey::in_edge_data(
-                    space,
-                    edge.dst_vid,
-                    &edge.edge_type,
-                    edge.src_vid,
-                    edge.ranking,
-                );
-                self.ctx.kvstore.delete(&in_key).await?;
-            } else {
-                asserted.push((edge.src_vid, edge.edge_type.clone(), edge.dst_vid));
-            }
-        }
-
-        // Drop all inferred vertex types (domain/range only produces these), to
-        // be re-derived by the run below.
-        let vtype_prefix = format!("{}:vtype:", space);
-        for (key, _) in self
+        let entries = self
             .ctx
             .kvstore
-            .scan_prefix(vtype_prefix.as_bytes())
+            .scan_prefix(format!("{space}:edge:").as_bytes())
+            .await?;
+        let mut asserted = Vec::new();
+        let mut deletes = Vec::new();
+        let mut puts = Vec::new();
+        for (key, value) in entries {
+            let edge = algo::decode_query_edge(&key, &value)?;
+            if edge.properties.contains_key(INFERRED_MARKER) {
+                deletes.push(key);
+            } else {
+                asserted.push((edge.src_vid, edge.edge_type.clone(), edge.dst_vid));
+                puts.push((
+                    SchemaKey::in_edge_data(
+                        space,
+                        edge.dst_vid,
+                        &edge.edge_type,
+                        edge.src_vid,
+                        edge.ranking,
+                    ),
+                    value,
+                ));
+            }
+        }
+        // Rebuild the reverse view exclusively from asserted forward records.
+        // This also removes orphaned derived reverse entries after older failures.
+        for (key, value) in self
+            .ctx
+            .kvstore
+            .scan_prefix(format!("{space}:in-edge:").as_bytes())
             .await?
         {
-            self.ctx.kvstore.delete(&key).await?;
+            algo::decode_query_edge(&key, &value)?;
+            deletes.push(key);
         }
-
-        // Drop all provenance: it is rebuilt by the run below from the surviving
-        // asserted edges, so a deleted fact's stale justifications disappear.
-        self.clear_provenance(space).await?;
+        for prefix in [
+            format!("{space}:vtype:").into_bytes(),
+            SchemaKey::prov_prefix(space),
+            SchemaKey::prov_rev_prefix(space),
+        ] {
+            deletes.extend(
+                self.ctx
+                    .kvstore
+                    .scan_prefix(&prefix)
+                    .await?
+                    .into_iter()
+                    .map(|(key, _)| key),
+            );
+        }
+        // batch_apply applies puts before deletes; retain asserted reverse keys.
+        let keep: HashSet<_> = puts.iter().map(|(k, _)| k.clone()).collect();
+        deletes.retain(|key| !keep.contains(key));
+        self.ctx
+            .kvstore
+            .batch_apply(puts, deletes, Vec::new())
+            .await?;
 
         // Re-derive the full closure from the surviving asserted edges.
         self.run_materialization(space, asserted, &meta).await
     }
 
     /// Load every edge schema's `semantics` and build the [`RelMeta`] index.
-    async fn load_rel_meta(&self, space: &str) -> Result<RelMeta> {
+    pub(super) async fn load_rel_meta(&self, space: &str) -> Result<RelMeta> {
         let prefix = format!("space:{}:edge:", space);
         let entries = self.ctx.kvstore.scan_prefix(prefix.as_bytes()).await?;
         let mut meta = RelMeta::default();
-        for (_key, value) in entries {
-            let json: serde_json::Value = match serde_json::from_slice(&value) {
-                Ok(j) => j,
-                Err(_) => continue, // tolerate a non-schema / legacy blob
+        for (key, value) in entries {
+            let json: serde_json::Value = serde_json::from_slice(&value)?;
+            let name = json
+                .get("name")
+                .and_then(|n| n.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    ExecutionError::InvalidOperation("Invalid inference edge schema name".into())
+                })?
+                .to_owned();
+            if key != SchemaKey::edge(space, &name) {
+                return Err(ExecutionError::InvalidOperation(
+                    "Inference schema key/name mismatch".into(),
+                ));
+            }
+            let sem: SemanticFlags = match json.get("semantics") {
+                Some(value) => serde_json::from_value(value.clone())?,
+                None => SemanticFlags::default(),
             };
-            let Some(name) = json.get("name").and_then(|n| n.as_str()) else {
-                continue;
-            };
-            let name = name.to_string();
-            let sem: SemanticFlags = json
-                .get("semantics")
-                .cloned()
-                .and_then(|s| serde_json::from_value(s).ok())
-                .unwrap_or_default();
+            if sem
+                .property_chain
+                .as_ref()
+                .is_some_and(|chain| chain.len() != 2)
+            {
+                return Err(ExecutionError::InvalidOperation(
+                    "Invalid inference property chain".into(),
+                ));
+            }
             if sem.transitive {
                 meta.transitive.insert(name.clone());
             }
@@ -229,9 +225,8 @@ impl Executor {
             if let Some(c) = sem.range {
                 meta.range.insert(name.clone(), c);
             }
-            // CHAIN [p1, p2]: index by both links so the chain closes whichever
-            // edge is inserted last. Ignore malformed chains (len != 2) — the
-            // DDL validator already rejects them; this is defensive.
+            // CHAIN [p1, p2]: index both links. The schema decoder above
+            // rejects malformed chains before any graph changes.
             if let Some(chain) = sem.property_chain {
                 if let [p1, p2] = chain.as_slice() {
                     meta.chain_first
@@ -320,7 +315,7 @@ impl Executor {
             if meta.transitive.contains(&p) {
                 let etype = [p.clone()];
                 // (s,p,d) ∧ (d,p,x) ⟹ (s,p,x)
-                for n in algo::get_neighbors(&self.ctx, space, d, &etype).await? {
+                for n in self.inference_neighbors(space, d, &etype, false).await? {
                     derived.push((
                         (s, p.clone(), n.dst),
                         Justification {
@@ -337,7 +332,7 @@ impl Executor {
                     ));
                 }
                 // (y,p,s) ∧ (s,p,d) ⟹ (y,p,d)  (n.dst is the source vertex y)
-                for n in algo::get_incoming_neighbors(&self.ctx, space, s, &etype).await? {
+                for n in self.inference_neighbors(space, s, &etype, true).await? {
                     derived.push((
                         (n.dst, p.clone(), d),
                         Justification {
@@ -360,7 +355,7 @@ impl Executor {
             if let Some(axioms) = meta.chain_first.get(&p) {
                 for (q, p2) in axioms {
                     let et = [p2.clone()];
-                    for n in algo::get_neighbors(&self.ctx, space, d, &et).await? {
+                    for n in self.inference_neighbors(space, d, &et, false).await? {
                         derived.push((
                             (s, q.clone(), n.dst),
                             Justification {
@@ -383,7 +378,7 @@ impl Executor {
             if let Some(axioms) = meta.chain_second.get(&p) {
                 for (q, p1) in axioms {
                     let et = [p1.clone()];
-                    for n in algo::get_incoming_neighbors(&self.ctx, space, s, &et).await? {
+                    for n in self.inference_neighbors(space, s, &et, true).await? {
                         derived.push((
                             (n.dst, q.clone(), d),
                             Justification {
@@ -402,86 +397,71 @@ impl Executor {
                 }
             }
 
-            // domain/range ⟹ vertex type inference (subject is-a domain,
-            // object is-a range). Types do not entail further edges, so they
-            // are written (with provenance) but not enqueued.
-            if let Some(class) = meta.domain.get(&p) {
-                self.record_provenance(
-                    space,
-                    &Fact::Vtype {
-                        vid: s,
+            for (vid, class, rule) in [
+                (s, meta.domain.get(&p), RuleKind::Domain),
+                (d, meta.range.get(&p), RuleKind::Range),
+            ] {
+                if let Some(class) = class {
+                    let fact = Fact::Vtype {
+                        vid,
                         class: class.clone(),
-                    },
-                    Justification {
-                        rule: RuleKind::Domain,
-                        premises: vec![premise.clone()],
-                    },
-                )
-                .await?;
-                if self.assert_vertex_type(space, s, class).await? {
-                    written += 1;
+                    };
+                    let key = SchemaKey::vtype(space, vid, class);
+                    let is_new = self.ctx.kvstore.get(&key).await?.is_none();
+                    Self::charge_inference(cap, &mut written, is_new)?;
+                    let mut puts = self
+                        .provenance_puts(
+                            space,
+                            &fact,
+                            Justification {
+                                rule,
+                                premises: vec![premise.clone()],
+                            },
+                        )
+                        .await?;
+                    if is_new {
+                        puts.push((key, Vec::new()));
+                    }
+                    self.ctx
+                        .kvstore
+                        .batch_apply(puts, Vec::new(), Vec::new())
+                        .await?;
                 }
             }
-            if let Some(class) = meta.range.get(&p) {
-                self.record_provenance(
-                    space,
-                    &Fact::Vtype {
-                        vid: d,
-                        class: class.clone(),
-                    },
-                    Justification {
-                        rule: RuleKind::Range,
-                        premises: vec![premise.clone()],
-                    },
-                )
-                .await?;
-                if self.assert_vertex_type(space, d, class).await? {
-                    written += 1;
-                }
-            }
-            if written >= cap {
-                tracing::warn!(
-                    cap,
-                    "O-5 materialization hit max_traversal_nodes; closure may be partial"
-                );
-                return Ok(());
-            }
-
             for (triple, justification) in derived {
                 let (s2, p2, d2) = (triple.0, triple.1.clone(), triple.2);
-                // Record provenance for *every* derivation — even of an edge
-                // already in the graph — so the justification set is complete
-                // for retraction. record_provenance dedups identical entries.
-                self.record_provenance(
-                    space,
-                    &Fact::Edge {
-                        s: s2,
-                        p: p2.clone(),
-                        d: d2,
-                    },
-                    justification,
-                )
-                .await?;
-
-                if !seen.insert(triple.clone()) {
-                    continue; // already queued/processed this run
+                let fact = Fact::Edge {
+                    s: s2,
+                    p: p2.clone(),
+                    d: d2,
+                };
+                let exists = self.triple_exists(space, s2, &p2, d2).await?;
+                Self::charge_inference(cap, &mut written, !exists)?;
+                let mut puts = self.provenance_puts(space, &fact, justification).await?;
+                if !exists {
+                    let mut properties = HashMap::new();
+                    properties.insert(INFERRED_MARKER.to_string(), Value::Bool(true));
+                    let edge = CodecEdgeData {
+                        src_vid: s2,
+                        dst_vid: d2,
+                        edge_type: p2.clone(),
+                        ranking: 0,
+                        properties,
+                    };
+                    let data = VertexCodec::encode_edge(&edge)
+                        .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
+                    puts.push((SchemaKey::edge_data(space, s2, &p2, d2, 0), data.clone()));
+                    puts.push((SchemaKey::in_edge_data(space, d2, &p2, s2, 0), data));
                 }
-                // Already in the graph (asserted, or inferred at an earlier
-                // insert): its own consequences are already materialized — skip
-                // writing/enqueueing (its provenance above is still recorded).
-                if self.triple_exists(space, s2, &p2, d2).await? {
-                    continue;
+                // Forward edge, reverse edge, forward provenance and reverse
+                // provenance share one atomic batch on Memory/redb.
+                self.ctx
+                    .kvstore
+                    .batch_apply(puts, Vec::new(), Vec::new())
+                    .await?;
+                if seen.insert(triple.clone()) && !exists {
+                    worklist.push_back(triple);
                 }
-                self.write_inferred_edge(space, s2, &p2, d2).await?;
-                written += 1;
-                if written >= cap {
-                    tracing::warn!(
-                        cap,
-                        "O-5 materialization hit max_traversal_nodes; closure may be partial"
-                    );
-                    return Ok(());
-                }
-                worklist.push_back(triple);
             }
         }
         Ok(())
@@ -491,192 +471,48 @@ impl Executor {
     pub(super) async fn triple_exists(&self, space: &str, s: i64, p: &str, d: i64) -> Result<bool> {
         // Trailing colon prevents dst prefix collisions (`:1:` vs `:10:`).
         let prefix = format!("{}:edge:{}:{}:{}:", space, s, p, d);
-        let hits = self
-            .ctx
-            .kvstore
-            .scan_with_filter(prefix.as_bytes(), Box::new(|_, _| true), Some(1))
-            .await?;
+        let hits = self.ctx.kvstore.scan_prefix(prefix.as_bytes()).await?;
+        for (key, value) in &hits {
+            algo::decode_query_edge(key, value)?;
+        }
         Ok(!hits.is_empty())
     }
 
-    /// Persist an inferred edge `(s)-p->(d)` at ranking 0 — forward + reverse
-    /// index — tagged `__inferred__` so it is queryable yet distinguishable.
-    async fn write_inferred_edge(&self, space: &str, s: i64, p: &str, d: i64) -> Result<()> {
-        let mut properties = HashMap::new();
-        properties.insert(INFERRED_MARKER.to_string(), Value::Bool(true));
-        let edge = CodecEdgeData {
-            src_vid: s,
-            dst_vid: d,
-            edge_type: p.to_string(),
-            ranking: 0,
-            properties,
-        };
-        let data = VertexCodec::encode_edge(&edge)
-            .map_err(|e| crate::error::ExecutionError::Io(std::io::Error::other(e.to_string())))?;
-        let fwd = format!("{}:edge:{}:{}:{}:0", space, s, p, d);
-        // Immediate puts (not batched) so the running fixpoint's neighbor/
-        // existence reads observe edges written earlier in this same run.
-        self.ctx.kvstore.put(fwd.as_bytes(), &data).await?;
-        let in_key = SchemaKey::in_edge_data(space, d, p, s, 0);
-        self.ctx.kvstore.put(&in_key, &data).await?;
+    fn charge_inference(cap: usize, written: &mut usize, is_new: bool) -> Result<()> {
+        if is_new {
+            if cap != 0 && *written >= cap {
+                return Err(ExecutionError::ResourceExhausted(format!(
+                    "Inference closure exceeds max_traversal_nodes ({cap}); assertions/history may already be committed. Inference remains dirty; increase the budget and run REPAIR INFERENCE."
+                )));
+            }
+            *written += 1;
+        }
         Ok(())
     }
 
-    /// Record inferred class membership `{space}:vtype:{vid}:{class}` (from
-    /// domain/range). Returns `true` if newly written, `false` if already
-    /// present (so the caller counts only new inferences against the cap).
-    async fn assert_vertex_type(&self, space: &str, vid: i64, class: &str) -> Result<bool> {
-        let key = SchemaKey::vtype(space, vid, class);
-        if self.ctx.kvstore.get(&key).await?.is_some() {
-            return Ok(false);
-        }
-        self.ctx.kvstore.put(&key, &[]).await?;
-        Ok(true)
-    }
-
-    /// Incremental retraction via provenance-based **DRed** (PLAN.md O-10
-    /// Phase 3), replacing the O(graph) full re-materialization for DELETE EDGE.
-    ///
-    /// `deleted` are the asserted edges just removed by the caller. Two phases:
-    ///
-    /// 1. **Overdelete** — transitive closure over the reverse-provenance index
-    ///    (`dependents_of`) from each deleted edge: every inferred fact that
-    ///    named a removed fact as a premise is tentatively deleted (edge keys +
-    ///    its provenance), recursing through inferred edges. An edge that *also*
-    ///    exists as asserted survives and is not recursed through (it still
-    ///    supports its dependents). vtypes never entail, so they are leaves.
-    /// 2. **Rederive** — re-run materialization seeded with the surviving
-    ///    asserted edges incident to the affected vertices. Rules are local
-    ///    (1-edge for symmetric/inverse/subprop/domain/range; adjacent-edge for
-    ///    transitive, whose neighbor lookups read the live graph), so this
-    ///    neighborhood seed re-derives exactly the facts still supported — the
-    ///    DRed rederive pass that gives correct retraction under recursion
-    ///    (transitive cycles) without DRed's classic over-deletion surviving.
-    ///
-    /// No-op for spaces without semantic relations (nothing was inferred).
-    pub(super) async fn retract_edges_incremental(
+    async fn inference_neighbors(
         &self,
         space: &str,
-        deleted: Vec<Triple>,
-    ) -> Result<()> {
-        let meta = self.load_rel_meta(space).await?;
-        if meta.is_empty() {
-            return Ok(());
-        }
-
-        let mut affected: HashSet<i64> = HashSet::new();
-        let mut visited: HashSet<Fact> = HashSet::new();
-        let mut processed: HashSet<Triple> = HashSet::new();
-        let mut frontier: VecDeque<Triple> = VecDeque::new();
-        for (s, p, d) in deleted {
-            affected.insert(s);
-            affected.insert(d);
-            frontier.push_back((s, p, d));
-        }
-
-        // ---- Overdelete ----
-        while let Some((s, p, d)) = frontier.pop_front() {
-            if !processed.insert((s, p.clone(), d)) {
-                continue;
-            }
-            for g in self.dependents_of(space, s, &p, d).await? {
-                if !visited.insert(g.clone()) {
-                    continue;
-                }
-                match &g {
-                    Fact::Edge {
-                        s: gs,
-                        p: gp,
-                        d: gd,
-                    } => {
-                        // An asserted copy survives → it still supports its own
-                        // dependents; don't delete or recurse through it.
-                        if self.edge_has_asserted(space, *gs, gp, *gd).await? {
-                            continue;
-                        }
-                        affected.insert(*gs);
-                        affected.insert(*gd);
-                        // Inferred edges are written at ranking 0 (write_inferred_edge).
-                        self.ctx
-                            .kvstore
-                            .delete(&SchemaKey::edge_data(space, *gs, gp, *gd, 0))
-                            .await?;
-                        self.ctx
-                            .kvstore
-                            .delete(&SchemaKey::in_edge_data(space, *gd, gp, *gs, 0))
-                            .await?;
-                        self.purge_fact_provenance(space, &g).await?;
-                        frontier.push_back((*gs, gp.clone(), *gd));
-                    }
-                    Fact::Vtype { vid, class } => {
-                        affected.insert(*vid);
-                        self.ctx
-                            .kvstore
-                            .delete(&SchemaKey::vtype(space, *vid, class))
-                            .await?;
-                        self.purge_fact_provenance(space, &g).await?;
-                    }
-                }
-            }
-            // Dependents are now traversed, so the removed edge's reverse-prov
-            // entry can go (it supports nothing). Done *after* reading dependents
-            // above — deleting it earlier would lose the traversal links.
-            self.delete_prov_rev_edge(space, s, &p, d).await?;
-        }
-
-        // ---- Rederive from surviving asserted edges incident to affected vertices ----
-        let mut seeds: Vec<Triple> = Vec::new();
-        let mut seen: HashSet<Triple> = HashSet::new();
-        for v in &affected {
-            for t in self.surviving_asserted_incident(space, *v).await? {
-                if seen.insert(t.clone()) {
-                    seeds.push(t);
-                }
-            }
-        }
-        self.run_materialization(space, seeds, &meta).await
-    }
-
-    /// True if an **asserted** (non-`__inferred__`) edge `(s)-p->(d)` exists at
-    /// any ranking. Distinguishes a fact that survives a delete (asserted) from
-    /// one that is purely materialized (retractable).
-    async fn edge_has_asserted(&self, space: &str, s: i64, p: &str, d: i64) -> Result<bool> {
-        let prefix = format!("{}:edge:{}:{}:{}:", space, s, p, d);
-        for (_k, v) in self.ctx.kvstore.scan_prefix(prefix.as_bytes()).await? {
-            if let Ok(edge) = VertexCodec::decode_edge(&v) {
-                if !edge.properties.contains_key(INFERRED_MARKER) {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    /// Surviving **asserted** edges incident to vertex `v` (both out- and
-    /// in-edges), as `(src, type, dst)` triples — the rederive seed set. Inferred
-    /// edges are excluded (they are re-derived, not seeds).
-    async fn surviving_asserted_incident(&self, space: &str, v: i64) -> Result<Vec<Triple>> {
-        let mut out = Vec::new();
-        let push_asserted = |edge: byoridb_codec::EdgeData, acc: &mut Vec<Triple>| {
-            if !edge.properties.contains_key(INFERRED_MARKER) {
-                acc.push((edge.src_vid, edge.edge_type, edge.dst_vid));
-            }
+        vid: i64,
+        types: &[String],
+        incoming: bool,
+    ) -> Result<Vec<algo::GraphNeighbor>> {
+        let prefix = if incoming {
+            SchemaKey::in_edge_data_dst_prefix(space, vid)
+        } else {
+            SchemaKey::edge_data_src_prefix(space, vid)
         };
-        // Out-edges: {space}:edge:{v}:
-        let out_prefix = SchemaKey::edge_data_src_prefix(space, v);
-        for (_k, val) in self.ctx.kvstore.scan_prefix(&out_prefix).await? {
-            if let Ok(edge) = VertexCodec::decode_edge(&val) {
-                push_asserted(edge, &mut out);
+        let mut result = Vec::new();
+        for (key, value) in self.ctx.kvstore.scan_prefix(&prefix).await? {
+            let edge = algo::decode_query_edge(&key, &value)?;
+            if types.contains(&edge.edge_type) {
+                result.push(algo::GraphNeighbor {
+                    dst: if incoming { edge.src_vid } else { edge.dst_vid },
+                    edge,
+                });
             }
         }
-        // In-edges: {space}:in-edge:{v}: (value is the denormalized edge payload)
-        let in_prefix = SchemaKey::in_edge_data_dst_prefix(space, v);
-        for (_k, val) in self.ctx.kvstore.scan_prefix(&in_prefix).await? {
-            if let Ok(edge) = VertexCodec::decode_edge(&val) {
-                push_asserted(edge, &mut out);
-            }
-        }
-        Ok(out)
+        Ok(result)
     }
 }
 

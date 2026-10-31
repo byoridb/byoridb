@@ -10,14 +10,12 @@
 받으며, 그 밖의 인자는 거부합니다:
 
 ```bash
-$ byoridb-server --version
-byoridb-server 0.4.20 (commit c9bd11c39001, release)
-
-$ byoridb-server --help    # lists every key and environment variable below
+byoridb-server --version
+byoridb-server --help
 ```
 
-위 출력은 v0.4.20 릴리스를 기준으로 한 예시입니다. 설치된 바이너리는 자체 버전과
-커밋을 표시합니다. `--version`은 태그가 없는 리비전까지 포함하여 정확한 빌드를
+설치된 바이너리는 자체 버전·커밋·build profile을 표시합니다. `--help`는 설정 키와
+환경변수를 보여 줍니다. `--version`은 태그가 없는 리비전까지 포함하여 정확한 빌드를
 식별합니다. 수정된 작업 트리에서 빌드하면 `-dirty`가 붙고, Git 체크아웃 밖에서
 빌드하면 `unknown`을 표시합니다. 두 옵션 모두 인증 정보를 읽거나 스토리지를
 열거나 수신 소켓을 바인딩하지 않고 종료하므로 설치된 바이너리에 언제든 안전하게
@@ -87,7 +85,7 @@ CLI는 별도의 환경변수를 사용합니다:
 성공한 로그인은 실패 허용 횟수를 소모하지 않습니다. 동시 Argon2 검증 제한을
 초과한 요청은 대기하며, 이 제한은 세션 수를 제한하지 않습니다. 통신 규약은
 [로그인 시도 제한](../reference/api.md#login-throttling)을 참고하세요.
-기본값은 외부에 노출된 수신 소켓에 적합합니다:
+지원하는 TLS·네트워크 경계를 통해 listener를 노출할 때는 이 기본값을 유지하세요:
 
 ```toml
 [auth]
@@ -170,12 +168,28 @@ export BYORIDB__AUTH__SESSION_TTL_SECS=3600
 | --- | --- | --- |
 | `BYORIDB_CACHE_SIZE_MB` | `256` | redb 페이지 캐시 크기(MiB); 양수여야 함 |
 | `BYORIDB_DURABILITY` | 즉시 영속성 | `none`, `relaxed`, `eventual`은 완화된 영속성을 선택 |
-| `BYORIDB_MAX_MEMORY_MB` | `1024` | 쿼리별 구체화된 결과의 메모리 소프트 상한; `0`이면 비활성화 |
-| `BYORIDB_MAX_SCAN_LIMIT` | `100000` | 대체 스캔 한 번의 최대 행 수; `0`이면 비활성화 |
+| `BYORIDB_MAX_MEMORY_MB` | `1024` | 구체화 결과와 별도 DML 준비 버퍼의 소프트 예산; `0`이면 비활성화 |
+| `BYORIDB_MAX_SCAN_LIMIT` | `100000` | guarded full-prefix/index partition scan별 후보 예산; `0`이면 비활성화 |
 | `RUST_LOG` | 구독자 기본값 | Rust tracing 필터, 예: `byoridb_graph=debug` |
 
 완화된 영속성을 사용하면 비정상 종료 후 최근 커밋이 유실될 수 있습니다.
 다시 적재할 수 있는 데이터에만 사용하고 일반 서비스 운영에는 사용하지 마세요.
+
+**현재 소스의 계약:** 로컬 LOOKUP은 필터 전의 원시 후보를
+셉니다. 정확한 scan 상한은 성공할 수 있고 cap+1이면 실패하며 query `LIMIT/OFFSET`이
+이를 우회하지 못합니다. 전체 쿼리 작업량·메모리 예산은 아닙니다. 분산 indexed LOOKUP도
+partition별 같은 상한과 query에 묶인 keyset page를 사용하며 누락·손상된 partition을
+거부합니다. 동시 쓰기에 대한 공통 snapshot은 없고 분산 full scan과 ordered range는
+계속 미지원입니다.
+
+FIND는 별도 환경변수 대신 내부 `ExecutionConfig` 필드를 사용합니다.
+`max_traversal_nodes`(100,000)는 확장 vertex 또는 hop 제한 가중치 조회의 vertex/hop
+상태를 세며, `max_find_paths`(1,024)는 `FIND ALL SHORTEST PATHS`의 완성 경로 개수를
+제한합니다. 둘 다 `0`이면 비활성화합니다. 실행은 초과 시 오류를 반환하고 정확한 경로
+개수 경계는 허용하며 frontier 메모리나 읽은 edge 개수는 제한하지 않습니다.
+`u32::MAX`보다 큰 `UPTO`는 wrap 대신 거부합니다. Schema를 확인하는 edge range,
+엄격한 레코드 decoder, 가중치 검증 비용과 미지원 FIND 절은 [데이터 조회](../guide/ngql/dql.md)를
+참고하세요. 현재 checkout의 계약이며 이전 릴리스는 기존 경계를 유지합니다.
 
 ## 클러스터 설정
 
@@ -192,12 +206,13 @@ meta_addr = "0.0.0.0:9559"
 
 대응하는 환경변수는 `BYORIDB__CLUSTER__NODE_ID`, `BYORIDB__CLUSTER__PEERS`,
 `BYORIDB__CLUSTER__ADVERTISE_ADDR`, `BYORIDB__CLUSTER__BOOTSTRAP`,
-`BYORIDB__CLUSTER__META_ADDR`입니다. 쉼표로 구분한 `peers` 값이 비어 있지 않으면
-Meta 실행기가 활성화됩니다.
+`BYORIDB__CLUSTER__META_ADDR`입니다. 이 키들은 예약된 설정입니다. Standalone launcher는
+비어 있지 않은 `peers`, `bootstrap = true`를 포함해 위 기본값과 다른 모든 값을 storage나
+listener를 열기 전에 거부합니다.
 
-클러스터 시작 기능은 아직 완성되지 않았습니다. Storage/Raft 피어 초기화, 배포 구성
-연결, 다중 노드 운영의 종단 간 검증이 완료되지 않았습니다. 현재 클러스터 설정이나
-`docker-compose.yml`의 서비스 세 개를 운영 환경용 분산 배포로 간주하지 마세요.
+Storage/Raft 피어 초기화, 배포 wiring, 다중 노드 운영 검증은 아직 완료되지 않았습니다.
+기본 `docker-compose.yml`은 loopback 전용 host port와 영속 volume을 사용하는
+standalone 서버 하나를 실행합니다.
 
 ## 네트워크 보안
 

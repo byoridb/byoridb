@@ -32,12 +32,17 @@ pub struct ExecutionConfig {
     /// `BYORIDB_MAX_MEMORY_MB`.
     pub max_memory_mb: usize,
     pub enable_optimization: bool,
-    /// Hard cap on the number of vertices BFS/Dijkstra will process before
-    /// returning early. Guards against pathological traversals on cycles or
-    /// dense graphs. `0` disables the cap.
+    /// Traversal work budget. FIND charges expanded vertices (or vertex/hop
+    /// states for hop-bounded weighted paths); MATCH variable-length expansion
+    /// charges path states. Exceeding either query budget fails explicitly.
+    /// This is not a bound on frontier memory or scanned edges. Other algorithm
+    /// consumers retain their own completion contracts. `0` disables the cap.
     pub max_traversal_nodes: usize,
-    /// Maximum number of rows returned by a single scan_prefix call.
-    /// Prevents OOM from unbounded full-table scans (MATCH fallback, LOOKUP).
+    /// Candidate budget for MATCH/LOOKUP scans, independent of query LIMIT.
+    /// Bounded paths probe one extra candidate and fail on overflow; predicates
+    /// and result windows do not turn an incomplete scan into complete success.
+    /// Applies to each local index-partition scan or full-prefix scan, not to
+    /// all query work or memory. Distributed LOOKUP has a separate contract.
     /// `0` disables the cap (not recommended in production).
     pub max_scan_limit: usize,
     /// Maximum number of GO steps allowed per query.
@@ -45,7 +50,8 @@ pub struct ExecutionConfig {
     pub max_go_steps: u32,
     /// Maximum number of paths `FIND ALL SHORTEST PATHS` will enumerate.
     /// The shortest-path DAG can hold combinatorially many distinct paths
-    /// on dense graphs; enumeration stops at this cap. `0` disables the cap.
+    /// on dense graphs; discovering another complete path beyond this cap fails
+    /// the query. Exactly this many paths succeed. `0` disables the cap.
     pub max_find_paths: usize,
     /// Minimum vector count before `RECOMMEND ... BY EMBEDDING` builds and uses
     /// a persisted HNSW index (PLAN.md R-2b). At or below this, exact flat KNN

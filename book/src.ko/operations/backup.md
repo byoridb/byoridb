@@ -46,7 +46,9 @@ byoridb-backup create \
   --label "daily-before-upgrade"
 ```
 
-명령은 다음과 같이 timestamp 기반 디렉터리를 만듭니다.
+명령은 timestamp·나노초·무작위 suffix가 있는 디렉터리를 배타적으로 생성합니다.
+`create` 또는 `list`가 출력한 정확한 ID를 사용하세요. 아래 예시는 계속 지원하는
+legacy ID입니다.
 
 ```text
 /var/lib/byoridb/backups/backup_1785313593/
@@ -80,10 +82,14 @@ byoridb-backup verify \
   --backup-id backup_1785313593
 ```
 
-현재 `verify`는 catalog에서 백업을 찾을 수 있는지만 확인합니다. `data.redb`를 열거나
-table 전체, application record, row count를 검증하지 않으며 query도 실행하지
-않습니다. 실패한 `create`도 timestamp 디렉터리를 남길 수 있으므로 `verify`만으로
-사용 가능한 snapshot이라고 판단하지 마세요.
+`verify`는 manifest, 정확한 파일 크기와 format 1 archive의 SHA-256을 확인합니다.
+격리된 사본을 열어 redb page 무결성과 모든 table entry를 검사하며 원본 백업과
+source 파일은 수정하거나 복구하지 않습니다. 누락·절단·손상·미지원 manifest/data는
+전체 검증에서도 nonzero exit로 실패합니다. 버전과 hash가 없는 legacy manifest는
+별도로 표시하고 크기·물리 무결성을 검사하지만 과거 digest를 제공하지는 않습니다.
+Format 1은 `kv`와 `history`가 모두 필요하며 legacy `kv` 전용 archive는 읽을 수
+있습니다. Hash는 손상 검출용으로 인증·암호화를 제공하지 않습니다. 검증은 application
+query를 실행하지 않으며 검증·복원 임시 사본을 위한 추가 디스크 공간이 필요합니다.
 
 중요한 백업마다 다음을 확인하세요.
 
@@ -120,8 +126,17 @@ Root 비밀번호는 user record에서 복원하지 않습니다. Root는 항상
 `BYORIDB_ROOT_PASSWORD`로 정의합니다. 영속적인 non-root user record는 database
 snapshot에 포함됩니다.
 
-`restore --overwrite`는 복사 전에 기존 target 디렉터리를 재귀적으로 삭제합니다.
-사용 전에 정확한 target을 확인하고 rollback 사본을 보관하세요.
+`restore --overwrite`는 교체 데이터를 모두 복사·검증한 뒤 기존 디렉터리를 이동합니다.
+일반적인 복사·검증·교체 실패에서는 기존 target을 보존하거나 되돌립니다. 실행 중인
+target의 redb lock, 겹치는 backup/target 경로, 상위 경로 탈출과 symlink target은
+거부합니다. 두 directory rename 사이 강제 종료는 crash-atomic하지 않습니다.
+재시작·재시도 전에 형제 경로 `.byoridb-restore-*/previous`를 보존하고 확인하세요.
+OS rollback도 실패하면 복구 파일의 경로를 오류에 표시합니다. 복원 중 다른 복원
+프로세스나 서버를 시작하지 마세요.
+
+자동 복구 검증은 실제 CLI로 생성한 archive를 복원한 뒤 current/history/tombstone
+쿼리, schema, index, 사용자 인증과 string VID mapping을 비교합니다. RTO는 운영
+데이터로 직접 측정한 시간을 기준으로 정하세요.
 
 ## 보존 명령
 

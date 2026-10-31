@@ -549,7 +549,14 @@ impl Executor {
 
         self.ctx
             .kvstore
-            .put(&edge_key, serde_json::to_vec(&edge_data)?.as_slice())
+            .batch_apply(
+                vec![
+                    (edge_key, serde_json::to_vec(&edge_data)?),
+                    (Self::inference_dirty_key(&space), b"1".to_vec()),
+                ],
+                Vec::new(),
+                Vec::new(),
+            )
             .await?;
 
         Ok(ExecutorResult::empty())
@@ -714,10 +721,12 @@ impl Executor {
         // Increment version
         self.increment_schema_version(&mut schema_data);
 
-        // Save updated schema
+        // Keep the semantic recovery fence in the schema transaction.
+        let mut puts = vec![(key, serde_json::to_vec(&schema_data)?)];
+        self.fence_semantic_batch(space, &mut puts).await?;
         self.ctx
             .kvstore
-            .put(&key, serde_json::to_vec(&schema_data)?.as_slice())
+            .batch_apply(puts, Vec::new(), Vec::new())
             .await?;
 
         Ok(ExecutorResult::success_message(format!(
@@ -961,7 +970,14 @@ impl Executor {
                 }
 
                 // Delete edge
-                self.ctx.kvstore.delete(edge_key.as_bytes()).await?;
+                self.ctx
+                    .kvstore
+                    .batch_apply(
+                        vec![(Self::inference_dirty_key(space), b"1".to_vec())],
+                        vec![edge_key.into_bytes()],
+                        Vec::new(),
+                    )
+                    .await?;
 
                 Ok(ExecutorResult {
                     columns: vec![],

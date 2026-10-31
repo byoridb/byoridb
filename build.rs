@@ -24,6 +24,26 @@ fn main() {
             println!("cargo:rerun-if-changed={head}");
         }
     }
+    // A normal commit updates the current branch ref, not the symbolic HEAD
+    // file. Cached release builds must still identify the new commit.
+    if let Some(reference) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = git(&["rev-parse", "--git-path", &reference]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    if let Some(index) = git(&["rev-parse", "--git-path", "index"]) {
+        if Path::new(&index).exists() {
+            println!("cargo:rerun-if-changed={index}");
+        }
+    }
+    // Once rerun-if-changed is used, Cargo no longer watches package sources
+    // implicitly. Watch tracked files so an incremental build from edited
+    // sources does not continue claiming its previous clean commit identity.
+    if let Some(files) = git(&["ls-files"]) {
+        for file in files.lines() {
+            println!("cargo:rerun-if-changed={file}");
+        }
+    }
 }
 
 /// Short SHA with a `-dirty` marker for uncommitted changes, or `unknown`

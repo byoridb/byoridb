@@ -70,6 +70,8 @@ pub enum ExecutionPlan {
 
     /// CHECK CONSISTENCY — report ontology consistency violations (O-6).
     CheckConsistency,
+    CheckInference,
+    RepairInference,
 
     /// CHECK SHAPE — report vertices violating a declared shape's constraints.
     CheckShape,
@@ -489,59 +491,214 @@ const MATCH_GRAPH_FUNCTIONS: &[&str] = &[
     "ISA",
 ];
 
-/// Aggregates, which MATCH computes over all binding rows at once rather than
-/// per row.
-const MATCH_AGGREGATES: &[&str] = &["COUNT", "SUM", "AVG", "MAX", "MIN", "COLLECT"];
+/// Only top-level RETURN aggregates are implemented by MATCH.
+const MATCH_AGGREGATES: &[&str] = &["COUNT", "SUM", "AVG", "MAX", "MIN"];
 
-/// Reject a MATCH expression that calls a function the engine does not
-/// implement, naming the function.
-///
-/// This is a planning error on purpose (#102). The MATCH evaluator produces a
-/// `Value` with no error channel, so an unrecognised call used to become `NULL`:
-/// merely confusing in `RETURN`, but in `WHERE` it made the predicate false for
-/// every row, so an unsupported function reported "0 rows" and a caller could
-/// not tell that from "nothing matched". Refusing the query up front means no
-/// such result is ever produced.
-fn reject_unknown_functions(expr: &Expression) -> Result<()> {
+fn invalid_match_expression(message: impl Into<String>) -> crate::error::ExecutionError {
+    crate::error::ExecutionError::InvalidOperation(message.into())
+}
+
+fn validate_match_scalar(expr: &Expression) -> Result<()> {
     match expr {
+        Expression::Literal(_) | Expression::PropRef { .. } => Ok(()),
+        Expression::Identifier(name) if name != "*" => Ok(()),
         Expression::FunctionCall { name, args } => {
-            let upper = name.to_uppercase();
-            let known = MATCH_GRAPH_FUNCTIONS.contains(&upper.as_str())
-                || MATCH_AGGREGATES.contains(&upper.as_str())
-                || crate::evaluator::SCALAR_FUNCTIONS.contains(&upper.as_str());
-            if !known {
-                return Err(crate::error::ExecutionError::InvalidOperation(format!(
+            let upper = name.to_ascii_uppercase();
+            if MATCH_AGGREGATES.contains(&upper.as_str()) || upper == "COLLECT" {
+                return Err(invalid_match_expression(format!(
+                    "Unsupported MATCH aggregate placement: {name}"
+                )));
+            }
+            if !MATCH_GRAPH_FUNCTIONS.contains(&upper.as_str())
+                && !crate::evaluator::SCALAR_FUNCTIONS.contains(&upper.as_str())
+            {
+                return Err(invalid_match_expression(format!(
                     "Unknown function: {name}"
                 )));
             }
             for arg in args {
-                reject_unknown_functions(arg)?;
+                validate_match_scalar(arg)?;
             }
             Ok(())
         }
-        Expression::BinaryOp { left, right, .. } => {
-            reject_unknown_functions(left)?;
-            reject_unknown_functions(right)
-        }
-        Expression::UnaryOp { operand, .. } => reject_unknown_functions(operand),
         Expression::List(items) => {
             for item in items {
-                reject_unknown_functions(item)?;
+                validate_match_scalar(item)?;
             }
             Ok(())
         }
-        Expression::Map(entries) => {
-            for value in entries.values() {
-                reject_unknown_functions(value)?;
-            }
-            Ok(())
-        }
-        // Leaves: nothing to inspect.
-        Expression::Literal(_)
-        | Expression::Identifier(_)
-        | Expression::PropRef { .. }
-        | Expression::DstVertexProp { .. } => Ok(()),
+        _ => Err(invalid_match_expression(
+            "Unsupported MATCH scalar expression",
+        )),
     }
+}
+
+fn validate_match_condition(expr: &Expression) -> Result<()> {
+    use byoridb_parser::ast::BinaryOperator;
+    match expr {
+        Expression::BinaryOp {
+            op: BinaryOperator::And | BinaryOperator::Or,
+            left,
+            right,
+        } => {
+            validate_match_condition(left)?;
+            validate_match_condition(right)
+        }
+        Expression::BinaryOp { op, left, right }
+            if !matches!(
+                op,
+                BinaryOperator::Add
+                    | BinaryOperator::Sub
+                    | BinaryOperator::Mul
+                    | BinaryOperator::Div
+                    | BinaryOperator::Mod
+            ) =>
+        {
+            validate_match_scalar(left)?;
+            validate_match_scalar(right)
+        }
+        _ => validate_match_scalar(expr),
+    }
+}
+
+fn validate_match_return(expr: &Expression) -> Result<()> {
+    if let Expression::FunctionCall { name, args } = expr {
+        let upper = name.to_ascii_uppercase();
+        if MATCH_AGGREGATES.contains(&upper.as_str()) {
+            let [arg] = args.as_slice() else {
+                return Err(invalid_match_expression(format!(
+                    "MATCH {name} requires exactly one argument"
+                )));
+            };
+            if upper == "COUNT" && matches!(arg, Expression::Identifier(name) if name == "*") {
+                return Ok(());
+            }
+            return validate_match_scalar(arg);
+        }
+    }
+    validate_match_scalar(expr)
+}
+
+fn validate_match_pattern(pattern: &byoridb_parser::ast::Pattern) -> Result<()> {
+    use byoridb_parser::ast::Pattern;
+    match pattern {
+        Pattern::Multiple(patterns) => {
+            for pattern in patterns {
+                validate_match_pattern(pattern)?;
+            }
+        }
+        Pattern::Path(path) => {
+            for expr in path
+                .start
+                .props
+                .values()
+                .chain(path.nodes.iter().flat_map(|node| node.props.values()))
+                .chain(path.edges.iter().flat_map(|edge| edge.props.values()))
+            {
+                if !matches!(expr, Expression::Literal(_)) {
+                    return Err(invalid_match_expression(
+                        "MATCH pattern properties require literal values",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve every ORDER BY item to a projected column before any data access.
+/// Aliases take precedence; otherwise the exact RETURN expression is required.
+/// Synthetic display names such as `value` are not implicit aliases.
+pub(crate) fn match_order_keys(plan: &MatchPlan) -> Result<Vec<(usize, bool)>> {
+    if plan.order_by.is_empty() {
+        return Ok(vec![]);
+    }
+    let cols = plan.return_clause.as_ref().ok_or_else(|| {
+        invalid_match_expression("MATCH ORDER BY requires an explicit RETURN clause")
+    })?;
+    let mut keys = Vec::with_capacity(plan.order_by.len());
+    for item in &plan.order_by {
+        let aliases: Vec<usize> = if let Expression::Identifier(name) = &item.expr {
+            cols.iter()
+                .enumerate()
+                .filter_map(|(index, col)| (col.alias.as_ref() == Some(name)).then_some(index))
+                .collect()
+        } else {
+            vec![]
+        };
+        let index = match aliases.as_slice() {
+            [index] => *index,
+            [] => cols
+                .iter()
+                .position(|col| same_match_expression(&col.expression, &item.expr))
+                .ok_or_else(|| {
+                    invalid_match_expression(
+                        "MATCH ORDER BY must reference a RETURN expression or alias",
+                    )
+                })?,
+            _ => {
+                return Err(invalid_match_expression(
+                    "MATCH ORDER BY alias is ambiguous",
+                ))
+            }
+        };
+        keys.push((index, item.descending));
+    }
+    Ok(keys)
+}
+
+fn same_match_expression(left: &Expression, right: &Expression) -> bool {
+    match (left, right) {
+        (
+            Expression::FunctionCall {
+                name: left_name,
+                args: left_args,
+            },
+            Expression::FunctionCall {
+                name: right_name,
+                args: right_args,
+            },
+        ) => {
+            left_name.eq_ignore_ascii_case(right_name)
+                && left_args.len() == right_args.len()
+                && left_args
+                    .iter()
+                    .zip(right_args)
+                    .all(|(left, right)| same_match_expression(left, right))
+        }
+        (Expression::List(left), Expression::List(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| same_match_expression(left, right))
+        }
+        _ => left == right,
+    }
+}
+
+/// Validate before scanning, so unsupported clauses cannot masquerade as an
+/// empty result merely because no row reaches the evaluator.
+pub(crate) fn validate_match_expressions(plan: &MatchPlan) -> Result<()> {
+    validate_match_pattern(&plan.pattern)?;
+    for pattern in &plan.optional_patterns {
+        validate_match_pattern(pattern)?;
+    }
+    if let Some(expr) = &plan.where_clause {
+        validate_match_condition(expr)?;
+    }
+    if let Some(cols) = &plan.return_clause {
+        for col in cols {
+            validate_match_return(&col.expression)?;
+        }
+    }
+    if let Some(exprs) = &plan.group_by {
+        for expr in exprs {
+            validate_match_scalar(expr)?;
+        }
+    }
+    match_order_keys(plan)?;
+    Ok(())
 }
 
 impl ExecutionPlanBuilder {
@@ -1050,6 +1207,8 @@ impl ExecutionPlanBuilder {
                 limit: rec.limit,
             })),
             Statement::CheckConsistency => Ok(ExecutionPlan::CheckConsistency),
+            Statement::CheckInference => Ok(ExecutionPlan::CheckInference),
+            Statement::RepairInference => Ok(ExecutionPlan::RepairInference),
             Statement::CheckShape => Ok(ExecutionPlan::CheckShape),
             Statement::ExplainInference {
                 src,
@@ -1075,35 +1234,29 @@ impl ExecutionPlanBuilder {
                 where_clause: find_stmt.where_clause,
                 yield_clause: find_stmt.yield_clause.map(|c| format!("{:?}", c)),
             })),
-            Statement::Match(match_stmt) => Ok(ExecutionPlan::Match(MatchPlan {
-                pattern: match_stmt.pattern,
-                where_clause: {
-                    if let Some(filter) = &match_stmt.where_clause {
-                        reject_unknown_functions(filter)?;
-                    }
-                    match_stmt.where_clause
-                },
-                optional_patterns: match_stmt.optional_patterns,
-                return_clause: match_stmt
-                    .return_clause
-                    .map(|c| {
-                        c.columns
+            Statement::Match(match_stmt) => {
+                let plan = MatchPlan {
+                    pattern: match_stmt.pattern,
+                    where_clause: match_stmt.where_clause,
+                    optional_patterns: match_stmt.optional_patterns,
+                    return_clause: match_stmt.return_clause.map(|clause| {
+                        clause
+                            .columns
                             .into_iter()
-                            .map(|col| {
-                                reject_unknown_functions(&col.expression)?;
-                                Ok(MatchReturnColumn {
-                                    expression: col.expression,
-                                    alias: col.alias,
-                                })
+                            .map(|col| MatchReturnColumn {
+                                expression: col.expression,
+                                alias: col.alias,
                             })
-                            .collect::<Result<Vec<_>>>()
-                    })
-                    .transpose()?,
-                group_by: match_stmt.group_by,
-                order_by: match_stmt.order_by,
-                limit: match_stmt.limit,
-                offset: match_stmt.offset,
-            })),
+                            .collect()
+                    }),
+                    group_by: match_stmt.group_by,
+                    order_by: match_stmt.order_by,
+                    limit: match_stmt.limit,
+                    offset: match_stmt.offset,
+                };
+                validate_match_expressions(&plan)?;
+                Ok(ExecutionPlan::Match(plan))
+            }
             Statement::Compound(clauses) => {
                 let mut planned = Vec::with_capacity(clauses.len());
                 for clause in clauses {

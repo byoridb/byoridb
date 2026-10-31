@@ -104,6 +104,19 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Opaque continuation tied to the complete index query, not merely a VID.
+/// Keyset pagination observes current data; it does not establish a snapshot.
+#[derive(Serialize, Deserialize)]
+struct LookupCursor {
+    version: u8,
+    space_id: u32,
+    index_name: String,
+    schema_name: String,
+    fields: Vec<String>,
+    prefix: Vec<u8>,
+    last_key: Vec<u8>,
+}
+
 /// Index manager for a storage node
 pub struct IndexManager {
     kvstore: Arc<dyn KVStore>,
@@ -566,11 +579,9 @@ impl IndexManager {
         Ok(())
     }
 
-    /// Count index entries grouped by their (single) indexed value, scanning the
-    /// whole index without decoding any vertex blobs. Accelerates `GROUP BY
-    /// <indexed_prop>` + COUNT(*): O(index entries with tiny keys) instead of
-    /// O(vertices with full blob decode). Single-field indexes only (multi-field
-    /// errors → caller falls back to full scan).
+    /// Count raw index entries grouped by their single indexed value.
+    /// This validates keys but does not revalidate live vertices or impose a
+    /// query scan budget. It is not a complete MATCH aggregation result.
     pub async fn tag_index_group_counts(
         &self,
         part_id: u32,
@@ -582,7 +593,6 @@ impl IndexManager {
             ));
         }
         let prefix = KeyUtils::tag_index_prefix(part_id, index_def.id);
-        let plen = prefix.len();
         let entries = self
             .kvstore
             .scan_prefix(&prefix)
@@ -592,13 +602,20 @@ impl IndexManager {
         // encoding is canonical per IndexValue::encode, so it's a valid key.
         let mut counts: HashMap<Vec<u8>, (IndexValue, u64)> = HashMap::new();
         for (key, _) in &entries {
-            if key.len() <= plen {
-                continue;
+            let malformed = || {
+                IndexError::Storage(format!(
+                    "malformed tag-index key for index '{}' in partition {}",
+                    index_def.index_name, part_id
+                ))
+            };
+            let payload = key.strip_prefix(prefix.as_slice()).ok_or_else(&malformed)?;
+            let value_len = payload.len().checked_sub(8).ok_or_else(&malformed)?;
+            let values = &payload[..value_len];
+            let (value, consumed) = IndexValue::decode(values).ok_or_else(&malformed)?;
+            if consumed != value_len {
+                return Err(malformed());
             }
-            if let Some((value, consumed)) = IndexValue::decode(&key[plen..]) {
-                let vbytes = key[plen..plen + consumed].to_vec();
-                counts.entry(vbytes).or_insert((value, 0)).1 += 1;
-            }
+            counts.entry(values.to_vec()).or_insert((value, 0)).1 += 1;
         }
         Ok(counts.into_values().collect())
     }
@@ -770,8 +787,6 @@ impl IndexManager {
     ) -> Result<Vec<EdgeIndexScanResult>, IndexError> {
         let prefix = KeyUtils::edge_index_prefix_with_values(part_id, index_def.id, prefix_values);
 
-        // Calculate property value length for parsing
-        let prop_len: usize = prefix_values.iter().map(|v| v.encoded_len()).sum();
         let limit = (options.limit > 0).then_some(options.limit);
 
         // Bounded ranges, mirroring `scan_tag_index`. Ignoring `ScanOptions`
@@ -814,18 +829,40 @@ impl IndexManager {
         }
         .map_err(|e| IndexError::Storage(e.to_string()))?;
 
+        let header_len = KeyUtils::edge_index_prefix(part_id, index_def.id).len();
         let mut results: Vec<EdgeIndexScanResult> = entries
             .iter()
-            .filter_map(|(key, _)| {
-                KeyUtils::parse_edge_index_edge(key, prop_len).map(|(src_vid, rank, dst_vid)| {
-                    EdgeIndexScanResult {
-                        src_vid,
-                        rank,
-                        dst_vid,
-                    }
+            .map(|(key, _)| {
+                let malformed = || {
+                    IndexError::Storage(format!(
+                        "malformed edge-index key for index '{}' in partition {}",
+                        index_def.index_name, part_id
+                    ))
+                };
+                // Preserve every raw candidate in the cap+1 completeness
+                // probe: corruption is an error, never a discarded row.
+                let value_end = key
+                    .len()
+                    .checked_sub(24)
+                    .filter(|end| *end >= header_len)
+                    .ok_or_else(&malformed)?;
+                let mut values = &key[header_len..value_end];
+                for _ in &index_def.fields {
+                    let (_, consumed) = IndexValue::decode(values).ok_or_else(&malformed)?;
+                    values = &values[consumed..];
+                }
+                if !values.is_empty() {
+                    return Err(malformed());
+                }
+                let (src_vid, rank, dst_vid) =
+                    KeyUtils::parse_edge_index_edge(key, 0).ok_or_else(malformed)?;
+                Ok(EdgeIndexScanResult {
+                    src_vid,
+                    rank,
+                    dst_vid,
                 })
             })
-            .collect();
+            .collect::<Result<_, IndexError>>()?;
 
         // Apply limit
         if options.limit > 0 && results.len() > options.limit {
@@ -833,6 +870,162 @@ impl IndexManager {
         }
 
         Ok(results)
+    }
+
+    /// A bounded page of raw equality-index entries. The extra entry is read
+    /// and validated to distinguish a full final page from an incomplete page.
+    async fn lookup_page_keys(
+        &self,
+        part_id: u32,
+        index_def: &IndexDef,
+        values: &[IndexValue],
+        limit: usize,
+        cursor: &[u8],
+        edge: bool,
+    ) -> Result<(Vec<Vec<u8>>, Vec<u8>, bool), IndexError> {
+        if part_id == 0
+            || values.len() > index_def.fields.len()
+            || (edge && index_def.index_type != IndexType::Edge)
+            || (!edge && index_def.index_type != IndexType::Tag)
+        {
+            return Err(IndexError::InvalidValue(
+                "invalid index page request".to_string(),
+            ));
+        }
+        let prefix = if edge {
+            KeyUtils::edge_index_prefix_with_values(part_id, index_def.id, values)
+        } else {
+            KeyUtils::tag_index_prefix_with_values(part_id, index_def.id, values)
+        };
+        let header_len = if edge {
+            KeyUtils::edge_index_prefix(part_id, index_def.id).len()
+        } else {
+            KeyUtils::tag_index_prefix(part_id, index_def.id).len()
+        };
+        let validate_key = |key: &[u8]| -> Result<(), IndexError> {
+            let invalid = || IndexError::InvalidValue("malformed index page key".to_string());
+            if !key.starts_with(&prefix) {
+                return Err(invalid());
+            }
+            let value_end = key
+                .len()
+                .checked_sub(if edge { 24 } else { 8 })
+                .filter(|end| *end >= header_len)
+                .ok_or_else(invalid)?;
+            let mut encoded = &key[header_len..value_end];
+            for _ in &index_def.fields {
+                let (_, consumed) = IndexValue::decode(encoded).ok_or_else(invalid)?;
+                encoded = &encoded[consumed..];
+            }
+            if !encoded.is_empty() {
+                return Err(invalid());
+            }
+            Ok(())
+        };
+        let start = if cursor.is_empty() {
+            prefix.clone()
+        } else {
+            let parsed: LookupCursor = serde_json::from_slice(cursor)
+                .map_err(|_| IndexError::InvalidValue("invalid index cursor".to_string()))?;
+            if parsed.version != 1
+                || parsed.space_id != index_def.space_id
+                || parsed.index_name != index_def.index_name
+                || parsed.schema_name != index_def.schema_name
+                || parsed.fields != index_def.fields
+                || parsed.prefix != prefix
+            {
+                return Err(IndexError::InvalidValue(
+                    "index cursor does not match this query".to_string(),
+                ));
+            }
+            validate_key(&parsed.last_key)?;
+            // Range starts are inclusive. Appending zero excludes exactly the
+            // previous key without skipping any larger (including corrupt) key.
+            let mut start = parsed.last_key;
+            start.push(0);
+            start
+        };
+        let end = prefix_successor(&prefix).ok_or_else(|| {
+            IndexError::InvalidValue("index prefix has no upper bound".to_string())
+        })?;
+        let limit = if limit == 0 { 1024 } else { limit };
+        let probe = limit
+            .checked_add(1)
+            .ok_or_else(|| IndexError::InvalidValue("index page limit overflow".to_string()))?;
+        let entries = self
+            .kvstore
+            .scan_range(&start, &end, Some(probe))
+            .await
+            .map_err(|e| IndexError::Storage(e.to_string()))?;
+        for (key, _) in &entries {
+            validate_key(key)?;
+        }
+        let has_more = entries.len() > limit;
+        let keys: Vec<_> = entries
+            .into_iter()
+            .take(limit)
+            .map(|(key, _)| key)
+            .collect();
+        let next_cursor = if has_more {
+            serde_json::to_vec(&LookupCursor {
+                version: 1,
+                space_id: index_def.space_id,
+                index_name: index_def.index_name.clone(),
+                schema_name: index_def.schema_name.clone(),
+                fields: index_def.fields.clone(),
+                prefix,
+                last_key: keys.last().unwrap().clone(),
+            })
+            .map_err(|e| IndexError::Storage(e.to_string()))?
+        } else {
+            vec![]
+        };
+        Ok((keys, next_cursor, has_more))
+    }
+
+    /// Continue an equality lookup using the opaque cursor returned by this method.
+    pub async fn lookup_tag_page(
+        &self,
+        part_id: u32,
+        index_def: &IndexDef,
+        values: &[IndexValue],
+        limit: usize,
+        cursor: &[u8],
+    ) -> Result<(Vec<i64>, Vec<u8>, bool), IndexError> {
+        let (keys, cursor, has_more) = self
+            .lookup_page_keys(part_id, index_def, values, limit, cursor, false)
+            .await?;
+        let vids = keys
+            .iter()
+            .map(|key| {
+                KeyUtils::parse_tag_index_vid(key, 0)
+                    .ok_or_else(|| IndexError::InvalidValue("invalid index VID".to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((vids, cursor, has_more))
+    }
+
+    /// Edge equivalent of `lookup_tag_page`.
+    #[allow(clippy::type_complexity)]
+    pub async fn lookup_edge_page(
+        &self,
+        part_id: u32,
+        index_def: &IndexDef,
+        values: &[IndexValue],
+        limit: usize,
+        cursor: &[u8],
+    ) -> Result<(Vec<(i64, i64, i64)>, Vec<u8>, bool), IndexError> {
+        let (keys, cursor, has_more) = self
+            .lookup_page_keys(part_id, index_def, values, limit, cursor, true)
+            .await?;
+        let edges = keys
+            .iter()
+            .map(|key| {
+                KeyUtils::parse_edge_index_edge(key, 0)
+                    .ok_or_else(|| IndexError::InvalidValue("invalid index edge".to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((edges, cursor, has_more))
     }
 
     /// Lookup tag by exact property values
@@ -1235,6 +1428,50 @@ mod tests {
         assert_eq!(m.get("b"), Some(&1), "b counted 1");
         assert_eq!(m.get("c"), Some(&2), "c counted 2");
         assert_eq!(m.len(), 3, "exactly 3 distinct values");
+    }
+
+    #[tokio::test]
+    async fn test_tag_index_group_counts_rejects_malformed_keys() {
+        let kvstore = Arc::new(MemoryKVStore::new());
+        let manager = IndexManager::new(kvstore.clone());
+        let id = manager
+            .create_tag_index(
+                1,
+                "item_group_idx".to_string(),
+                1,
+                "item".to_string(),
+                vec!["group".to_string()],
+                vec![0],
+            )
+            .await
+            .unwrap();
+        let index = manager.get_index(1, "item_group_idx").await.unwrap();
+        let prefix = KeyUtils::tag_index_prefix(1, id);
+        let valid = KeyUtils::tag_index_key(1, id, &[IndexValue::Int(7)], 0);
+        let missing_vid = valid[..valid.len() - 8].to_vec();
+        let short_vid = valid[..valid.len() - 1].to_vec();
+        let mut extra_suffix = valid.clone();
+        extra_suffix.push(0);
+        let mut invalid_field = prefix.clone();
+        invalid_field.push(0xff);
+        invalid_field.extend(0i64.to_be_bytes());
+        for key in [prefix, missing_vid, short_vid, extra_suffix, invalid_field] {
+            kvstore.put(&key, &[]).await.unwrap();
+            assert!(
+                manager.tag_index_group_counts(1, &index).await.is_err(),
+                "malformed group key must not disappear or count as a row: {key:?}"
+            );
+            kvstore.delete(&key).await.unwrap();
+        }
+        kvstore.put(&valid, &[]).await.unwrap();
+        assert_eq!(
+            manager
+                .tag_index_group_counts(1, &index)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

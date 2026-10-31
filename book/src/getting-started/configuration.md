@@ -10,14 +10,12 @@ The server does not expose command-line flags for these settings. It accepts
 only `--version` and `--help`, and rejects anything else:
 
 ```bash
-$ byoridb-server --version
-byoridb-server 0.4.20 (commit c9bd11c39001, release)
-
-$ byoridb-server --help    # lists every key and environment variable below
+byoridb-server --version
+byoridb-server --help
 ```
 
-The output above illustrates the v0.4.20 release baseline; an installed binary
-reports its own version and commit. `--version` identifies the exact build,
+The installed binary reports its own version, commit and build profile.
+`--help` lists configuration keys and environment variables. `--version` identifies the exact build,
 including revisions that were not tagged. A build made from a modified working
 tree is marked `-dirty`, and a build
 made outside a git checkout reports `unknown`. Both flags exit without reading
@@ -87,8 +85,8 @@ throttled. Failed logins are limited per account, per source address, and by a
 lockout. Successful logins do not consume failure budgets; concurrent Argon2
 verification queues rather than limits sessions — see
 [Login throttling](../reference/api.md#login-throttling)
-for the wire contract. The defaults are the right choice for an exposed
-listener:
+for the wire contract. Keep these defaults when exposing a listener through
+the supported TLS and network boundary:
 
 ```toml
 [auth]
@@ -170,12 +168,30 @@ These variables are read directly by the current process:
 | --- | --- | --- |
 | `BYORIDB_CACHE_SIZE_MB` | `256` | redb page-cache size in MiB; values must be positive |
 | `BYORIDB_DURABILITY` | immediate durability | `none`, `relaxed`, or `eventual` selects relaxed durability |
-| `BYORIDB_MAX_MEMORY_MB` | `1024` | Soft per-query materialized-result memory cap; `0` disables it |
-| `BYORIDB_MAX_SCAN_LIMIT` | `100000` | Maximum rows from one fallback scan; `0` disables it |
+| `BYORIDB_MAX_MEMORY_MB` | `1024` | Soft materialized-result and separate DML staging budgets; `0` disables them |
+| `BYORIDB_MAX_SCAN_LIMIT` | `100000` | Candidate budget per guarded full-prefix/index-partition scan; `0` disables it |
 | `RUST_LOG` | subscriber default | Rust tracing filter, for example `byoridb_graph=debug` |
 
 Relaxed durability can lose recent commits after a crash. Use it only for data
 that can be reloaded, not normal serving.
+
+**Current source contract:** local LOOKUP counts
+raw candidates before filtering; exactly at the scan cap may succeed, cap+1
+fails, and query `LIMIT/OFFSET` cannot bypass it. This is not a global query-work
+or memory budget. Distributed indexed LOOKUP applies the same cap per partition,
+uses query-bound keyset pages and rejects unavailable or invalid partitions.
+Concurrent writes are not read from a shared snapshot; full scans and ordered
+ranges remain unsupported in distributed execution.
+
+FIND uses internal `ExecutionConfig` fields, not additional environment variables:
+`max_traversal_nodes` (100,000) counts expanded vertices or vertex/hop states for
+hop-bounded weighted queries; `max_find_paths` (1,024) caps complete paths from
+`FIND ALL SHORTEST PATHS`. `0` disables either. Execution errors on overflow,
+allows the exact path-count boundary, and does not bound frontier memory or edges
+scanned. `UPTO` above `u32::MAX` is rejected rather than wrapped. For schema-aware
+edge ranges, strict record decoding, weighted validation costs and unsupported
+FIND clauses, see [data queries](../guide/ngql/dql.md). These contracts describe
+the current checkout; older releases retain their own boundaries.
 
 ## Cluster settings
 
@@ -193,13 +209,13 @@ meta_addr = "0.0.0.0:9559"
 The matching variables are
 `BYORIDB__CLUSTER__NODE_ID`, `BYORIDB__CLUSTER__PEERS`,
 `BYORIDB__CLUSTER__ADVERTISE_ADDR`, `BYORIDB__CLUSTER__BOOTSTRAP`, and
-`BYORIDB__CLUSTER__META_ADDR`. A comma-separated non-empty `peers` value enables
-the Meta launcher.
+`BYORIDB__CLUSTER__META_ADDR`. These keys are reserved. The standalone launcher
+rejects any value that differs from the defaults above, including nonempty
+`peers` or `bootstrap = true`, before opening storage or listeners.
 
-Cluster startup is still incomplete: Storage/Raft peer bootstrap, deployment
-wiring, and multi-node operational end-to-end coverage are not closed. Do not
-treat the current cluster switches or the three services in `docker-compose.yml`
-as a production distributed deployment.
+Storage/Raft peer bootstrap, deployment wiring and multi-node operational
+acceptance remain incomplete. The default `docker-compose.yml` runs one
+standalone server with loopback-only host ports and a persistent volume.
 
 ## Network security
 

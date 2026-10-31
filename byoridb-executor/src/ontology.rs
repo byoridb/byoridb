@@ -12,7 +12,6 @@
 use crate::context::ExecutionContext;
 use crate::error::{ExecutionError, Result};
 use crate::key::SchemaKey;
-use byoridb_codec::VertexCodec;
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -149,8 +148,7 @@ pub(crate) async fn vertex_class_set(
     let Some(blob) = ctx.kvstore.get(&SchemaKey::vertex(space, vid)).await? else {
         return Ok(None);
     };
-    let vertex = VertexCodec::decode_vertex(&blob)
-        .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
+    let vertex = crate::record_decode::decode_vertex(vid, &blob)?;
 
     // Direct classes = declared tags ∪ inferred types.
     let mut direct: Vec<String> = vertex.tags.iter().map(|t| t.name.clone()).collect();

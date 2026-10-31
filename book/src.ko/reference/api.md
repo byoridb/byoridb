@@ -321,6 +321,11 @@ HTTP query 문자열의 상한은 1 MiB이며 초과하면 HTTP 413을 반환합
 두 query route는 선택적인 `read_only` flag를 받습니다. gRPC `ExecuteRequest`에도
 같은 field가 있습니다.
 
+HTTP query body는 `session_id`, `query`, `read_only`만 받습니다. `params`나
+잘못 표기한 `readOnly` 등 알 수 없는 field는 실행 전에 HTTP 422로 거부합니다.
+Typed parameter binding은 아직 미지원이며 embedded `execute_with_params`도 비어
+있지 않은 parameter를 무시하지 않고 거부합니다.
+
 ```bash
 curl -sS http://127.0.0.1:19669/api/v1/query \
   -H 'Content-Type: application/json' \
@@ -379,6 +384,20 @@ Client가 status로 다음 동작을 결정할 수 있도록 실패 유형을 �
 
 `/api/v1/query/json`은 raw JSON text 안에 같은 status와 code를 반환합니다. 단 HTTP
 413 응답은 `QUERY_TOO_LARGE` code 없이 plain string으로 반환합니다.
+
+### 변경 결과와 추론 복구
+
+단일 DML 문장은 graph/history/index/vector/counter/sameAs 변경을 준비해 Memory/redb에서
+한 번에 commit합니다. Closure 완성은 별도이므로 실행 오류나 응답 유실 전에 assertion이
+이미 반영됐을 수 있습니다. Compound query는 절별 commit이며 뒤 절의 오류가 앞 절을
+되돌리지 않습니다. 영속 idempotency key나 mutation-outcome 조회가 없으므로 확인 없이
+같은 변경을 재시도하면 안전하지 않습니다.
+
+`CHECK INFERENCE`로 `complete` 또는 `repair_required`를 확인하세요. 복구가 필요하면
+GOD/ADMIN이 `REPAIR INFERENCE`를 실행할 때까지 graph 읽기와 추가 변경을 거부합니다.
+이 명령은 `read_only`가 true인 요청에서도 거부하며 asserted history는 보존합니다.
+복구 뒤 현재 fact를 확인한 후 재시도를 판단하세요.
+[추론 상태와 복구](../guide/ngql/dql.md#inference-status-and-recovery)를 참고하세요.
 
 ### Session 종료
 

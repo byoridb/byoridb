@@ -6,13 +6,16 @@ ByoriDB는 애플리케이션 계층의 인증과 역할 검사를 제공하지�
 경계를 자체적으로 제공하지는 않습니다. 운영자는 아래의 네트워크 및 전송 계층
 보호를 별도로 구성해야 합니다.
 
+[Standalone TLS 프로필](secure-deployment.md)이 이 전송 경계를 구현하고 검증합니다.
+Space별 권한이나 cluster 전체 session 폐기를 추가하는 것은 아닙니다.
+
 취약점 제보 절차와 권위 있는 제한 사항은 저장소의
 [보안 정책](https://github.com/byoridb/byoridb/blob/main/SECURITY.ko.md)을 참고하세요.
 
 ## Root credential
 
 스탠드얼론 서버는 `BYORIDB_ROOT_PASSWORD`가 없거나 빈 문자열이면 시작을
-거부합니다. 공백으로만 구성된 값에 대한 별도 강도 검사는 현재 수행하지 않습니다.
+거부합니다. 공백으로만 구성된 값도 거부하며 그 이상의 비밀번호 강도 검사는 없습니다.
 
 ```bash
 export BYORIDB_ROOT_PASSWORD='use-a-secret-manager-value'
@@ -42,7 +45,7 @@ entropy가 충분한 비밀번호를 요구해야 합니다.
 - 기본 permission은 wildcard space `*`에 적용되며, 공개된 space 범위 ACL 문법은
   없습니다.
 - `Write`는 graph data의 insert, update, delete를 포함합니다.
-- 사용자와 role 변경, `BALANCE`, `SHOW USERS`, `SHOW ROLES`, `SHOW SESSIONS`는
+- 사용자와 role 변경, `REPAIR INFERENCE`, `BALANCE`, `SHOW USERS`, `SHOW ROLES`, `SHOW SESSIONS`는
   다른 role이 `Create` 권한을 가지고 있어도 `GOD` 또는 `ADMIN`만 실행할 수
   있습니다.
 - `SHOW USERS`는 password hash 없이 built-in root와 영속 사용자를 반환합니다.

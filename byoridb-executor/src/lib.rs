@@ -27,6 +27,7 @@ pub mod match_impl;
 pub(crate) mod ontology;
 pub mod plan;
 pub mod profile;
+pub(crate) mod record_decode;
 #[cfg(feature = "distributed")]
 pub mod storage_client;
 pub mod transaction;

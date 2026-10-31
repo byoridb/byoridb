@@ -117,7 +117,7 @@ jobs:
       - name: Build release binaries (server + bulk loader + CLI)
         # `-p` is required: the bins live in different workspace packages, so
         # `--bin X --bin Y` alone fails ("no bin target in default-run packages").
-        run: cargo build --locked --release -p byoridb --bin byoridb-server -p byoridb-bulkloader --bin byoridb-bulkloader -p byoridb-client --bin byoridb-cli
+        run: cargo build --locked --release -p byoridb --bin byoridb-server --bin byoridb-backup -p byoridb-bulkloader --bin byoridb-bulkloader -p byoridb-client --bin byoridb-cli
 
       - name: Build & push Docker image
         run: |

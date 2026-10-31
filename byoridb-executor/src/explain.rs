@@ -262,7 +262,13 @@ fn reverse_single_edge_end(p: &crate::plan::MatchPlan) -> Option<&NodePattern> {
         return None;
     }
     let path = match &p.pattern {
-        Pattern::Path(path) if path.edges.len() == 1 => path,
+        Pattern::Path(path)
+            if path.edges.len() == 1
+                && path.edges[0].direction == EdgeDirection::Outgoing
+                && path.edges[0].range.is_none() =>
+        {
+            path
+        }
         _ => return None,
     };
     let end = path.nodes.first()?;
@@ -477,9 +483,8 @@ async fn lookup_access_for_mode(
     p: &LookupPlan,
     distributed: bool,
 ) -> AccessPath {
-    // An edge LOOKUP uses its index only for a single-field equality: there is
-    // no bounded-range form of the edge index scan, so a range predicate takes
-    // the scan and must be reported as one (#79).
+    // Both tag and edge ranges require a schema-compatible physical index
+    // domain. Otherwise execution uses the complete predicate scan.
     let name = match &p.lookup_type {
         LookupType::Tag(t) => t.clone(),
         LookupType::Edge(e) => e.clone(),
@@ -494,28 +499,31 @@ async fn lookup_access_for_mode(
                     return access;
                 }
                 if let Some(field) = lookup_index_field(expr) {
-                    // Equality and ordered ranges both use the edge index now
-                    // (#122); an unordered boundary still takes the scan, the
-                    // same rule the tag path applies.
-                    let ordered_boundary = match range_lookup_literal(expr) {
-                        None => true,
-                        Some(value) => {
-                            matches!(
-                                value,
-                                byoridb_common::Value::Bool(_) | byoridb_common::Value::Int(_)
-                            ) || matches!(value, byoridb_common::Value::Float(number)
-                                if !number.is_nan() && number != 0.0)
+                    if let Some(value) = range_lookup_literal(expr) {
+                        match crate::executor::range_index_boundary(
+                            ctx,
+                            &crate::key::SchemaKey::edge(space, &name),
+                            &field,
+                            &value,
+                        )
+                        .await
+                        {
+                            Ok(Some(_)) => {}
+                            Ok(None) => return lookup_full_scan_access(distributed),
+                            Err(_) => {
+                                return AccessPath::Unsupported(
+                                    "LOOKUP schema metadata is unavailable".to_string(),
+                                );
+                            }
                         }
-                    };
-                    if ordered_boundary {
-                        let space_id = ctx.resolve_space_id().await;
-                        if let Some(index) = im.list_edge_indexes(space_id).await.iter().find(|i| {
-                            i.schema_name.eq_ignore_ascii_case(&name)
-                                && i.fields.len() == 1
-                                && i.fields[0] == field
-                        }) {
-                            return AccessPath::Index(index.index_name.clone());
-                        }
+                    }
+                    let space_id = ctx.resolve_space_id().await;
+                    if let Some(index) = im.list_edge_indexes(space_id).await.iter().find(|i| {
+                        i.schema_name.eq_ignore_ascii_case(&name)
+                            && i.fields.len() == 1
+                            && i.fields[0] == field
+                    }) {
+                        return AccessPath::Index(index.index_name.clone());
                     }
                 }
             }
@@ -534,11 +542,21 @@ async fn lookup_access_for_mode(
                     let Some(space) = ctx.space.as_deref() else {
                         return lookup_full_scan_access(distributed);
                     };
-                    if crate::executor::range_index_boundary(ctx, space, tag, &field, &value)
-                        .await
-                        .is_none()
+                    match crate::executor::range_index_boundary(
+                        ctx,
+                        &crate::key::SchemaKey::tag(space, tag),
+                        &field,
+                        &value,
+                    )
+                    .await
                     {
-                        return lookup_full_scan_access(distributed);
+                        Ok(Some(_)) => {}
+                        Ok(None) => return lookup_full_scan_access(distributed),
+                        Err(_) => {
+                            return AccessPath::Unsupported(
+                                "LOOKUP schema metadata is unavailable".to_string(),
+                            );
+                        }
                     }
                 }
                 let space_id = ctx.resolve_space_id().await;
@@ -944,6 +962,8 @@ fn plan_kind(plan: &ExecutionPlan) -> &'static str {
         ExecutionPlan::Lookup(_) => "Lookup",
         ExecutionPlan::Recommend(_) => "Recommend",
         ExecutionPlan::CheckConsistency => "CheckConsistency",
+        ExecutionPlan::CheckInference => "CheckInference",
+        ExecutionPlan::RepairInference => "RepairInference",
         ExecutionPlan::CheckShape => "CheckShape",
         ExecutionPlan::ExplainInference { .. } => "ExplainInference",
         ExecutionPlan::Compound(_) => "Compound",
@@ -1112,6 +1132,84 @@ mod tests {
             .iter()
             .any(|r| matches!(&r[ai], byoridb_common::Value::String(s) if s.contains("FULL SCAN")));
         assert!(has_full, "no index should flag FULL SCAN: {:?}", res.rows);
+    }
+
+    #[tokio::test]
+    async fn explain_lookup_corrupt_schema_does_not_advertise_scan_fallback() {
+        let exec = exec_with_age_index().await;
+        exec.ctx()
+            .kvstore
+            .put(
+                &crate::key::SchemaKey::tag("default", "person"),
+                b"{invalid",
+            )
+            .await
+            .unwrap();
+
+        let res = run(&exec, "EXPLAIN LOOKUP ON person WHERE person.age > 30").await;
+        let ai = access_col(&res);
+        assert!(res.rows.iter().any(|row| matches!(
+            &row[ai],
+            byoridb_common::Value::String(access)
+                if access == "UNSUPPORTED: LOOKUP schema metadata is unavailable"
+        )));
+        assert!(!res.rows.iter().any(|row| matches!(
+            &row[ai],
+            byoridb_common::Value::String(access) if access.contains("FULL SCAN")
+        )));
+
+        let statement =
+            byoridb_parser::parse("PROFILE LOOKUP ON person WHERE person.age > 30").unwrap();
+        let plan = ExecutionPlanBuilder::build(statement).unwrap();
+        assert!(exec.execute(plan).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn explain_edge_numeric_range_uses_schema_aware_scan_fallback() {
+        let kv = Arc::new(MemoryKVStore::new());
+        let ctx = Arc::new(
+            ExecutionContext::new(kv.clone())
+                .with_space("default".to_string())
+                .with_space_id(1),
+        );
+        let exec = Executor::new(ctx);
+        run(&exec, "CREATE EDGE metric (score double)").await;
+        run(&exec, "CREATE EDGE INDEX metric_score_idx ON metric(score)").await;
+        for predicate in ["score > 0", "score > 0.5", "10 < score"] {
+            let query = format!("EXPLAIN LOOKUP ON metric WHERE {predicate}");
+            let result = run(&exec, &query).await;
+            let ai = access_col(&result);
+            assert!(
+                result.rows.iter().any(|row| matches!(
+                    &row[ai],
+                    byoridb_common::Value::String(access) if access.contains("FULL SCAN")
+                )),
+                "{query}: {:?}",
+                result.rows
+            );
+            assert!(!result.rows.iter().any(|row| matches!(
+                &row[ai],
+                byoridb_common::Value::String(access) if access.contains("metric_score_idx")
+            )));
+        }
+        kv.put(
+            &crate::key::SchemaKey::edge("default", "metric"),
+            b"{invalid",
+        )
+        .await
+        .unwrap();
+        let result = run(&exec, "EXPLAIN LOOKUP ON metric WHERE score > 0").await;
+        let ai = access_col(&result);
+        assert!(result.rows.iter().any(|row| matches!(
+            &row[ai],
+            byoridb_common::Value::String(access)
+                if access == "UNSUPPORTED: LOOKUP schema metadata is unavailable"
+        )));
+        let statement = byoridb_parser::parse("PROFILE LOOKUP ON metric WHERE score > 0").unwrap();
+        assert!(exec
+            .execute(ExecutionPlanBuilder::build(statement).unwrap())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -1443,6 +1541,30 @@ mod tests {
             !exec.ctx().took_full_scan(),
             "full_scan flag must stay clear for the reverse-edge index path"
         );
+    }
+
+    #[tokio::test]
+    async fn explain_reverse_point_lookup_requires_fixed_outgoing_edge() {
+        let exec = exec_graph().await;
+        for (pattern, reverse) in [
+            ("(p:product)-[:belongs_to]->(c:category)", true),
+            ("(p:product)<-[:belongs_to]-(c:category)", false),
+            ("(p:product)-[:belongs_to]-(c:category)", false),
+            ("(p:product)-[:belongs_to*1..2]->(c:category)", false),
+        ] {
+            let result = run(
+                &exec,
+                &format!("EXPLAIN MATCH {pattern} WHERE id(c)==100 RETURN p"),
+            )
+            .await;
+            let ai = access_col(&result);
+            let point_lookup = result.rows.iter().any(|row| {
+                matches!(
+                    &row[ai], byoridb_common::Value::String(access) if access == "point lookup"
+                )
+            });
+            assert_eq!(point_lookup, reverse, "{pattern}: {:?}", result.rows);
+        }
     }
 
     #[tokio::test]

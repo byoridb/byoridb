@@ -12,7 +12,7 @@
 //! redb KV + insertion-only forward-chaining engine.
 //!
 //! **Strategy.** sameAs is asserted as a reserved edge type:
-//! `INSERT EDGE sameAs() VALUES a->b:()`. After the asserted edges commit (and
+//! `INSERT EDGE sameAs() VALUES a->b:()`. Inside the asserted statement transaction (and
 //! *before* O-5 forward-chaining), [`Executor::merge_sameas_triples`] union-finds
 //! the two equivalence classes and **collapses** the larger-id representative
 //! into the smaller-id one (D2: min-id representative). The loser's edges
@@ -29,22 +29,18 @@
 //! retract a merge. DELETE of a merged node / a sameAs edge is rejected
 //! (`executor::dml` guards). A future B/F retraction algorithm is out of scope.
 
-use super::Executor;
-use crate::error::Result;
+use super::{inference::INFERRED_MARKER, Executor};
+use crate::error::{ExecutionError, Result};
 use crate::key::SchemaKey;
 use crate::ontology;
-use byoridb_codec::{EdgeData as CodecEdgeData, TagData as CodecTagData, VertexCodec, VertexData};
-use std::collections::HashSet;
+use byoridb_codec::{EdgeData, TagData, VertexCodec, VertexData};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// Reserved edge type asserting owl:sameAs node equivalence (D1). Do not declare
-/// O-4 semantic flags on it — equivalence is handled here, not by O-5 rules.
 pub(super) const SAMEAS_EDGE: &str = "sameAs";
 
 impl Executor {
-    /// Apply owl:sameAs merges for the `sameAs`-typed triples in `triples`
-    /// (PLAN.md O-8). No-op for spaces/inserts without sameAs edges. Called by
-    /// INSERT EDGE before O-5 materialization so forward-chaining runs over the
-    /// canonicalized graph (D10).
+    /// All writes target the statement-local overlay. Exceeding the merge cap
+    /// fails the whole asserted statement, including its history and mappings.
     pub(super) async fn merge_sameas_triples(
         &self,
         space: &str,
@@ -56,52 +52,124 @@ impl Executor {
             if p != SAMEAS_EDGE || a == b {
                 continue;
             }
-            let rep_a = ontology::representative_of(&self.ctx, space, *a).await?;
-            let rep_b = ontology::representative_of(&self.ctx, space, *b).await?;
-            if rep_a == rep_b {
-                continue; // already the same equivalence class
+            let a = ontology::representative_of(&self.ctx, space, *a).await?;
+            let b = ontology::representative_of(&self.ctx, space, *b).await?;
+            if a == b {
+                continue;
             }
-            let (winner, loser) = (rep_a.min(rep_b), rep_a.max(rep_b));
-            self.collapse_node(space, winner, loser).await?;
+            if cap != 0 && merged >= cap {
+                return Err(ExecutionError::ResourceExhausted(format!("sameAs merges exceed max_traversal_nodes ({cap}); no statement writes committed")));
+            }
+            self.collapse_node(space, a.min(b), a.max(b)).await?;
             merged += 1;
-            if merged >= cap {
-                tracing::warn!(
-                    cap,
-                    "O-8 sameAs merge hit max_traversal_nodes; some equivalences left unmerged"
-                );
-                return Ok(());
-            }
+        }
+        if merged > 0 {
+            self.rebuild_asserted_degree_counters(space).await?;
         }
         Ok(())
     }
 
-    /// Collapse representative `loser` into representative `winner`
-    /// (`winner < loser`). Rewrites all of loser's vid-addressed facts onto
-    /// winner, then repoints loser and its former members in the union-find map.
-    /// Immediate puts/deletes (not batched) so a later step in the same merge
-    /// run observes earlier rewrites, mirroring O-5's convention.
     async fn collapse_node(&self, space: &str, winner: i64, loser: i64) -> Result<()> {
-        self.rewrite_out_edges(space, winner, loser).await?;
-        self.rewrite_in_edges(space, winner, loser).await?;
-        self.rewrite_vtype(space, winner, loser).await?;
+        let mut edges = BTreeMap::new();
+        for prefix in [
+            SchemaKey::edge_data_src_prefix(space, loser),
+            SchemaKey::in_edge_data_dst_prefix(space, loser),
+        ] {
+            for (key, value) in self.ctx.kvstore.scan_prefix(&prefix).await? {
+                let edge = crate::algo::decode_query_edge(&key, &value)?;
+                let fwd = SchemaKey::edge_data(
+                    space,
+                    edge.src_vid,
+                    &edge.edge_type,
+                    edge.dst_vid,
+                    edge.ranking,
+                );
+                let forward = self.ctx.kvstore.get(&fwd).await?.ok_or_else(|| {
+                    ExecutionError::InvalidOperation("sameAs found an orphan reverse edge".into())
+                })?;
+                let forward_edge = crate::algo::decode_query_edge(&fwd, &forward)?;
+                if forward_edge != edge {
+                    return Err(ExecutionError::InvalidOperation(
+                        "sameAs forward/reverse edge mismatch".into(),
+                    ));
+                }
+                edges.insert(fwd, edge);
+            }
+        }
+        // Remove all old identities first, then combine collisions at their
+        // canonical identities. Existing winner assertions win property conflicts.
+        for (key, edge) in &edges {
+            let mut deletes = self.edge_index_keys(space, edge).await?;
+            deletes.extend([
+                key.clone(),
+                SchemaKey::in_edge_data(
+                    space,
+                    edge.dst_vid,
+                    &edge.edge_type,
+                    edge.src_vid,
+                    edge.ranking,
+                ),
+            ]);
+            let versions = if edge.properties.contains_key(INFERRED_MARKER) {
+                Vec::new()
+            } else {
+                Self::build_tombstones(vec![key.clone()])
+            };
+            self.ctx
+                .kvstore
+                .batch_apply(Vec::new(), deletes, versions)
+                .await?;
+        }
+        for (_, mut edge) in edges {
+            if edge.src_vid == loser {
+                edge.src_vid = winner;
+            }
+            if edge.dst_vid == loser {
+                edge.dst_vid = winner;
+            }
+            self.write_merged_edge(space, edge).await?;
+        }
+        for (key, _) in self
+            .ctx
+            .kvstore
+            .scan_prefix(&SchemaKey::vtype_prefix(space, loser))
+            .await?
+        {
+            let class = SchemaKey::vtype_class_from_key(&key)
+                .filter(|class| SchemaKey::vtype(space, loser, class) == key)
+                .ok_or_else(|| {
+                    ExecutionError::InvalidOperation(
+                        "Invalid inferred type key during sameAs".into(),
+                    )
+                })?;
+            self.ctx
+                .kvstore
+                .put(&SchemaKey::vtype(space, winner, &class), &[])
+                .await?;
+            self.ctx.kvstore.delete(&key).await?;
+        }
         self.merge_vertex_blob(space, winner, loser).await?;
-
-        // Repoint loser → winner, plus every member previously collapsed into
-        // loser (their facts already live on loser, now moving to winner).
         let repr = ontology::encode_repr(winner);
-        for m in ontology::members_of(&self.ctx, space, loser).await? {
+        for (key, _) in self
+            .ctx
+            .kvstore
+            .scan_prefix(&SchemaKey::sameas_members_prefix(space, loser))
+            .await?
+        {
+            let member = SchemaKey::sameas_member_from_key(&key)
+                .filter(|member| SchemaKey::sameas_member(space, loser, *member) == key)
+                .ok_or_else(|| {
+                    ExecutionError::InvalidOperation("Invalid sameAs member key".into())
+                })?;
             self.ctx
                 .kvstore
-                .put(&SchemaKey::sameas(space, m), &repr)
+                .put(&SchemaKey::sameas(space, member), &repr)
                 .await?;
             self.ctx
                 .kvstore
-                .put(&SchemaKey::sameas_member(space, winner, m), &[])
+                .put(&SchemaKey::sameas_member(space, winner, member), &[])
                 .await?;
-            self.ctx
-                .kvstore
-                .delete(&SchemaKey::sameas_member(space, loser, m))
-                .await?;
+            self.ctx.kvstore.delete(&key).await?;
         }
         self.ctx
             .kvstore
@@ -114,177 +182,188 @@ impl Executor {
         Ok(())
     }
 
-    /// Rewrite loser's outgoing edges onto winner (forward `{space}:edge:{loser}:`
-    /// scan). Both indexes (forward + in-edge) are deleted and re-written; a
-    /// self-loop `loser→loser` becomes `winner→winner`.
-    async fn rewrite_out_edges(&self, space: &str, winner: i64, loser: i64) -> Result<()> {
-        let prefix = SchemaKey::edge_data_src_prefix(space, loser);
-        for (key, value) in self.ctx.kvstore.scan_prefix(&prefix).await? {
-            let Ok(mut edge) = VertexCodec::decode_edge(&value) else {
-                continue;
-            };
-            let p = edge.edge_type.clone();
-            let old_dst = edge.dst_vid;
-            let r = edge.ranking;
-            self.ctx.kvstore.delete(&key).await?;
-            self.ctx
-                .kvstore
-                .delete(&SchemaKey::in_edge_data(space, old_dst, &p, loser, r))
-                .await?;
-            edge.src_vid = winner;
-            edge.dst_vid = if old_dst == loser { winner } else { old_dst };
-            self.write_edge(space, &edge).await?;
-        }
-        Ok(())
-    }
-
-    /// Rewrite loser's incoming edges onto winner (reverse `{space}:in-edge:{loser}:`
-    /// scan). Self-loops were already handled by [`Self::rewrite_out_edges`]
-    /// (their in-edge entry is gone), so a residual `src == loser` is skipped.
-    async fn rewrite_in_edges(&self, space: &str, winner: i64, loser: i64) -> Result<()> {
-        let prefix = SchemaKey::in_edge_data_dst_prefix(space, loser);
-        for (key, value) in self.ctx.kvstore.scan_prefix(&prefix).await? {
-            let Ok(mut edge) = VertexCodec::decode_edge(&value) else {
-                continue;
-            };
-            let old_src = edge.src_vid;
-            if old_src == loser {
-                self.ctx.kvstore.delete(&key).await?; // stale self-loop in-edge
-                continue;
-            }
-            let p = edge.edge_type.clone();
-            let r = edge.ranking;
-            self.ctx.kvstore.delete(&key).await?;
-            self.ctx
-                .kvstore
-                .delete(&SchemaKey::edge_data(space, old_src, &p, loser, r))
-                .await?;
-            edge.dst_vid = winner;
-            self.write_edge(space, &edge).await?;
-        }
-        Ok(())
-    }
-
-    /// Persist an edge to both the forward and reverse-edge indexes.
-    async fn write_edge(&self, space: &str, edge: &CodecEdgeData) -> Result<()> {
-        let data = VertexCodec::encode_edge(edge)
-            .map_err(|e| crate::error::ExecutionError::Io(std::io::Error::other(e.to_string())))?;
-        let fwd = SchemaKey::edge_data(
+    async fn write_merged_edge(&self, space: &str, mut edge: EdgeData) -> Result<()> {
+        let key = SchemaKey::edge_data(
             space,
             edge.src_vid,
             &edge.edge_type,
             edge.dst_vid,
             edge.ranking,
         );
-        self.ctx.kvstore.put(&fwd, &data).await?;
-        let rev = SchemaKey::in_edge_data(
-            space,
-            edge.dst_vid,
-            &edge.edge_type,
-            edge.src_vid,
-            edge.ranking,
-        );
-        self.ctx.kvstore.put(&rev, &data).await?;
-        Ok(())
-    }
-
-    /// Move loser's inferred class memberships (O-5 domain/range) onto winner.
-    async fn rewrite_vtype(&self, space: &str, winner: i64, loser: i64) -> Result<()> {
-        let prefix = SchemaKey::vtype_prefix(space, loser);
-        for (key, _) in self.ctx.kvstore.scan_prefix(&prefix).await? {
-            if let Some(class) = SchemaKey::vtype_class_from_key(&key) {
-                self.ctx
-                    .kvstore
-                    .put(&SchemaKey::vtype(space, winner, &class), &[])
-                    .await?;
+        let mut deletes = Vec::new();
+        if let Some(bytes) = self.ctx.kvstore.get(&key).await? {
+            let existing = crate::algo::decode_query_edge(&key, &bytes)?;
+            deletes = self.edge_index_keys(space, &existing).await?;
+            let existing_asserted = !existing.properties.contains_key(INFERRED_MARKER);
+            let incoming_asserted = !edge.properties.contains_key(INFERRED_MARKER);
+            if existing_asserted || !incoming_asserted {
+                let incoming = edge.properties;
+                edge = existing;
+                if incoming_asserted {
+                    for (key, value) in incoming {
+                        edge.properties.entry(key).or_insert(value);
+                    }
+                }
             }
-            self.ctx.kvstore.delete(&key).await?;
         }
+        let data = VertexCodec::encode_edge(&edge)
+            .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
+        let mut puts = vec![
+            (key.clone(), data.clone()),
+            (
+                SchemaKey::in_edge_data(
+                    space,
+                    edge.dst_vid,
+                    &edge.edge_type,
+                    edge.src_vid,
+                    edge.ranking,
+                ),
+                data.clone(),
+            ),
+        ];
+        puts.extend(
+            self.edge_index_keys(space, &edge)
+                .await?
+                .into_iter()
+                .map(|key| (key, Vec::new())),
+        );
+        let keep: HashSet<_> = puts.iter().map(|(key, _)| key.clone()).collect();
+        deletes.retain(|key| !keep.contains(key));
+        let versions = if edge.properties.contains_key(INFERRED_MARKER) {
+            Vec::new()
+        } else {
+            Self::build_versions(vec![(key, data)])
+        };
+        self.ctx
+            .kvstore
+            .batch_apply(puts, deletes, versions)
+            .await?;
         Ok(())
     }
 
-    /// Merge loser's vertex blob into winner's (D6: winner wins on property
-    /// conflict), maintaining the tagvid index and dense embedding store, then
-    /// delete the loser blob. No-op if loser has no vertex record (edge-only id).
     async fn merge_vertex_blob(&self, space: &str, winner: i64, loser: i64) -> Result<()> {
         let loser_key = SchemaKey::vertex(space, loser);
-        let Some(loser_blob) = self.ctx.kvstore.get(&loser_key).await? else {
+        let Some(bytes) = self.ctx.kvstore.get(&loser_key).await? else {
             return Ok(());
         };
-        let loser_v = VertexCodec::decode_vertex(&loser_blob)
-            .map_err(|e| crate::error::ExecutionError::Io(std::io::Error::other(e.to_string())))?;
-
+        let loser_v = crate::record_decode::decode_vertex(loser, &bytes)?;
         let winner_key = SchemaKey::vertex(space, winner);
         let mut winner_v = match self.ctx.kvstore.get(&winner_key).await? {
-            Some(b) => VertexCodec::decode_vertex(&b).map_err(|e| {
-                crate::error::ExecutionError::Io(std::io::Error::other(e.to_string()))
-            })?,
+            Some(bytes) => crate::record_decode::decode_vertex(winner, &bytes)?,
             None => VertexData {
                 vid: winner,
                 tags: Vec::new(),
             },
         };
-
-        let mut dirty_vec_props: HashSet<String> = HashSet::new();
-
-        // Tear down loser's tagvid + dense-vector entries and fold its tags in.
-        for ltag in &loser_v.tags {
-            self.ctx
-                .kvstore
-                .delete(&SchemaKey::tagvid(space, &ltag.name, loser))
-                .await?;
-            for (prop, value) in &ltag.properties {
-                if crate::executor::recommend::pack_embedding(value).is_some() {
-                    self.ctx
-                        .kvstore
-                        .delete(&SchemaKey::vec_data(space, prop, loser))
-                        .await?;
-                    dirty_vec_props.insert(prop.clone());
+        let mut deletes = self.vertex_index_keys(space, &loser_v).await?;
+        deletes.extend(self.vertex_index_keys(space, &winner_v).await?);
+        deletes.push(loser_key.clone());
+        let mut dirty = HashSet::new();
+        for tag in &loser_v.tags {
+            deletes.push(SchemaKey::tagvid(space, &tag.name, loser));
+            for (prop, value) in &tag.properties {
+                if super::recommend::pack_embedding(value).is_some() {
+                    deletes.push(SchemaKey::vec_data(space, prop, loser));
+                    dirty.insert(prop.clone());
                 }
             }
-            match winner_v.tags.iter_mut().find(|t| t.name == ltag.name) {
-                Some(wtag) => {
-                    for (k, v) in &ltag.properties {
-                        // winner wins: only fill props it lacks.
-                        wtag.properties
-                            .entry(k.clone())
-                            .or_insert_with(|| v.clone());
-                    }
+            if let Some(wtag) = winner_v.tags.iter_mut().find(|t| t.name == tag.name) {
+                for (key, value) in &tag.properties {
+                    wtag.properties
+                        .entry(key.clone())
+                        .or_insert_with(|| value.clone());
                 }
-                None => winner_v.tags.push(CodecTagData {
-                    name: ltag.name.clone(),
-                    properties: ltag.properties.clone(),
-                }),
+            } else {
+                winner_v.tags.push(TagData {
+                    name: tag.name.clone(),
+                    properties: tag.properties.clone(),
+                });
             }
         }
-
-        self.ctx.kvstore.delete(&loser_key).await?;
-
-        let wdata = VertexCodec::encode_vertex(&winner_v)
-            .map_err(|e| crate::error::ExecutionError::Io(std::io::Error::other(e.to_string())))?;
-        self.ctx.kvstore.put(&winner_key, &wdata).await?;
-
-        // Re-assert winner's tagvid + dense vectors for the (possibly extended)
-        // tag/prop set.
-        for wtag in &winner_v.tags {
-            self.ctx
-                .kvstore
-                .put(&SchemaKey::tagvid(space, &wtag.name, winner), &[])
-                .await?;
-            for (prop, value) in &wtag.properties {
-                if let Some(bytes) = crate::executor::recommend::pack_embedding(value) {
-                    self.ctx
-                        .kvstore
-                        .put(&SchemaKey::vec_data(space, prop, winner), &bytes)
-                        .await?;
-                    dirty_vec_props.insert(prop.clone());
+        let data = VertexCodec::encode_vertex(&winner_v)
+            .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
+        let mut puts = vec![(winner_key.clone(), data.clone())];
+        puts.extend(
+            self.vertex_index_keys(space, &winner_v)
+                .await?
+                .into_iter()
+                .map(|key| (key, Vec::new())),
+        );
+        for tag in &winner_v.tags {
+            puts.push((SchemaKey::tagvid(space, &tag.name, winner), Vec::new()));
+            for (prop, value) in &tag.properties {
+                if let Some(bytes) = super::recommend::pack_embedding(value) {
+                    puts.push((SchemaKey::vec_data(space, prop, winner), bytes));
+                    dirty.insert(prop.clone());
                 }
             }
         }
+        puts.extend(
+            dirty
+                .into_iter()
+                .map(|prop| (SchemaKey::vec_index_dirty(space, &prop), Vec::new())),
+        );
+        let keep: HashSet<_> = puts.iter().map(|(key, _)| key.clone()).collect();
+        deletes.retain(|key| !keep.contains(key));
+        let mut versions = Self::build_tombstones(vec![loser_key]);
+        versions.extend(Self::build_versions(vec![(winner_key, data)]));
+        self.ctx
+            .kvstore
+            .batch_apply(puts, deletes, versions)
+            .await?;
+        Ok(())
+    }
 
-        for prop in &dirty_vec_props {
-            self.mark_vector_index_dirty(space, prop).await?;
+    async fn rebuild_asserted_degree_counters(&self, space: &str) -> Result<()> {
+        let mut counts: HashMap<Vec<u8>, i64> = HashMap::new();
+        for (key, value) in self
+            .ctx
+            .kvstore
+            .scan_prefix(format!("{space}:edge:").as_bytes())
+            .await?
+        {
+            let edge = crate::algo::decode_query_edge(&key, &value)?;
+            if edge.properties.contains_key(INFERRED_MARKER) {
+                continue;
+            }
+            *counts
+                .entry(SchemaKey::indeg_counter(
+                    space,
+                    &edge.edge_type,
+                    edge.dst_vid,
+                ))
+                .or_default() += 1;
+            *counts
+                .entry(SchemaKey::outdeg_counter(
+                    space,
+                    &edge.edge_type,
+                    edge.src_vid,
+                ))
+                .or_default() += 1;
         }
+        let mut deletes = Vec::new();
+        for prefix in [format!("{space}:indeg:"), format!("{space}:outdeg:")] {
+            deletes.extend(
+                self.ctx
+                    .kvstore
+                    .scan_prefix(prefix.as_bytes())
+                    .await?
+                    .into_iter()
+                    .filter(|(key, _)| !counts.contains_key(key))
+                    .map(|(key, _)| key),
+            );
+        }
+        self.ctx
+            .kvstore
+            .batch_apply(
+                counts
+                    .into_iter()
+                    .map(|(key, count)| (key, SchemaKey::encode_count(count)))
+                    .collect(),
+                deletes,
+                Vec::new(),
+            )
+            .await?;
         Ok(())
     }
 }

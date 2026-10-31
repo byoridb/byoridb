@@ -368,7 +368,7 @@ async fn successful_property_index_partitions_keep_all_rows() {
 }
 
 #[tokio::test]
-async fn failed_indexed_group_count_never_falls_back_to_success() {
+async fn grouped_count_uses_validated_candidates_instead_of_unchecked_index_counts() {
     let (store, ctx) = context(0, 1);
     let index_id = create_index(&ctx).await;
     index_vertex(&ctx, index_id, 1, 1).await;
@@ -377,9 +377,12 @@ async fn failed_indexed_group_count_never_falls_back_to_success() {
         .execute_match(match_plan(
             "MATCH (n:item) RETURN n.item.age AS age, count(*) AS total GROUP BY n.item.age",
         ))
-        .await;
-    assert_eq!(store.failures.load(Ordering::SeqCst), 1);
-    assert_index_error(result);
+        .await
+        .unwrap();
+    // An index without a property predicate is no longer a count shortcut.
+    // The normal candidate path validates the tag-vid entry and live vertex.
+    assert_eq!(store.failures.load(Ordering::SeqCst), 0);
+    assert_eq!(result.rows, vec![vec![Value::Int(10), Value::Int(1)]]);
 }
 
 #[tokio::test]

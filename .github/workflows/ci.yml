@@ -137,10 +137,18 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  secure-profile:
+    name: Standalone TLS deployment drill
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and exercise the private TLS deployment
+        run: python3 deploy/secure/smoke.py --build
+
   build:
     name: Build Release
     runs-on: ubuntu-latest
-    needs: [check, fmt, clippy, test, audit]
+    needs: [check, fmt, clippy, test, audit, secure-profile]
     steps:
       - uses: actions/checkout@v7
 
@@ -167,6 +175,17 @@ jobs:
 
       - name: Build release
         run: cargo build --locked --workspace --release
+
+      - name: Exercise the release executables
+        run: |
+          VERSION=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          python3 scripts/release_smoke.py --bin-dir target/release \
+            --version "$VERSION" --commit "$(git rev-parse HEAD)"
+
+      - name: Exercise the prebuilt deployment image
+        run: |
+          docker build --file Dockerfile.prebuilt --tag byoridb-prebuilt:ci .
+          python3 deploy/secure/smoke.py --image byoridb-prebuilt:ci
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7

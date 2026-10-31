@@ -12,10 +12,10 @@
 //! - Result aggregation
 
 use crate::storage_client::{StorageClientError, StorageQueryClient};
-use byoridb_meta::MetaClient;
+use byoridb_meta::{schema::PartAllocation, MetaClient};
 use byoridb_storage::proto::storage::{BloomFilterType, EdgeData, EdgeKey, IndexValue, VertexData};
 use futures::future::join_all;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -40,6 +40,9 @@ pub enum DistributedQueryError {
 
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+
+    #[error("LOOKUP candidate scan exceeded max_scan_limit ({cap}) in partition {part_id}; query result is incomplete")]
+    ScanBudgetExceeded { part_id: u32, cap: usize },
 }
 
 pub type Result<T> = std::result::Result<T, DistributedQueryError>;
@@ -77,6 +80,74 @@ pub struct DistributedQueryExecutor {
     meta_client: Arc<MetaClient>,
     #[allow(dead_code)]
     config: DistributedQueryConfig,
+}
+
+fn invalid_response(message: &str) -> DistributedQueryError {
+    StorageClientError::InvalidResponse(message.to_string()).into()
+}
+
+fn validate_allocations(
+    space_id: u32,
+    partition_num: u32,
+    mut allocs: Vec<PartAllocation>,
+) -> Result<Vec<PartAllocation>> {
+    if space_id == 0 || partition_num == 0 || allocs.len() != partition_num as usize {
+        return Err(DistributedQueryError::InvalidConfig(format!(
+            "expected {partition_num} partition allocations for space {space_id}, got {}",
+            allocs.len()
+        )));
+    }
+    allocs.sort_by_key(|alloc| alloc.part_id);
+    for (index, alloc) in allocs.iter().enumerate() {
+        if alloc.space_id != space_id || alloc.part_id != index as u32 + 1 {
+            return Err(DistributedQueryError::InvalidConfig(
+                "partition allocations must uniquely cover the requested space and partitions 1..N"
+                    .to_string(),
+            ));
+        }
+        if alloc.hosts.is_empty() {
+            return Err(DistributedQueryError::NoPartitionHosts {
+                part_id: alloc.part_id,
+            });
+        }
+        if alloc
+            .hosts
+            .iter()
+            .any(|(host, port)| host.trim().is_empty() || *port == 0 || *port > u16::MAX as u32)
+        {
+            return Err(DistributedQueryError::InvalidConfig(
+                "partition allocation contains an invalid host or port".to_string(),
+            ));
+        }
+    }
+    Ok(allocs)
+}
+
+fn lookup_page_limit(cap: usize, already_read: usize) -> u32 {
+    if cap == 0 {
+        1024
+    } else {
+        cap.saturating_sub(already_read).min(1024) as u32
+    }
+}
+
+fn validate_lookup_page(
+    len: usize,
+    requested: u32,
+    has_more: bool,
+    cursor: &[u8],
+    seen: &mut HashSet<Vec<u8>>,
+) -> Result<()> {
+    if len > requested as usize
+        || (has_more && (len == 0 || cursor.is_empty()))
+        || (!has_more && !cursor.is_empty())
+    {
+        return Err(invalid_response("invalid index pagination response"));
+    }
+    if has_more && !seen.insert(cursor.to_vec()) {
+        return Err(invalid_response("index pagination did not advance"));
+    }
+    Ok(())
 }
 
 impl DistributedQueryExecutor {
@@ -174,6 +245,7 @@ impl DistributedQueryExecutor {
         tag_names: Vec<String>,
         prop_names: Vec<String>,
     ) -> Result<Vec<VertexData>> {
+        let allocs = self.partition_hosts(space_id, partition_num).await?;
         if vids.is_empty() {
             return Ok(vec![]);
         }
@@ -197,7 +269,7 @@ impl DistributedQueryExecutor {
             let prop_names = prop_names.clone();
 
             // Get partition host
-            let (host, port) = self.get_partition_host(space_id, part_id).await?;
+            let (host, port) = allocs[(part_id - 1) as usize].hosts[0].clone();
 
             debug!(
                 "Partition {} -> {}:{} ({} VIDs)",
@@ -208,9 +280,20 @@ impl DistributedQueryExecutor {
             );
 
             let task = async move {
-                storage_client
+                let requested: HashSet<_> = part_vids.iter().copied().collect();
+                let response = storage_client
                     .batch_get_vertices(&host, port, space_id, part_vids, tag_names, prop_names)
-                    .await
+                    .await?;
+                if response
+                    .vertices
+                    .iter()
+                    .any(|vertex| !requested.contains(&vertex.vid))
+                {
+                    return Err(StorageClientError::InvalidResponse(
+                        "fetch returned an unrequested VID".to_string(),
+                    ));
+                }
+                Ok(response)
             };
 
             tasks.push(task);
@@ -257,6 +340,7 @@ impl DistributedQueryExecutor {
         edge_keys: Vec<EdgeKey>,
         prop_names: Vec<String>,
     ) -> Result<Vec<EdgeData>> {
+        let allocs = self.partition_hosts(space_id, partition_num).await?;
         if edge_keys.is_empty() {
             return Ok(vec![]);
         }
@@ -278,7 +362,7 @@ impl DistributedQueryExecutor {
             let prop_names = prop_names.clone();
 
             // Get partition host
-            let (host, port) = self.get_partition_host(space_id, part_id).await?;
+            let (host, port) = allocs[(part_id - 1) as usize].hosts[0].clone();
 
             debug!(
                 "Partition {} -> {}:{} ({} edges)",
@@ -289,9 +373,28 @@ impl DistributedQueryExecutor {
             );
 
             let task = async move {
-                storage_client
+                let requested: HashSet<_> = part_edges
+                    .iter()
+                    .map(|key| (key.src_vid, key.dst_vid, key.ranking, key.edge_type.clone()))
+                    .collect();
+                let response = storage_client
                     .batch_get_edges(&host, port, space_id, part_edges, prop_names)
-                    .await
+                    .await?;
+                if response.edges.iter().any(|edge| {
+                    edge.key.as_ref().is_none_or(|key| {
+                        !requested.contains(&(
+                            key.src_vid,
+                            key.dst_vid,
+                            key.ranking,
+                            key.edge_type.clone(),
+                        ))
+                    })
+                }) {
+                    return Err(StorageClientError::InvalidResponse(
+                        "fetch returned an unrequested or missing edge identity".to_string(),
+                    ));
+                }
+                Ok(response)
             };
 
             tasks.push(task);
@@ -316,8 +419,8 @@ impl DistributedQueryExecutor {
             }
         }
 
-        if !errors.is_empty() && all_edges.is_empty() {
-            return Err(errors.pop().unwrap().into());
+        if let Some(error) = errors.pop() {
+            return Err(error.into());
         }
 
         info!(
@@ -348,6 +451,7 @@ impl DistributedQueryExecutor {
         edge_type: &str,
         prop_names: Vec<String>,
     ) -> Result<Vec<EdgeData>> {
+        let allocs = self.partition_hosts(space_id, partition_num).await?;
         if src_vids.is_empty() {
             return Ok(vec![]);
         }
@@ -370,7 +474,7 @@ impl DistributedQueryExecutor {
                 vec![edge_type.to_string()]
             };
             let prop_names = prop_names.clone();
-            let (host, port) = self.get_partition_host(space_id, part_id).await?;
+            let (host, port) = allocs[(part_id - 1) as usize].hosts[0].clone();
 
             let task = async move {
                 storage_client
@@ -402,8 +506,8 @@ impl DistributedQueryExecutor {
             }
         }
 
-        if !errors.is_empty() && all_edges.is_empty() {
-            return Err(errors.pop().unwrap().into());
+        if let Some(error) = errors.pop() {
+            return Err(error.into());
         }
 
         info!(
@@ -425,92 +529,77 @@ impl DistributedQueryExecutor {
         prop_names: Vec<String>,
         limit: u32,
     ) -> Result<Vec<VertexData>> {
-        info!(
-            "Executing distributed SCAN: space_id={}, tag={}, limit={}",
-            space_id, tag_name, limit
-        );
+        let allocs = self.partition_hosts(space_id, partition_num).await?;
+        let tasks = allocs.into_iter().map(|alloc| {
+            let prop_names = prop_names.clone();
+            async move {
+                let (host, port) = &alloc.hosts[0];
+                let mut cursor = Vec::new();
+                let mut seen_cursors = HashSet::new();
+                let mut vertices = Vec::new();
+                loop {
+                    let page_limit = if limit == 0 {
+                        1024
+                    } else {
+                        (limit as usize - vertices.len()).min(1024) as u32
+                    };
+                    let response = self
+                        .storage_client
+                        .scan_vertices(
+                            host,
+                            *port,
+                            space_id,
+                            alloc.part_id,
+                            tag_name.to_string(),
+                            prop_names.clone(),
+                            cursor,
+                            page_limit,
+                        )
+                        .await?;
+                    validate_lookup_page(
+                        response.vertices.len(),
+                        page_limit,
+                        response.has_more,
+                        &response.next_cursor,
+                        &mut seen_cursors,
+                    )?;
+                    vertices.extend(response.vertices);
+                    if !response.has_more || (limit > 0 && vertices.len() >= limit as usize) {
+                        return Ok::<_, DistributedQueryError>(vertices);
+                    }
+                    cursor = response.next_cursor;
+                }
+            }
+        });
+        let mut vertices = Vec::new();
+        for result in join_all(tasks).await {
+            vertices.extend(result?);
+        }
+        if limit > 0 {
+            vertices.truncate(limit as usize);
+        }
+        Ok(vertices)
+    }
 
-        // Get all partition allocations
+    // ===== Index Lookup Methods =====
+
+    /// All expected partitions must have valid, unambiguous ownership before
+    /// any work is dispatched. A missing partition is not an empty partition.
+    async fn partition_hosts(
+        &self,
+        space_id: u32,
+        partition_num: u32,
+    ) -> Result<Vec<PartAllocation>> {
         let allocs = self
             .meta_client
             .get_parts_alloc(space_id)
             .await
             .map_err(|e| DistributedQueryError::MetaError(e.to_string()))?;
-
-        // Create scan task for each partition
-        let limit_per_partition = (limit / partition_num).max(100);
-        let mut tasks = Vec::new();
-
-        for alloc in allocs {
-            if let Some((host, port)) = alloc.hosts.first() {
-                let storage_client = self.storage_client.clone();
-                let tag_name = tag_name.to_string();
-                let prop_names = prop_names.clone();
-                let host = host.clone();
-                let port = *port;
-                let part_id = alloc.part_id;
-
-                let task = async move {
-                    storage_client
-                        .scan_vertices(
-                            &host,
-                            port,
-                            space_id,
-                            part_id,
-                            tag_name,
-                            prop_names,
-                            vec![],
-                            limit_per_partition,
-                        )
-                        .await
-                };
-
-                tasks.push(task);
-            }
-        }
-
-        // Execute all tasks in parallel
-        let results = join_all(tasks).await;
-
-        // Aggregate results
-        let mut all_vertices = Vec::new();
-        let mut errors = Vec::new();
-
-        for result in results {
-            match result {
-                Ok(response) => {
-                    all_vertices.extend(response.vertices);
-                    // Check if we've hit the total limit
-                    if all_vertices.len() >= limit as usize {
-                        all_vertices.truncate(limit as usize);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!("Partition scan failed: {}", e);
-                    errors.push(e);
-                }
-            }
-        }
-
-        if !errors.is_empty() && all_vertices.is_empty() {
-            return Err(errors.pop().unwrap().into());
-        }
-
-        info!(
-            "Distributed SCAN completed: {} vertices returned",
-            all_vertices.len()
-        );
-
-        Ok(all_vertices)
+        validate_allocations(space_id, partition_num, allocs)
     }
 
-    // ===== Index Lookup Methods =====
-
-    /// Execute distributed LOOKUP by tag index
-    ///
-    /// Scans all partitions in parallel for index matches and aggregates results.
-    /// Returns matching vertex IDs.
+    /// Read every matching raw index entry in each partition. `max_scan_limit`
+    /// is a per-partition safety budget (zero means unlimited), not SQL LIMIT.
     pub async fn execute_lookup_tag_index(
         &self,
         space_id: u32,
@@ -518,105 +607,72 @@ impl DistributedQueryExecutor {
         index_id: u32,
         index_name: &str,
         values: Vec<IndexValue>,
-        limit: u32,
+        max_scan_limit: usize,
     ) -> Result<Vec<i64>> {
-        info!(
-            "Executing distributed LOOKUP tag index: space_id={}, index_id={}, index_name={}",
-            space_id, index_id, index_name
-        );
-
-        // Get all partition allocations
-        let allocs = self
-            .meta_client
-            .get_parts_alloc(space_id)
-            .await
-            .map_err(|e| DistributedQueryError::MetaError(e.to_string()))?;
-        if partition_num == 0 || allocs.len() != partition_num as usize {
-            return Err(DistributedQueryError::InvalidConfig(format!(
-                "expected {partition_num} partition allocations for space {space_id}, got {}",
-                allocs.len()
-            )));
-        }
-
-        // Create lookup task for each partition
-        // Each partition may contain every globally requested row. Dividing the
-        // limit by partition count under-fetches skewed indexes, so over-fetch
-        // per partition and truncate only after every response succeeds.
-        let limit_per_partition = limit;
-        let mut tasks = Vec::new();
-
-        for alloc in allocs {
-            let (host, port) =
-                alloc
-                    .hosts
-                    .first()
-                    .ok_or(DistributedQueryError::NoPartitionHosts {
-                        part_id: alloc.part_id,
-                    })?;
-            let storage_client = self.storage_client.clone();
-            let index_name = index_name.to_string();
+        let allocs = self.partition_hosts(space_id, partition_num).await?;
+        let tasks = allocs.into_iter().map(|alloc| {
             let values = values.clone();
-            let host = host.clone();
-            let port = *port;
-            let part_id = alloc.part_id;
-
-            let task = async move {
-                storage_client
-                    .lookup_tag_index(
-                        &host,
-                        port,
-                        space_id,
-                        part_id,
-                        index_id,
-                        index_name,
-                        values,
-                        limit_per_partition,
-                        vec![], // No cursor for initial request
-                    )
-                    .await
-            };
-
-            tasks.push(task);
-        }
-
-        // Execute all tasks in parallel
-        let results = join_all(tasks).await;
-
-        // Aggregate results
-        let mut all_vids = Vec::new();
-        let mut errors = Vec::new();
-
-        for result in results {
-            match result {
-                Ok(response) => {
-                    all_vids.extend(response.vids);
-                }
-                Err(e) => {
-                    warn!("Partition index lookup failed: {}", e);
-                    errors.push(e);
+            async move {
+                let (host, port) = &alloc.hosts[0];
+                let mut cursor = Vec::new();
+                let mut seen_cursors = HashSet::new();
+                let mut vids = Vec::new();
+                loop {
+                    let page_limit = lookup_page_limit(max_scan_limit, vids.len());
+                    let response = self
+                        .storage_client
+                        .lookup_tag_index(
+                            host,
+                            *port,
+                            space_id,
+                            alloc.part_id,
+                            index_id,
+                            index_name.to_string(),
+                            values.clone(),
+                            page_limit,
+                            cursor.clone(),
+                        )
+                        .await?;
+                    validate_lookup_page(
+                        response.vids.len(),
+                        page_limit,
+                        response.has_more,
+                        &response.next_cursor,
+                        &mut seen_cursors,
+                    )?;
+                    for vid in &response.vids {
+                        if byoridb_common::hash::compute_partition(*vid, partition_num)
+                            != alloc.part_id
+                        {
+                            return Err(invalid_response("index VID belongs to another partition"));
+                        }
+                    }
+                    vids.extend(response.vids);
+                    if max_scan_limit > 0
+                        && (vids.len() > max_scan_limit
+                            || (vids.len() == max_scan_limit && response.has_more))
+                    {
+                        return Err(DistributedQueryError::ScanBudgetExceeded {
+                            part_id: alloc.part_id,
+                            cap: max_scan_limit,
+                        });
+                    }
+                    if !response.has_more {
+                        return Ok(vids);
+                    }
+                    cursor = response.next_cursor;
                 }
             }
+        });
+        let mut vids = Vec::new();
+        for result in join_all(tasks).await {
+            vids.extend(result?);
         }
-
-        if let Some(error) = errors.pop() {
-            return Err(error.into());
-        }
-        if all_vids.len() > limit as usize {
-            all_vids.truncate(limit as usize);
-        }
-
-        info!(
-            "Distributed LOOKUP tag index completed: {} VIDs returned",
-            all_vids.len()
-        );
-
-        Ok(all_vids)
+        Ok(vids)
     }
 
-    /// Execute distributed LOOKUP by edge index
-    ///
-    /// Scans all partitions in parallel for index matches and aggregates results.
-    /// Returns matching EdgeKeys.
+    /// Edge counterpart of `execute_lookup_tag_index`, with identical paging
+    /// and per-partition completeness requirements.
     pub async fn execute_lookup_edge_index(
         &self,
         space_id: u32,
@@ -624,87 +680,70 @@ impl DistributedQueryExecutor {
         index_id: u32,
         index_name: &str,
         values: Vec<IndexValue>,
-        limit: u32,
+        max_scan_limit: usize,
     ) -> Result<Vec<EdgeKey>> {
-        info!(
-            "Executing distributed LOOKUP edge index: space_id={}, index_id={}, index_name={}",
-            space_id, index_id, index_name
-        );
-
-        // Get all partition allocations
-        let allocs = self
-            .meta_client
-            .get_parts_alloc(space_id)
-            .await
-            .map_err(|e| DistributedQueryError::MetaError(e.to_string()))?;
-
-        // Create lookup task for each partition
-        let limit_per_partition = (limit / partition_num).max(100);
-        let mut tasks = Vec::new();
-
-        for alloc in allocs {
-            if let Some((host, port)) = alloc.hosts.first() {
-                let storage_client = self.storage_client.clone();
-                let index_name = index_name.to_string();
-                let values = values.clone();
-                let host = host.clone();
-                let port = *port;
-                let part_id = alloc.part_id;
-
-                let task = async move {
-                    storage_client
+        let allocs = self.partition_hosts(space_id, partition_num).await?;
+        let tasks = allocs.into_iter().map(|alloc| {
+            let values = values.clone();
+            async move {
+                let (host, port) = &alloc.hosts[0];
+                let mut cursor = Vec::new();
+                let mut seen_cursors = HashSet::new();
+                let mut edges = Vec::new();
+                loop {
+                    let page_limit = lookup_page_limit(max_scan_limit, edges.len());
+                    let response = self
+                        .storage_client
                         .lookup_edge_index(
-                            &host,
-                            port,
+                            host,
+                            *port,
                             space_id,
-                            part_id,
+                            alloc.part_id,
                             index_id,
-                            index_name,
-                            values,
-                            limit_per_partition,
-                            vec![], // No cursor for initial request
+                            index_name.to_string(),
+                            values.clone(),
+                            page_limit,
+                            cursor.clone(),
                         )
-                        .await
-                };
-
-                tasks.push(task);
-            }
-        }
-
-        // Execute all tasks in parallel
-        let results = join_all(tasks).await;
-
-        // Aggregate results
-        let mut all_edges = Vec::new();
-        let mut errors = Vec::new();
-
-        for result in results {
-            match result {
-                Ok(response) => {
-                    all_edges.extend(response.edges);
-                    // Check if we've hit the total limit
-                    if all_edges.len() >= limit as usize {
-                        all_edges.truncate(limit as usize);
-                        break;
+                        .await?;
+                    validate_lookup_page(
+                        response.edges.len(),
+                        page_limit,
+                        response.has_more,
+                        &response.next_cursor,
+                        &mut seen_cursors,
+                    )?;
+                    for edge in &response.edges {
+                        if byoridb_common::hash::compute_partition(edge.src_vid, partition_num)
+                            != alloc.part_id
+                        {
+                            return Err(invalid_response(
+                                "index edge belongs to another partition",
+                            ));
+                        }
                     }
-                }
-                Err(e) => {
-                    warn!("Partition edge index lookup failed: {}", e);
-                    errors.push(e);
+                    edges.extend(response.edges);
+                    if max_scan_limit > 0
+                        && (edges.len() > max_scan_limit
+                            || (edges.len() == max_scan_limit && response.has_more))
+                    {
+                        return Err(DistributedQueryError::ScanBudgetExceeded {
+                            part_id: alloc.part_id,
+                            cap: max_scan_limit,
+                        });
+                    }
+                    if !response.has_more {
+                        return Ok(edges);
+                    }
+                    cursor = response.next_cursor;
                 }
             }
+        });
+        let mut edges = Vec::new();
+        for result in join_all(tasks).await {
+            edges.extend(result?);
         }
-
-        if !errors.is_empty() && all_edges.is_empty() {
-            return Err(errors.pop().unwrap().into());
-        }
-
-        info!(
-            "Distributed LOOKUP edge index completed: {} edges returned",
-            all_edges.len()
-        );
-
-        Ok(all_edges)
+        Ok(edges)
     }
 
     /// Execute distributed Bloom filter check
@@ -870,3 +909,7 @@ mod tests {
         assert!(!config.read_from_followers);
     }
 }
+
+#[cfg(test)]
+#[path = "distributed_completeness_tests.rs"]
+mod completeness_tests;

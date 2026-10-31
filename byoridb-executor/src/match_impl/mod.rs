@@ -8,8 +8,14 @@
 //! by `MatchPlan` and walks the stored graph, applying label and property
 //! filters via [`PatternMatcher::matches_node`] / `matches_edge_data`.
 
+#[cfg(test)]
+mod count_completeness_tests;
+#[cfg(test)]
+mod decode_completeness_tests;
 mod match_executor;
 mod pattern_matcher;
+#[cfg(test)]
+mod projection_completeness_tests;
 mod var_length;
 
 #[cfg(test)]
@@ -53,7 +59,7 @@ mod tests {
         )
     }
 
-    fn vertex_blob(tags: &[(&str, &[(&str, serde_json::Value)])]) -> Vec<u8> {
+    fn vertex_blob(vid: i64, tags: &[(&str, &[(&str, serde_json::Value)])]) -> Vec<u8> {
         let tag_data: Vec<TagData> = tags
             .iter()
             .map(|(name, props)| {
@@ -84,7 +90,7 @@ mod tests {
             })
             .collect();
         VertexCodec::encode_vertex(&VertexData {
-            vid: 0,
+            vid,
             tags: tag_data,
         })
         .unwrap()
@@ -139,14 +145,14 @@ mod tests {
             .await
             .unwrap();
 
-        let alice_blob = vertex_blob(&[("person", &[("name", serde_json::json!("Alice"))])]);
+        let alice_blob = vertex_blob(100, &[("person", &[("name", serde_json::json!("Alice"))])]);
         ctx.kvstore
             .put(b"default:vertex:100", &alice_blob)
             .await
             .unwrap();
 
         let unindexed_alice_blob =
-            vertex_blob(&[("person", &[("name", serde_json::json!("Alice"))])]);
+            vertex_blob(101, &[("person", &[("name", serde_json::json!("Alice"))])]);
         ctx.kvstore
             .put(b"default:vertex:101", &unindexed_alice_blob)
             .await
@@ -178,37 +184,40 @@ mod tests {
     #[test]
     fn matches_node_accepts_empty_pattern() {
         let matcher = make_matcher();
-        let blob = vertex_blob(&[("person", &[])]);
+        let blob = vertex_blob(0, &[("person", &[])]);
         let pattern = node_pattern_with(vec![], vec![]);
-        assert!(matcher.matches_node(&blob, &pattern).unwrap());
+        assert!(matcher.matches_node(0, &blob, &pattern).unwrap());
     }
 
     #[test]
     fn matches_node_rejects_on_label_mismatch() {
         let matcher = make_matcher();
-        let blob = vertex_blob(&[("person", &[])]);
+        let blob = vertex_blob(0, &[("person", &[])]);
         let pattern = node_pattern_with(vec!["team"], vec![]);
-        assert!(!matcher.matches_node(&blob, &pattern).unwrap());
+        assert!(!matcher.matches_node(0, &blob, &pattern).unwrap());
     }
 
     #[test]
     fn matches_node_accepts_on_label_match() {
         let matcher = make_matcher();
-        let blob = vertex_blob(&[("person", &[])]);
+        let blob = vertex_blob(0, &[("person", &[])]);
         let pattern = node_pattern_with(vec!["person"], vec![]);
-        assert!(matcher.matches_node(&blob, &pattern).unwrap());
+        assert!(matcher.matches_node(0, &blob, &pattern).unwrap());
     }
 
     #[test]
     fn matches_node_filters_by_property() {
         let matcher = make_matcher();
-        let blob = vertex_blob(&[(
-            "person",
-            &[
-                ("name", serde_json::json!("Alice")),
-                ("age", serde_json::json!(30)),
-            ],
-        )]);
+        let blob = vertex_blob(
+            0,
+            &[(
+                "person",
+                &[
+                    ("name", serde_json::json!("Alice")),
+                    ("age", serde_json::json!(30)),
+                ],
+            )],
+        );
         let pattern_match = node_pattern_with(
             vec!["person"],
             vec![(
@@ -216,7 +225,7 @@ mod tests {
                 Expression::Literal(Literal::String("Alice".to_string())),
             )],
         );
-        assert!(matcher.matches_node(&blob, &pattern_match).unwrap());
+        assert!(matcher.matches_node(0, &blob, &pattern_match).unwrap());
 
         let pattern_mismatch = node_pattern_with(
             vec!["person"],
@@ -225,19 +234,22 @@ mod tests {
                 Expression::Literal(Literal::String("Bob".to_string())),
             )],
         );
-        assert!(!matcher.matches_node(&blob, &pattern_mismatch).unwrap());
+        assert!(!matcher.matches_node(0, &blob, &pattern_mismatch).unwrap());
     }
 
     #[test]
     fn matches_node_requires_all_properties() {
         let matcher = make_matcher();
-        let blob = vertex_blob(&[(
-            "person",
-            &[
-                ("name", serde_json::json!("Alice")),
-                ("age", serde_json::json!(30)),
-            ],
-        )]);
+        let blob = vertex_blob(
+            0,
+            &[(
+                "person",
+                &[
+                    ("name", serde_json::json!("Alice")),
+                    ("age", serde_json::json!(30)),
+                ],
+            )],
+        );
         // age matches but name is missing
         let pattern = node_pattern_with(
             vec![],
@@ -246,15 +258,15 @@ mod tests {
                 ("age", Expression::Literal(Literal::Int(30))),
             ],
         );
-        assert!(!matcher.matches_node(&blob, &pattern).unwrap());
+        assert!(!matcher.matches_node(0, &blob, &pattern).unwrap());
     }
 
     #[test]
-    fn matches_node_ignores_non_json_blobs() {
+    fn matches_node_rejects_non_json_blobs() {
         let matcher = make_matcher();
         let blob = b"not json".to_vec();
         let pattern = node_pattern_with(vec!["person"], vec![]);
-        assert!(!matcher.matches_node(&blob, &pattern).unwrap());
+        assert!(matcher.matches_node(0, &blob, &pattern).is_err());
     }
 
     #[test]
@@ -379,9 +391,9 @@ mod h6_multipattern_tests {
     use byoridb_kvstore::store::MemoryKVStore;
     use std::sync::Arc;
 
-    fn vblob(tag: &str, name: &str) -> Vec<u8> {
+    fn vblob(vid: i64, tag: &str, name: &str) -> Vec<u8> {
         VertexCodec::encode_vertex(&VertexData {
-            vid: 0,
+            vid,
             tags: vec![TagData {
                 name: tag.to_string(),
                 properties: [(
@@ -413,23 +425,23 @@ mod h6_multipattern_tests {
     async fn seed(ctx: &Arc<ExecutionContext>) {
         // p1, p2 (product) → c (category); p1 → t1, p2 → t2 (tag)
         ctx.kvstore
-            .put(b"default:vertex:1", &vblob("product", "P1"))
+            .put(b"default:vertex:1", &vblob(1, "product", "P1"))
             .await
             .unwrap();
         ctx.kvstore
-            .put(b"default:vertex:2", &vblob("product", "P2"))
+            .put(b"default:vertex:2", &vblob(2, "product", "P2"))
             .await
             .unwrap();
         ctx.kvstore
-            .put(b"default:vertex:100", &vblob("category", "C"))
+            .put(b"default:vertex:100", &vblob(100, "category", "C"))
             .await
             .unwrap();
         ctx.kvstore
-            .put(b"default:vertex:200", &vblob("itemtag", "T1"))
+            .put(b"default:vertex:200", &vblob(200, "itemtag", "T1"))
             .await
             .unwrap();
         ctx.kvstore
-            .put(b"default:vertex:201", &vblob("itemtag", "T2"))
+            .put(b"default:vertex:201", &vblob(201, "itemtag", "T2"))
             .await
             .unwrap();
         ctx.kvstore
@@ -575,7 +587,7 @@ mod h6_multipattern_tests {
             ctx.kvstore
                 .put(
                     format!("default:vertex:{}", vid).as_bytes(),
-                    &vblob("class", &format!("C{}", vid)),
+                    &vblob(vid, "class", &format!("C{}", vid)),
                 )
                 .await
                 .unwrap();
@@ -696,11 +708,11 @@ mod h6_multipattern_tests {
         // previously Undirected fell through to outgoing-only and found
         // nothing.
         ctx.kvstore
-            .put(b"default:vertex:1", &vblob("person", "A"))
+            .put(b"default:vertex:1", &vblob(1, "person", "A"))
             .await
             .unwrap();
         ctx.kvstore
-            .put(b"default:vertex:2", &vblob("person", "B"))
+            .put(b"default:vertex:2", &vblob(2, "person", "B"))
             .await
             .unwrap();
         put_edge_both_ways(&ctx, 2, 1, "knows").await;
@@ -718,7 +730,7 @@ mod h6_multipattern_tests {
             ctx.kvstore
                 .put(
                     format!("default:vertex:{}", vid).as_bytes(),
-                    &vblob("person", &format!("P{}", vid)),
+                    &vblob(vid, "person", &format!("P{}", vid)),
                 )
                 .await
                 .unwrap();
@@ -754,7 +766,7 @@ mod h6_multipattern_tests {
             ctx.kvstore
                 .put(
                     format!("default:vertex:{}", vid).as_bytes(),
-                    &vblob("person", &format!("P{}", vid)),
+                    &vblob(vid, "person", &format!("P{}", vid)),
                 )
                 .await
                 .unwrap();
@@ -858,7 +870,7 @@ mod h6_multipattern_tests {
             ctx.kvstore
                 .put(
                     format!("default:vertex:{}", vid).as_bytes(),
-                    &vblob("person", &format!("P{}", vid)),
+                    &vblob(vid, "person", &format!("P{}", vid)),
                 )
                 .await
                 .unwrap();
@@ -890,7 +902,7 @@ mod h6_multipattern_tests {
             ctx.kvstore
                 .put(
                     format!("default:vertex:{}", vid).as_bytes(),
-                    &vblob("person", &format!("P{}", vid)),
+                    &vblob(vid, "person", &format!("P{}", vid)),
                 )
                 .await
                 .unwrap();
@@ -921,7 +933,7 @@ mod h6_multipattern_tests {
             ctx.kvstore
                 .put(
                     format!("default:vertex:{}", vid).as_bytes(),
-                    &vblob("person", &format!("P{}", vid)),
+                    &vblob(vid, "person", &format!("P{}", vid)),
                 )
                 .await
                 .unwrap();
@@ -958,7 +970,7 @@ mod h6_multipattern_tests {
     async fn count_revalidates_stale_tagvid_entries() {
         let ctx = make_context();
         ctx.kvstore
-            .put(b"default:vertex:1", &vblob("person", "live"))
+            .put(b"default:vertex:1", &vblob(1, "person", "live"))
             .await
             .unwrap();
         ctx.kvstore
@@ -981,7 +993,7 @@ mod h6_multipattern_tests {
     async fn stale_only_tagvid_falls_back_to_live_vertex_scan() {
         let ctx = make_context();
         ctx.kvstore
-            .put(b"default:vertex:1", &vblob("person", "live"))
+            .put(b"default:vertex:1", &vblob(1, "person", "live"))
             .await
             .unwrap();
         ctx.kvstore
@@ -1013,7 +1025,7 @@ mod h6_multipattern_tests {
             .await
             .unwrap();
         ctx.kvstore
-            .put(b"default:vertex:-7", &vblob("person", "corrupt"))
+            .put(b"default:vertex:-7", &vblob(-7, "person", "corrupt"))
             .await
             .unwrap();
         ctx.kvstore

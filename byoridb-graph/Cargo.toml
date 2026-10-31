@@ -16,6 +16,7 @@ server = [
     "dep:tonic-prost",
     "dep:prost",
     "dep:axum",
+    "dep:tokio-stream",
     "dep:metrics-exporter-prometheus",
     "dep:tracing-subscriber",
     "byoridb-storage/distributed",
@@ -43,6 +44,7 @@ tonic = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
+tokio-stream = { workspace = true, features = ["net"], optional = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
 argon2 = "0.5"

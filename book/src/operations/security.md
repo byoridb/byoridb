@@ -6,6 +6,9 @@ ByoriDB has application-layer authentication and role checks, but it does not
 yet provide a complete production security perimeter. Operators must supply the
 network and transport controls described below.
 
+The [standalone TLS profile](secure-deployment.md) implements and tests those
+transport boundaries. It does not add space-scoped grants or cluster revocation.
+
 For vulnerability reporting and the authoritative limitations list, see the
 repository [security policy](https://github.com/byoridb/byoridb/blob/main/SECURITY.md).
 
@@ -46,7 +49,7 @@ Important current semantics:
 - `Write` covers insert, update, and delete.
 - Ordinary `ALTER` currently checks `Create`; it is not separately enforced by
   the `Alter` permission variant.
-- User and role mutation, `BALANCE`, `SHOW USERS`, `SHOW ROLES`, and
+- User and role mutation, `REPAIR INFERENCE`, `BALANCE`, `SHOW USERS`, `SHOW ROLES`, and
   `SHOW SESSIONS` require GOD or ADMIN even when another role has `Create`.
   `SHOW USERS` lists the built-in root account and persisted users without
   password hashes. `SHOW ROLES` currently returns that same user/role listing.

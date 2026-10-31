@@ -288,8 +288,15 @@ impl Parser {
             } else if self.match_token(Token::Upto) {
                 let steps = match self.peek_token()? {
                     Token::Integer(n) if n > 0 => {
+                        let steps = u32::try_from(n).map_err(|_| {
+                            ParseError::InvalidSyntax(format!(
+                                "UPTO step count exceeds {} at {}",
+                                u32::MAX,
+                                self.err_location()
+                            ))
+                        })?;
                         self.advance();
-                        n as u32
+                        steps
                     }
                     _ => {
                         return Err(ParseError::InvalidSyntax(format!(

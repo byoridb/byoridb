@@ -29,6 +29,7 @@
 
 - [Security](./operations/security.md)
 - [Deployment](./operations/deployment.md)
+- [TLS single-node deployment](./operations/secure-deployment.md)
 - [Backup and restore](./operations/backup.md)
 - [Monitoring](./operations/monitoring.md)
 

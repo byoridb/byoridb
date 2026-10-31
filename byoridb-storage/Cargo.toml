@@ -13,7 +13,7 @@ default = []
 # Pulls in tonic (→ axum/hyper/mio/socket2) which cannot compile to wasm32. Off
 # for embedded; StorageEnv and the storage *types* (index, key, codec, errors,
 # raft) are pure-Rust and always available (redb-backed, no C++ toolchain).
-distributed = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
+distributed = ["dep:tonic", "dep:tonic-prost", "dep:prost", "byoridb-meta/distributed"]
 
 [dependencies]
 byoridb-common = { path = "../byoridb-common" }

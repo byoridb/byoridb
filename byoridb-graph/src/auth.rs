@@ -1177,6 +1177,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_counts_requests_while_authentication_is_waiting() {
+        for discovery in [false, true] {
+            let manager = make_manager();
+            let sessions = manager.sessions.clone();
+            let service = Arc::new(crate::GraphService::with_auth(
+                Arc::new(byoridb_kvstore::MemoryKVStore::new()),
+                manager,
+            ));
+            let session = service
+                .authenticate("root".into(), TEST_PW.into())
+                .await
+                .unwrap();
+            let paused_auth = sessions.write().await;
+            let state = service.shutdown_state();
+            let request_service = service.clone();
+            let request = tokio::spawn(async move {
+                if discovery {
+                    request_service
+                        .discover(
+                            session,
+                            crate::discovery::DiscoveryRequest {
+                                contract_version: "1".to_string(),
+                                space: None,
+                            },
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| format!("{error:?}"))
+                } else {
+                    request_service
+                        .execute(session, "CREATE SPACE admission_test".into())
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while state.active_queries() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("request must register before awaiting auth");
+            state.stop_accepting();
+            assert!(
+                !state
+                    .drain(Duration::from_millis(20), Duration::from_millis(2))
+                    .await
+            );
+            drop(paused_auth);
+            request.await.unwrap().unwrap();
+            assert_eq!(state.active_queries(), 0);
+            assert!(service
+                .execute(session, "SHOW SPACES".into())
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn test_authenticate_root_success() {
         let mgr = make_manager();
         let session_id = mgr.authenticate("root", TEST_PW).await.unwrap();

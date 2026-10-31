@@ -1,0 +1,57 @@
+# Standalone TLS profile; do not combine with the local compose file.
+services:
+  server:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ${BYORIDB_IMAGE:-byoridb-server:local}
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,nosuid,noexec,size=256m,mode=1777"]
+    stop_grace_period: 300s
+    environment:
+      RUST_LOG: info
+      BYORIDB_ROOT_PASSWORD: ${BYORIDB_ROOT_PASSWORD:?set BYORIDB_ROOT_PASSWORD}
+      BYORIDB__SERVER__GRAPH_ADDR: 0.0.0.0:9669
+      BYORIDB__SERVER__HTTP_ADDR: 0.0.0.0:19669
+      BYORIDB__STORAGE__DATA_PATHS: /app/data
+    volumes:
+      - data:/app/data
+    networks: [backend]
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:19669/ready]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+  proxy:
+    image: nginx:1.30.6-alpine@sha256:0e52bd054126cdc040b1276c0af347aeb02a41b9cfe305d6094767ac30e97949
+    user: "10001:10001"
+    # Private keys are 0640 and readable only by their configured host group.
+    group_add: ["${BYORIDB_TLS_CERT_GID:-10001}"]
+    entrypoint: [nginx]
+    command: [-g, "daemon off;", -c, /etc/nginx/nginx.conf]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,nosuid,noexec,size=64m,mode=1777"]
+    stop_signal: SIGQUIT
+    stop_grace_period: 45s
+    depends_on:
+      server:
+        condition: service_healthy
+    ports:
+      - "${BYORIDB_TLS_BIND:-127.0.0.1}:${BYORIDB_HTTPS_PORT:-8443}:8443"
+      - "${BYORIDB_TLS_BIND:-127.0.0.1}:${BYORIDB_GRPCS_PORT:-9443}:9443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${BYORIDB_TLS_CERT_DIR:?set BYORIDB_TLS_CERT_DIR}:/etc/byoridb/tls:ro
+    networks: [frontend, backend]
+networks:
+  frontend:
+  backend:
+    internal: true
+volumes:
+  data:

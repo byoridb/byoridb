@@ -14,7 +14,7 @@
 
 use crate::context::ExecutionContext;
 use crate::error::{ExecutionError, Result};
-use byoridb_codec::{EdgeData, VertexCodec};
+use byoridb_codec::EdgeData;
 use byoridb_parser::ast::{EdgePattern, NodePattern};
 use std::sync::Arc;
 
@@ -32,18 +32,15 @@ impl PatternMatcher {
 
     /// Check if a vertex blob matches a node pattern.
     ///
-    /// Decodes the vertex using `VertexCodec` (supports both proto and JSON
-    /// on-disk formats) and checks label and property filters against the
-    /// decoded `VertexData`. Returns true when there are no filters.
-    pub(crate) fn matches_node(&self, vertex_blob: &[u8], pattern: &NodePattern) -> Result<bool> {
-        if pattern.labels.is_empty() && pattern.props.is_empty() {
-            return Ok(true);
-        }
-
-        let vertex = match VertexCodec::decode_vertex(vertex_blob) {
-            Ok(v) => v,
-            Err(_) => return Ok(false),
-        };
+    /// Validates the vertex against its authoritative key before applying
+    /// filters. Unfiltered nodes must not admit corrupt or mismatched records.
+    pub(crate) fn matches_node(
+        &self,
+        expected_vid: i64,
+        vertex_blob: &[u8],
+        pattern: &NodePattern,
+    ) -> Result<bool> {
+        let vertex = crate::record_decode::decode_vertex(expected_vid, vertex_blob)?;
 
         // Label filter. `(n:A:B)` requires every listed tag; `(n:A|B)` requires at
         // least one (#124). Before this the matcher always accepted "at least
@@ -95,7 +92,7 @@ impl PatternMatcher {
     /// Check if a decoded edge matches an edge pattern's property filter.
     ///
     /// Edge-type filtering is handled by the walker through
-    /// [`algo::get_neighbors`], so this only enforces the pattern's
+    /// MATCH's strict neighbor reader, so this only enforces the pattern's
     /// `props` map.
     pub(crate) fn matches_edge_data(&self, edge: &EdgeData, pattern: &EdgePattern) -> Result<bool> {
         if pattern.props.is_empty() {

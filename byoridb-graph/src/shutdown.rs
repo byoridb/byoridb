@@ -4,8 +4,8 @@
 
 //! Readiness / graceful-shutdown coordination.
 //!
-//! A single [`ShutdownState`] is shared by the gRPC and HTTP servers (each
-//! owns its own `GraphService`) and by the server binary's signal handler:
+//! A single [`ShutdownState`] is shared by the gRPC and HTTP service and by
+//! the server binary's signal handler:
 //!
 //! 1. On SIGTERM/SIGINT the binary calls [`ShutdownState::stop_accepting`].
 //! 2. `/ready` starts returning 503, so Kubernetes pulls the pod out of the
@@ -15,7 +15,11 @@
 //!    reaches zero (queries already running finish normally) or a timeout
 //!    expires, and only then tears the servers down.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+const STOPPING: u64 = 1 << 63;
+const ACTIVE_MASK: u64 = STOPPING - 1;
 
 /// Shared readiness flag + in-flight query counter.
 ///
@@ -23,40 +27,50 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// it covers every exit path (success, error, panic-unwind drop).
 #[derive(Debug)]
 pub struct ShutdownState {
-    accepting: AtomicBool,
-    active_queries: AtomicU64,
+    // Admission and shutdown share one atomic word. A request can never pass
+    // the accepting check and become invisible to a concurrent drain.
+    state: AtomicU64,
+}
+
+pub(crate) struct AdmissionGuard(Arc<ShutdownState>);
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.0.state.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl ShutdownState {
     pub fn new() -> Self {
         Self {
-            accepting: AtomicBool::new(true),
-            active_queries: AtomicU64::new(0),
+            state: AtomicU64::new(0),
         }
     }
 
     /// Whether new queries are accepted (readiness).
     pub fn is_accepting(&self) -> bool {
-        self.accepting.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) & STOPPING == 0
     }
 
     /// Flip readiness off: `/ready` → 503, new queries rejected.
     pub fn stop_accepting(&self) {
-        self.accepting.store(false, Ordering::Release);
+        self.state.fetch_or(STOPPING, Ordering::AcqRel);
     }
 
     /// Number of queries currently executing across all services sharing
     /// this state.
     pub fn active_queries(&self) -> u64 {
-        self.active_queries.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) & ACTIVE_MASK
     }
 
-    pub(crate) fn query_started(&self) {
-        self.active_queries.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub(crate) fn query_finished(&self) {
-        self.active_queries.fetch_sub(1, Ordering::AcqRel);
+    /// Reserve a drain slot before the first request await, including auth.
+    pub(crate) fn try_admit(self: &Arc<Self>) -> Option<AdmissionGuard> {
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & STOPPING == 0 && state < ACTIVE_MASK).then(|| state + 1)
+            })
+            .ok()
+            .map(|_| AdmissionGuard(self.clone()))
     }
 
     /// Wait until no queries are in flight, polling every `poll` interval,
@@ -107,16 +121,39 @@ mod tests {
 
     #[tokio::test]
     async fn drain_times_out_with_active_queries() {
-        let s = ShutdownState::new();
-        s.query_started();
+        let s = Arc::new(ShutdownState::new());
+        let admitted = s.try_admit().unwrap();
+        s.stop_accepting();
+        assert!(s.try_admit().is_none());
         assert!(
             !s.drain(Duration::from_millis(50), Duration::from_millis(10))
                 .await
         );
-        s.query_finished();
+        drop(admitted);
         assert!(
             s.drain(Duration::from_secs(1), Duration::from_millis(10))
                 .await
         );
+    }
+
+    #[test]
+    fn admission_and_shutdown_are_one_ordered_transition() {
+        for _ in 0..100 {
+            let state = Arc::new(ShutdownState::new());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let other_state = state.clone();
+            let other_barrier = barrier.clone();
+            let request = std::thread::spawn(move || {
+                other_barrier.wait();
+                other_state.try_admit()
+            });
+            barrier.wait();
+            state.stop_accepting();
+            let admitted = request.join().unwrap();
+            assert_eq!(state.active_queries(), u64::from(admitted.is_some()));
+            assert!(state.try_admit().is_none());
+            drop(admitted);
+            assert_eq!(state.active_queries(), 0);
+        }
     }
 }

@@ -6,7 +6,75 @@
 //! and touch nothing on disk while doing either.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+
+fn runtime_command(dir: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_byoridb-server"));
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("BYORIDB") {
+            command.env_remove(name);
+        }
+    }
+    command
+        .current_dir(dir)
+        .env("BYORIDB_ROOT_PASSWORD", "test-only-launch-secret")
+        .env("BYORIDB__SERVER__GRAPH_ADDR", "127.0.0.1:0")
+        .env("BYORIDB__SERVER__HTTP_ADDR", "127.0.0.1:0")
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn bounded_output(command: &mut Command) -> Output {
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "server failed to exit: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn occupied_protocol_port_fails_before_storage_or_readiness() {
+    for (variable, protocol) in [
+        ("BYORIDB__SERVER__GRAPH_ADDR", "gRPC"),
+        ("BYORIDB__SERVER__HTTP_ADDR", "HTTP"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let output = bounded_output(
+            runtime_command(dir.path()).env(variable, occupied.local_addr().unwrap().to_string()),
+        );
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains(&format!("Failed to bind {protocol} listener")));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Server is ready"));
+        assert!(!dir.path().join("data").exists());
+    }
+}
+
+#[test]
+fn unsupported_cluster_configuration_fails_before_storage_or_listeners() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = bounded_output(
+        runtime_command(dir.path()).env("BYORIDB__CLUSTER__PEERS", "127.0.0.1:9559"),
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Cluster deployment is not supported"));
+    assert!(!dir.path().join("data").exists());
+}
 
 /// Run the server binary in an empty directory with every variable that could
 /// steer it removed, so a data directory appearing under `dir` can only have

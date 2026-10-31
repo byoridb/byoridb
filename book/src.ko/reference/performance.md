@@ -115,9 +115,10 @@ entry를 갱신합니다.
 - Tag range access는 Boolean 또는 정수 schema와 일치하는 literal을 요구합니다.
   Float/Double property는 저장된 정수와 실수가 서로 다른 index key 영역에 놓이므로
   predicate scan을 사용합니다.
-- Edge range helper는 Boolean, 정수, 0이나 NaN이 아닌 실수 boundary를 지원합니다.
-  String key는 사전순 range access를 제공하지 않으며, 지원하지 않는 boundary는
-  predicate scan으로 돌아갑니다.
+- Edge range helper는 Boolean, 정수, 0이나 NaN이 아닌 실수 boundary를 받습니다.
+  현재 실행 경로는 schema를 확인해 Float/Double edge property를 predicate scan으로
+  보내므로 정수·실수 key 영역 혼합으로 일치 결과를 누락하지 않으며 `EXPLAIN`도 실행과
+  일치합니다. String key는 사전순 range를 제공하지 않고 미지원 boundary도 scan을 씁니다.
 - Distributed 실행에서는 ordered `LOOKUP` range를 거부합니다. `!=`는 ordered
   range fast path가 아닙니다.
 
@@ -134,6 +135,39 @@ aggregate 또는 일부 property만 필요할 때 전체 vertex payload를 반�
 result materialization은 memory bound이며 application guard는 추정치이므로 bounded
 query를 대체하지 못합니다.
 
+### MATCH count·aggregate 실행
+
+**현재 MATCH 계약:** 안전하지 않은
+indexed-group·degree-counter shortcut을 제거했습니다. 지원되는 단순 단일 node
+`COUNT(*)`는 검증된 후보를 streaming 집계하며 결과 범위 전에 prefix별 원시 cap+1
+검사(0 무제한, 정확한 cap 허용)를 적용합니다. 나머지 grouped/edge/count는 일반
+검증된 matching을 사용합니다. 기존 shortcut이 숫자를 반환하던 쿼리가 더 느리거나
+메모리를 더 쓰고 scan/traversal 예산에 도달할 수 있으므로 이전 성능 수치를 유지하지
+말고 다시 측정해야 합니다.
+
+저장소의 raw grouping helper는 key 인코딩을 검사하지만 실제 쿼리 count 구현이 아니며
+자체 쿼리 예산도 없습니다. 이 helper로 쿼리 완전성·상한을 입증하지 않습니다.
+결과 `LIMIT/OFFSET`은 집계 평가 후 적용하며 overflow를 숨기지 못합니다. 정수 SUM은
+정수 결과 타입과 정확한 연산을 유지하고 실수 SUM/AVG는 비유한 결과를 거부합니다.
+혼합 타입 MIN/MAX의 완전한 순서를 보장하는 것은 아닙니다.
+
+타입을 보존하는 group key는 map 항목을 정렬하고 graph entity identity를 사용하며
+실수 signed zero를 정규화하되 정수/실수 group은 구분합니다. 비유한 값과
+Path/Set/DataSet/Geography group key는 거부합니다. ORDER BY는 모호하지 않은 별칭이나
+정확한 projected 표현식을 scan 전에 해석하고 미지원 참조는 정렬을 건너뛰지 않고 실패합니다.
+집계 출력에는 공통 추정 행 크기 예산을 적용하며 중간 메모리 전체의 상한은 아닙니다.
+
+Projection·WHERE·grouping·aggregate는 관련 저장소/decode/VID 오류를 전파하며
+없는 값은 별도로 유지합니다. LOOKUP·MATCH·온톨로지 읽기는 엄격한 vertex decoder를
+공유하고 MATCH의 edge·중간 identity 검사는 실제 decode한 레코드에 적용합니다.
+Required/OPTIONAL의 bound 시작점은 label/property를 재검사하고 무방향 self-loop는
+전체 edge identity로 중복 제거하며 다른 rank·반대 방향 edge는 보존합니다.
+Required/OPTIONAL의 bound 도착점·반복 node/edge identity를 보존하고 node/edge binding 종류 충돌은
+발생 시 거부하며 새 OPTIONAL null을 뒤에서 재바인딩하지 않습니다. 역방향 조회와
+`EXPLAIN`은 outgoing/no-range 조건을 적용합니다. 부분 index와 남은 MATCH 계약에는
+별도 수용 검증이 필요하며 전체 쿼리 작업량의 상한을 보장하지는 않습니다. 분산 LOOKUP과
+추론 복구는 아래와 [데이터 쿼리](../guide/ngql/dql.md)의 별도 계약을 따릅니다.
+
 ### Batch write
 
 ```sql
@@ -143,9 +177,16 @@ INSERT VERTEX person(name, age) VALUES
   3:("Carol", 28);
 ```
 
-하나의 multi-row statement를 사용하면 statement별 transaction 대신 redb batch
-하나를 commit할 수 있습니다. `batch_apply`에 전달된 current entity write와 대응
-temporal history version은 함께 commit됩니다.
+한 DML 문장의 current entity, asserted history, secondary/reverse index, vector,
+counter, sameAs 변경을 준비한 뒤 Memory/redb의 원자적 `batch_apply` 한 번으로 반영합니다.
+준비 도중 오류나 취소가 발생하면 원본 store는 바뀌지 않습니다. `BYORIDB_MAX_MEMORY_MB`는
+결과 행과 별도로 준비 write set도 제한하지만 임시 할당 전체의 상한은 아닙니다.
+
+추론 closure는 assertion batch 다음에 완성합니다. 영속 dirty marker가 완결 또는 관리자
+복구까지 graph 읽기와 추가 쓰기를 막습니다. 따라서 추론 오류 전에 assertion이 이미
+commit됐을 수 있습니다. Compound 문장은 절별로 commit하며 전체 rollback을 제공하지
+않습니다. Embedded custom KV backend도 같은 보장을 제공하려면 원자적인
+`batch_apply`가 필요합니다.
 
 ### 올바른 traversal 방향 사용
 
@@ -161,15 +202,37 @@ incoming/undirected traversal은 전체 edge scan 대신 유지되는 reverse-ed
 | Guard | 기본값 | 설정 |
 |---|---:|---|
 | 추정 result-memory budget | 1024 MiB | `BYORIDB_MAX_MEMORY_MB`; `0`이면 비활성 |
-| guarded prefix scan 반환 row | 100,000 | `BYORIDB_MAX_SCAN_LIMIT`; `0`이면 비활성 |
-| traversal/materialization 방문 node | 100,000 | 내부 execution 기본값 |
+| guarded prefix/index partition scan별 원시 후보 | 100,000 | `BYORIDB_MAX_SCAN_LIMIT`; `0`이면 비활성 |
+| traversal 작업 예산(`max_traversal_nodes`) | 100,000 | 내부 execution 기본값; `0`이면 비활성 |
 | 최대 GO/MATCH path step | 20 | 내부 execution 기본값 |
-| 최대 shortest path 열거 수 | 1,024 | 내부 execution 기본값 |
+| shortest path 열거 수(`max_find_paths`) | 1,024 | 내부 execution 기본값; `0`이면 비활성 |
 
-일부 traversal algorithm은 cap에서 warning 후 partial/truncated result를 반환하고,
-너무 큰 step range는 error를 반환합니다. Guard를 높이거나 끄면 incomplete
-analytical query가 out-of-memory process failure로 바뀔 수 있습니다. 하나씩
-바꾸며 process/PVC metric을 관찰하세요.
+**현재 소스의 계약:** 로컬 LOOKUP은 full-prefix 또는
+index partition scan별 원시 후보를 하나 더 확인합니다. 정확히 cap이면 성공할 수 있고
+작은 `LIMIT/OFFSET`이 추가 후보를 제외하더라도 cap+1이면 실패합니다. 이 scan별 예산은
+전체 쿼리 작업량이나 메모리를 제한하지 않습니다. 분산 indexed LOOKUP은 partition별로
+이 예산과 query에 묶인 keyset page·원격 payload 검증을 적용하며 page 간 snapshot은 없습니다.
+관련 storage/schema/decode 오류와 손상된 edge-index key는 부분 성공 대신 실패합니다.
+LOOKUP/FIND의 공통 edge decoder는 JSON·구조 멤버 타입·명시한 key/payload identity를
+확인하며 LOOKUP은 vertex도 검사합니다. 이전 형식의 생략된 VID/rank/properties는
+유지합니다. 실제 decode한 레코드만 검증하며 LIMIT이 이후 decode를 멈추거나 FIND가
+무관한 type을 건너뛸 수 있습니다. 손상 전체 탐지나 FIND의 vertex 검증을 뜻하지 않습니다.
+
+FIND는 확장 vertex를 세며 hop 제한이 있는 가중치 경로는 vertex/hop 상태를 셉니다.
+Frontier 메모리나 읽은 edge의 상한은 아닙니다. 예산 초과 시 실패하며
+`FIND ALL SHORTEST PATHS`도 완성 경로 하나가 `max_find_paths`를 초과할 때만 실패하므로
+정확한 경계에서는 성공할 수 있습니다. 가중치 `UPTO`는 hop을 제한합니다. 생략하면
+가중치는 hop 무제한이고 비가중치는 기본 10단계입니다. `u32::MAX`보다 큰 `UPTO`는
+wrap된 상한 대신 파싱 오류가 됩니다. 가중치는 음수가 아닌 유한 값이어야
+합니다. 도달 가능한 가중치의 보수적 검증은 선택한 경로 외의 작업을 추가할 수 있고 관련
+데이터 손상은 오류입니다. `FIND WHERE/YIELD`는 미지원이며 실행 전에 거부합니다.
+[FIND path](../guide/ngql/dql.md#find-path)를 참고하세요.
+
+Semantic 변경은 현재 추론 closure 전체를 재구축하는 O(graph) 작업이며 완결까지 해당
+space의 읽기·쓰기를 조정합니다. 대표 graph로 쓰기 지연과 복구 시간을 측정하세요. 중단된
+closure는 미완료 상태로 표시하며 `REPAIR INFERENCE`가 필요합니다. 이 경로들의 guard가
+모든 연산의 전체 작업량·메모리 예산을 보장하지는 않습니다. Guard를 높이거나 끄면 메모리 부족으로 프로세스가
+종료될 수 있으므로 하나씩 바꾸며 process/PVC metric을 관찰하세요.
 
 `ExecutionConfig`의 `timeout_ms` field는 현재 일반 server-side query timeout으로
 강제되지 않습니다. 외부 timeout을 신중히 적용하세요. HTTP client timeout이
@@ -220,5 +283,5 @@ pruning policy는 현재 구현되지 않았습니다.
   아닙니다.
 - persisted HNSW는 executor의 vector-count threshold를 넘을 때만 사용하며 작은
   집합은 exact flat cosine search를 사용합니다.
-- 여러 node처럼 보이는 Compose configuration은 distributed performance topology가
-  아닙니다. Independent database로만 benchmark하세요.
+- 기본 Compose는 standalone 서버 하나를 실행합니다. 독립 instance 여러 개가
+  distributed performance topology를 구성하지는 않습니다.

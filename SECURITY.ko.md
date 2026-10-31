@@ -55,7 +55,7 @@ container image 또는 `.env` 파일에 commit하지 마세요.
 ### 권한
 
 ByoriDB는 statement 단위 role 검사를 적용합니다. 사용자 및 role 관리,
-`SHOW USERS`, `SHOW ROLES`, `SHOW SESSIONS`, `BALANCE`는 `GOD` 또는 `ADMIN`을
+`SHOW USERS`, `SHOW ROLES`, `SHOW SESSIONS`, `REPAIR INFERENCE`, `BALANCE`는 `GOD` 또는 `ADMIN`을
 요구합니다. Compound statement와 `PROFILE`이 실행하는 내부 statement도 재귀적으로
 검사합니다.
 
@@ -89,6 +89,9 @@ Session ID를 로그, analytics, trace 또는 issue report에 넣지 마세요.
 
 - **Native transport encryption 없음:** HTTP와 gRPC는 plaintext입니다. 신뢰할 수
   있는 ingress, proxy 또는 service mesh에서 TLS를 종료하고 backend hop을 보호하세요.
+  [Standalone TLS 프로필](book/src.ko/operations/secure-deployment.md)은 검증된 비공개
+  backend, 암호화한 HTTP/gRPC endpoint, 운영 route 제한과 인증서 교체를 제공합니다.
+  기존 AKS manifest만으로는 이 경계가 제공되지 않습니다.
 - **In-process login throttling만 제공:** 실패한 로그인은 계정별(60초당 20회),
   source IP별(60초당 60회), 그리고 연속 5회 실패 후 300초 lockout으로 throttle됩니다.
   성공한 로그인은 실패 횟수를 소비하지 않습니다. Argon2 pool은 기본적으로 최대 4개를

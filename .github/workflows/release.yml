@@ -28,10 +28,10 @@ env:
   RELEASE_REF: ${{ inputs.ref || github.ref }}
 
 jobs:
-  # Gate: audit the exact release ref, then run fmt + workspace tests before
+  # Gate: audit the exact release ref, then run the complete CI checks before
   # building or publishing. The CI push workflow is not a release dependency.
   gate:
-    name: CI gate (audit + fmt + workspace tests)
+    name: CI gate (audit + fmt + check + clippy + tests)
     runs-on: ubuntu-latest
     steps:
       # First step in the whole workflow, before checkout or a toolchain: it only
@@ -77,9 +77,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.90"
-          components: rustfmt
+          components: rustfmt, clippy
       - name: Format check
         run: cargo fmt --all --check
+      - name: Check all targets and features
+        run: cargo check --locked --workspace --all-targets --all-features
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Workspace tests (serial)
         run: cargo test --locked --workspace --all-features -- --test-threads=1
 
@@ -129,7 +133,11 @@ jobs:
 
       - name: Add cross-compile target (macOS x86_64 on ARM runner)
         if: matrix.target == 'x86_64-apple-darwin'
-        run: rustup target add x86_64-apple-darwin
+        run: |
+          rustup target add x86_64-apple-darwin
+          if [ "$(uname -m)" = arm64 ]; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
 
       - name: Cache cargo registry
         uses: actions/cache@v6
@@ -150,8 +158,21 @@ jobs:
           RELEASE_DIR="target/${{ matrix.target }}/release"
           test -x "$RELEASE_DIR/byoridb-server"
           test -x "$RELEASE_DIR/byoridb-cli"
+          test -x "$RELEASE_DIR/byoridb-backup"
           file "$RELEASE_DIR/byoridb-server"
           file "$RELEASE_DIR/byoridb-cli"
+          file "$RELEASE_DIR/byoridb-backup"
+
+      - name: Exercise the prebuilt deployment image (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          RELEASE_DIR="target/${{ matrix.target }}/release"
+          docker build --file Dockerfile.prebuilt --tag byoridb-prebuilt:release \
+            --build-arg BINARY_PATH="$RELEASE_DIR/byoridb-server" \
+            --build-arg BACKUP_PATH="$RELEASE_DIR/byoridb-backup" \
+            --build-arg BULKLOADER_PATH="$RELEASE_DIR/byoridb-bulkloader" \
+            --build-arg CLI_PATH="$RELEASE_DIR/byoridb-cli" .
+          python3 deploy/secure/smoke.py --image byoridb-prebuilt:release
 
       # Reuses the hard-won details from byoridb/byori's signing job: a
       # Keychain Access .p12 export carries only the leaf and its private key,
@@ -215,8 +236,7 @@ jobs:
           set -euo pipefail
           RELEASE_DIR="target/${{ matrix.target }}/release"
           KEYCHAIN_PATH="$RUNNER_TEMP/byoridb-signing.keychain-db"
-          BINS=(byoridb-server byoridb-cli)
-          [ -f "$RELEASE_DIR/byoridb-backup" ] && BINS+=(byoridb-backup)
+          BINS=(byoridb-server byoridb-cli byoridb-backup)
 
           # Every shipped Mach-O is signed individually: unlike an .app bundle
           # there is nothing that covers the others. The hardened runtime
@@ -274,12 +294,20 @@ jobs:
       - name: Package (Linux/macOS)
         run: |
           cd target/${{ matrix.target }}/release
-          BINS=(byoridb-server byoridb-cli)
-          [ -f byoridb-backup ] && BINS+=(byoridb-backup)
+          BINS=(byoridb-server byoridb-cli byoridb-backup)
           ARCHIVE="../../../byoridb-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
           tar -czvf "$ARCHIVE" "${BINS[@]}" -C ../../.. LICENSE NOTICES.md
           tar -tzf "$ARCHIVE" | grep -Fxq LICENSE
           tar -tzf "$ARCHIVE" | grep -Fxq NOTICES.md
+
+      - name: Exercise the extracted release archive
+        run: |
+          set -euo pipefail
+          STAGE=$(mktemp -d)
+          trap 'rm -rf "$STAGE"' EXIT
+          tar -xzf "byoridb-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" -C "$STAGE"
+          python3 scripts/release_smoke.py --bin-dir "$STAGE" \
+            --version "${RELEASE_TAG#v}" --commit "$(git rev-parse HEAD)"
 
       - name: Remove signing keychain (macOS)
         if: always() && runner.os == 'macOS'
@@ -294,9 +322,20 @@ jobs:
           name: byoridb-${{ matrix.target }}
           path: byoridb-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
 
+  secure-profile:
+    name: Standalone TLS deployment drill
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - name: Build and exercise the private TLS deployment
+        run: python3 deploy/secure/smoke.py --build
+
   release:
     name: Create Release
-    needs: build
+    needs: [build, secure-profile]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -310,8 +349,24 @@ jobs:
         with:
           path: artifacts
 
-      - name: List artifacts
-        run: find artifacts -type f
+      - name: Verify the complete release set
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import tarfile
+          targets = {"x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+                     "x86_64-apple-darwin", "aarch64-apple-darwin"}
+          archives = list(Path("artifacts").rglob("*.tar.gz"))
+          assert {p.name for p in archives} == {
+              f"byoridb-{os.environ['RELEASE_TAG']}-{target}.tar.gz" for target in targets}
+          assert len(archives) == 4
+          required = {"byoridb-server", "byoridb-cli", "byoridb-backup", "LICENSE", "NOTICES.md"}
+          for archive in archives:
+              with tarfile.open(archive) as contents:
+                  assert set(contents.getnames()) == required, archive
+              print(archive)
+          PY
 
       - name: Create Release
         uses: softprops/action-gh-release@v3

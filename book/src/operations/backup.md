@@ -48,7 +48,9 @@ byoridb-backup create \
   --label "daily-before-upgrade"
 ```
 
-The command creates a timestamp-based directory such as:
+The command exclusively creates a timestamp/nanosecond/random-suffix directory.
+Use the exact ID printed by `create` or `list`; the following examples use a
+legacy ID, which remains supported:
 
 ```text
 /var/lib/byoridb/backups/backup_1785313593/
@@ -74,7 +76,7 @@ byoridb-backup info \
 does not use a separate WAL flush and the option is currently a no-op. It does
 not make a live backup possible.
 
-## Verification limits
+## Content verification
 
 ```bash
 byoridb-backup verify \
@@ -82,10 +84,16 @@ byoridb-backup verify \
   --backup-id backup_1785313593
 ```
 
-The current `verify` command checks that a backup can be found in the catalog;
-it does not walk every table, validate application records, compare row counts,
-or execute queries; it does not open `data.redb`. A failed `create` can also leave a timestamp-named
-directory, so do not treat `verify` alone as proof of a usable snapshot.
+`verify` checks the manifest, exact file size and, for format 1 archives,
+SHA-256. It opens an isolated copy, checks redb page integrity and reads every
+table entry. Original backup/source files are never repaired or modified.
+Missing, truncated, corrupt and unsupported manifests/data fail with a nonzero
+exit status, including verify-all. Legacy manifests without a version/hash are
+identified explicitly and receive size and physical-integrity checks; this
+cannot provide a historical digest. Format 1 requires both `kv` and `history`;
+legacy `kv`-only archives remain readable. The hash detects corruption and does
+not authenticate or encrypt a backup. Verification does not execute application
+queries, and temporary verification/restore copies require additional disk space.
 
 For each important backup:
 
@@ -125,9 +133,18 @@ The root password is not restored from a user record; root is always defined by
 `BYORIDB_ROOT_PASSWORD` at server startup. Durable non-root user records are
 inside the database snapshot.
 
-`restore --overwrite` recursively removes an existing target directory before
-copying the snapshot. Verify the exact target and retain a rollback copy before
-using it.
+`restore --overwrite` verifies and stages the complete replacement before moving
+the old directory. Ordinary copy, verification or promotion failures preserve or
+restore the old target. A running target's redb lock, overlapping backup/target
+paths, traversal and symlink targets are rejected. A hard process kill between
+the two directory renames is not crash-atomic: retain and inspect the sibling
+`.byoridb-restore-*/previous` directory before restarting or retrying. A failed OS
+rollback reports the preserved recovery path. Do not run concurrent restorers
+or start a server while a restore is in progress.
+
+The automated recovery drill compares current/history/tombstone queries,
+schema, indexes, user authentication and string VID mappings after restoring an
+actual CLI-created archive. Record timings on your own data for an RTO estimate.
 
 ## Retention commands
 

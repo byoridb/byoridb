@@ -2,7 +2,7 @@
 
 **English** | [한국어](../ko/development/roadmap.html)
 
-Updated 2026-10-30 from code baseline **v0.4.21** (`6d77d89`). ByoriDB is developing into an
+Updated 2026-10-31 against released **v0.4.22** (`main` at `6851936`). ByoriDB is developing into an
 **agent-first, general-purpose graph and ontology database**. Agents are direct
 consumers; people operate, evaluate, govern and purchase deployments. Agent memory
 is one use case. The goal is correct task completion with inspectable evidence and
@@ -12,10 +12,17 @@ The [product philosophy and design](https://github.com/byoridb/byoridb/blob/main
 define the target contracts. The delivery source of truth is
 [docs/PLAN.md](https://github.com/byoridb/byoridb/blob/main/docs/PLAN.md).
 This is an approved direction and acceptance plan, not a release schedule.
-Read-only discovery contract 1 is implemented in the foundations slice; other
-agent contracts remain PLANNED or IN PROGRESS as recorded in the plan.
+Read-only discovery contract 1 and the foundations correctness fixes are released.
+Broader agent contracts remain PLANNED or IN PROGRESS; an unfinished task may
+contain released slices, as recorded in the plan.
 
-## Available in the code baseline
+[CI](https://github.com/byoridb/byoridb/actions/runs/41054788495) and
+[Auto-release](https://github.com/byoridb/byoridb/actions/runs/41054789050) succeeded.
+The [v0.4.22 release](https://github.com/byoridb/byoridb/releases/tag/v0.4.22) has four
+Linux/macOS x86_64/arm64 `.tar.gz` artifacts. The previous v0.4.21/pre-foundations
+snapshot is historical; active QRY-2 branch work below is not yet released.
+
+## Available in v0.4.22
 
 - Vertex and edge CRUD, `FETCH`, `GO`, `MATCH`, tag/edge `LOOKUP`, path finding,
   `EXPLAIN` and `PROFILE`. Edge updates and eligible local edge-index ranges are
@@ -29,10 +36,15 @@ agent contracts remain PLANNED or IN PROGRESS as recorded in the plan.
   full snapshot backup and restore that preserve both tables.
 - A single-node redb server with shared HTTP/gRPC authentication, durable users,
   built-in roles, local revocation, configurable login throttling and session TTL.
+- Authenticated read-only discovery contract 1 over HTTP/gRPC: bounded schema,
+  global-role permissions, explicit capabilities and fixed discovery errors.
+- `OPTIONAL MATCH` error propagation and explicit MATCH candidate/variable-length
+  cap errors; index-partition failures propagate and malformed tag-index keys fail.
 
 These capabilities have limits. `WHY` and recommendation still need string VID
 parity. `sameAs` merging is irreversible. Compound statements are not transactions.
-Scan and inference limits do not yet have a uniform complete-or-error contract.
+At that release baseline, scan and inference limits do not have a uniform
+complete-or-error contract.
 Backup metadata verification is not a full content check or restore drill.
 Native TLS, space-scoped grants and a supported multi-node runtime are absent.
 Selected nGQL/OWL-style features do not imply full language/standard conformance.
@@ -41,7 +53,7 @@ Selected nGQL/OWL-style features do not imply full language/standard conformance
 
 | Order | Outcome | Acceptance focus |
 |---|---|---|
-| Release prerequisite | Resolve dependency audit findings (DEP-1) | Compatible updates reduce the audit from 10 vulnerabilities to zero; audit is required in automatic version bump and release paths |
+| Release requirement — completed | DEP-1 DONE, released in v0.4.22 | Zero vulnerabilities at acceptance; one bincode unmaintained warning remains. Automatic version bump/release paths require audit; future releases must pass again |
 | 1 | Correctness and machine contracts (QRY-1–4, API-1–2, AGT-1–2, EVAL-1) | Complete results or explicit errors, inference recovery, actual cancellation; typed parameters/errors, authorized discovery, bounded results/evidence and an early agent evaluation baseline |
 | 2 | Recovery, reliable writes and access boundaries (OPS-1–2, TXN-1–2, SEC-3/1, AGT-3–4) | Restore drills and versioned storage; explicit compound outcomes then atomic DML; early space grants/TLS; durable idempotent outcomes, revisions and preview/apply |
 | 3 | Ontology consistency and evidence (SEM-6/3/4/7/8) | String VID parity, vertex-type explanations, shape/inference and cardinality policy, revision-checked `sameAs` preview/merge records, assertion origin and explicit premise-trust policy |
@@ -49,37 +61,26 @@ Selected nGQL/OWL-style features do not imply full language/standard conformance
 | 5 | Operational acceptance (SEC-5) | Metrics/diagnostics access and retention, observable runtime behavior, tested recovery/upgrade runbooks |
 | 6 | Correctness- and agent-evaluation-driven performance (PERF-1–3) | Correct results and successful agent work before throughput/cost, real concurrency, LDBC batch-read acceptance, measured optimization |
 
-The first implementation slice, **QRY-1**, propagates errors returned by
+**QRY-1 is DONE and released in v0.4.22.** It propagates errors returned by
 `OPTIONAL MATCH` execution and pattern resolution while preserving genuine
-no-match null bindings. It is implemented on `main` in commit `10a7811` with
-eight focused regressions and prior workspace/documentation checks passing;
-release publication has not been verified.
+no-match null bindings; eight focused regressions passed. The release proof is
+linked above. The same release includes MATCH candidate-scan and variable-length
+cap errors, index-partition error propagation, strict tag-index decoding and
+iterative long-string lexing. A small query `LIMIT` cannot bypass candidate
+budgets. Broader QRY-2 acceptance remains **IN PROGRESS**.
 
-The next foundations slice adds explicit errors for MATCH candidate-scan and
-variable-length traversal caps, propagates index partition failures, rejects
-malformed tag-index keys, and replaces recursive long-string lexing with an
-iterative scanner. A small query `LIMIT` does not bypass a candidate scan budget.
-QRY-2 remains IN PROGRESS: LOOKUP/path limits, projection/decode errors and count
-optimizations still need acceptance.
-
-HTTP `POST /api/v1/discover` and gRPC `Discover` now provide discovery contract 1:
-authenticated, bounded tag/edge/property schemas, global-role permissions,
-explicit unsupported capabilities, and stable discovery errors. No typed query
-parameters, snapshot/revision tokens or space grants are implied. See the
-[API reference](../reference/api.html#read-only-discovery-contract-1).
-Two deterministic EVAL-1 fixtures verify discovery, exact INT64/string-ID answers,
-denied writes and unchanged final state; they are not autonomous model runs.
-
-Next work is the remaining QRY-2 audit and API-1 typed parameter binding, with
-API-2 general result/error semantics and inference/retraction fixtures. Restore
-trials and TLS work can proceed in parallel. Runtime acceptance remains required
-before a capability is advertised.
-
-EVAL-1 covers discovery, traversal, explanation, retraction, timeout/retry,
-concurrent writes and access denial. Verify exact final state, evidence and denied
-side effects first. Pin model/version/date, prompts/settings, data/seed, repetitions
-and budgets; declare success targets before testing and record unsupported baseline
-tasks. Compare calls, tokens and latency only for equivalent successful work.
+The current source consolidates LOOKUP/FIND/MATCH completeness, distributed
+index continuation and remote fetch checks, inference recovery, single-statement
+DML staging, backup integrity/restore drills and server lifecycle fixes. See the
+[standalone acceptance record](https://github.com/byoridb/byoridb/blob/main/docs/DEPLOYMENT_READINESS.md)
+for exact guarantees and executable evidence. QRY-2 remains IN PROGRESS. QRY-3,
+OPS-1 and SEC-1 are DONE at source acceptance, with release publication pending.
+Local gates and real recovery/TLS drills passed; hosted workflows and archives
+for the final commit must still confirm publication. The
+[TLS deployment profile](../operations/secure-deployment.md) is the supported
+network boundary. A single-statement transaction does not complete TXN-2's future
+multi-statement/inference contract. Typed operations, idempotency and revisions
+remain planned; the release workflow must pass before publication is claimed.
 
 ## Machine-contract boundaries
 

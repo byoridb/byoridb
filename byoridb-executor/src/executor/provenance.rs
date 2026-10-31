@@ -15,21 +15,9 @@
 //! than overwrite. Capturing *all* justifications — even re-derivations of a
 //! fact already in the graph — is what makes correct retraction possible later.
 //!
-//! Two consumers:
-//! - **explanation** (Phase 2): "why does `(s,p,d)` hold?" walks the
-//!   justification tree, recursing into premises that are themselves inferred.
-//! - **incremental retraction** (Phase 3): when a premise is deleted, a fact
-//!   that loses *all* its justifications can be retracted without a full
-//!   re-materialization. (Recursive support / well-foundedness is handled in
-//!   Phase 3; this module only records.)
-//!
-//! Phase 1 (this module) records and reads provenance. It does **not** change
-//! retraction — inference.rs still does full re-materialization on delete, and
-//! that path now also clears this keyspace so it is rebuilt from scratch.
-//!
-//! **Cost**: recording is a read-modify-write per derived fact (dedup append),
-//! roughly doubling KV ops during materialization. Acceptable for the
-//! correctness-first foundation; batching/append-only is a later optimization.
+//! `WHY` reads these records; corrupt values fail explicitly. Recovery rebuilds
+//! all provenance from assertions. Each newly inferred fact and both directions
+//! of its provenance are committed together in a single Memory/redb batch.
 
 use super::{Executor, ExecutorResult};
 use crate::error::{ExecutionError, Result};
@@ -77,188 +65,54 @@ fn prov_key(space: &str, fact: &Fact) -> Vec<u8> {
 }
 
 impl Executor {
-    /// Record that `fact` was entailed by `justification`, accumulating it into
-    /// the fact's justification set (deduplicated). Idempotent: re-recording an
-    /// identical justification is a no-op.
-    pub(super) async fn record_provenance(
+    /// Build all forward/reverse provenance writes without committing, allowing
+    /// the derived fact itself to be persisted in the same atomic batch.
+    pub(super) async fn provenance_puts(
         &self,
         space: &str,
         fact: &Fact,
         justification: Justification,
-    ) -> Result<()> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let key = prov_key(space, fact);
-        let mut justs = match self.ctx.kvstore.get(&key).await? {
-            // A corrupt/legacy blob is treated as "no provenance" and replaced —
-            // provenance is derived metadata, safe to rebuild.
-            Some(bytes) => serde_json::from_slice::<Vec<Justification>>(&bytes).unwrap_or_default(),
+        let mut justs: Vec<Justification> = match self.ctx.kvstore.get(&key).await? {
+            Some(bytes) => serde_json::from_slice(&bytes)?,
             None => Vec::new(),
         };
         if justs.contains(&justification) {
-            return Ok(());
+            return Ok(Vec::new());
         }
-        // Reverse index: each premise edge now supports `fact`. Every premise is
-        // an edge (vtypes never entail), so vtype premises (none today) are
-        // skipped. Maintained in lockstep with the forward entry above, so the
-        // dedup early-return keeps both sides consistent.
+        let mut puts = Vec::new();
+        let mut premises = HashSet::new();
         for premise in &justification.premises {
+            if !premises.insert(premise) {
+                continue;
+            }
             if let Fact::Edge { s, p, d } = premise {
-                self.add_prov_rev(space, *s, p, *d, fact).await?;
+                let key = SchemaKey::prov_rev_edge(space, *s, p, *d);
+                let mut deps: Vec<Fact> = match self.ctx.kvstore.get(&key).await? {
+                    Some(bytes) => serde_json::from_slice(&bytes)?,
+                    None => Vec::new(),
+                };
+                if !deps.contains(fact) {
+                    deps.push(fact.clone());
+                    puts.push((key, serde_json::to_vec(&deps)?));
+                }
             }
         }
         justs.push(justification);
-        let data = serde_json::to_vec(&justs)
-            .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
-        self.ctx.kvstore.put(&key, &data).await?;
-        Ok(())
+        puts.push((key, serde_json::to_vec(&justs)?));
+        Ok(puts)
     }
 
-    /// Append `dependent` to the reverse-provenance list of premise edge
-    /// `(s)-p->(d)` (deduplicated).
-    async fn add_prov_rev(
-        &self,
-        space: &str,
-        s: i64,
-        p: &str,
-        d: i64,
-        dependent: &Fact,
-    ) -> Result<()> {
-        let key = SchemaKey::prov_rev_edge(space, s, p, d);
-        let mut deps = match self.ctx.kvstore.get(&key).await? {
-            Some(bytes) => serde_json::from_slice::<Vec<Fact>>(&bytes).unwrap_or_default(),
-            None => Vec::new(),
-        };
-        if deps.contains(dependent) {
-            return Ok(());
-        }
-        deps.push(dependent.clone());
-        let data = serde_json::to_vec(&deps)
-            .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
-        self.ctx.kvstore.put(&key, &data).await?;
-        Ok(())
-    }
-
-    /// The dependent facts directly supported by premise edge `(s)-p->(d)` —
-    /// i.e. facts that have a justification naming this edge as a premise.
-    /// Empty if the edge supports nothing. Used by DRed overdeletion.
-    pub(super) async fn dependents_of(
-        &self,
-        space: &str,
-        s: i64,
-        p: &str,
-        d: i64,
-    ) -> Result<Vec<Fact>> {
-        let key = SchemaKey::prov_rev_edge(space, s, p, d);
-        match self.ctx.kvstore.get(&key).await? {
-            Some(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// Read the recorded justifications for a fact. Empty means the fact is
-    /// asserted (ground truth) or has no provenance recorded.
-    // Consumed by the Phase 2 explanation surface (walks the justification tree)
-    // and by Phase 1 regression tests; not yet called from non-test code.
-    #[allow(dead_code)]
     pub(super) async fn provenance_of(
         &self,
         space: &str,
         fact: &Fact,
     ) -> Result<Vec<Justification>> {
-        let key = prov_key(space, fact);
-        match self.ctx.kvstore.get(&key).await? {
-            Some(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
+        match self.ctx.kvstore.get(&prov_key(space, fact)).await? {
+            Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
             None => Ok(Vec::new()),
         }
-    }
-
-    /// Remove `dependent` from the reverse-provenance list of premise edge
-    /// `(s)-p->(d)`. Deletes the key when the list becomes empty. No-op if the
-    /// entry or membership is absent.
-    async fn remove_prov_rev(
-        &self,
-        space: &str,
-        s: i64,
-        p: &str,
-        d: i64,
-        dependent: &Fact,
-    ) -> Result<()> {
-        let key = SchemaKey::prov_rev_edge(space, s, p, d);
-        let Some(bytes) = self.ctx.kvstore.get(&key).await? else {
-            return Ok(());
-        };
-        let mut deps: Vec<Fact> = serde_json::from_slice(&bytes).unwrap_or_default();
-        let before = deps.len();
-        deps.retain(|f| f != dependent);
-        if deps.len() == before {
-            return Ok(());
-        }
-        if deps.is_empty() {
-            self.ctx.kvstore.delete(&key).await?;
-        } else {
-            let data = serde_json::to_vec(&deps)
-                .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
-            self.ctx.kvstore.put(&key, &data).await?;
-        }
-        Ok(())
-    }
-
-    /// Erase the *forward* provenance trace of `fact` when it is retracted: its
-    /// own forward justifications, and its membership in each premise's
-    /// reverse-prov list. Keeps the reverse index consistent so future
-    /// retractions don't chase ghosts.
-    ///
-    /// Does **not** delete `fact`'s own reverse-prov entry (the list of facts it
-    /// supports) — DRed overdeletion must read that to traverse `fact`'s
-    /// dependents first, and deletes it only afterwards (see
-    /// `retract_edges_incremental`). Also does not touch data keys; the caller
-    /// deletes those.
-    pub(super) async fn purge_fact_provenance(&self, space: &str, fact: &Fact) -> Result<()> {
-        // Unlink `fact` from each premise's reverse list.
-        let mut premises: HashSet<Fact> = HashSet::new();
-        for j in self.provenance_of(space, fact).await? {
-            for prem in j.premises {
-                premises.insert(prem);
-            }
-        }
-        for prem in premises {
-            if let Fact::Edge { s, p, d } = prem {
-                self.remove_prov_rev(space, s, &p, d, fact).await?;
-            }
-        }
-        // Delete the fact's own forward provenance.
-        self.ctx.kvstore.delete(&prov_key(space, fact)).await?;
-        Ok(())
-    }
-
-    /// Delete an edge's reverse-prov entry (the list of facts it supports).
-    /// Called by DRed overdeletion *after* the edge's dependents have been
-    /// traversed.
-    pub(super) async fn delete_prov_rev_edge(
-        &self,
-        space: &str,
-        s: i64,
-        p: &str,
-        d: i64,
-    ) -> Result<()> {
-        self.ctx
-            .kvstore
-            .delete(&SchemaKey::prov_rev_edge(space, s, p, d))
-            .await?;
-        Ok(())
-    }
-
-    /// Drop every provenance entry in a space. Called by full
-    /// re-materialization before re-deriving, so justifications never go stale.
-    pub(super) async fn clear_provenance(&self, space: &str) -> Result<()> {
-        for prefix in [
-            SchemaKey::prov_prefix(space),
-            SchemaKey::prov_rev_prefix(space),
-        ] {
-            for (key, _) in self.ctx.kvstore.scan_prefix(&prefix).await? {
-                self.ctx.kvstore.delete(&key).await?;
-            }
-        }
-        Ok(())
     }
 
     /// Explain how an inferred edge `(src)-edge_type->(dst)` was entailed, by

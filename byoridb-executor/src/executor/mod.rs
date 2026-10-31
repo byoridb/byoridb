@@ -60,6 +60,23 @@ impl Executor {
     /// Execute a query plan
     pub async fn execute(&self, plan: ExecutionPlan) -> Result<ExecutorResult> {
         let start = std::time::Instant::now();
+        let scope = self.inference_scope(&plan);
+        let lock = scope.as_ref().map(|(space, _)| self.inference_lock(space));
+        let mut write_guard = None;
+        let mut read_guard = None;
+        if let (Some((space, mutation)), Some(lock)) = (&scope, &lock) {
+            if *mutation {
+                write_guard = Some(lock.write().await);
+            } else {
+                read_guard = Some(lock.read().await);
+            }
+            if !matches!(
+                plan,
+                ExecutionPlan::CheckInference | ExecutionPlan::RepairInference
+            ) {
+                self.ensure_inference_clean(space).await?;
+            }
+        }
 
         let result = match plan {
             ExecutionPlan::Show(show_plan) => self.execute_show(show_plan).await?,
@@ -68,15 +85,17 @@ impl Executor {
             ExecutionPlan::Create(create_plan) => self.execute_create(create_plan).await?,
             ExecutionPlan::Alter(alter_plan) => self.execute_alter(alter_plan).await?,
             ExecutionPlan::Drop(drop_plan) => self.execute_drop(drop_plan).await?,
-            ExecutionPlan::Insert(insert_plan) => self.execute_insert(insert_plan).await?,
-            ExecutionPlan::Update(update_plan) => self.execute_update(update_plan).await?,
-            ExecutionPlan::Delete(delete_plan) => self.execute_delete(delete_plan).await?,
-            ExecutionPlan::DeleteEdge(plan) => self.execute_delete_edge(plan).await?,
+            plan @ (ExecutionPlan::Insert(_)
+            | ExecutionPlan::Update(_)
+            | ExecutionPlan::Delete(_)
+            | ExecutionPlan::DeleteEdge(_)) => self.execute_dml_atomically(plan).await?,
             ExecutionPlan::Fetch(fetch_plan) => self.execute_fetch(fetch_plan).await?,
             ExecutionPlan::Go(go_plan) => self.execute_go(go_plan).await?,
             ExecutionPlan::Lookup(lookup_plan) => self.execute_lookup(lookup_plan).await?,
             ExecutionPlan::Recommend(rec_plan) => self.execute_recommend(rec_plan).await?,
             ExecutionPlan::CheckConsistency => self.execute_check_consistency().await?,
+            ExecutionPlan::CheckInference => self.check_inference().await?,
+            ExecutionPlan::RepairInference => self.repair_inference().await?,
             ExecutionPlan::CheckShape => self.execute_check_shape().await?,
             ExecutionPlan::ExplainInference {
                 src,
@@ -86,7 +105,7 @@ impl Executor {
             ExecutionPlan::Match(match_plan) => {
                 use crate::match_impl::MatchExecutor;
                 let match_executor = MatchExecutor::new(self.ctx.clone());
-                match_executor.execute_match(match_plan).await?
+                match_executor.execute_match_unfenced(match_plan).await?
             }
             ExecutionPlan::Find(find_plan) => self.execute_find(find_plan).await?,
             ExecutionPlan::Grant(grant_plan) => self.execute_grant(grant_plan).await?,
@@ -98,6 +117,17 @@ impl Executor {
             }
         };
 
+        if let Some((space, true)) = &scope {
+            if self.inference_is_dirty(space).await? {
+                self.rematerialize_space(space).await?;
+                self.ctx
+                    .kvstore
+                    .delete(&Self::inference_dirty_key(space))
+                    .await?;
+            }
+        }
+        drop(read_guard);
+        drop(write_guard);
         let latency = start.elapsed().as_millis() as u64;
 
         Ok(ExecutorResult {
@@ -224,33 +254,38 @@ pub(crate) fn expression_contains_ordered_range(
 }
 
 /// Convert a LOOKUP range literal to the indexed field's physical key type.
+/// The caller supplies the resolved tag or edge schema key so names shared
+/// between both kinds cannot select the wrong field type.
 /// Returning `None` deliberately routes unsupported or ambiguous comparisons
 /// through the full predicate evaluator, preserving cross-type correctness.
 pub(crate) async fn range_index_boundary(
     ctx: &ExecutionContext,
-    space: &str,
-    tag: &str,
+    schema_key: &[u8],
     field: &str,
     value: &byoridb_common::Value,
-) -> Option<byoridb_storage::key::IndexValue> {
+) -> Result<Option<byoridb_storage::key::IndexValue>> {
     use byoridb_common::Value;
     use byoridb_storage::key::IndexValue;
 
-    let schema = ctx
-        .kvstore
-        .get(&crate::key::SchemaKey::tag(space, tag))
-        .await
-        .ok()??;
-    let schema: serde_json::Value = serde_json::from_slice(&schema).ok()?;
+    let Some(schema) = ctx.kvstore.get(schema_key).await? else {
+        return Ok(None);
+    };
+    let schema: serde_json::Value = serde_json::from_slice(&schema)?;
     let data_type = schema
-        .get("properties")?
-        .as_array()?
-        .iter()
-        .find(|property| property.get("name").and_then(|name| name.as_str()) == Some(field))?
-        .get("data_type")?
-        .as_str()?;
+        .get("properties")
+        .and_then(|properties| properties.as_array())
+        .and_then(|properties| {
+            properties
+                .iter()
+                .find(|property| property.get("name").and_then(|name| name.as_str()) == Some(field))
+        })
+        .and_then(|property| property.get("data_type"))
+        .and_then(|data_type| data_type.as_str());
+    let Some(data_type) = data_type else {
+        return Ok(None);
+    };
 
-    match (data_type, value) {
+    Ok(match (data_type, value) {
         ("Bool", Value::Bool(value)) => Some(IndexValue::Bool(*value)),
         ("Int8" | "Int16" | "Int32" | "Int64", Value::Int(value)) => Some(IndexValue::Int(*value)),
         // Float/Double columns accept both Int and Float Values, while DML
@@ -261,7 +296,7 @@ pub(crate) async fn range_index_boundary(
         // domains safely.
         ("Float" | "Double", _) => None,
         _ => None,
-    }
+    })
 }
 
 mod auth_exec;
@@ -269,13 +304,23 @@ mod class_ddl;
 mod consistency;
 mod ddl;
 mod dml;
+mod dml_atomic;
+#[cfg(test)]
+mod dml_atomic_tests;
 #[cfg(test)]
 mod dogfood_regression;
 mod dql;
+#[cfg(test)]
+mod find_completeness_tests;
+#[cfg(test)]
+mod lookup_completeness_tests;
 // Re-exported so `EXPLAIN` resolves tag-vs-edge with the same rule the executor
 // uses, rather than keeping a second copy that could drift (#79).
 pub(crate) use dql::lookup_targets_edge;
 mod inference;
+mod inference_recovery;
+#[cfg(test)]
+mod inference_recovery_tests;
 mod provenance;
 mod recommend;
 mod sameas;
@@ -2128,6 +2173,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edge_numeric_range_matches_scan_across_literal_and_storage_types() {
+        for data_type in ["float", "double"] {
+            let executor = create_executor();
+            for query in [
+                format!("CREATE EDGE metric (score {data_type})"),
+                "INSERT EDGE metric(score) VALUES 1->2:(10), 1->3:(10.5), 1->4:(-2.5)".to_string(),
+            ] {
+                let statement = byoridb_parser::parse(&query).unwrap();
+                executor
+                    .execute(ExecutionPlanBuilder::build(statement).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let predicates = [
+                ("score > 0", vec![2, 3]),
+                ("score > 0.5", vec![2, 3]),
+                ("10 < score", vec![3]),
+                ("score <= 10", vec![2, 4]),
+            ];
+            // Establish answers without an index, then create/backfill the
+            // index through DDL. Float columns preserve both physical numeric
+            // Value variants, so neither index domain alone is sufficient.
+            for indexed in [false, true] {
+                if indexed {
+                    let statement = byoridb_parser::parse(
+                        "CREATE EDGE INDEX metric_score_idx ON metric(score)",
+                    )
+                    .unwrap();
+                    executor
+                        .execute(ExecutionPlanBuilder::build(statement).unwrap())
+                        .await
+                        .unwrap();
+                }
+                for (predicate, expected) in &predicates {
+                    let query = format!("LOOKUP ON metric WHERE {predicate}");
+                    let statement = byoridb_parser::parse(&query).unwrap();
+                    let result = executor
+                        .execute(ExecutionPlanBuilder::build(statement).unwrap())
+                        .await
+                        .unwrap();
+                    let mut destinations: Vec<_> = result
+                        .rows
+                        .iter()
+                        .map(|row| match row[1] {
+                            byoridb_common::Value::Int(dst) => dst,
+                            _ => panic!("expected integer destination"),
+                        })
+                        .collect();
+                    destinations.sort_unstable();
+                    assert_eq!(
+                        &destinations, expected,
+                        "{data_type}, indexed={indexed}, {query}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn lookup_indexes_are_scoped_to_the_requested_tag() {
         let kvstore = Arc::new(MemoryKVStore::new());
         let ctx = Arc::new(
@@ -2318,7 +2422,7 @@ mod tests {
                 .with_space("default".to_string())
                 .with_space_id(1)
                 .with_config(ExecutionConfig {
-                    max_scan_limit: 2,
+                    max_scan_limit: 8,
                     ..ExecutionConfig::default()
                 }),
         );
@@ -2384,10 +2488,10 @@ mod tests {
                 "LOOKUP ON indexed_item WHERE indexed_item.score > 0 OFFSET 1",
             )
             .await,
-            vec![2, 3]
+            vec![2, 3, 4]
         );
-        // Unrelated vertices sort before this tag's rows. LIMIT must count
-        // predicate matches, not raw prefix entries.
+        // Unrelated vertices consume the candidate budget, while query LIMIT
+        // counts predicate matches after the bounded candidate scan completes.
         assert_eq!(
             lookup_vids(
                 &executor,
@@ -2402,7 +2506,7 @@ mod tests {
                 "LOOKUP ON scanned_item WHERE scanned_item.score > 0 OFFSET 1",
             )
             .await,
-            vec![102, 103]
+            vec![102, 103, 104]
         );
         assert_eq!(
             lookup_vids(
@@ -2466,7 +2570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lookup_explicit_limit_overrides_default_scan_limit() {
+    async fn test_lookup_explicit_limit_does_not_override_candidate_budget() {
         let kvstore = Arc::new(MemoryKVStore::new());
         let ctx = Arc::new(
             ExecutionContext::new(kvstore.clone())
@@ -2496,29 +2600,24 @@ mod tests {
                 .unwrap();
         }
 
-        let capped = executor
-            .execute_lookup(LookupPlan {
-                lookup_type: LookupType::Tag("player".to_string()),
-                where_clause: None,
-                yield_clause: YieldClause { columns: vec![] },
-                limit: None,
-                offset: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(capped.rows.len(), 2);
-
-        let explicit = executor
-            .execute_lookup(LookupPlan {
-                lookup_type: LookupType::Tag("player".to_string()),
-                where_clause: None,
-                yield_clause: YieldClause { columns: vec![] },
-                limit: Some(3),
-                offset: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(explicit.rows.len(), 3);
+        for limit in [None, Some(1), Some(3)] {
+            let result = executor
+                .execute_lookup(LookupPlan {
+                    lookup_type: LookupType::Tag("player".to_string()),
+                    where_clause: None,
+                    yield_clause: YieldClause { columns: vec![] },
+                    limit,
+                    offset: None,
+                })
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::error::ExecutionError::ResourceExhausted(_))
+                ),
+                "query LIMIT {limit:?} must not hide or raise the candidate budget: {result:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2572,7 +2671,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_match_count_uses_unlimited_count_path() {
+    async fn test_match_count_respects_scan_budget_and_zero_disables_it() {
         let kvstore = Arc::new(MemoryKVStore::new());
         let ctx = Arc::new(
             ExecutionContext::new(kvstore.clone())
@@ -2604,10 +2703,27 @@ mod tests {
             kvstore.put(tagvid.as_bytes(), &[]).await.unwrap();
         }
 
-        let stmt = byoridb_parser::parse("MATCH (n:post) RETURN count(n)").unwrap();
-        let plan = ExecutionPlanBuilder::build(stmt).unwrap();
-        let result = executor.execute(plan).await.unwrap();
-        assert_eq!(result.rows, vec![vec![byoridb_common::Value::Int(3)]]);
+        let unlimited = Executor::new(Arc::new(
+            ExecutionContext::new(kvstore)
+                .with_space("default".to_string())
+                .with_config(ExecutionConfig {
+                    max_scan_limit: 0,
+                    ..ExecutionConfig::default()
+                }),
+        ));
+        for query in [
+            "MATCH (n:post) RETURN count(n) LIMIT 1",
+            "MATCH (n:post) RETURN count(*) LIMIT 1",
+        ] {
+            let plan =
+                || ExecutionPlanBuilder::build(byoridb_parser::parse(query).unwrap()).unwrap();
+            assert!(matches!(
+                executor.execute(plan()).await,
+                Err(ExecutionError::ResourceExhausted(_))
+            ));
+            let result = unlimited.execute(plan()).await.unwrap();
+            assert_eq!(result.rows, vec![vec![byoridb_common::Value::Int(3)]]);
+        }
     }
 
     // ===== INDEX operations without MetaClient =====
@@ -3007,7 +3123,10 @@ mod tests {
         ctx.partition_num = Some(7);
         let executor = Executor::new(Arc::new(ctx));
 
-        let resolved = executor.resolve_local_partition_num("default").await;
+        let resolved = executor
+            .resolve_local_partition_num("default")
+            .await
+            .unwrap();
         assert_eq!(resolved, 7);
     }
 
@@ -3018,22 +3137,28 @@ mod tests {
     async fn test_resolve_local_partition_num_falls_back_to_one() {
         let executor = create_executor();
 
-        let resolved = executor.resolve_local_partition_num("default").await;
+        let resolved = executor
+            .resolve_local_partition_num("default")
+            .await
+            .unwrap();
         assert_eq!(resolved, 1);
     }
 
     /// A stored partition count of 0 would cause the caller's 1..=n loop to
-    /// evaluate to an empty range, missing every partition. Clamp to at
-    /// least 1 so the loop always touches part 1.
+    /// evaluate to an empty range, missing every partition. Reject this invalid
+    /// configuration instead of silently choosing a different partition set.
     #[tokio::test]
-    async fn test_resolve_local_partition_num_clamps_zero_to_one() {
+    async fn test_resolve_local_partition_num_rejects_zero() {
         let kvstore = Arc::new(MemoryKVStore::new());
         let mut ctx = ExecutionContext::new(kvstore).with_space("default".to_string());
         ctx.partition_num = Some(0);
         let executor = Executor::new(Arc::new(ctx));
 
         let resolved = executor.resolve_local_partition_num("default").await;
-        assert_eq!(resolved, 1, "partition_num must never resolve to 0");
+        assert!(matches!(
+            resolved,
+            Err(crate::error::ExecutionError::InvalidOperation(_))
+        ));
     }
 
     // ===== H-series bug regression tests =====

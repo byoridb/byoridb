@@ -2,12 +2,12 @@
 
 # Installation
 
-The documented release baseline,
-[v0.4.20](https://github.com/byoridb/byoridb/releases/tag/v0.4.20)
-(2026-08-30 KST), provides prebuilt archives for Linux x86_64/arm64 and macOS
-x86_64/arm64. Check the
-[latest release page](https://github.com/byoridb/byoridb/releases/latest) for
-newer artifacts. Older releases do not retroactively gain new platforms or
+The [latest release page](https://github.com/byoridb/byoridb/releases/latest)
+provides prebuilt archives for Linux x86_64/arm64 and macOS x86_64/arm64.
+Each archive contains the server, CLI, backup tool, license and notices. Its
+release workflow runs authenticated HTTP/gRPC queries, graceful restart and
+backup/restore against the extracted binaries before publication.
+Older releases do not retroactively gain new checks, platforms or
 signatures. A tagged release can lag `main`; the source-build instructions below
 build the exact checkout. The repository pins Rust 1.90, so a `rustup`
 installation will select the expected compiler automatically.
@@ -114,7 +114,8 @@ cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ## Start the server
 
 The standalone binary refuses to start without a non-empty root password. It
-never generates and prints a recoverable password to the logs.
+does not impose a separate strength check on whitespace-only values and never
+generates and prints a recoverable password to the logs.
 
 ```bash
 export BYORIDB_ROOT_PASSWORD='replace-with-a-long-random-secret'

@@ -27,6 +27,10 @@ pub enum Statement {
     Recommend(RecommendStatement),
     /// `CHECK CONSISTENCY` — report ontology consistency violations (O-6).
     CheckConsistency,
+    /// Inspect the selected space's durable inference completion state.
+    CheckInference,
+    /// Rebuild derived inference from current assertions (GOD/ADMIN only).
+    RepairInference,
     /// `CHECK SHAPE` — report vertices that violate a declared shape's
     /// property constraints (required / datatype / value predicate). Shape
     /// validation is the SHACL-style complement to O-6 disjointness checking.

@@ -55,15 +55,12 @@ pub struct RunningQuery {
 struct ActiveQueryGuard {
     registry: Arc<DashMap<u64, RunningQuery>>,
     id: u64,
-    /// Shared drain counter for graceful shutdown (see [`crate::shutdown`]).
-    shutdown: Arc<crate::shutdown::ShutdownState>,
 }
 
 impl Drop for ActiveQueryGuard {
     fn drop(&mut self) {
         self.registry.remove(&self.id);
         crate::metrics::dec_inflight();
-        self.shutdown.query_finished();
     }
 }
 
@@ -203,11 +200,9 @@ impl GraphService {
             },
         );
         crate::metrics::inc_inflight();
-        self.shutdown.query_started();
         ActiveQueryGuard {
             registry: self.active_queries.clone(),
             id,
-            shutdown: self.shutdown.clone(),
         }
     }
 
@@ -276,9 +271,7 @@ impl GraphService {
     {
         use crate::auth::Permission;
         use crate::discovery::{DiscoveryError as Error, DiscoveryLimits, DiscoveryResponse};
-        if !self.shutdown.is_accepting() {
-            return Err(Error::ServiceUnavailable);
-        }
+        let _admission = self.shutdown.try_admit().ok_or(Error::ServiceUnavailable)?;
         if session_id <= 0 {
             return Err(Error::AuthRequired);
         }
@@ -542,11 +535,11 @@ impl GraphService {
         // Graceful shutdown: once the signal handler flips readiness off, new
         // queries fail fast and clearly; queries already past this gate drain
         // to completion before the servers stop.
-        if !self.shutdown.is_accepting() {
-            return Err(GraphError::InvalidOperation(
+        let _admission = self.shutdown.try_admit().ok_or_else(|| {
+            GraphError::InvalidOperation(
                 "server is shutting down; not accepting new queries".to_string(),
-            ));
-        }
+            )
+        })?;
 
         // Auth is authoritative and is touched before graph session state, so
         // an expired bearer cannot extend a graph-only sliding TTL entry.
@@ -813,6 +806,7 @@ impl GraphService {
             | Statement::Drop(DropStatement::User(_))
             | Statement::Grant(_)
             | Statement::Revoke(_)
+            | Statement::RepairInference
             | Statement::Balance(_) => true,
             Statement::Compound(clauses) => clauses
                 .iter()
@@ -888,9 +882,13 @@ impl GraphService {
             | Statement::Recommend(_)
             | Statement::ExplainInference { .. }
             | Statement::CheckConsistency
+            | Statement::CheckInference
             | Statement::CheckShape => Permission::Read,
             // Write
-            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => Permission::Write,
+            Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::RepairInference => Permission::Write,
             // Create / schema
             Statement::Create(_) | Statement::Alter(_) | Statement::Balance(_) => {
                 Permission::Create
@@ -926,6 +924,8 @@ impl GraphService {
             Statement::Find(_) => QueryType::Find,
             Statement::Recommend(_) => QueryType::Recommend,
             Statement::CheckConsistency => QueryType::Show,
+            Statement::CheckInference => QueryType::Show,
+            Statement::RepairInference => QueryType::Alter,
             Statement::CheckShape => QueryType::Show,
             Statement::ExplainInference { .. } => QueryType::Show,
             Statement::Grant(_) => QueryType::Create, // User management uses Create metrics
@@ -944,8 +944,13 @@ impl GraphService {
         &self,
         session_id: i64,
         stmt: String,
-        _params: std::collections::HashMap<String, String>,
+        params: std::collections::HashMap<String, String>,
     ) -> Result<DataSet> {
+        if !params.is_empty() {
+            return Err(GraphError::InvalidOperation(
+                "typed query parameters are not supported; no statement was executed".to_string(),
+            ));
+        }
         self.execute(session_id, stmt).await
     }
 
@@ -990,6 +995,76 @@ mod tests {
             .authenticate("root".to_string(), ROOT_PASSWORD.to_string())
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unsupported_parameters_fail_before_the_statement_can_mutate() {
+        let store = Arc::new(MemoryKVStore::new());
+        let service = test_service(store.clone());
+        let session = root_session(&service).await;
+        let error = service
+            .execute_with_params(
+                session,
+                "CREATE SPACE must_not_exist".into(),
+                std::collections::HashMap::from([("unused".into(), "value".into())]),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("parameters are not supported"));
+        assert!(store.scan_prefix(b"space:").await.unwrap().is_empty());
+        let result = service
+            .execute_with_params(session, "SHOW SPACES".into(), Default::default())
+            .await
+            .unwrap();
+        assert!(result.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inference_repair_requires_admin_and_status_is_readable() {
+        let service = test_service(Arc::new(MemoryKVStore::new()));
+        let root = root_session(&service).await;
+        service
+            .execute(root, "CREATE SPACE repair_auth".into())
+            .await
+            .unwrap();
+        service
+            .execute(
+                root,
+                r#"CREATE USER repair_reader WITH PASSWORD "test-only-reader" ROLE GUEST"#.into(),
+            )
+            .await
+            .unwrap();
+        let guest = service
+            .authenticate("repair_reader".into(), "test-only-reader".into())
+            .await
+            .unwrap();
+        service
+            .execute(guest, "USE repair_auth".into())
+            .await
+            .unwrap();
+        service
+            .execute(guest, "CHECK INFERENCE".into())
+            .await
+            .unwrap();
+        for query in [
+            "REPAIR INFERENCE",
+            "PROFILE REPAIR INFERENCE",
+            "SHOW SPACES; REPAIR INFERENCE",
+        ] {
+            let error = service.execute(guest, query.into()).await.unwrap_err();
+            assert!(
+                matches!(error, GraphError::AuthFailed(_)),
+                "{query}: {error}"
+            );
+        }
+        service
+            .execute(root, "USE repair_auth".into())
+            .await
+            .unwrap();
+        service
+            .execute(root, "REPAIR INFERENCE".into())
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -1842,6 +1917,7 @@ mod tests {
             "SHOW SPACES; DELETE VERTEX 1",
             // PROFILE executes the inner statement.
             "PROFILE INSERT VERTEX person(name) VALUES 1:('ada')",
+            "REPAIR INFERENCE",
         ] {
             let error = service
                 .execute_with_options(session, stmt.to_string(), QueryOptions { read_only: true })

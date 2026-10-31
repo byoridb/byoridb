@@ -1,51 +1,31 @@
+# Local single-node deployment. The TCP listeners are plaintext and loopback-only.
+# For network clients use deploy/secure/compose.yml (TLS termination).
 services:
-  byoridb-server-1:
+  byoridb:
     build: .
-    image: byoridb-server:latest
-    container_name: byoridb-server-1
+    image: ${BYORIDB_IMAGE:-byoridb-server:local}
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,nosuid,noexec,size=256m,mode=1777"]
+    stop_grace_period: 300s
     ports:
-      - "9669:9669"
-      - "19669:19669"
+      - "127.0.0.1:${BYORIDB_GRPC_PORT:-9669}:9669"
+      - "127.0.0.1:${BYORIDB_HTTP_PORT:-19669}:19669"
     environment:
-      - RUST_LOG=info
-      - BYORIDB_ROOT_PASSWORD=${BYORIDB_ROOT_PASSWORD:?set BYORIDB_ROOT_PASSWORD before running docker compose}
-      - BYORIDB__SERVER__GRAPH_ADDR=0.0.0.0:9669
-      - BYORIDB__SERVER__HTTP_ADDR=0.0.0.0:19669
-      - BYORIDB__STORAGE__DATA_PATHS=/app/data
+      RUST_LOG: info
+      BYORIDB_ROOT_PASSWORD: ${BYORIDB_ROOT_PASSWORD:?set BYORIDB_ROOT_PASSWORD}
+      BYORIDB__SERVER__GRAPH_ADDR: 0.0.0.0:9669
+      BYORIDB__SERVER__HTTP_ADDR: 0.0.0.0:19669
+      BYORIDB__STORAGE__DATA_PATHS: /app/data
     volumes:
-      - byoridb-data-1:/app/data
-
-  byoridb-server-2:
-    image: byoridb-server:latest
-    container_name: byoridb-server-2
-    ports:
-      - "9670:9669"
-      - "19670:19669"
-    environment:
-      - RUST_LOG=info
-      - BYORIDB_ROOT_PASSWORD=${BYORIDB_ROOT_PASSWORD:?set BYORIDB_ROOT_PASSWORD before running docker compose}
-      - BYORIDB__SERVER__GRAPH_ADDR=0.0.0.0:9669
-      - BYORIDB__SERVER__HTTP_ADDR=0.0.0.0:19669
-      - BYORIDB__STORAGE__DATA_PATHS=/app/data
-    volumes:
-      - byoridb-data-2:/app/data
-
-  byoridb-server-3:
-    image: byoridb-server:latest
-    container_name: byoridb-server-3
-    ports:
-      - "9671:9669"
-      - "19671:19669"
-    environment:
-      - RUST_LOG=info
-      - BYORIDB_ROOT_PASSWORD=${BYORIDB_ROOT_PASSWORD:?set BYORIDB_ROOT_PASSWORD before running docker compose}
-      - BYORIDB__SERVER__GRAPH_ADDR=0.0.0.0:9669
-      - BYORIDB__SERVER__HTTP_ADDR=0.0.0.0:19669
-      - BYORIDB__STORAGE__DATA_PATHS=/app/data
-    volumes:
-      - byoridb-data-3:/app/data
-
+      - byoridb-data:/app/data
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:19669/ready]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
 volumes:
-  byoridb-data-1:
-  byoridb-data-2:
-  byoridb-data-3:
+  byoridb-data:

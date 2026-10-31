@@ -194,10 +194,8 @@ mod tests {
         assert_eq!(vids, vec![6, 5, 4], "descending vids, top-3");
     }
 
-    /// Edge-degree GROUP BY COUNT fast-path: `MATCH (c:cat)<-[:in_category]-()
-    /// RETURN c.cat.name, COUNT(*)` must count each category's incoming edges via
-    /// key prefix (no edge decode) and return the correct per-group totals.
-    /// This is the TOP-category/brand query that full-scanned for minutes.
+    /// Grouped incoming-edge counts must use the same validated matches with
+    /// an unlabeled or labeled endpoint.
     #[tokio::test]
     async fn match_edge_degree_group_count_reverse() {
         let e = create_executor();
@@ -229,7 +227,7 @@ mod tests {
             got
         };
 
-        // Far node is unlabeled `()` → fast-path.
+        // The unlabeled far node must still exist and its edges must decode.
         let fast = run(
             &e,
             "MATCH (c:category)<-[:in_category]-() RETURN c.category.name AS k, COUNT(*) AS n",
@@ -241,8 +239,7 @@ mod tests {
             "reverse edge-degree counts per category"
         );
 
-        // Far node carries a label `(s:sku)` → fast-path declines, full scan must
-        // produce the identical result (fallback correctness).
+        // Adding the matching endpoint label preserves the group totals.
         let fallback = run(
             &e,
             "MATCH (c:category)<-[:in_category]-(s:sku) RETURN c.category.name AS k, COUNT(*) AS n",
@@ -263,8 +260,10 @@ mod tests {
     async fn duplicate_edge_insert_counts_degree_once() {
         let e = create_executor();
         run(&e, "CREATE TAG category(name STRING)").await;
+        run(&e, "CREATE TAG sku(code STRING)").await;
         run(&e, "CREATE EDGE in_category()").await;
         run(&e, "INSERT VERTEX category(name) VALUES 100:(\"elec\")").await;
+        run(&e, "INSERT VERTEX sku(code) VALUES 1:(\"s\")").await;
         run(&e, "INSERT EDGE in_category() VALUES 1->100:()").await;
         // Same edge again — must NOT double-count the degree.
         run(&e, "INSERT EDGE in_category() VALUES 1->100:()").await;
@@ -291,7 +290,7 @@ mod tests {
         );
     }
 
-    /// Forward direction (`->`) of the same fast-path: count out-edges per node.
+    /// Forward direction (`->`): count validated outgoing matches per group.
     #[tokio::test]
     async fn match_edge_degree_group_count_forward() {
         let e = create_executor();

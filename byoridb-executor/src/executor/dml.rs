@@ -2,6 +2,9 @@
 //
 // This source code is licensed under Apache 2.0 License.
 
+// These helpers target the statement-local MutationStore when invoked through
+// Executor::execute. All logical batches, index/vector/counter writes and
+// sameAs rewrites are committed together only after the whole helper succeeds.
 use super::{Executor, ExecutorResult};
 use crate::error::{ExecutionError, Result};
 use crate::key::SchemaKey;
@@ -37,11 +40,9 @@ impl Executor {
                 // all-or-nothing. FIXED_STRING reverse-key reservations are
                 // intentionally stable/non-recycled and happen before this
                 // batch, so an I/O failure may leave unused mapping metadata.
-                let space_id = self.ctx.resolve_space_id().await;
-                let tag_indexes = match self.ctx.index_manager.as_ref() {
-                    Some(im) => im.list_tag_indexes(space_id).await,
-                    None => Vec::new(),
-                };
+                let tag_indexes = self
+                    .mutation_indexes(&effective_space, byoridb_storage::IndexType::Tag)
+                    .await?;
                 let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                 // T-트랙: (현재뷰 키, blob) 쌍을 모아 커밋 후 이력에 append.
                 let mut vertex_versions: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -77,6 +78,8 @@ impl Executor {
                 // final duplicate row. Tag-vid puts/deletes are derived after
                 // all rows are built, avoiding conflicting operations in the
                 // same atomic batch and making last-row-wins overwrites exact.
+                let mut old_view_deletes = Vec::new();
+                let mut final_vertices = std::collections::BTreeMap::new();
                 let mut original_tags: std::collections::HashMap<
                     i64,
                     std::collections::HashSet<String>,
@@ -99,19 +102,36 @@ impl Executor {
                             "failed to create VID mapping in space '{effective_space}'"
                         ))
                     })?;
+                    let internal_vid = crate::ontology::representative_of(
+                        &self.ctx,
+                        &effective_space,
+                        internal_vid,
+                    )
+                    .await?;
                     let key = format!("{}:vertex:{}", effective_space, internal_vid);
                     if let std::collections::hash_map::Entry::Vacant(entry) =
                         original_tags.entry(internal_vid)
                     {
                         let tags = match self.ctx.kvstore.get(key.as_bytes()).await? {
-                            Some(existing) => VertexCodec::decode_vertex(&existing)
-                                .map_err(|e| {
-                                    ExecutionError::Io(std::io::Error::other(e.to_string()))
-                                })?
-                                .tags
-                                .into_iter()
-                                .map(|tag| tag.name)
-                                .collect(),
+                            Some(existing) => {
+                                let old =
+                                    crate::record_decode::decode_vertex(internal_vid, &existing)?;
+                                old_view_deletes
+                                    .extend(self.vertex_index_keys(&effective_space, &old).await?);
+                                for tag in &old.tags {
+                                    for (prop, value) in &tag.properties {
+                                        if super::recommend::pack_embedding(value).is_some() {
+                                            old_view_deletes.push(SchemaKey::vec_data(
+                                                &effective_space,
+                                                prop,
+                                                internal_vid,
+                                            ));
+                                            dirty_vec_props.insert(prop.clone());
+                                        }
+                                    }
+                                }
+                                old.tags.into_iter().map(|tag| tag.name).collect()
+                            }
                             None => std::collections::HashSet::new(),
                         };
                         entry.insert(tags);
@@ -142,24 +162,24 @@ impl Executor {
                     // T-트랙: 현재뷰 blob을 이력 버전으로도 기록.
                     vertex_versions.push((key_bytes.clone(), data.clone()));
                     batch.push((key_bytes, data));
-                    // Dense embedding side-store (PLAN.md R-2a): any numeric-list
-                    // property is mirrored as packed f32 under {space}:vec:{prop}:{vid}
-                    // so cosine KNN scans packed floats instead of decoding vertices.
-                    for tag in &codec_vertex.tags {
+                    final_vertices.insert(internal_vid, codec_vertex);
+                    inserted += 1;
+                }
+                for (vid, vertex) in &final_vertices {
+                    for tag in &vertex.tags {
                         for (prop, value) in &tag.properties {
-                            if let Some(bytes) = crate::executor::recommend::pack_embedding(value) {
-                                let vkey = crate::key::SchemaKey::vec_data(
-                                    &effective_space,
-                                    prop,
-                                    internal_vid,
-                                );
-                                batch.push((vkey, bytes));
+                            if let Some(bytes) = super::recommend::pack_embedding(value) {
+                                batch.push((
+                                    SchemaKey::vec_data(&effective_space, prop, *vid),
+                                    bytes,
+                                ));
                                 dirty_vec_props.insert(prop.clone());
                             }
                         }
                     }
+                    // The index list was strictly validated before planning.
                     for index in &tag_indexes {
-                        for tag in codec_vertex
+                        for tag in vertex
                             .tags
                             .iter()
                             .filter(|tag| tag.name == index.schema_name)
@@ -175,16 +195,14 @@ impl Executor {
                                     )
                                 })
                                 .collect::<Vec<_>>();
-                            let idx_key = byoridb_storage::KeyUtils::tag_index_key(
-                                1,
-                                index.id,
-                                &values,
-                                internal_vid,
-                            );
-                            batch.push((idx_key, Vec::new()));
+                            batch.push((
+                                byoridb_storage::KeyUtils::tag_index_key(
+                                    1, index.id, &values, *vid,
+                                ),
+                                Vec::new(),
+                            ));
                         }
                     }
-                    inserted += 1;
                 }
                 let mut tagvid_deletes = Vec::new();
                 for (vid, tags) in &final_tags {
@@ -199,6 +217,12 @@ impl Executor {
                 }
                 // T-트랙 v1.1: 현재뷰 쓰기 + 이력 버전 append 를 단일 트랜잭션으로
                 // 커밋 (dual-write 원자성).
+                tagvid_deletes.extend(old_view_deletes);
+                let final_keys: std::collections::HashSet<_> =
+                    batch.iter().map(|(key, _)| key.clone()).collect();
+                tagvid_deletes.retain(|key| !final_keys.contains(key));
+                self.fence_semantic_batch(&effective_space, &mut batch)
+                    .await?;
                 self.ctx
                     .kvstore
                     .batch_apply(batch, tagvid_deletes, Self::build_versions(vertex_versions))
@@ -230,11 +254,9 @@ impl Executor {
                 let vid_type = crate::vid::space_vid_type(&self.ctx, &effective_space).await?;
                 // Collect all KV writes into one batch → single redb commit
                 // (one fsync) per multi-row INSERT, applied atomically.
-                let space_id = self.ctx.resolve_space_id().await;
-                let edge_indexes = match self.ctx.index_manager.as_ref() {
-                    Some(im) => im.list_edge_indexes(space_id).await,
-                    None => Vec::new(),
-                };
+                let edge_indexes = self
+                    .mutation_indexes(&effective_space, byoridb_storage::IndexType::Edge)
+                    .await?;
                 let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                 // T-트랙: (현재뷰 엣지 키, blob) 쌍을 모아 커밋 후 이력에 append.
                 let mut edge_versions: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -251,6 +273,8 @@ impl Executor {
                 // duplicate edge's degree at most once.
                 let mut seen_edges: std::collections::HashSet<Vec<u8>> =
                     std::collections::HashSet::new();
+                let mut edge_view_deletes = Vec::new();
+                let mut final_edges = std::collections::BTreeMap::new();
                 // Validate every row and endpoint type before any string VID
                 // mapping is materialized. The subsequent loop only builds the
                 // already-validated atomic write batch.
@@ -288,6 +312,10 @@ impl Executor {
                             "failed to create destination VID mapping in space '{effective_space}'"
                         ))
                     })?;
+                    let src = crate::ontology::representative_of(&self.ctx, &effective_space, src)
+                        .await?;
+                    let dst = crate::ontology::representative_of(&self.ctx, &effective_space, dst)
+                        .await?;
                     let key = format!(
                         "{}:edge:{}:{}:{}:{}",
                         effective_space, src, edge_type_name, dst, edge.ranking
@@ -308,8 +336,20 @@ impl Executor {
                     // — both within this batch (`seen_edges`) and against edges
                     // already persisted. Otherwise re-inserting inflated the degree
                     // counter, and a later delete left a ghost count.
-                    let edge_is_new = seen_edges.insert(key_bytes.clone())
-                        && self.ctx.kvstore.get(&key_bytes).await?.is_none();
+                    let edge_is_new = if seen_edges.insert(key_bytes.clone()) {
+                        match self.ctx.kvstore.get(&key_bytes).await? {
+                            Some(bytes) => {
+                                let old = crate::algo::decode_query_edge(&key_bytes, &bytes)?;
+                                edge_view_deletes
+                                    .extend(self.edge_index_keys(&effective_space, &old).await?);
+                                old.properties
+                                    .contains_key(super::inference::INFERRED_MARKER)
+                            }
+                            None => true,
+                        }
+                    } else {
+                        false
+                    };
                     // T-트랙: 현재뷰 엣지 blob을 이력 버전으로도 기록.
                     edge_versions.push((key_bytes.clone(), data.clone()));
                     batch.push((key_bytes, data.clone()));
@@ -324,32 +364,8 @@ impl Executor {
                         edge.ranking,
                     );
                     batch.push((in_edge_key, data));
-                    for index in edge_indexes
-                        .iter()
-                        .filter(|index| index.schema_name == edge_type_name)
-                    {
-                        let values = index
-                            .fields
-                            .iter()
-                            .map(|field| {
-                                self.byoridb_value_to_index_value(
-                                    codec_edge
-                                        .properties
-                                        .get(field)
-                                        .unwrap_or(&byoridb_common::Value::null()),
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        let idx_key = byoridb_storage::KeyUtils::edge_index_key(
-                            1,
-                            index.id,
-                            &values,
-                            codec_edge.src_vid,
-                            codec_edge.ranking,
-                            codec_edge.dst_vid,
-                        );
-                        batch.push((idx_key, Vec::new()));
-                    }
+                    final_edges
+                        .insert((src, edge_type_name.clone(), dst, edge.ranking), codec_edge);
                     new_triples.push((src, edge_type_name.clone(), dst));
                     if edge_is_new {
                         *deg_in.entry((edge_type_name.clone(), dst)).or_insert(0) += 1;
@@ -357,10 +373,48 @@ impl Executor {
                     }
                     inserted += 1;
                 }
+                for edge in final_edges.values() {
+                    for index in edge_indexes
+                        .iter()
+                        .filter(|index| index.schema_name == edge.edge_type)
+                    {
+                        let values = index
+                            .fields
+                            .iter()
+                            .map(|field| {
+                                self.byoridb_value_to_index_value(
+                                    edge.properties
+                                        .get(field)
+                                        .unwrap_or(&byoridb_common::Value::null()),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        batch.push((
+                            byoridb_storage::KeyUtils::edge_index_key(
+                                1,
+                                index.id,
+                                &values,
+                                edge.src_vid,
+                                edge.ranking,
+                                edge.dst_vid,
+                            ),
+                            Vec::new(),
+                        ));
+                    }
+                }
+                let final_keys: std::collections::HashSet<_> =
+                    batch.iter().map(|(key, _)| key.clone()).collect();
+                edge_view_deletes.retain(|key| !final_keys.contains(key));
                 // T-트랙 v1.1: 현재뷰 쓰기 + 이력 버전 append 단일 트랜잭션.
+                self.fence_semantic_batch(&effective_space, &mut batch)
+                    .await?;
                 self.ctx
                     .kvstore
-                    .batch_apply(batch, Vec::new(), Self::build_versions(edge_versions))
+                    .batch_apply(
+                        batch,
+                        edge_view_deletes,
+                        Self::build_versions(edge_versions),
+                    )
                     .await?;
                 // Maintain edge-degree counters for the asserted edges (used by
                 // the COUNT fast-path). Atomic increment so concurrent inserts
@@ -381,17 +435,6 @@ impl Executor {
                 // classes onto a canonical representative *before* O-5 so
                 // forward-chaining runs over the canonicalized graph (D10).
                 self.merge_sameas_triples(&effective_space, &new_triples)
-                    .await?;
-                // Ontology forward-chaining materialization (O-5): derive and
-                // persist entailed edges. No-op if the space declares no
-                // semantic relations. Runs after the asserted edges are
-                // committed so the closure reads them. sameAs triples are
-                // handled by the merge above, not by O-5 rules — exclude them.
-                let onto_triples: Vec<_> = new_triples
-                    .into_iter()
-                    .filter(|(_, p, _)| p != crate::executor::sameas::SAMEAS_EDGE)
-                    .collect();
-                self.materialize_inserted_edges(&effective_space, onto_triples)
                     .await?;
                 Ok(ExecutorResult {
                     columns: vec!["Inserted".to_string()],
@@ -484,6 +527,11 @@ impl Executor {
         edge_type: &str,
         props: &std::collections::HashMap<String, byoridb_common::Value>,
     ) -> Result<()> {
+        if props.contains_key(super::inference::INFERRED_MARKER) {
+            return Err(ExecutionError::InvalidOperation(
+                "__inferred__ is reserved for materialized inference".into(),
+            ));
+        }
         let edge_key = SchemaKey::edge(space, edge_type);
         let schema_bytes = self
             .ctx
@@ -582,6 +630,8 @@ impl Executor {
             return no_op();
         };
 
+        let src = crate::ontology::representative_of(&self.ctx, &effective_space, src).await?;
+        let dst = crate::ontology::representative_of(&self.ctx, &effective_space, dst).await?;
         let key = format!(
             "{}:edge:{}:{}:{}:{}",
             effective_space, src, target.edge_name, dst, target.ranking
@@ -590,8 +640,10 @@ impl Executor {
         let Some(existing) = self.ctx.kvstore.get(&key_bytes).await? else {
             return no_op();
         };
-        let mut edge_data = VertexCodec::decode_edge(&existing)
-            .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
+        let mut edge_data = crate::algo::decode_query_edge(&key_bytes, &existing)?;
+        let was_inferred = edge_data
+            .properties
+            .contains_key(super::inference::INFERRED_MARKER);
         let old_props = edge_data.properties.clone();
 
         // WHEN is evaluated against the edge's CURRENT properties, exposed both
@@ -612,6 +664,11 @@ impl Executor {
         for (field, value) in &plan.updates {
             edge_data.properties.insert(field.clone(), value.clone());
         }
+        // A user UPDATE promotes a derived edge to an asserted fact. Otherwise
+        // its new properties/history would be silently discarded by repair.
+        edge_data
+            .properties
+            .remove(super::inference::INFERRED_MARKER);
         let encoded = VertexCodec::encode_edge(&edge_data)
             .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?;
 
@@ -637,11 +694,10 @@ impl Executor {
         // batch; this is now the third.
         let mut index_puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut index_deletes: Vec<Vec<u8>> = Vec::new();
-        if let Some(im) = self.ctx.index_manager.as_ref() {
-            let space_id = self.ctx.resolve_space_id().await;
-            for index in im
-                .list_edge_indexes(space_id)
-                .await
+        {
+            for index in self
+                .mutation_indexes(&effective_space, byoridb_storage::IndexType::Edge)
+                .await?
                 .iter()
                 .filter(|index| index.schema_name == target.edge_name)
             {
@@ -689,6 +745,8 @@ impl Executor {
             (in_edge_key, encoded.clone()),
         ];
         puts.extend(index_puts);
+        self.fence_semantic_batch(&effective_space, &mut puts)
+            .await?;
         self.ctx
             .kvstore
             .batch_apply(
@@ -697,6 +755,22 @@ impl Executor {
                 Self::build_versions(vec![(key_bytes, encoded)]),
             )
             .await?;
+
+        if was_inferred {
+            self.ctx
+                .kvstore
+                .add_counters(vec![
+                    (
+                        SchemaKey::indeg_counter(&effective_space, &target.edge_name, dst),
+                        1,
+                    ),
+                    (
+                        SchemaKey::outdeg_counter(&effective_space, &target.edge_name, src),
+                        1,
+                    ),
+                ])
+                .await?;
+        }
 
         Ok(ExecutorResult {
             columns: vec!["Updated".to_string()],
@@ -734,6 +808,12 @@ impl Executor {
         let existing_vid =
             crate::vid::resolve_vid(&self.ctx, &effective_space, vid_type, &plan.vid, false)
                 .await?;
+        let existing_vid = match existing_vid {
+            Some(vid) => {
+                Some(crate::ontology::representative_of(&self.ctx, &effective_space, vid).await?)
+            }
+            None => None,
+        };
         let existing_data = match existing_vid {
             Some(vid) => {
                 self.ctx
@@ -749,8 +829,10 @@ impl Executor {
         // mapping is assigned only after every operation that can reject or
         // turn this UPDATE into a no-op.
         let mut vertex_data = if let Some(data) = existing_data {
-            VertexCodec::decode_vertex(&data)
-                .map_err(|e| ExecutionError::Io(std::io::Error::other(e.to_string())))?
+            crate::record_decode::decode_vertex(
+                existing_vid.expect("existing vertex has resolved id"),
+                &data,
+            )?
         } else {
             byoridb_codec::VertexData {
                 vid: existing_vid.unwrap_or(0),
@@ -860,6 +942,8 @@ impl Executor {
                 Vec::new(),
             ));
         }
+        self.fence_semantic_batch(&effective_space, &mut current_puts)
+            .await?;
         self.ctx
             .kvstore
             .batch_apply(
@@ -873,8 +957,10 @@ impl Executor {
         // values and add entries for the NEW ones. Without this, LOOKUP kept
         // returning the pre-update value and missed the new one.
         if let Some(im) = self.ctx.index_manager.as_ref() {
-            let space_id = self.ctx.resolve_space_id().await;
-            for index in im.list_tag_indexes(space_id).await {
+            for index in self
+                .mutation_indexes(&effective_space, byoridb_storage::IndexType::Tag)
+                .await?
+            {
                 if let Some(old_props) = old_tag_props.get(&index.schema_name) {
                     let old_values: Vec<_> = index
                         .fields
@@ -933,7 +1019,10 @@ impl Executor {
                     // Persisted HNSW index (R-2b) is now stale for this property.
                     self.mark_vector_index_dirty(&effective_space, k).await?;
                 }
-                None => self.ctx.kvstore.delete(&vkey).await?,
+                None => {
+                    self.ctx.kvstore.delete(&vkey).await?;
+                    self.mark_vector_index_dirty(&effective_space, k).await?;
+                }
             }
         }
 
@@ -1017,13 +1106,12 @@ impl Executor {
         let mut del_keys: Vec<Vec<u8>> = Vec::new();
         // Tag indexes to keep consistent as vertices are removed (DELETE
         // previously left stale index entries pointing at deleted vids).
-        let del_tag_indexes = match self.ctx.index_manager.as_ref() {
-            Some(im) => im.list_tag_indexes(self.ctx.resolve_space_id().await).await,
-            None => Vec::new(),
-        };
+        let del_tag_indexes = self
+            .mutation_indexes(&effective_space, byoridb_storage::IndexType::Tag)
+            .await?;
         for (vid, (key, exists)) in resolved_vids.iter().zip(keys.iter().zip(results.iter())) {
             let Some(data) = exists else { continue };
-            let vertex = VertexCodec::decode_vertex(data).ok();
+            let vertex = Some(crate::record_decode::decode_vertex(*vid, data)?);
 
             // Evaluate the optional WHERE condition; skip vertices that don't
             // match. Previously the condition was ignored and every listed vid
@@ -1095,17 +1183,16 @@ impl Executor {
             }
         }
         // T-트랙 v1.1: 현재뷰 삭제 + tombstone append 단일 트랜잭션.
+        let mut fence_puts = Vec::new();
+        self.fence_semantic_batch(&effective_space, &mut fence_puts)
+            .await?;
         self.ctx
             .kvstore
-            .batch_apply(Vec::new(), del_keys, Self::build_tombstones(tombstones))
+            .batch_apply(fence_puts, del_keys, Self::build_tombstones(tombstones))
             .await?;
         for prop in &dirty_vec_props {
             self.mark_vector_index_dirty(&effective_space, prop).await?;
         }
-
-        // O-9 retraction: re-materialize so any inferred vertex types / edges
-        // tied to the removed vertices are retracted. No-op without semantics.
-        self.rematerialize_space(&effective_space).await?;
 
         Ok(ExecutorResult {
             columns: vec!["Deleted".to_string()],
@@ -1141,21 +1228,14 @@ impl Executor {
 
         // Fetched once rather than per row, like INSERT EDGE does, and filtered
         // to this statement's edge type so the per-row work is only the values.
-        let edge_indexes = match self.ctx.index_manager.as_ref() {
-            Some(im) => {
-                let space_id = self.ctx.resolve_space_id().await;
-                im.list_edge_indexes(space_id)
-                    .await
-                    .into_iter()
-                    .filter(|index| index.schema_name == plan.edge_name)
-                    .collect()
-            }
-            None => Vec::new(),
-        };
+        let edge_indexes: Vec<_> = self
+            .mutation_indexes(&effective_space, byoridb_storage::IndexType::Edge)
+            .await?
+            .into_iter()
+            .filter(|index| index.schema_name == plan.edge_name)
+            .collect();
 
         let mut deleted = 0i64;
-        // Asserted edges actually removed — seed set for incremental retraction.
-        let mut deleted_edges: Vec<(i64, String, i64)> = Vec::new();
         // Edge-degree counter decrements for edges that actually existed.
         let mut deg_in: std::collections::HashMap<(String, i64), i64> =
             std::collections::HashMap::new();
@@ -1181,6 +1261,10 @@ impl Executor {
             else {
                 continue;
             };
+            // Canonicalize before constructing the deduplication key: aliases
+            // of either endpoint address the same asserted edge and history.
+            let src = crate::ontology::representative_of(&self.ctx, &effective_space, src).await?;
+            let dst = crate::ontology::representative_of(&self.ctx, &effective_space, dst).await?;
             // Key format: {space}:edge:{src}:{edge_type}:{dst}:{ranking}
             let key = format!(
                 "{}:edge:{}:{}:{}:{}",
@@ -1195,6 +1279,15 @@ impl Executor {
                 None
             };
             if let Some(blob) = existing {
+                let decoded_edge = crate::algo::decode_query_edge(key.as_bytes(), &blob)?;
+                if decoded_edge
+                    .properties
+                    .contains_key(super::inference::INFERRED_MARKER)
+                {
+                    return Err(ExecutionError::InvalidOperation(
+                        "Cannot delete an inferred-only edge; delete its supporting assertions instead".into(),
+                    ));
+                }
                 del_keys.push(key.as_bytes().to_vec());
                 tombstones.push(key.as_bytes().to_vec());
                 // Keep the reverse-edge index in sync (written by INSERT EDGE).
@@ -1206,47 +1299,35 @@ impl Executor {
                 // them, but delete used to leave them behind — harmless only
                 // because nothing read them yet. Edge LOOKUP would surface them
                 // as hits on deleted edges (#79).
-                if !edge_indexes.is_empty() {
-                    match VertexCodec::decode_edge(&blob) {
-                        Ok(edge) => {
-                            for index in &edge_indexes {
-                                let values = index
-                                    .fields
-                                    .iter()
-                                    .map(|field| {
-                                        self.byoridb_value_to_index_value(
-                                            edge.properties
-                                                .get(field)
-                                                .unwrap_or(&byoridb_common::Value::null()),
-                                        )
-                                    })
-                                    .collect::<Vec<_>>();
-                                del_keys.push(byoridb_storage::KeyUtils::edge_index_key(
-                                    1, index.id, &values, src, *ranking, dst,
-                                ));
-                            }
-                        }
-                        // A blob that cannot be decoded still has its edge keys
-                        // removed; its index entries are unreachable by value, so
-                        // failing the delete over them would strand the edge.
-                        Err(error) => tracing::warn!(
-                            space = %effective_space,
-                            edge_type = %plan.edge_name,
-                            err = %error,
-                            "edge blob did not decode; its index entries were left in place"
-                        ),
-                    }
+                for index in &edge_indexes {
+                    let values = index
+                        .fields
+                        .iter()
+                        .map(|field| {
+                            self.byoridb_value_to_index_value(
+                                decoded_edge
+                                    .properties
+                                    .get(field)
+                                    .unwrap_or(&byoridb_common::Value::null()),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    del_keys.push(byoridb_storage::KeyUtils::edge_index_key(
+                        1, index.id, &values, src, *ranking, dst,
+                    ));
                 }
                 *deg_in.entry((plan.edge_name.clone(), dst)).or_insert(0) -= 1;
                 *deg_out.entry((plan.edge_name.clone(), src)).or_insert(0) -= 1;
                 deleted += 1;
-                deleted_edges.push((src, plan.edge_name.clone(), dst));
             }
         }
         // T-트랙 v1.1: 현재뷰 삭제 + tombstone append 단일 트랜잭션.
+        let mut fence_puts = Vec::new();
+        self.fence_semantic_batch(&effective_space, &mut fence_puts)
+            .await?;
         self.ctx
             .kvstore
-            .batch_apply(Vec::new(), del_keys, Self::build_tombstones(tombstones))
+            .batch_apply(fence_puts, del_keys, Self::build_tombstones(tombstones))
             .await?;
 
         // Apply the degree-counter decrements (atomic; ≤0 removes the key).
@@ -1261,13 +1342,6 @@ impl Executor {
         if !counter_deltas.is_empty() {
             self.ctx.kvstore.add_counters(counter_deltas).await?;
         }
-
-        // O-10 Phase 3 retraction: incremental DRed over provenance — overdelete
-        // the deleted edges' dependent closure, then rederive from surviving
-        // neighbors. Touches only the affected region (vs O-9 full re-mat).
-        // No-op for spaces without semantic relations.
-        self.retract_edges_incremental(&effective_space, deleted_edges)
-            .await?;
 
         Ok(ExecutorResult {
             columns: vec!["Deleted".to_string()],

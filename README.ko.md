@@ -42,8 +42,9 @@ ByoriDB의 주 호출자는 AI 에이전트입니다. 데이터 모델을 발견
 - **Ontology inference:** class hierarchy 및 transitive, symmetric, inverse,
   subproperty, equivalent-property, 2-link property-chain을 포함한 일부
   RDFS-Plus/OWL 2 RL 스타일 규칙을 write 시점에 materialize합니다.
-- **Provenance:** `WHY`는 inferred edge의 rule과 premise를 설명하며, asserted
-  edge 삭제 시 provenance를 이용한 incremental retraction을 지원합니다.
+- **Provenance와 복구:** `WHY`는 inferred edge의 rule과 premise를 설명합니다.
+  Semantic 변경은 현재 closure를 재구축합니다. `CHECK INFERENCE`로 미완료 상태를
+  확인하고 관리자가 `REPAIR INFERENCE`를 실행한 뒤 읽기를 재개할 수 있습니다.
 - **Identity merge:** 명시적 `sameAs` edge가 되돌릴 수 없는 canonical merge를
   수행합니다. 이는 완전한 OWL semantics보다 의도적으로 좁은 범위입니다.
 - **Temporal history:** asserted vertex/edge write는 current view 변경과 history
@@ -87,8 +88,8 @@ ByoriDB는 전체 OWL 2 RL rule set이나 범용 temporal query language를 구�
   custom Raft 구현을 포함합니다.
 
 지원되는 standalone launcher는 한 프로세스에서 embedded storage와 Graph HTTP/gRPC
-listener를 시작합니다. Meta gRPC server는 `cluster.peers`를 설정했을 때만 시작하며,
-이 설정만으로 미완성 multi-node 경로가 production-ready 상태가 되지는 않습니다.
+listener를 시작합니다. 기본값이 아닌 cluster 설정은 거부합니다. 부분적으로 구현된
+Meta/Raft component는 지원되는 multi-node 배포를 구성하지 않습니다.
 사용자 record는 영속적이지만 live session은 프로세스 사이에 공유되지 않습니다.
 서버를 재시작하면 해당 session은 무효화되며, 현재 multi-instance 배포는 session
 폐기를 서로 조정하지 않습니다.
@@ -97,16 +98,18 @@ listener를 시작합니다. Meta gRPC server는 `cluster.peers`를 설정했을
 
 ### 릴리스 아카이브
 
-문서의 릴리스 기준은 2026-08-30(KST)에 공개된
-[v0.4.20](https://github.com/byoridb/byoridb/releases/tag/v0.4.20)이며 Linux
+[최신 릴리스 페이지](https://github.com/byoridb/byoridb/releases/latest)에서 Linux
 x86_64/arm64와 macOS x86_64/arm64용 archive를 제공합니다. macOS binary는 signing과
-notarization을 거쳤습니다. 이후 artifact는
-[최신 릴리스 페이지](https://github.com/byoridb/byoridb/releases/latest)에서 확인하고,
+notarization을 거칩니다. 각 archive에는 server, query CLI, offline backup 도구,
+license와 notices가 포함됩니다. 현재 릴리스 workflow는 압축 해제한 binary로 인증,
+재시작 후 데이터 유지 및 복구 검증을 요구합니다. 이전 archive에 새 검증이 소급
+적용되지는 않습니다. 해당 릴리스 workflow의 성공 결과를 확인하고,
 배포 artifact는 tag 또는 commit SHA로 식별하세요. tag 이후 `main`의 변경은 해당
 릴리스에 포함되지 않습니다.
 
 Windows는 현재 지원하지 않습니다. 지원 플랫폼, 서명 검증 및 이전 archive의 제약은
-[설치 문서](book/src.ko/getting-started/installation.md)를 참고하세요.
+[설치 문서](book/src.ko/getting-started/installation.md)를 참고하세요. 네트워크 배포에는
+[비공개 backend TLS 프로필](book/src.ko/operations/secure-deployment.md)을 사용하세요.
 
 ### 사전 요구사항
 
@@ -189,6 +192,7 @@ space-scoped `GRANT` 문법이 없습니다. 따라서 tenant isolation 경계�
 - [빠른 시작](QUICKSTART.ko.md)
 - [사용자 및 운영 가이드](book/src.ko/SUMMARY.md)
 - [구현 상태, 제약 및 roadmap](docs/PLAN.ko.md)
+- [Standalone 릴리스 인수 기준과 복구 경계](docs/DEPLOYMENT_READINESS.ko.md)
 - [기여하기](CONTRIBUTING.ko.md)
 - [보안 정책](SECURITY.ko.md)
 - [오픈소스 고지(영문)](NOTICES.md)
