@@ -3,9 +3,10 @@
 **English** | [한국어](../ko/architecture/agent-first.html)
 
 ByoriDB is designed for agents that need to understand relationships, inspect
-derivations, and maintain consistent state. The engine remains a general-purpose
-graph and ontology database. Agent memory, dependency analysis, and knowledge
-catalogues are application profiles over it.
+derivations, and maintain consistent state. Agent memory is the primary workload.
+The graph core remains a general property graph, so dependency analysis and
+knowledge catalogues can use it as application profiles. The ontology layer is a
+bounded set of deterministic rules, not an OWL implementation.
 
 **Status: adopted product direction, with implementation delivered incrementally.**
 The canonical [product design](https://github.com/byoridb/byoridb/blob/main/docs/PRODUCT_DESIGN.md)

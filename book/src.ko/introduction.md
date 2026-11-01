@@ -6,14 +6,15 @@
   <img src="../assets/byoridb-icon.png" alt="ByoriDB official icon" width="256">
 </p>
 
-ByoriDB는 **AI 에이전트를 주 호출자로 설계하는** Rust 그래프·온톨로지 데이터베이스입니다.
-스키마 발견, 관계 조회, 근거 확인, 변경 준비, 호출자 권한 안에서의 적용, 결과 확인으로
-이어지는 예측 가능한 실행 흐름이 제품 목표입니다. Agent memory는 이 범용 엔진의
-응용 사례 중 하나입니다.
+ByoriDB는 **AI 에이전트를 주 호출자로 설계하는** 에이전트 메모리용 Rust 그래프
+데이터베이스입니다. 스키마 발견, 관계 조회, 근거 확인, 변경 준비, 호출자 권한
+안에서의 적용, 결과 확인으로 이어지는 예측 가능한 실행 흐름이 제품 목표입니다.
+Agent memory가 주 워크로드이며 그래프 코어는 범용 property graph로 유지됩니다.
+ByoriDB는 OWL이나 RDF 저장소가 아니며, 추론은 결정적인 규칙의 제한된 집합입니다.
 
 [Agent-first 설계](architecture/agent-first.html)는 채택한 방향과 계획 중인 계약을
 설명합니다. 현재 엔진은 nGQL에서 영감을 받은 쿼리 언어, 영속 property graph,
-RDFS-Plus 방식의 전방 추론, 추천 기능, asserted vertex와 edge의 과거 시점 조회를
+RDFS/OWL 어휘를 쓰는 규칙 기반 전방 추론, 추천 기능, asserted vertex와 edge의 과거 시점 조회를
 제공합니다. 구조화된 Agent 연산, 영속 요청 결과, revision에 묶인 변경 미리보기는
 계획 단계입니다. 구현된 인터페이스는 [API 레퍼런스](reference/api.html)에 명시합니다.
 

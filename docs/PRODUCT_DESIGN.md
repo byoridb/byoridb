@@ -2,10 +2,13 @@
 
 > **English** | [한국어](PRODUCT_DESIGN.ko.md)
 >
-> Adopted direction: 2026-10-30. This document defines the product and architecture
-> target. It is not an announcement of implemented APIs or a released capability.
+> Adopted direction: 2026-10-30. Positioning clarified: 2026-11-01 (agent memory
+> is the primary workload; the ontology layer is a bounded rule set, not OWL).
+> This document defines the product and architecture target. It is not an
+> announcement of implemented APIs or a released capability.
 
-ByoriDB is an **agent-first, general-purpose graph and ontology database**.
+ByoriDB is an **agent-first graph database for agent memory**, with an explicit
+deterministic rule layer.
 It gives agents a place to query relationships, apply explicit rules, inspect
 derivations, and change shared state under enforceable contracts. The product
 aims to improve correct task completion and state consistency within a bounded
@@ -28,10 +31,14 @@ rule execution, derivations, constraints, and data access enforcement. Applicati
 own model selection, prompts, task planning, approvals, business actions, and
 external side effects. ByoriDB does not become an LLM runtime or an agent scheduler.
 
-Agent memory is one application of the engine. Other workloads include dependency
-analysis, changing domain models, policy evaluation, and shared operational state.
-The graph and ontology core remains general purpose. A protocol adapter does not
-define the storage model or become the only way to use the database.
+Agent memory is the primary workload and sets priorities. The graph core remains
+a general property graph, so dependency analysis, changing domain models, policy
+evaluation, and shared operational state can use it, but they do not drive the
+roadmap. The ontology layer is a bounded set of deterministic rules, not an OWL
+implementation. Complete OWL semantics, class expressions, and an IRI/RDF data
+model are non-goals unless a concrete requirement to ingest and reason over
+external standard ontologies appears. A protocol adapter does not define the
+storage model or become the only way to use the database.
 
 Keep the Rust single-node engine and redb storage foundation. HTTP/gRPC, supported
 clients, and future adapters must share execution and authorization semantics.
