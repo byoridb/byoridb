@@ -6,17 +6,28 @@
   <img src="book/src/assets/byoridb-icon.png" alt="ByoriDB official icon" width="256">
 </p>
 
-> An agent-first graph and ontology database, designed for evidence-backed
-> queries and reliable state changes.
+> A graph database for agent memory: facts an agent can query, explain, and
+> change with explicit outcomes.
 
-ByoriDB's primary callers are AI agents. Its product goal is to let them discover
-the data model, query relationships, inspect derivations, and change state with
-explicit outcomes. Humans configure access, inspect behavior, and operate the
-service. Agent memory, dependency analysis, and knowledge-driven applications
-share the same general-purpose engine.
+AI agents lose context between sessions. Retrieval-only memory returns similar
+text, and a plain graph store keeps relationships but cannot tell an agent why a
+fact holds or what it looked like earlier. ByoriDB targets that gap. An agent
+stores structured facts and relations, derives new facts from a small set of
+explicit rules, asks `WHY` an inferred fact holds, and reads past state with
+`AS OF`. Explicit outcomes and safe retries for every change are planned, not
+yet implemented.
 
-The current Rust implementation combines a property graph with a semantic layer:
-nGQL-style queries, write-time ontology materialization, inferred-edge
+AI agents are the primary callers. Humans configure access, inspect behavior,
+and operate the service. The engine remains a general property graph, so other
+workloads such as dependency analysis can use it, but agent memory sets the
+priorities.
+
+ByoriDB is not an OWL or RDF store. Its inference is a bounded set of
+deterministic rules that borrow RDFS/OWL vocabulary. Complete OWL semantics,
+class expressions, and an IRI/RDF data model are non-goals.
+
+The current Rust implementation combines a property graph with a rule layer:
+nGQL-style queries, write-time rule materialization, inferred-edge
 explanations, and asserted-fact temporal reads in one standalone server process.
 The [product philosophy and design](docs/PRODUCT_DESIGN.md) defines the target
 agent contract; [the development plan](docs/PLAN.md) distinguishes implemented
@@ -26,7 +37,7 @@ query/discovery behavior from planned structured operations and reliable retries
 > Looking for the local knowledge graph and agent-memory product for Claude
 > Code, Codex, and other coding agents? See
 > **[byoridb/byori](https://github.com/byoridb/byori)**. Byori is an agent-memory
-> application and MCP integration built on this general-purpose engine. Its
+> application and MCP integration built on this engine. Its
 > domain-specific tools are distinct from the engine's planned agent contract.
 
 > [!CAUTION]
@@ -42,9 +53,11 @@ query/discovery behavior from planned structured operations and reliable retries
   `UPDATE` and indexed edge `LOOKUP`.
 - **Vertex IDs:** standalone spaces support `INT64` and `FIXED_STRING(n)` IDs;
   `RECOMMEND` remains `INT64`-only and `WHY` accepts integer IDs.
-- **Ontology inference:** write-time materialization for class hierarchies and
-  selected RDFS-Plus/OWL 2 RL-style rules, including transitive, symmetric,
-  inverse, subproperty, equivalent-property, and two-link property-chain rules.
+- **Rule-based inference:** write-time materialization for class hierarchies
+  (including equivalent classes and a `DISJOINT WITH` consistency check),
+  domain/range typing, and property rules: transitive, symmetric, inverse,
+  subproperty, equivalent-property, and two-link property-chain. The rules use
+  RDFS/OWL vocabulary but ByoriDB is not OWL-conformant.
 - **Provenance and recovery:** `WHY` explains an inferred edge’s rule and premises.
   Semantic changes rebuild current closure. `CHECK INFERENCE` reports incomplete
   state; an administrator can run `REPAIR INFERENCE` before reads resume.
@@ -73,7 +86,8 @@ destination VIDs and loads them in one batch before projection. Missing tags,
 properties, or destination vertices project as `NULL`. `EXPLAIN` and `PROFILE`
 show this work as `GetVertices` with `batch destination projection` detail.
 
-ByoriDB does not implement the complete OWL 2 RL rule set or a general temporal
+ByoriDB does not implement OWL semantics (class expressions, cardinality,
+open-world reasoning), IRIs, RDF/SPARQL compatibility, or a general temporal
 query language. In the current temporal model, valid time and transaction time
 are generated together by the server; temporal `MATCH`, `GO`, `BETWEEN`, and
 user-supplied `VALID FROM/TO` are not supported. Inference uses the current view

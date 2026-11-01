@@ -6,16 +6,26 @@
   <img src="book/src/assets/byoridb-icon.png" alt="ByoriDB official icon" width="256">
 </p>
 
-> 에이전트가 근거를 확인하며 조회하고 상태를 신뢰할 수 있게 변경하도록 설계하는
-> Agent-first 그래프·온톨로지 데이터베이스입니다.
+> 에이전트 메모리를 위한 그래프 데이터베이스입니다. 에이전트가 사실을 조회하고,
+> 근거를 설명받고, 변경 결과를 명확히 알 수 있게 합니다.
 
-ByoriDB의 주 호출자는 AI 에이전트입니다. 데이터 모델을 발견하고, 관계를 조회하고,
-도출 근거를 확인하며, 변경 결과를 명확히 알 수 있게 하는 것이 제품 목표입니다.
-사람은 접근 권한을 설정하고 동작을 검토하며 서비스를 운영합니다. Agent memory,
-의존성 분석, 지식 기반 애플리케이션은 같은 범용 엔진을 사용합니다.
+AI 에이전트는 세션이 바뀌면 맥락을 잃습니다. 검색 기반 메모리는 비슷한 텍스트를
+돌려줄 뿐이고, 일반 그래프 저장소는 관계를 보관하지만 어떤 사실이 왜 성립하는지,
+과거에는 어땠는지 알려 주지 못합니다. ByoriDB는 이 간극을 겨냥합니다. 에이전트는
+구조화된 사실과 관계를 저장하고, 소수의 명시적 규칙으로 새 사실을 도출하며,
+`WHY`로 추론된 사실의 근거를 묻고, `AS OF`로 과거 상태를 조회합니다. 모든 변경에
+대한 명시적 결과와 안전한 재시도는 계획 중이며 아직 구현되지 않았습니다.
 
-현재 Rust 구현은 property graph와 semantic layer를 결합합니다. 하나의 standalone
-서버 프로세스에서 nGQL 스타일 쿼리, write-time ontology materialization, 추론 edge
+주 호출자는 AI 에이전트입니다. 사람은 접근 권한을 설정하고 동작을 검토하며
+서비스를 운영합니다. 엔진은 범용 property graph로 유지되므로 의존성 분석 같은 다른
+워크로드도 쓸 수 있지만, 우선순위는 에이전트 메모리가 정합니다.
+
+ByoriDB는 OWL이나 RDF 저장소가 아닙니다. 추론은 RDFS/OWL 어휘를 빌린, 결정적인
+규칙의 제한된 집합입니다. 완전한 OWL semantics, 클래스 표현식, IRI/RDF 데이터
+모델은 목표가 아닙니다.
+
+현재 Rust 구현은 property graph와 규칙 계층을 결합합니다. 하나의 standalone
+서버 프로세스에서 nGQL 스타일 쿼리, write 시점 규칙 materialization, 추론 edge
 설명, asserted fact의 과거 시점 조회를 제공합니다.
 [제품 철학과 설계](docs/PRODUCT_DESIGN.ko.md)는 목표 Agent 계약을 정의하고,
 [개발 계획](docs/PLAN.ko.md)은 구현된 query/discovery와 계획 중인 구조화 연산·안전한
@@ -24,7 +34,7 @@ ByoriDB의 주 호출자는 AI 에이전트입니다. 데이터 모델을 발견
 > [!NOTE]
 > Claude Code, Codex 등 코딩 에이전트용 로컬 지식 그래프 및 agent-memory 제품을
 > 찾는다면 **[byoridb/byori](https://github.com/byoridb/byori)**를 참고하세요. Byori는
-> 이 범용 엔진 위의 Agent memory 애플리케이션과 MCP 연동입니다. 그 도메인별 도구는
+> 이 엔진 위의 Agent memory 애플리케이션과 MCP 연동입니다. 그 도메인별 도구는
 > 엔진에서 계획하는 Agent 계약과 구분됩니다.
 
 > [!CAUTION]
@@ -39,9 +49,11 @@ ByoriDB의 주 호출자는 AI 에이전트입니다. 데이터 모델을 발견
   vertex/edge 변경.
 - **Vertex ID:** standalone space는 `INT64`와 `FIXED_STRING(n)` ID를 지원합니다.
   `RECOMMEND`는 아직 `INT64` 전용이고 `WHY`는 정수 ID를 받습니다.
-- **Ontology inference:** class hierarchy 및 transitive, symmetric, inverse,
-  subproperty, equivalent-property, 2-link property-chain을 포함한 일부
-  RDFS-Plus/OWL 2 RL 스타일 규칙을 write 시점에 materialize합니다.
+- **규칙 기반 추론:** class hierarchy(equivalent class와 `DISJOINT WITH`
+  일관성 검사 포함), domain/range 타이핑, 그리고 transitive, symmetric, inverse,
+  subproperty, equivalent-property, 2-link property-chain 규칙을 write 시점에
+  materialize합니다. 규칙은 RDFS/OWL 어휘를 쓰지만 ByoriDB는 OWL 규격을 준수하지
+  않습니다.
 - **Provenance와 복구:** `WHY`는 inferred edge의 rule과 premise를 설명합니다.
   Semantic 변경은 현재 closure를 재구축합니다. `CHECK INFERENCE`로 미완료 상태를
   확인하고 관리자가 `REPAIR INFERENCE`를 실행한 뒤 읽기를 재개할 수 있습니다.
@@ -69,8 +81,8 @@ projection 전에 한 번의 batch로 읽습니다. tag, property 또는 destina
 `NULL`을 반환합니다. `EXPLAIN`과 `PROFILE`에는 이 작업이 `batch destination
 projection` detail을 가진 `GetVertices`로 표시됩니다.
 
-ByoriDB는 전체 OWL 2 RL rule set이나 범용 temporal query language를 구현하지
-않습니다. 현재 temporal model에서는 valid time과 transaction time을 서버가 함께
+ByoriDB는 OWL semantics(클래스 표현식, cardinality, open-world 추론), IRI,
+RDF/SPARQL 호환, 범용 temporal query language를 구현하지 않습니다. 현재 temporal model에서는 valid time과 transaction time을 서버가 함께
 생성하며 temporal `MATCH`, `GO`, `BETWEEN`, 사용자가 지정하는 `VALID FROM/TO`는
 지원하지 않습니다. Inference는 current view를 사용하며 과거 inferred fact를
 재구성하지 않습니다. 상세 상태와 제약은 [구현 계획](docs/PLAN.ko.md)을
