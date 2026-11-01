@@ -3,8 +3,9 @@
 [English](../../architecture/agent-first.html) | **한국어**
 
 ByoriDB는 관계를 이해하고, 도출 근거를 확인하며, 상태의 일관성을 유지해야 하는
-에이전트를 위해 설계합니다. 엔진은 범용 그래프·온톨로지 데이터베이스로 유지합니다.
-Agent memory, 의존성 분석, 지식 카탈로그는 그 위의 응용 프로필입니다.
+에이전트를 위해 설계합니다. Agent memory가 주 워크로드입니다. 그래프 코어는 범용
+property graph로 유지되므로 의존성 분석과 지식 카탈로그는 그 위의 응용 프로필로 쓸 수
+있습니다. 온톨로지 계층은 결정적인 규칙의 제한된 집합이며 OWL 구현이 아닙니다.
 
 **상태: 채택한 제품 방향이며 구현은 단계적으로 제공합니다.**
 기준 문서인 [제품 설계](https://github.com/byoridb/byoridb/blob/main/docs/PRODUCT_DESIGN.ko.md)는
