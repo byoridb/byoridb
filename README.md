@@ -18,9 +18,11 @@ explicit rules, asks `WHY` an inferred fact holds, and reads past state with
 yet implemented.
 
 AI agents are the primary callers. Humans configure access, inspect behavior,
-and operate the service. The engine remains a general property graph, so other
-workloads such as dependency analysis can use it, but agent memory sets the
-priorities.
+and operate the service. ByoriDB is the engine. [Byori](https://github.com/byoridb/byori),
+the agent-memory application and MCP integration for coding agents, is its
+reference application, and Byori's needs set the engine's priorities. Other
+applications are being built on the same engine. The engine remains a general
+property graph, so workloads such as dependency analysis can use it too.
 
 ByoriDB is not an OWL or RDF store. Its inference is a bounded set of
 deterministic rules that borrow RDFS/OWL vocabulary. Complete OWL semantics,

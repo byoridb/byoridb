@@ -31,8 +31,10 @@ rule execution, derivations, constraints, and data access enforcement. Applicati
 own model selection, prompts, task planning, approvals, business actions, and
 external side effects. ByoriDB does not become an LLM runtime or an agent scheduler.
 
-Agent memory is the primary workload and sets priorities. The graph core remains
-a general property graph, so dependency analysis, changing domain models, policy
+Agent memory is the primary workload. Byori, the agent-memory application for
+coding agents, is the reference application, and its needs set priorities. Other
+applications are being built on the same engine. The graph core remains a general
+property graph, so dependency analysis, changing domain models, policy
 evaluation, and shared operational state can use it, but they do not drive the
 roadmap. The ontology layer is a bounded set of deterministic rules, not an OWL
 implementation. Complete OWL semantics, class expressions, and an IRI/RDF data
