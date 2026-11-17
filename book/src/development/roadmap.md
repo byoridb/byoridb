@@ -3,9 +3,10 @@
 **English** | [한국어](../ko/development/roadmap.html)
 
 Updated 2026-10-31 against released **v0.4.23** (tag commit `fb96cb3`). ByoriDB is developing into an
-**agent-first, general-purpose graph and ontology database**. Agents are direct
-consumers; people operate, evaluate, govern and purchase deployments. Agent memory
-is one use case. The goal is correct task completion with inspectable evidence and
+**agent-first graph database for agent memory** with a bounded rule layer. Agents
+are direct consumers; people operate, evaluate, govern and purchase deployments.
+Agent memory is the primary workload; complete OWL semantics and an RDF/IRI data
+model are non-goals. The goal is correct task completion with inspectable evidence and
 reliable state changes; agent cost or speed advantages still need measurement.
 
 The [product philosophy and design](https://github.com/byoridb/byoridb/blob/main/docs/PRODUCT_DESIGN.md)

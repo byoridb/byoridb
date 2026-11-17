@@ -6,15 +6,17 @@
   <img src="assets/byoridb-icon.png" alt="ByoriDB official icon" width="256">
 </p>
 
-ByoriDB is a Rust graph and ontology database designed around **AI agents as
-the primary callers**. The product goal is a predictable loop: discover the
+ByoriDB is a Rust graph database for **agent memory**, designed around **AI agents
+as the primary callers**. The product goal is a predictable loop: discover the
 schema, query relationships, inspect evidence, prepare a change, apply it within
-the caller's authority, and verify the outcome. Agent memory is one application
-of this general-purpose engine.
+the caller's authority, and verify the outcome. Agent memory is the primary
+workload; the graph core stays a general property graph. ByoriDB is not an OWL or
+RDF store: its inference is a bounded set of deterministic rules.
 
 The [agent-first design](architecture/agent-first.html) describes the adopted
 direction and planned contracts. Today the engine provides an nGQL-inspired
-query language, a persistent property graph, RDFS-Plus-style forward reasoning,
+query language, a persistent property graph, rule-based forward inference using
+RDFS/OWL vocabulary,
 recommendation primitives, and point-in-time reads for asserted vertices and
 edges. Structured agent operations, durable request outcomes, and revision-bound
 previews are planned; the [API reference](reference/api.html) documents the

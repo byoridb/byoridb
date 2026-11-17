@@ -6,10 +6,12 @@
 > This is a source-based plan, not a live deployment report. Unreleased work and
 > checks performed during this revision are identified separately below.
 
-This is the authoritative delivery plan for an **agent-first, general-purpose
-graph and ontology database**. Agents are its direct consumers; people operate,
-evaluate, govern, and purchase deployments. Agent memory is one use case, not the
-scope of the engine. The [product philosophy and design](PRODUCT_DESIGN.md) define
+This is the authoritative delivery plan for an **agent-first graph database for
+agent memory** with a bounded deterministic rule layer. Agents are its direct
+consumers; people operate, evaluate, govern, and purchase deployments. Agent
+memory is the primary workload and sets priorities; the graph core stays a general
+property graph, and the rule layer is not an OWL implementation (positioning
+clarified 2026-11-01). The [product philosophy and design](PRODUCT_DESIGN.md) define
 the target contracts; this plan tracks their implementation and acceptance. The
 [book roadmap](../book/src/development/roadmap.md) is the public summary.
 Update both languages together. Earlier rationale, retired task IDs, and incident

@@ -1,7 +1,7 @@
 [book]
 title = "ByoriDB Documentation"
 authors = ["ByoriDB Contributors"]
-description = "Agent-first graph and ontology database: product design, implemented APIs, and operations"
+description = "Agent-first graph database for agent memory: product design, implemented APIs, and operations"
 language = "en"
 multilingual = false
 src = "src"
