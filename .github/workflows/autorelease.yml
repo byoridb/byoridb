@@ -1,6 +1,6 @@
 name: Auto-release
 
-# Every push to main publishes the next patch release.
+# Pushes to main publish the next patch release unless only documentation changed.
 #
 # The tag alone is not enough. `src/version.rs` builds `--version` from
 # CARGO_PKG_VERSION, so what a binary reports comes from `[workspace.package]`
@@ -10,6 +10,10 @@ name: Auto-release
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'book/**'
   # Everything above depends on GitHub turning a push into a run. That link was
   # broken for this repository on the day this workflow landed — `pull_request`
   # and `push` created no check suites at all while `workflow_dispatch` kept

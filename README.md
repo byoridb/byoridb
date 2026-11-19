@@ -6,8 +6,13 @@
   <img src="book/src/assets/byoridb-icon.png" alt="ByoriDB official icon" width="256">
 </p>
 
-> A graph database for agent memory: facts an agent can query, explain, and
-> change with explicit outcomes.
+ByoriDB is a **database engine** for storing and querying relationships. One way to use it is to ask a coding agent to build a tool for a question you often run into:
+
+> Build our team a source tracker with ByoriDB. When I open a proposal, I want to see the notes it cites and the interviews they came from. I'd also like to pick an interview and see which proposals drew on it.
+
+The agent builds the app that imports your material and displays the results. ByoriDB stores the links between proposals, notes, and interviews. The app can define a rule that an interview counts as a source for a proposal if the proposal cites a note from that interview. ByoriDB can then find those sources and tell you which note accounts for each connection.
+
+## Agent memory
 
 AI agents lose context between sessions. Retrieval-only memory returns similar
 text, and a plain graph store keeps relationships but cannot tell an agent why a
