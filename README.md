@@ -12,6 +12,12 @@ ByoriDB is a **database engine** for storing and querying relationships. One way
 
 The agent builds the app that imports your material and displays the results. ByoriDB stores the links between proposals, notes, and interviews. The app can define a rule that an interview counts as a source for a proposal if the proposal cites a note from that interview. ByoriDB can then find those sources and tell you which note accounts for each connection.
 
+## Running it on your own computer
+
+On an Apple Silicon Mac, the server executable was **11.9 MiB** and used **about 29 MiB of memory** while idle with an empty database. After storing and reading back 1,000 short notes and 999 links between them, the server used about 38 MiB of memory and its data file occupied 1.04 MiB on disk.
+
+We measured the v0.4.26 release three times on macOS 27.2, starting with a fresh database each time. Memory figures are for the server process alone, sampled as resident set size (RSS) one second after each stage. Budget separately for your app or AI model. Longer documents and concurrent queries can have different peak requirements.
+
 ## Agent memory
 
 AI agents lose context between sessions. Retrieval-only memory returns similar
